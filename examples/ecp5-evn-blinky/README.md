@@ -16,7 +16,9 @@ sudo apt install yosys nextpnr-ecp5 fpga-trellis fpga-trellis-database openfpgal
 ```
 
 In addition to the bitstream, `build/` contains the post-technology-mapping
-netlist, post-P&R SDF, utilization and timing report, and stage logs.
+netlist, post-P&R SDF, utilization and timing report, and stage logs. Veryl
+emits generated SystemVerilog into `build/veryl/`; source directories remain
+generated-file-free.
 
 | Artifact | Purpose |
 | --- | --- |

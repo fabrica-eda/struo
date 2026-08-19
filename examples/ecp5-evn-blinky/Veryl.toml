@@ -6,3 +6,4 @@ version = "0.1.0"
 clock_type = "posedge"
 reset_type = "async_low"
 sources = ["src"]
+target = { type = "directory", path = "build/veryl" }

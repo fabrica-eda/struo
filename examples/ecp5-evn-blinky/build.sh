@@ -19,7 +19,7 @@ cd -- "${example_dir}"
 veryl build
 
 yosys -ql "${build_dir}/yosys.log" -p "
-    read_verilog -sv src/Top.sv;
+    read_verilog -sv ${build_dir}/veryl/Top.sv;
     synth_ecp5 -top ${top} -json ${build_dir}/Top.json;
     write_verilog -noattr ${build_dir}/Top.synth.v
 "
