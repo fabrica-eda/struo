@@ -1,0 +1,15 @@
+[package]
+name = "struo-synth"
+description = "Synthesis passes and pipeline for Struo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+struo-ir = { path = "../struo-ir" }
+struo-rtl = { path = "../struo-rtl" }
+
+[lints]
+workspace = true

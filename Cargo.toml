@@ -1,0 +1,34 @@
+[workspace]
+members = [
+    "crates/struo-cli",
+    "crates/struo-frontend-veryl",
+    "crates/struo-ir",
+    "crates/struo-rtl",
+    "crates/struo-sim",
+    "crates/struo-synth",
+    "crates/struo-target-ecp5",
+]
+default-members = ["crates/struo-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Struo contributors"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.test]
+opt-level = 1

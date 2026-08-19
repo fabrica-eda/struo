@@ -1,0 +1,16 @@
+[package]
+name = "struo-frontend-veryl"
+description = "Veryl analyzer adapter for Struo RTL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+struo-rtl = { path = "../struo-rtl" }
+veryl-analyzer = "=0.20.3"
+veryl-parser = { version = "=0.20.3", default-features = false }
+
+[lints]
+workspace = true

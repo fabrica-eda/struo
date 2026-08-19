@@ -1,0 +1,27 @@
+/// First end-to-end hardware smoke test for LFE5UM5G-85F-EVN.
+module Top (
+    clk: input  clock,
+    btn: input  reset,
+    led: output logic<8>,
+) {
+    var counter: logic<24>;
+
+    always_ff (clk, btn) {
+        if_reset {
+            counter = 0;
+        } else {
+            counter = counter + 1;
+        }
+    }
+
+    always_comb {
+        led[0] = counter[23];
+        led[1] = counter[22];
+        led[2] = counter[21];
+        led[3] = counter[20];
+        led[4] = counter[19];
+        led[5] = counter[18];
+        led[6] = counter[17];
+        led[7] = counter[16];
+    }
+}

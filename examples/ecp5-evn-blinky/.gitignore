@@ -1,0 +1,6 @@
+/.build/
+/build/
+/dependencies/
+/ecp5_evn_blinky.f
+/src/*.sv
+/src/*.sv.map

@@ -1,0 +1,11 @@
+[package]
+name = "struo-ir"
+description = "Technology-independent circuit IR for Struo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

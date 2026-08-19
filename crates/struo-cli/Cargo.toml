@@ -1,0 +1,21 @@
+[package]
+name = "struo-cli"
+description = "Command-line interface for Struo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "struo"
+path = "src/main.rs"
+
+[dependencies]
+struo-ir = { path = "../struo-ir" }
+struo-sim = { path = "../struo-sim" }
+struo-synth = { path = "../struo-synth" }
+struo-target-ecp5 = { path = "../struo-target-ecp5" }
+
+[lints]
+workspace = true
