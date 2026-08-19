@@ -1,9 +1,13 @@
 //! Lattice ECP5 target descriptions and reproducible tool recipes.
 
-use struo_sim::{
-    ReleaseBlocked, SimulationRecipe, SimulationSource, SimulationSourceKind, VerificationPolicy,
-    VerificationReport, VerificationStage,
+mod mapped;
+
+pub use mapped::{
+    Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPort, MappingError,
+    PortDirection as MappedPortDirection, Reset, map_to_ecp5,
 };
+
+use struo_sim::{ReleaseBlocked, VerificationPolicy, VerificationReport, VerificationStage};
 
 /// Board constraints distributed with this crate.
 pub const LFE5UM5G_85F_EVN_LPF: &str = include_str!("../../../boards/lfe5um5g-85f-evn/base.lpf");
@@ -52,12 +56,8 @@ pub struct ToolCommand {
 /// Conventional paths belonging to one immutable build directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlowArtifacts {
-    /// Struo-emitted synthesizable Verilog.
-    pub rtl_verilog: String,
-    /// Yosys JSON consumed by nextpnr.
-    pub synthesized_json: String,
-    /// Technology-mapped Verilog used for gate-level simulation.
-    pub synthesized_verilog: String,
+    /// Serialized mapped netlist consumed by nextpnr.
+    pub mapped_json: String,
     /// nextpnr textual configuration.
     pub routed_config: String,
     /// Packed FPGA bitstream.
@@ -74,9 +74,7 @@ impl FlowArtifacts {
     pub fn under(root: &str) -> Self {
         let root = root.trim_end_matches('/');
         Self {
-            rtl_verilog: format!("{root}/design.rtl.v"),
-            synthesized_json: format!("{root}/design.synth.json"),
-            synthesized_verilog: format!("{root}/design.synth.v"),
+            mapped_json: format!("{root}/design.json"),
             routed_config: format!("{root}/design.config"),
             bitstream: format!("{root}/design.bit"),
             svf: format!("{root}/design.svf"),
@@ -107,65 +105,6 @@ impl Ecp5Flow {
         }
     }
 
-    /// Yosys command that emits both nextpnr JSON and a technology-mapped
-    /// Verilog netlist. The latter must not be discarded.
-    #[must_use]
-    pub fn synthesis_command(&self) -> ToolCommand {
-        let script = format!(
-            "hierarchy -check -top {top}; synth_ecp5 -top {top} -json {json}; \
-             write_verilog -noattr -norename {netlist}",
-            top = self.top,
-            json = self.artifacts.synthesized_json,
-            netlist = self.artifacts.synthesized_verilog,
-        );
-        ToolCommand {
-            program: "yosys",
-            args: vec!["-p".into(), script, self.artifacts.rtl_verilog.clone()],
-            evidence: None,
-        }
-    }
-
-    /// Yosys check that rejects missing and black-box primitive models before
-    /// gate-level simulation.
-    #[must_use]
-    pub fn black_box_check_command(&self) -> ToolCommand {
-        let script = format!(
-            "read_verilog +/ecp5/cells_sim.v; read_verilog {netlist}; \
-             hierarchy -check -simcheck -top {top}",
-            netlist = self.artifacts.synthesized_verilog,
-            top = self.top,
-        );
-        ToolCommand {
-            program: "yosys",
-            args: vec!["-p".into(), script],
-            evidence: Some(VerificationStage::BlackBoxCheck),
-        }
-    }
-
-    /// Gate-level simulation inputs. `+/ecp5/cells_sim.v` must be resolved
-    /// beneath the active Yosys data directory before invoking Icarus or
-    /// Verilator. Black-box-only declarations are intentionally not included.
-    #[must_use]
-    pub fn post_synthesis_simulation(&self, testbench: impl Into<String>) -> SimulationRecipe {
-        SimulationRecipe::post_synthesis(
-            self.top.clone(),
-            vec![
-                SimulationSource {
-                    kind: SimulationSourceKind::PrimitiveModels,
-                    path: "+/ecp5/cells_sim.v".into(),
-                },
-                SimulationSource {
-                    kind: SimulationSourceKind::SynthesizedNetlist,
-                    path: self.artifacts.synthesized_verilog.clone(),
-                },
-                SimulationSource {
-                    kind: SimulationSourceKind::Testbench,
-                    path: testbench.into(),
-                },
-            ],
-        )
-    }
-
     /// nextpnr command for the exact UM5G-85K CABGA381 device.
     #[must_use]
     pub fn place_and_route_command(&self) -> ToolCommand {
@@ -178,7 +117,7 @@ impl Ecp5Flow {
                 "--speed".into(),
                 self.board.speed_grade.to_string(),
                 "--json".into(),
-                self.artifacts.synthesized_json.clone(),
+                self.artifacts.mapped_json.clone(),
                 "--lpf".into(),
                 self.artifacts.constraints.clone(),
                 "--textcfg".into(),
@@ -218,9 +157,7 @@ impl Ecp5Flow {
 
 #[cfg(test)]
 mod tests {
-    use struo_sim::{
-        SimulationSourceKind, VerificationPolicy, VerificationReport, VerificationStage,
-    };
+    use struo_sim::{VerificationPolicy, VerificationReport};
 
     use super::{Ecp5Flow, LFE5UM5G_85F_EVN, LFE5UM5G_85F_EVN_LPF};
 
@@ -230,19 +167,6 @@ mod tests {
         assert_eq!(LFE5UM5G_85F_EVN.nextpnr_device, "--um5g-85k");
         assert_eq!(LFE5UM5G_85F_EVN.nextpnr_package, "CABGA381");
         assert!(LFE5UM5G_85F_EVN_LPF.contains("SITE \"A10\""));
-    }
-
-    #[test]
-    fn synthesized_netlist_is_a_required_simulation_input() {
-        let flow = Ecp5Flow::evaluation_board("Top", "build/Top");
-        let simulation = flow.post_synthesis_simulation("tests/Top_tb.sv");
-
-        assert_eq!(simulation.stage, VerificationStage::PostSynthesisSimulation);
-        assert!(simulation.reject_black_boxes);
-        assert!(simulation.sources.iter().any(|source| {
-            source.kind == SimulationSourceKind::SynthesizedNetlist
-                && source.path.ends_with("design.synth.v")
-        }));
     }
 
     #[test]

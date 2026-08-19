@@ -1,0 +1,16 @@
+[package]
+name = "struo-celox"
+description = "Celox simulation adapter for Struo technology-mapped netlists"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+celox-frontend-sdk = { git = "https://github.com/celox-sim/celox", rev = "250693d37147d4aa32fa6a232b35b51752547dc9" }
+struo-ir = { path = "../struo-ir" }
+struo-target-ecp5 = { path = "../struo-target-ecp5" }
+
+[lints]
+workspace = true

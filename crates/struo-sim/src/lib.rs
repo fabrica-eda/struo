@@ -168,54 +168,6 @@ impl Display for ReleaseBlocked {
 
 impl Error for ReleaseBlocked {}
 
-/// Role of a source in an external simulator invocation.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SimulationSourceKind {
-    /// Emitted RTL being tested.
-    Rtl,
-    /// Technology-mapped netlist emitted by synthesis.
-    SynthesizedNetlist,
-    /// Testbench or cocotb/VPI wrapper.
-    Testbench,
-    /// Functional model for target primitives.
-    PrimitiveModels,
-}
-
-/// One input to a simulator.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SimulationSource {
-    /// Semantic role of this file.
-    pub kind: SimulationSourceKind,
-    /// Path stored relative to the artifact root when possible.
-    pub path: String,
-}
-
-/// Reproducible external simulation inputs.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SimulationRecipe {
-    /// Stage satisfied by this simulation.
-    pub stage: VerificationStage,
-    /// Simulation top module.
-    pub top: String,
-    /// Ordered simulator inputs.
-    pub sources: Vec<SimulationSource>,
-    /// If true, an unresolved or black-box primitive is a hard failure.
-    pub reject_black_boxes: bool,
-}
-
-impl SimulationRecipe {
-    /// Creates the required recipe for a synthesized gate-level netlist.
-    #[must_use]
-    pub fn post_synthesis(top: impl Into<String>, sources: Vec<SimulationSource>) -> Self {
-        Self {
-            stage: VerificationStage::PostSynthesisSimulation,
-            top: top.into(),
-            sources,
-            reject_black_boxes: true,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{StageOutcome, VerificationPolicy, VerificationReport, VerificationStage};

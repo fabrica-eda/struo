@@ -19,7 +19,9 @@ struo-rtl              module / type / clock / reset / register / memory
 struo-ir               bit-level, target-independent netlist
     │  technology mapping
     ▼
-ECP5 netlist           LUT / FF / EBR / DSP / IO primitives
+ECP5 mapped netlist    LUT4 / TRELLIS_FF primitives
+    ├── Celox FrontendArtifact for post-map simulation
+    └── Yosys JSON-compatible serialization for nextpnr
 ```
 
 Crate responsibilities:
@@ -28,8 +30,10 @@ Crate responsibilities:
 - `struo-rtl`: frontend-independent RTL that preserves hardware semantics
 - `struo-ir`: low-level netlist manipulated by synthesis passes
 - `struo-synth`: RTL validation, lowering, and optimization pipeline
-- `struo-sim`: RTL/gate simulation, equivalence, and release gates
-- `struo-target-ecp5`: ECP5 primitives, tool recipes, and board profiles
+- `struo-sim`: equivalence policy and release gates
+- `struo-celox`: Celox SDK adapter for technology-mapped netlists
+- `struo-target-ecp5`: ECP5 primitives, nextpnr serialization, tool recipes,
+  and board profiles
 - `struo-cli`: compiler driver
 
 `struo-frontend-veryl` currently converts only the module and port shell.
@@ -65,13 +69,15 @@ Every stage below must pass before a bitstream can be released:
 
 `struo-sim::VerificationReport::authorize_bitstream` rejects bitstream
 packaging and programming if any stage is missing, skipped, or failed.
-Post-synthesis simulation uses Yosys `+/ecp5/cells_sim.v`; black-box-only models
-must not be used to make a simulation pass.
+Post-synthesis simulation converts the same mapped Rust object that is
+serialized for nextpnr into a Celox `FrontendArtifact`. Verilog is not an
+intermediate representation in this path. Reference simulation continues to
+use Celox's native Veryl frontend; Struo's internal synthesis IR is not exported
+back to Celox.
 
-The intended open-source toolchain consists of Yosys, nextpnr-ecp5, Project
-Trellis (`ecppack`), Icarus Verilog or Verilator, and a formal engine. A
-bitstream-generation smoke test for a minimal Veryl circuit is available under
-`examples/ecp5-evn-blinky`.
+The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
+synthesis. The existing Veryl/Yosys bitstream smoke test remains under
+`examples/ecp5-evn-blinky` while the Veryl AIR adapter is completed.
 
 ## Development
 
@@ -79,9 +85,15 @@ bitstream-generation smoke test for a minimal Veryl circuit is available under
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-cargo run -- demo
+cargo run -- demo /tmp/struo-blinky.nextpnr.json /tmp/struo-blinky.celox.json
 ```
 
-The next implementation unit is complete lowering of the Veryl analyzer's
-`Comb`, `Ff`, and `Inst` nodes into `struo-rtl`, followed by running identical
-test vectors in the RTL and ECP5 gate-level simulators.
+The implemented synthesis subset includes bitwise logic, wrapping addition and
+subtraction, equality, muxes, concatenation, slicing, registers, enables, and
+synchronous or asynchronous constant resets. It performs constant folding and
+structural hashing, then maps Boolean nodes to `LUT4` and registers to
+`TRELLIS_FF`. Memories, hierarchy, and inout ports are rejected explicitly.
+
+The next frontend unit is complete lowering of Veryl analyzer `Comb`, `Ff`, and
+`Inst` nodes into `struo-rtl`; the synthesis and ECP5 mapping path no longer
+depends on generated Verilog.

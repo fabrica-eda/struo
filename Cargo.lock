@@ -237,6 +237,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "celox-frontend-sdk"
+version = "0.1.0"
+source = "git+https://github.com/celox-sim/celox?rev=250693d37147d4aa32fa6a232b35b51752547dc9#250693d37147d4aa32fa6a232b35b51752547dc9"
+dependencies = [
+ "fxhash",
+ "num-bigint",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1845,10 +1857,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "struo-celox"
+version = "0.1.0"
+dependencies = [
+ "celox-frontend-sdk",
+ "struo-ir",
+ "struo-target-ecp5",
+]
+
+[[package]]
 name = "struo-cli"
 version = "0.1.0"
 dependencies = [
- "struo-ir",
+ "struo-celox",
+ "struo-rtl",
  "struo-sim",
  "struo-synth",
  "struo-target-ecp5",
@@ -1887,6 +1909,9 @@ dependencies = [
 name = "struo-target-ecp5"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "struo-ir",
  "struo-sim",
 ]
 

@@ -12,7 +12,8 @@ name = "struo"
 path = "src/main.rs"
 
 [dependencies]
-struo-ir = { path = "../struo-ir" }
+struo-celox = { path = "../struo-celox" }
+struo-rtl = { path = "../struo-rtl" }
 struo-sim = { path = "../struo-sim" }
 struo-synth = { path = "../struo-synth" }
 struo-target-ecp5 = { path = "../struo-target-ecp5" }
