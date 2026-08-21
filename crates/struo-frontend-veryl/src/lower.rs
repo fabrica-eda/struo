@@ -1204,6 +1204,39 @@ module CaseTop (
 }
 ";
 
+    const GENERATE_FOR_SOURCE: &str = r"
+module Increment (
+    value : input  logic<8>,
+    result: output logic<8>,
+) {
+    always_comb {
+        result = value + 8'h01;
+    }
+}
+
+module GenerateForBank::<PORTS: u32 = 2> (
+    values : input  logic<PORTS * 8>,
+    results: output logic<PORTS * 8>,
+) {
+    for i in 0..PORTS :lane {
+        inst increment: Increment (
+            value : values[i * 8+: 8] ,
+            result: results[i * 8+: 8],
+        );
+    }
+}
+
+module GenerateForTop (
+    values : input  logic<32>,
+    results: output logic<32>,
+) {
+    inst bank: GenerateForBank::<4> (
+        values : values ,
+        results: results,
+    );
+}
+";
+
     #[test]
     fn lowers_analyzed_comb_and_ff_through_ecp5_and_celox() {
         let design = analyze_and_lower(SOURCE, "air_lowering", "Top").unwrap();
@@ -1264,6 +1297,34 @@ module CaseTop (
             set(&mut simulator, "select", select);
             assert_value(&mut simulator, "decoded", expected);
         }
+    }
+
+    #[test]
+    fn flattens_parameter_bounded_generate_for_instances() {
+        let design = analyze_and_lower(
+            GENERATE_FOR_SOURCE,
+            "generate_for_lowering",
+            "GenerateForTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+        assert!(top.instances().is_empty());
+        for lane in 0..4 {
+            assert!(
+                top.signals().iter().any(|signal| {
+                    signal.name() == format!("bank.lane[{lane}].increment.value")
+                })
+            );
+        }
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let values = simulator.signal("values");
+        simulator
+            .modify(|io| io.set(values, 0xff7f_0100u32))
+            .unwrap();
+        assert_value(&mut simulator, "results", 0x0080_0201);
     }
 
     fn reset(simulator: &mut Simulator<NativeBackend>) {

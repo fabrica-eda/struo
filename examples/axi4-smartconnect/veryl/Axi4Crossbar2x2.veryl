@@ -179,6 +179,32 @@ module Axi4BurstDecoder (
     }
 }
 
+/// Statically elaborated bank of independent burst decoders.
+///
+/// Veryl expands the parameter-bounded generate loop in analyzer AIR, so Struo
+/// receives ordinary instances without generating an intermediate source file.
+module Axi4BurstDecoderBank::<PORTS: u32 = 2> (
+    addr        : input  logic<PORTS * 16>,
+    len         : input  logic<PORTS * 8> ,
+    size        : input  logic<PORTS * 3> ,
+    burst       : input  logic<PORTS * 2> ,
+    target0     : output logic<PORTS>     ,
+    target1     : output logic<PORTS>     ,
+    decode_error: output logic<PORTS>     ,
+) {
+    for i in 0..PORTS :decoder {
+        inst unit: Axi4BurstDecoder (
+            addr        : addr[i * 16+:16],
+            len         : len[i * 8+:8]   ,
+            size        : size[i * 3+:3]  ,
+            burst       : burst[i * 2+:2] ,
+            target0     : target0[i]      ,
+            target1     : target1[i]      ,
+            decode_error: decode_error[i] ,
+        );
+    }
+}
+
 /// Fixed two-initiator, two-target AXI4 crossbar.
 ///
 /// Each initiator may have two reads and two writes outstanding, provided their
@@ -325,41 +351,23 @@ module Axi4Crossbar2x2 (
     var s1_ar_target1     : logic;
     var s1_ar_decode_error: logic;
 
-    inst s0_aw_decoder: Axi4BurstDecoder (
-        addr        : s0_aw_payload[44:29],
-        len         : s0_aw_payload[28:21],
-        size        : s0_aw_payload[20:18],
-        burst       : s0_aw_payload[17:16],
-        target0     : s0_aw_target0       ,
-        target1     : s0_aw_target1       ,
-        decode_error: s0_aw_decode_error  ,
+    inst aw_decoders: Axi4BurstDecoderBank::<2> (
+        addr        : {s1_aw_payload[44:29], s0_aw_payload[44:29]},
+        len         : {s1_aw_payload[28:21], s0_aw_payload[28:21]},
+        size        : {s1_aw_payload[20:18], s0_aw_payload[20:18]},
+        burst       : {s1_aw_payload[17:16], s0_aw_payload[17:16]},
+        target0     : {s1_aw_target0, s0_aw_target0},
+        target1     : {s1_aw_target1, s0_aw_target1},
+        decode_error: {s1_aw_decode_error, s0_aw_decode_error},
     );
-    inst s1_aw_decoder: Axi4BurstDecoder (
-        addr        : s1_aw_payload[44:29],
-        len         : s1_aw_payload[28:21],
-        size        : s1_aw_payload[20:18],
-        burst       : s1_aw_payload[17:16],
-        target0     : s1_aw_target0       ,
-        target1     : s1_aw_target1       ,
-        decode_error: s1_aw_decode_error  ,
-    );
-    inst s0_ar_decoder: Axi4BurstDecoder (
-        addr        : s0.araddr         ,
-        len         : s0.arlen          ,
-        size        : s0.arsize         ,
-        burst       : s0.arburst        ,
-        target0     : s0_ar_target0     ,
-        target1     : s0_ar_target1     ,
-        decode_error: s0_ar_decode_error,
-    );
-    inst s1_ar_decoder: Axi4BurstDecoder (
-        addr        : s1.araddr         ,
-        len         : s1.arlen          ,
-        size        : s1.arsize         ,
-        burst       : s1.arburst        ,
-        target0     : s1_ar_target0     ,
-        target1     : s1_ar_target1     ,
-        decode_error: s1_ar_decode_error,
+    inst ar_decoders: Axi4BurstDecoderBank::<2> (
+        addr        : {s1.araddr, s0.araddr},
+        len         : {s1.arlen, s0.arlen},
+        size        : {s1.arsize, s0.arsize},
+        burst       : {s1.arburst, s0.arburst},
+        target0     : {s1_ar_target0, s0_ar_target0},
+        target1     : {s1_ar_target1, s0_ar_target1},
+        decode_error: {s1_ar_decode_error, s0_ar_decode_error},
     );
 
     always_comb {
