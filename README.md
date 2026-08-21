@@ -115,9 +115,12 @@ AW and W independently, streams W and R beats through backpressure, uses
 separate read/write round-robin arbitration, and locally completes unmapped
 bursts with `DECERR`. Tests take only the analyzed Veryl path through synthesis,
 ECP5 technology mapping, and Celox post-map simulation, with Celox's native
-Veryl frontend as the reference. The current fabric permits one read and one
-write transaction per initiator and target, so it preserves IDs and ordering
-without a response reorder buffer.
+Veryl frontend as the reference. Each initiator has two read and two write
+outstanding slots. A fifth downstream ID bit records the initiator, allowing
+responses for different IDs to return out of order; a repeated ID is held until
+its earlier transaction completes to preserve AXI ordering. The simulation
+tests exercise reverse-order B/R completion and full-slot backpressure through
+both the reference and post-map paths.
 
 The standalone crossbar exposes every AXI signal for simulation and therefore
 exceeds the evaluation board's physical IO count. Place-and-route coverage will

@@ -73,17 +73,25 @@ mod tests {
             set_u8(&mut simulator, "m0_rlast", 1);
             set_u8(&mut simulator, "s0_rready", 1);
             set_u8(&mut simulator, "s0_arvalid", 1);
+            assert_value(&mut simulator, "s0_arready", 0);
+            assert_value(&mut simulator, "s1_arready", 1);
             tick(&mut simulator);
             set_u8(&mut simulator, "m0_rvalid", 0);
             set_u8(&mut simulator, "m0_rlast", 0);
             set_u8(&mut simulator, "s0_rready", 0);
-
-            assert_value(&mut simulator, "s0_arready", 0);
-            assert_value(&mut simulator, "s1_arready", 1);
-            tick(&mut simulator);
             set_u8(&mut simulator, "s0_arvalid", 0);
             set_u8(&mut simulator, "s1_arvalid", 0);
             assert_value(&mut simulator, "m0_araddr", 0x0024);
+        }
+    }
+
+    #[test]
+    fn routes_multiple_outstanding_transactions_by_extended_id() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for mut simulator in [reference_simulator(), crossbar_simulator()] {
+            reset(&mut simulator);
+            exercise_out_of_order_reads(&mut simulator);
+            exercise_out_of_order_writes(&mut simulator);
         }
     }
 
@@ -194,7 +202,7 @@ mod tests {
         tick(simulator);
         set_u8(simulator, "s1_arvalid", 0);
         assert_value(simulator, "m0_arvalid", 1);
-        assert_value(simulator, "m0_arid", 6);
+        assert_value(simulator, "m0_arid", 0x16);
         assert_value(simulator, "m0_araddr", 0x0040);
         assert_value(simulator, "m0_arlen", 1);
         assert_value(simulator, "m0_arsize", 2);
@@ -208,7 +216,7 @@ mod tests {
         tick(simulator);
         set_u8(simulator, "m0_arready", 0);
 
-        set_u8(simulator, "m0_rid", 6);
+        set_u8(simulator, "m0_rid", 0x16);
         set_u32(simulator, "m0_rdata", 0xaaaa_0001);
         set_u8(simulator, "m0_rresp", 0);
         set_u8(simulator, "m0_rlast", 0);
@@ -287,6 +295,153 @@ mod tests {
         tick(simulator);
         set_u8(simulator, "s1_bready", 0);
         assert_value(simulator, "s1_bvalid", 0);
+    }
+
+    fn exercise_out_of_order_reads(simulator: &mut Simulator<JitBackend>) {
+        issue_single_read(simulator, 0, 1, 0x0100, 0);
+        issue_single_read(simulator, 0, 2, 0x8100, 1);
+
+        set_u8(simulator, "s0_arid", 3);
+        set_u16(simulator, "s0_araddr", 0x0200);
+        set_u8(simulator, "s0_arvalid", 1);
+        assert_value(simulator, "s0_arready", 0);
+
+        set_u8(simulator, "m1_rid", 2);
+        set_u32(simulator, "m1_rdata", 0x2222_2222);
+        set_u8(simulator, "m1_rlast", 1);
+        set_u8(simulator, "m1_rvalid", 1);
+        assert_value(simulator, "s0_rvalid", 1);
+        assert_value(simulator, "s0_rid", 2);
+        assert_value(simulator, "s0_rdata", 0x2222_2222);
+        assert_value(simulator, "m1_rready", 0);
+        tick(simulator);
+        set_u8(simulator, "s0_rready", 1);
+        assert_value(simulator, "m1_rready", 1);
+        tick(simulator);
+        set_u8(simulator, "m1_rvalid", 0);
+        set_u8(simulator, "s0_rready", 0);
+
+        assert_value(simulator, "s0_arready", 1);
+        tick(simulator);
+        set_u8(simulator, "s0_arvalid", 0);
+        assert_value(simulator, "m0_arvalid", 1);
+        assert_value(simulator, "m0_arid", 3);
+        set_u8(simulator, "m0_arready", 1);
+        tick(simulator);
+        set_u8(simulator, "m0_arready", 0);
+
+        set_u8(simulator, "s0_arid", 3);
+        set_u16(simulator, "s0_araddr", 0x8200);
+        set_u8(simulator, "s0_arvalid", 1);
+        assert_value(simulator, "s0_arready", 0);
+        set_u8(simulator, "s0_arvalid", 0);
+
+        set_u8(simulator, "m0_rid", 1);
+        set_u32(simulator, "m0_rdata", 0x1111_1111);
+        set_u8(simulator, "m0_rlast", 1);
+        set_u8(simulator, "m0_rvalid", 1);
+        set_u8(simulator, "s0_rready", 1);
+        assert_value(simulator, "s0_rid", 1);
+        tick(simulator);
+        set_u8(simulator, "m0_rvalid", 0);
+
+        set_u8(simulator, "m0_rid", 3);
+        set_u32(simulator, "m0_rdata", 0x3333_3333);
+        set_u8(simulator, "m0_rvalid", 1);
+        assert_value(simulator, "s0_rid", 3);
+        tick(simulator);
+        set_u8(simulator, "m0_rvalid", 0);
+        set_u8(simulator, "m0_rlast", 0);
+        set_u8(simulator, "s0_rready", 0);
+    }
+
+    fn exercise_out_of_order_writes(simulator: &mut Simulator<JitBackend>) {
+        issue_single_write(simulator, 0, 3, 0x0300, 0xaaaa_0003, 0);
+        issue_single_write(simulator, 0, 4, 0x8300, 0xbbbb_0004, 1);
+
+        set_u8(simulator, "s0_awid", 5);
+        set_u16(simulator, "s0_awaddr", 0x0400);
+        set_u8(simulator, "s0_awvalid", 1);
+        assert_value(simulator, "s0_awready", 0);
+
+        set_u8(simulator, "m1_bid", 4);
+        set_u8(simulator, "m1_bvalid", 1);
+        assert_value(simulator, "s0_bvalid", 1);
+        assert_value(simulator, "s0_bid", 4);
+        assert_value(simulator, "m1_bready", 0);
+        tick(simulator);
+        set_u8(simulator, "s0_bready", 1);
+        assert_value(simulator, "m1_bready", 1);
+        tick(simulator);
+        set_u8(simulator, "m1_bvalid", 0);
+        set_u8(simulator, "s0_bready", 0);
+
+        assert_value(simulator, "s0_awready", 1);
+        set_u8(simulator, "s0_awvalid", 0);
+
+        set_u8(simulator, "m0_bid", 3);
+        set_u8(simulator, "m0_bvalid", 1);
+        set_u8(simulator, "s0_bready", 1);
+        assert_value(simulator, "s0_bid", 3);
+        tick(simulator);
+        set_u8(simulator, "m0_bvalid", 0);
+        set_u8(simulator, "s0_bready", 0);
+    }
+
+    fn issue_single_read(
+        simulator: &mut Simulator<JitBackend>,
+        initiator: usize,
+        id: u8,
+        address: u16,
+        target: usize,
+    ) {
+        set_u8(simulator, &format!("s{initiator}_arid"), id);
+        set_u16(simulator, &format!("s{initiator}_araddr"), address);
+        set_u8(simulator, &format!("s{initiator}_arvalid"), 1);
+        assert_value(simulator, &format!("s{initiator}_arready"), 1);
+        tick(simulator);
+        set_u8(simulator, &format!("s{initiator}_arvalid"), 0);
+        assert_value(simulator, &format!("m{target}_arvalid"), 1);
+        assert_value(
+            simulator,
+            &format!("m{target}_arid"),
+            u64::from(id) | ((initiator as u64) << 4),
+        );
+        set_u8(simulator, &format!("m{target}_arready"), 1);
+        tick(simulator);
+        set_u8(simulator, &format!("m{target}_arready"), 0);
+    }
+
+    fn issue_single_write(
+        simulator: &mut Simulator<JitBackend>,
+        initiator: usize,
+        id: u8,
+        address: u16,
+        data: u32,
+        target: usize,
+    ) {
+        set_u8(simulator, &format!("s{initiator}_awid"), id);
+        set_u16(simulator, &format!("s{initiator}_awaddr"), address);
+        set_u8(simulator, &format!("s{initiator}_awvalid"), 1);
+        set_write_beat(simulator, initiator, data, true);
+        assert_value(simulator, &format!("s{initiator}_awready"), 1);
+        assert_value(simulator, &format!("s{initiator}_wready"), 1);
+        tick(simulator);
+        set_u8(simulator, &format!("s{initiator}_awvalid"), 0);
+        set_u8(simulator, &format!("s{initiator}_wvalid"), 0);
+        tick(simulator);
+        assert_value(simulator, &format!("m{target}_awvalid"), 1);
+        assert_value(simulator, &format!("m{target}_wvalid"), 1);
+        assert_value(
+            simulator,
+            &format!("m{target}_awid"),
+            u64::from(id) | ((initiator as u64) << 4),
+        );
+        set_u8(simulator, &format!("m{target}_awready"), 1);
+        set_u8(simulator, &format!("m{target}_wready"), 1);
+        tick(simulator);
+        set_u8(simulator, &format!("m{target}_awready"), 0);
+        set_u8(simulator, &format!("m{target}_wready"), 0);
     }
 
     fn set_write_beat(simulator: &mut Simulator<JitBackend>, index: usize, data: u32, last: bool) {
