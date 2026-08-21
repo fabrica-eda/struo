@@ -28,7 +28,6 @@ Crate responsibilities:
 
 - `struo-frontend-veryl`: adapter pinned to an exact `veryl-analyzer` version
 - `struo-rtl`: frontend-independent RTL that preserves hardware semantics
-- `struo-sample-axi4`: Veryl-authored protocol-level synthesis stress design
 - `struo-ir`: low-level netlist manipulated by synthesis passes
 - `struo-synth`: RTL validation, lowering, and optimization pipeline
 - `struo-sim`: equivalence policy and release gates
@@ -37,12 +36,11 @@ Crate responsibilities:
   and board profiles
 - `struo-cli`: compiler driver
 
-`struo-frontend-veryl` lowers analyzed Veryl `Comb` and `Ff` declarations,
-including procedural conditionals, static packed selects, arithmetic,
-comparisons, shifts, concatenations, and synchronous or asynchronous resets.
-Unsupported constructs such as hierarchy and memories fail explicitly. The
-older shell inventory API remains available for compatibility and never drops
-pending behavior silently.
+`struo-frontend-veryl` lowers analyzed Veryl `Comb`, `Ff`, and `Inst`
+declarations, including recursively flattened hierarchy, analyzer-expanded
+interface/modport connections, procedural conditionals, static packed selects,
+arithmetic, comparisons, shifts, concatenations, and synchronous or
+asynchronous resets. Unsupported constructs such as memories fail explicitly.
 
 ## First hardware target
 
@@ -74,11 +72,12 @@ Every stage below must pass before a bitstream can be released:
 `struo-sim::VerificationReport::authorize_bitstream` rejects bitstream
 packaging and programming if any stage is missing, skipped, or failed.
 Post-synthesis simulation converts the mapped Rust object directly into a Celox
-`FrontendArtifact` and passes it to `Simulator::from_frontend` in memory. It
-does not serialize or parse JSON. Only the independent nextpnr branch writes
-Yosys-compatible JSON. Verilog is not an intermediate representation in this
-path. Reference simulation continues to use Celox's native Veryl frontend;
-Struo's internal synthesis IR is not exported back to Celox.
+`FrontendArtifact`, passes it to `Simulator::from_frontend` in memory, and uses
+Celox's native execution backend. It does not serialize or parse JSON. Only the
+independent nextpnr branch writes Yosys-compatible JSON. Verilog is not an
+intermediate representation in this path. Reference simulation continues to
+use Celox's Veryl frontend and native execution backend; Struo's internal
+synthesis IR is not exported back to Celox.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under
@@ -92,7 +91,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo run -- demo /tmp/struo-blinky.nextpnr.json
 cargo run -- axi4-demo /tmp/struo-axi4.nextpnr.json
-(cd crates/struo-sample-axi4 && veryl fmt --check && veryl check)
+cargo run -- axi4-self-test /tmp/struo-axi4-self-test.nextpnr.json
+(cd examples/axi4-smartconnect && veryl fmt --check && veryl check)
 ```
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
@@ -100,17 +100,17 @@ addition and subtraction, signed and unsigned comparisons, variable logical
 and arithmetic shifts, muxes, concatenation, slicing, registers, enables, and
 synchronous or asynchronous constant resets. It performs constant folding and
 structural hashing, then maps Boolean nodes to `LUT4` and registers to
-`TRELLIS_FF`. Memories, hierarchy, and inout ports are rejected explicitly.
-
-The next frontend unit is hierarchy and `Inst` lowering. The implemented
-single-module path already consumes analyzer AIR directly and does not depend
-on generated Verilog.
+`TRELLIS_FF`. Memories and inout ports are rejected explicitly. Module
+instances are flattened before synthesis; the implemented path consumes
+analyzer AIR directly and does not depend on generated Verilog.
 
 ## Veryl AXI4 synthesis stress design
 
-`struo-sample-axi4` keeps the synthesizable crossbar in committed Veryl source.
-Its Rust API invokes the Veryl analyzer and lowers AIR into Struo RTL. The
-two-initiator, two-target fabric forwards AXI4 burst metadata and IDs, buffers
+`examples/axi4-smartconnect` keeps the synthesizable crossbar in committed
+Veryl source. Its Rust harness invokes the Veryl analyzer and lowers AIR into
+Struo RTL. The
+two-initiator, two-target fabric uses a parameterized Veryl `Axi4Interface` and
+modports, forwards AXI4 burst metadata and IDs, buffers
 AW and W independently, streams W and R beats through backpressure, uses
 separate read/write round-robin arbitration, and locally completes unmapped
 bursts with `DECERR`. Tests take only the analyzed Veryl path through synthesis,
@@ -122,8 +122,23 @@ its earlier transaction completes to preserve AXI ordering. The simulation
 tests exercise reverse-order B/R completion and full-slot backpressure through
 both the reference and post-map paths.
 
-The standalone crossbar exposes every AXI signal for simulation and therefore
-exceeds the evaluation board's physical IO count. Place-and-route coverage will
-use an internal self-test wrapper once hierarchy and instance-port lowering are
-implemented; reducing the protocol widths merely to satisfy top-level IO would
-not be a representative AXI4 design.
+`Axi4CrossbarSelfTest` instantiates the interface-based crossbar, an internal
+initiator, a target response model, and a result scoreboard. Its physical top
+exposes only clock, reset, pass, and fail, avoiding the evaluation board's IO
+limit without reducing the protocol widths. The corresponding constraints are
+in
+[`boards/lfe5um5g-85f-evn/axi4-self-test.lpf`](boards/lfe5um5g-85f-evn/axi4-self-test.lpf).
+
+The complete open-source hardware smoke flow is:
+
+```sh
+mkdir -p build/axi4-self-test
+cargo run -- axi4-self-test build/axi4-self-test/design.json
+nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
+  --json build/axi4-self-test/design.json \
+  --lpf boards/lfe5um5g-85f-evn/axi4-self-test.lpf \
+  --textcfg build/axi4-self-test/design.config \
+  --report build/axi4-self-test/nextpnr-report.json --freq 12
+ecppack --svf build/axi4-self-test/design.svf \
+  build/axi4-self-test/design.config build/axi4-self-test/design.bit
+```

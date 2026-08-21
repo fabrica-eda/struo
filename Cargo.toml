@@ -5,10 +5,10 @@ members = [
     "crates/struo-frontend-veryl",
     "crates/struo-ir",
     "crates/struo-rtl",
-    "crates/struo-sample-axi4",
     "crates/struo-sim",
     "crates/struo-synth",
     "crates/struo-target-ecp5",
+    "examples/axi4-smartconnect",
 ]
 default-members = ["crates/struo-cli"]
 resolver = "3"

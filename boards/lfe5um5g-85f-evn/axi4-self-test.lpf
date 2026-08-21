@@ -1,0 +1,14 @@
+# Lattice LFE5UM5G-85F-EVN AXI4 crossbar self-test wrapper
+# JP2 must be shorted to route the FTDI 12 MHz clock to A10.
+
+LOCATE COMP "clk" SITE "A10";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "rst_n" SITE "P4";
+IOBUF PORT "rst_n" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "passed" SITE "A13";
+LOCATE COMP "failed" SITE "A12";
+
+IOBUF PORT "passed" IO_TYPE=LVCMOS25;
+IOBUF PORT "failed" IO_TYPE=LVCMOS25;

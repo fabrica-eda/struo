@@ -1,0 +1,21 @@
+[package]
+name = "struo-example-axi4-smartconnect"
+description = "Veryl AXI4 SmartConnect synthesis and verification example for Struo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+struo-frontend-veryl = { path = "../../crates/struo-frontend-veryl" }
+struo-rtl = { path = "../../crates/struo-rtl" }
+
+[dev-dependencies]
+celox = "=0.3.1"
+struo-celox = { path = "../../crates/struo-celox" }
+struo-synth = { path = "../../crates/struo-synth" }
+struo-target-ecp5 = { path = "../../crates/struo-target-ecp5" }
+
+[lints]
+workspace = true
