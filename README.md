@@ -69,11 +69,12 @@ Every stage below must pass before a bitstream can be released:
 
 `struo-sim::VerificationReport::authorize_bitstream` rejects bitstream
 packaging and programming if any stage is missing, skipped, or failed.
-Post-synthesis simulation converts the same mapped Rust object that is
-serialized for nextpnr into a Celox `FrontendArtifact`. Verilog is not an
-intermediate representation in this path. Reference simulation continues to
-use Celox's native Veryl frontend; Struo's internal synthesis IR is not exported
-back to Celox.
+Post-synthesis simulation converts the mapped Rust object directly into a Celox
+`FrontendArtifact` and passes it to `Simulator::from_frontend` in memory. It
+does not serialize or parse JSON. Only the independent nextpnr branch writes
+Yosys-compatible JSON. Verilog is not an intermediate representation in this
+path. Reference simulation continues to use Celox's native Veryl frontend;
+Struo's internal synthesis IR is not exported back to Celox.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under
@@ -85,7 +86,7 @@ synthesis. The existing Veryl/Yosys bitstream smoke test remains under
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-cargo run -- demo /tmp/struo-blinky.nextpnr.json /tmp/struo-blinky.celox.json
+cargo run -- demo /tmp/struo-blinky.nextpnr.json
 ```
 
 The implemented synthesis subset includes bitwise logic, wrapping addition and

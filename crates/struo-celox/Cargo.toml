@@ -8,7 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-celox-frontend-sdk = { git = "https://github.com/celox-sim/celox", rev = "250693d37147d4aa32fa6a232b35b51752547dc9" }
+celox = "=0.3.1"
 struo-ir = { path = "../struo-ir" }
 struo-target-ecp5 = { path = "../struo-target-ecp5" }
 

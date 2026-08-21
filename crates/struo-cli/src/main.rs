@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use std::fs;
 
-use struo_celox::ecp5_frontend_artifact;
+use struo_celox::ecp5_simulator;
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Module, Polarity, Port, PortDirection,
     Register, Reset, ResetMode, StateDomain, ValueType,
@@ -19,8 +19,8 @@ const USAGE: &str = "\
 Struo FPGA synthesis playground
 
 Usage:
-  struo demo [NEXTPNR_JSON] [CELOX_JSON]
-                       synthesize the ECP5 EVN blinky and write backend artifacts
+  struo demo [NEXTPNR_JSON]
+                       synthesize and simulate the ECP5 EVN blinky
   struo help    show this help
 ";
 
@@ -36,7 +36,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn Error>> {
     match env::args().nth(1).as_deref() {
-        Some("demo") => run_demo(env::args().nth(2).as_deref(), env::args().nth(3).as_deref()),
+        Some("demo") => run_demo(env::args().nth(2).as_deref()),
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())
@@ -45,7 +45,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn run_demo(nextpnr_path: Option<&str>, celox_path: Option<&str>) -> Result<(), Box<dyn Error>> {
+fn run_demo(nextpnr_path: Option<&str>) -> Result<(), Box<dyn Error>> {
     let bit = ValueType {
         width: BitWidth::new(1)?,
         signed: false,
@@ -113,17 +113,20 @@ fn run_demo(nextpnr_path: Option<&str>, celox_path: Option<&str>) -> Result<(), 
         fs::write(path, mapped.to_nextpnr_json()?)?;
         println!("nextpnr JSON: {path}");
     }
-    let celox = ecp5_frontend_artifact(&mapped)?;
-    println!(
-        "Celox artifact: {} signals, {} expressions, {} registers",
-        celox.signals().len(),
-        celox.expressions().len(),
-        celox.registers().len()
-    );
-    if let Some(path) = celox_path {
-        fs::write(path, celox.to_json()?)?;
-        println!("Celox JSON: {path}");
+    let mut simulator = ecp5_simulator(&mapped)?.build_cranelift()?;
+    let clock = simulator.event("clk");
+    let reset = simulator.signal("btn");
+    let led = simulator.signal("led");
+    simulator.modify(|io| io.set(reset, 0u8))?;
+    simulator.tick(clock)?;
+    simulator.modify(|io| io.set(reset, 1u8))?;
+    for _ in 0..65_536 {
+        simulator.tick(clock)?;
     }
+    if simulator.get(led) != 1u8.into() {
+        return Err("post-map Celox simulation produced an unexpected LED value".into());
+    }
+    println!("Celox post-map simulation: passed without JSON serialization");
     let flow = Ecp5Flow::evaluation_board("ecp5_evn_blinky", "build/ecp5_evn_blinky");
     println!("target: {} ({})", flow.board.board, flow.board.device);
     println!("clock setup: {}", flow.board.clock_setup);

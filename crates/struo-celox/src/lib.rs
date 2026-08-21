@@ -2,16 +2,17 @@
 //!
 //! This crate is intentionally a backend adapter. Source RTL is simulated by
 //! Celox's Veryl frontend; only the post-technology-mapping object is converted
-//! into a synthetic [`celox_frontend_sdk::FrontendArtifact`].
+//! into a synthetic [`celox::FrontendArtifact`].
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use celox_frontend_sdk::{
+use celox::frontend_sdk::{
     ActiveLevel as CeloxActiveLevel, BuildError, Constant, Edge, ExprId, FrontendArtifact,
     ModuleBuilder, SignalId, UnaryOp, ValueType,
 };
+use celox::{Simulator, SimulatorBuilder};
 use struo_ir::{ActiveLevel, ClockEdge};
 use struo_target_ecp5::{Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection, Reset};
 
@@ -133,6 +134,21 @@ pub fn ecp5_frontend_artifact(
 
     emit_outputs(&mut builder, &wires, constants, outputs)?;
     finish_artifact(builder)
+}
+
+/// Creates an in-memory Celox simulator builder for an ECP5 mapped netlist.
+///
+/// The mapped object is converted directly into a [`FrontendArtifact`] and
+/// handed to Celox without JSON serialization or parsing.
+///
+/// # Errors
+///
+/// Returns an error when the mapped object cannot be represented by the Celox
+/// frontend SDK.
+pub fn ecp5_simulator(
+    netlist: &Ecp5Netlist,
+) -> Result<SimulatorBuilder<'static, Simulator>, CeloxAdapterError> {
+    Ok(Simulator::from_frontend(ecp5_frontend_artifact(netlist)?))
 }
 
 fn finish_artifact(builder: ModuleBuilder) -> Result<FrontendArtifact, CeloxAdapterError> {
@@ -414,11 +430,10 @@ impl From<BuildError> for CeloxAdapterError {
 mod tests {
     use std::num::NonZeroU32;
 
-    use celox_frontend_sdk::FrontendArtifact;
     use struo_ir::{ActiveLevel, ClockEdge, EnableControl, Netlist, RegisterCell, ResetControl};
     use struo_target_ecp5::map_to_ecp5;
 
-    use super::ecp5_frontend_artifact;
+    use super::{ecp5_frontend_artifact, ecp5_simulator};
 
     #[test]
     fn emits_lut_logic_as_a_valid_celox_artifact() {
@@ -435,11 +450,29 @@ mod tests {
         assert_eq!(artifact.port_order().len(), 3);
         assert_eq!(artifact.registers().len(), 0);
         assert!(!artifact.assignments().is_empty());
-        let encoded = artifact.to_json().unwrap();
-        assert_eq!(
-            FrontendArtifact::from_json(&encoded).unwrap().module_name(),
-            "logic"
-        );
+    }
+
+    #[test]
+    fn simulates_mapped_logic_without_json_round_trip() {
+        let mut source = Netlist::new("logic");
+        let lhs = source.add_input("lhs");
+        let rhs = source.add_input("rhs");
+        let value = source.add_xor(lhs, rhs);
+        source.add_output("value", value);
+        let mapped = map_to_ecp5(&source).unwrap();
+
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_cranelift().unwrap();
+        let lhs = simulator.signal("lhs");
+        let rhs = simulator.signal("rhs");
+        let value = simulator.signal("value");
+        simulator
+            .modify(|io| {
+                io.set(lhs, 1u8);
+                io.set(rhs, 0u8);
+            })
+            .unwrap();
+
+        assert_eq!(simulator.get(value), 1u8.into());
     }
 
     #[test]
