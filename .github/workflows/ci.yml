@@ -119,3 +119,17 @@ jobs:
           ecpunpack \
             build/ci/axi4-smartconnect/design.bit \
             build/ci/axi4-smartconnect/unpacked.config
+
+  required:
+    # Branch protection requires this stable check name.
+    name: Required CI
+    needs: validate
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+
+    steps:
+      - name: Require successful validation
+        env:
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+        run: test "$VALIDATE_RESULT" = success
