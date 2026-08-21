@@ -5,10 +5,61 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::sync::Mutex;
 
 use struo_rtl::{BitWidth, Design, Module, Port, PortDirection, RtlError, StateDomain, ValueType};
 use veryl_analyzer::ir::{Component, Declaration, Ir, VarKind};
-use veryl_parser::resource_table;
+use veryl_analyzer::{Analyzer, Context};
+use veryl_metadata::Metadata;
+use veryl_parser::{Parser, resource_table};
+
+mod lower;
+
+pub use lower::lower_analyzed_ir;
+
+static ANALYZER_LOCK: Mutex<()> = Mutex::new(());
+
+/// Analyzes one self-contained Veryl source and lowers its selected top.
+///
+/// This convenience entry point exists for direct source-to-synthesis flows.
+/// Projects with multiple compilation units may run the analyzer themselves
+/// and call [`lower_analyzed_ir`] with the combined AIR.
+///
+/// # Errors
+///
+/// Returns an error for parser or analyzer diagnostics, metadata setup, or
+/// semantic lowering failures.
+pub fn analyze_and_lower(source: &str, project: &str, top: &str) -> Result<Design, ImportError> {
+    let _guard = ANALYZER_LOCK
+        .lock()
+        .map_err(|_| ImportError::AnalysisFailed("analyzer lock was poisoned".into()))?;
+    veryl_analyzer::symbol_table::clear();
+    veryl_analyzer::attribute_table::clear();
+    let metadata = Metadata::create_default(project)
+        .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
+    let parsed = Parser::parse(source, &"")
+        .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
+    let analyzer = Analyzer::new(&metadata);
+    let mut context = Context::default();
+    let mut ir = Ir::default();
+    let pass1 = analyzer.analyze_pass1(project, &parsed.veryl);
+    if !pass1.is_empty() {
+        return Err(ImportError::AnalysisFailed(format!("{pass1:?}")));
+    }
+    let post1 = Analyzer::analyze_post_pass1();
+    if !post1.is_empty() {
+        return Err(ImportError::AnalysisFailed(format!("{post1:?}")));
+    }
+    let pass2 = analyzer.analyze_pass2(&parsed.veryl, &mut context, Some(&mut ir));
+    if !pass2.is_empty() {
+        return Err(ImportError::AnalysisFailed(format!("{pass2:?}")));
+    }
+    let post2 = Analyzer::analyze_post_pass2(&ir);
+    if !post2.is_empty() {
+        return Err(ImportError::AnalysisFailed(format!("{post2:?}")));
+    }
+    lower_analyzed_ir(&ir, top)
+}
 
 /// Exact Veryl analyzer release supported by this adapter.
 pub const SUPPORTED_VERYL_VERSION: &str = "0.20.3";
@@ -168,6 +219,12 @@ pub enum ImportError {
     UnloweredBehavior(LoweringInventory),
     /// The projected RTL metadata is invalid.
     InvalidRtl(RtlError),
+    /// The analyzed construct is not implemented by the semantic lowerer.
+    UnsupportedBehavior(String),
+    /// The requested top module was not present in the analyzer IR.
+    MissingTop(String),
+    /// Veryl parsing, analysis, or metadata setup failed.
+    AnalysisFailed(String),
 }
 
 impl Display for ImportError {
@@ -194,6 +251,13 @@ impl Display for ImportError {
                 pending.unsupported,
             ),
             Self::InvalidRtl(error) => write!(formatter, "invalid imported RTL: {error}"),
+            Self::UnsupportedBehavior(description) => {
+                write!(formatter, "unsupported Veryl behavior: {description}")
+            }
+            Self::MissingTop(top) => write!(formatter, "Veryl top module `{top}` was not found"),
+            Self::AnalysisFailed(diagnostic) => {
+                write!(formatter, "Veryl analysis failed: {diagnostic}")
+            }
         }
     }
 }

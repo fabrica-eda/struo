@@ -1,6 +1,6 @@
 [package]
-name = "struo-sample-axi-lite"
-description = "AXI4-Lite crossbar synthesis stress design for Struo"
+name = "struo-sample-axi4"
+description = "Veryl AXI4 crossbar synthesis design for Struo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+struo-frontend-veryl = { path = "../struo-frontend-veryl" }
 struo-rtl = { path = "../struo-rtl" }
 
 [dev-dependencies]

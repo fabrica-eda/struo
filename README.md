@@ -28,7 +28,7 @@ Crate responsibilities:
 
 - `struo-frontend-veryl`: adapter pinned to an exact `veryl-analyzer` version
 - `struo-rtl`: frontend-independent RTL that preserves hardware semantics
-- `struo-sample-axi-lite`: protocol-level synthesis stress design
+- `struo-sample-axi4`: Veryl-authored protocol-level synthesis stress design
 - `struo-ir`: low-level netlist manipulated by synthesis passes
 - `struo-synth`: RTL validation, lowering, and optimization pipeline
 - `struo-sim`: equivalence policy and release gates
@@ -37,9 +37,12 @@ Crate responsibilities:
   and board profiles
 - `struo-cli`: compiler driver
 
-`struo-frontend-veryl` currently converts only the module and port shell.
-`require_fully_lowered` fails while unsupported combinational logic, flip-flops,
-or instances remain, preventing synthesis from silently discarding behavior.
+`struo-frontend-veryl` lowers analyzed Veryl `Comb` and `Ff` declarations,
+including procedural conditionals, static packed selects, arithmetic,
+comparisons, shifts, concatenations, and synchronous or asynchronous resets.
+Unsupported constructs such as hierarchy and memories fail explicitly. The
+older shell inventory API remains available for compatibility and never drops
+pending behavior silently.
 
 ## First hardware target
 
@@ -88,7 +91,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo run -- demo /tmp/struo-blinky.nextpnr.json
-cargo run -- axi-lite-demo /tmp/struo-axi-lite.nextpnr.json
+cargo run -- axi4-demo /tmp/struo-axi4.nextpnr.json
+(cd crates/struo-sample-axi4 && veryl fmt --check && veryl check)
 ```
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
@@ -98,21 +102,25 @@ synchronous or asynchronous constant resets. It performs constant folding and
 structural hashing, then maps Boolean nodes to `LUT4` and registers to
 `TRELLIS_FF`. Memories, hierarchy, and inout ports are rejected explicitly.
 
-The next frontend unit is complete lowering of Veryl analyzer `Comb`, `Ff`, and
-`Inst` nodes into `struo-rtl`; the synthesis and ECP5 mapping path no longer
-depends on generated Verilog.
+The next frontend unit is hierarchy and `Inst` lowering. The implemented
+single-module path already consumes analyzer AIR directly and does not depend
+on generated Verilog.
 
-## AXI4-Lite synthesis stress design
+## Veryl AXI4 synthesis stress design
 
-`struo-sample-axi-lite` builds a two-initiator, two-target crossbar with
-independent AW and W buffering, all five ready/valid channels, target response
-ownership, round-robin contention handling, backpressure, and local `DECERR`
-completion. Its tests synthesize and technology-map the design, compile the
-mapped object directly with Celox, and exercise independent write channels,
-stalled responses, unmapped reads, and arbitration fairness.
+`struo-sample-axi4` keeps the synthesizable crossbar in committed Veryl source.
+Its Rust API invokes the Veryl analyzer and lowers AIR into Struo RTL. The
+two-initiator, two-target fabric forwards AXI4 burst metadata and IDs, buffers
+AW and W independently, streams W and R beats through backpressure, uses
+separate read/write round-robin arbitration, and locally completes unmapped
+bursts with `DECERR`. Tests take only the analyzed Veryl path through synthesis,
+ECP5 technology mapping, and Celox post-map simulation, with Celox's native
+Veryl frontend as the reference. The current fabric permits one read and one
+write transaction per initiator and target, so it preserves IDs and ordering
+without a response reorder buffer.
 
 The standalone crossbar exposes every AXI signal for simulation and therefore
 exceeds the evaluation board's physical IO count. Place-and-route coverage will
 use an internal self-test wrapper once hierarchy and instance-port lowering are
 implemented; reducing the protocol widths merely to satisfy top-level IO would
-not be a representative AXI4-Lite design.
+not be a representative AXI4 design.

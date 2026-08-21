@@ -1,0 +1,9 @@
+[project]
+name = "struo_axi4"
+version = "0.1.0"
+
+[build]
+clock_type = "posedge"
+reset_type = "async_low"
+sources = ["veryl"]
+target = { type = "directory", path = "build/veryl" }

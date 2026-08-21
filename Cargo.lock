@@ -3063,7 +3063,7 @@ version = "0.1.0"
 dependencies = [
  "struo-celox",
  "struo-rtl",
- "struo-sample-axi-lite",
+ "struo-sample-axi4",
  "struo-sim",
  "struo-synth",
  "struo-target-ecp5",
@@ -3073,8 +3073,13 @@ dependencies = [
 name = "struo-frontend-veryl"
 version = "0.1.0"
 dependencies = [
+ "celox",
+ "struo-celox",
  "struo-rtl",
+ "struo-synth",
+ "struo-target-ecp5",
  "veryl-analyzer",
+ "veryl-metadata",
  "veryl-parser",
 ]
 
@@ -3087,11 +3092,12 @@ name = "struo-rtl"
 version = "0.1.0"
 
 [[package]]
-name = "struo-sample-axi-lite"
+name = "struo-sample-axi4"
 version = "0.1.0"
 dependencies = [
  "celox",
  "struo-celox",
+ "struo-frontend-veryl",
  "struo-rtl",
  "struo-synth",
  "struo-target-ecp5",

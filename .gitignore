@@ -1,5 +1,7 @@
 /target/
 /build/
+/.build/
+**/.build/
 *.log
 .idea/
 .vscode/
