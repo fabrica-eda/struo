@@ -128,9 +128,9 @@ interface Axi4Interface::<ADDR_WIDTH: u32 = 16, DATA_WIDTH: u32 = 32, ID_WIDTH: 
 /// Validates and decodes a complete AXI4 burst.
 ///
 /// The decoder rejects reserved burst types, transfers wider than the data
-/// bus, invalid WRAP lengths or alignment, address overflow, and any burst
-/// crossing a 4 KiB boundary. A transfer is routed only when every byte lies
-/// inside one target window.
+/// bus, FIXED bursts longer than 16 beats, invalid WRAP lengths or alignment,
+/// address overflow, and any burst crossing a 4 KiB boundary. A transfer is
+/// routed only when every byte lies inside one target window.
 module Axi4BurstDecoder (
     addr        : input  logic<16>,
     len         : input  logic<8> ,
@@ -158,6 +158,7 @@ module Axi4BurstDecoder (
         case burst {
             2'b00: {
                 // FIXED repeats the same aligned transfer footprint.
+                protocol_valid = protocol_valid && (len <: 8'd16);
             }
             2'b01: {
                 last_address = aligned_address + burst_bytes - 17'h00001;
