@@ -431,6 +431,10 @@ mod tests {
     use std::num::NonZeroU32;
 
     use struo_ir::{ActiveLevel, ClockEdge, EnableControl, Netlist, RegisterCell, ResetControl};
+    use struo_rtl::{
+        BinaryOp, BitWidth, Constant, Design, Module, Port, PortDirection, StateDomain, ValueType,
+    };
+    use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
 
     use super::{ecp5_frontend_artifact, ecp5_simulator};
@@ -473,6 +477,90 @@ mod tests {
             .unwrap();
 
         assert_eq!(simulator.get(value), 1u8.into());
+    }
+
+    #[test]
+    fn simulates_synthesized_address_decode_without_json() {
+        let byte = ValueType {
+            width: BitWidth::new(8).unwrap(),
+            signed: false,
+            state: StateDomain::TwoState,
+        };
+        let bit = ValueType {
+            width: BitWidth::new(1).unwrap(),
+            signed: false,
+            state: StateDomain::TwoState,
+        };
+        let mut module = Module::new("AddressDecoder");
+        let address = module.add_port(Port {
+            name: "address".into(),
+            direction: PortDirection::Input,
+            r#type: byte,
+        });
+        let valid = module.add_port(Port {
+            name: "valid".into(),
+            direction: PortDirection::Input,
+            r#type: bit,
+        });
+        let route = module.add_port(Port {
+            name: "route".into(),
+            direction: PortDirection::Output,
+            r#type: ValueType {
+                width: BitWidth::new(2).unwrap(),
+                signed: false,
+                state: StateDomain::TwoState,
+            },
+        });
+        let address_value = module.read(address).unwrap();
+        let valid_value = module.read(valid).unwrap();
+        let limit_0 = module.constant(Constant::from_u64(BitWidth::new(8).unwrap(), 0x40));
+        let base_1 = module.constant(Constant::from_u64(BitWidth::new(8).unwrap(), 0x80));
+        let limit_1 = module.constant(Constant::from_u64(BitWidth::new(8).unwrap(), 0xc0));
+        let hit_0 = module
+            .binary(BinaryOp::LessThanUnsigned, address_value, limit_0)
+            .unwrap();
+        let above_base_1 = module
+            .binary(BinaryOp::GreaterOrEqualUnsigned, address_value, base_1)
+            .unwrap();
+        let below_limit_1 = module
+            .binary(BinaryOp::LessThanUnsigned, address_value, limit_1)
+            .unwrap();
+        let hit_1 = module
+            .binary(BinaryOp::And, above_base_1, below_limit_1)
+            .unwrap();
+        let hit_0 = module.binary(BinaryOp::And, valid_value, hit_0).unwrap();
+        let hit_1 = module.binary(BinaryOp::And, valid_value, hit_1).unwrap();
+        let route_value = module.concat(vec![hit_1, hit_0]).unwrap();
+        let route_target = module.whole(route).unwrap();
+        module.assign(route_target, route_value).unwrap();
+        let mut design = Design::new("AddressDecoder");
+        design.add_module(module);
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_cranelift().unwrap();
+        let address = simulator.signal("address");
+        let valid = simulator.signal("valid");
+        let route = simulator.signal("route");
+        for (address_value, expected) in [
+            (0x00u8, 1u8),
+            (0x3f, 1),
+            (0x40, 0),
+            (0x7f, 0),
+            (0x80, 2),
+            (0xbf, 2),
+            (0xc0, 0),
+        ] {
+            simulator
+                .modify(|io| {
+                    io.set(address, address_value);
+                    io.set(valid, 1u8);
+                })
+                .unwrap();
+            assert_eq!(simulator.get(route), expected.into());
+        }
+        simulator.modify(|io| io.set(valid, 0u8)).unwrap();
+        assert_eq!(simulator.get(route), 0u8.into());
     }
 
     #[test]

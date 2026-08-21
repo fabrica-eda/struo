@@ -89,8 +89,9 @@ cargo fmt --all -- --check
 cargo run -- demo /tmp/struo-blinky.nextpnr.json
 ```
 
-The implemented synthesis subset includes bitwise logic, wrapping addition and
-subtraction, equality, muxes, concatenation, slicing, registers, enables, and
+The implemented synthesis subset includes bitwise logic, reductions, wrapping
+addition and subtraction, signed and unsigned comparisons, variable logical
+and arithmetic shifts, muxes, concatenation, slicing, registers, enables, and
 synchronous or asynchronous constant resets. It performs constant folding and
 structural hashing, then maps Boolean nodes to `LUT4` and registers to
 `TRELLIS_FF`. Memories, hierarchy, and inout ports are rejected explicitly.

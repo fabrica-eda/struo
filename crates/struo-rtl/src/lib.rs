@@ -202,6 +202,8 @@ pub enum UnaryOp {
     LogicNot,
     /// OR reduction, producing one bit.
     ReduceOr,
+    /// AND reduction, producing one bit.
+    ReduceAnd,
     /// XOR reduction, producing one bit.
     ReduceXor,
 }
@@ -221,6 +223,55 @@ pub enum BinaryOp {
     Sub,
     /// Equality comparison, producing one bit.
     Equal,
+    /// Inequality comparison, producing one bit.
+    NotEqual,
+    /// Unsigned less-than comparison, producing one bit.
+    LessThanUnsigned,
+    /// Signed two's-complement less-than comparison, producing one bit.
+    LessThanSigned,
+    /// Unsigned less-than-or-equal comparison, producing one bit.
+    LessOrEqualUnsigned,
+    /// Signed two's-complement less-than-or-equal comparison, producing one bit.
+    LessOrEqualSigned,
+    /// Unsigned greater-than comparison, producing one bit.
+    GreaterThanUnsigned,
+    /// Signed two's-complement greater-than comparison, producing one bit.
+    GreaterThanSigned,
+    /// Unsigned greater-than-or-equal comparison, producing one bit.
+    GreaterOrEqualUnsigned,
+    /// Signed two's-complement greater-than-or-equal comparison, producing one bit.
+    GreaterOrEqualSigned,
+    /// Logical left shift, preserving the left operand width.
+    ShiftLeft,
+    /// Logical right shift, preserving the left operand width.
+    ShiftRightLogical,
+    /// Arithmetic right shift, preserving the left operand width.
+    ShiftRightArithmetic,
+}
+
+impl BinaryOp {
+    const fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            Self::Equal
+                | Self::NotEqual
+                | Self::LessThanUnsigned
+                | Self::LessThanSigned
+                | Self::LessOrEqualUnsigned
+                | Self::LessOrEqualSigned
+                | Self::GreaterThanUnsigned
+                | Self::GreaterThanSigned
+                | Self::GreaterOrEqualUnsigned
+                | Self::GreaterOrEqualSigned
+        )
+    }
+
+    const fn is_shift(self) -> bool {
+        matches!(
+            self,
+            Self::ShiftLeft | Self::ShiftRightLogical | Self::ShiftRightArithmetic
+        )
+    }
 }
 
 /// One typed RTL expression node.
@@ -572,11 +623,13 @@ impl Module {
         let input_type = self.expression(input)?.r#type;
         let r#type = match op {
             UnaryOp::BitNot => input_type,
-            UnaryOp::LogicNot | UnaryOp::ReduceOr | UnaryOp::ReduceXor => ValueType {
-                width: BitWidth::new(1)?,
-                signed: false,
-                state: input_type.state,
-            },
+            UnaryOp::LogicNot | UnaryOp::ReduceOr | UnaryOp::ReduceAnd | UnaryOp::ReduceXor => {
+                ValueType {
+                    width: BitWidth::new(1)?,
+                    signed: false,
+                    state: input_type.state,
+                }
+            }
         };
         Ok(self.push_expr(ExprKind::Unary { op, input }, r#type))
     }
@@ -589,16 +642,22 @@ impl Module {
     pub fn binary(&mut self, op: BinaryOp, lhs: ExprId, rhs: ExprId) -> Result<ExprId, RtlError> {
         let lhs_type = self.expression(lhs)?.r#type;
         let rhs_type = self.expression(rhs)?.r#type;
-        if lhs_type.width != rhs_type.width {
+        if !op.is_shift() && lhs_type.width != rhs_type.width {
             return Err(RtlError::WidthMismatch {
                 expected: lhs_type.width,
                 actual: rhs_type.width,
             });
         }
-        let r#type = if op == BinaryOp::Equal {
+        let r#type = if op.is_comparison() {
             ValueType {
                 width: BitWidth::new(1)?,
                 signed: false,
+                state: merge_state(lhs_type.state, rhs_type.state),
+            }
+        } else if op.is_shift() {
+            ValueType {
+                width: lhs_type.width,
+                signed: lhs_type.signed,
                 state: merge_state(lhs_type.state, rhs_type.state),
             }
         } else {

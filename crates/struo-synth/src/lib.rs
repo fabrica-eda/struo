@@ -283,6 +283,7 @@ impl<'a> Lowering<'a> {
                         vec![self.netlist.add_not(reduced)]
                     }
                     UnaryOp::ReduceOr => vec![self.reduce_or(&input)],
+                    UnaryOp::ReduceAnd => vec![self.reduce_and(&input)],
                     UnaryOp::ReduceXor => vec![self.reduce_xor(&input)],
                 }
             }
@@ -334,16 +335,118 @@ impl<'a> Lowering<'a> {
                     .collect::<Vec<_>>();
                 self.add_words(lhs, &inverted, true)
             }
-            BinaryOp::Equal => {
-                let mut result = self.netlist.add_constant(true);
-                for (&lhs, &rhs) in lhs.iter().zip(rhs) {
-                    let different = self.netlist.add_xor(lhs, rhs);
-                    let same = self.netlist.add_not(different);
-                    result = self.netlist.add_and(result, same);
-                }
-                vec![result]
+            BinaryOp::Equal => vec![self.equal_words(lhs, rhs)],
+            BinaryOp::NotEqual => {
+                let equal = self.equal_words(lhs, rhs);
+                vec![self.netlist.add_not(equal)]
             }
+            BinaryOp::LessThanUnsigned => vec![self.less_unsigned(lhs, rhs)],
+            BinaryOp::LessThanSigned => vec![self.less_signed(lhs, rhs)],
+            BinaryOp::LessOrEqualUnsigned => {
+                let less = self.less_unsigned(lhs, rhs);
+                let equal = self.equal_words(lhs, rhs);
+                vec![self.netlist.add_or(less, equal)]
+            }
+            BinaryOp::LessOrEqualSigned => {
+                let less = self.less_signed(lhs, rhs);
+                let equal = self.equal_words(lhs, rhs);
+                vec![self.netlist.add_or(less, equal)]
+            }
+            BinaryOp::GreaterThanUnsigned => vec![self.less_unsigned(rhs, lhs)],
+            BinaryOp::GreaterThanSigned => vec![self.less_signed(rhs, lhs)],
+            BinaryOp::GreaterOrEqualUnsigned => {
+                let less = self.less_unsigned(rhs, lhs);
+                let equal = self.equal_words(lhs, rhs);
+                vec![self.netlist.add_or(less, equal)]
+            }
+            BinaryOp::GreaterOrEqualSigned => {
+                let less = self.less_signed(rhs, lhs);
+                let equal = self.equal_words(lhs, rhs);
+                vec![self.netlist.add_or(less, equal)]
+            }
+            BinaryOp::ShiftLeft => self.shift_left(lhs, rhs),
+            BinaryOp::ShiftRightLogical => self.shift_right(lhs, rhs, false),
+            BinaryOp::ShiftRightArithmetic => self.shift_right(lhs, rhs, true),
         }
+    }
+
+    fn equal_words(&mut self, lhs: &[NetId], rhs: &[NetId]) -> NetId {
+        let mut result = self.netlist.add_constant(true);
+        for (&lhs, &rhs) in lhs.iter().zip(rhs) {
+            let different = self.netlist.add_xor(lhs, rhs);
+            let same = self.netlist.add_not(different);
+            result = self.netlist.add_and(result, same);
+        }
+        result
+    }
+
+    fn less_unsigned(&mut self, lhs: &[NetId], rhs: &[NetId]) -> NetId {
+        let mut less = self.netlist.add_constant(false);
+        let mut equal = self.netlist.add_constant(true);
+        for (&lhs, &rhs) in lhs.iter().zip(rhs).rev() {
+            let lhs_zero = self.netlist.add_not(lhs);
+            let lhs_zero_rhs_one = self.netlist.add_and(lhs_zero, rhs);
+            let first_difference_is_less = self.netlist.add_and(equal, lhs_zero_rhs_one);
+            less = self.netlist.add_or(less, first_difference_is_less);
+            let different = self.netlist.add_xor(lhs, rhs);
+            let same = self.netlist.add_not(different);
+            equal = self.netlist.add_and(equal, same);
+        }
+        less
+    }
+
+    fn less_signed(&mut self, lhs: &[NetId], rhs: &[NetId]) -> NetId {
+        let unsigned_less = self.less_unsigned(lhs, rhs);
+        let lhs_sign = lhs[lhs.len() - 1];
+        let rhs_sign = rhs[rhs.len() - 1];
+        let signs_differ = self.netlist.add_xor(lhs_sign, rhs_sign);
+        self.netlist.add_mux(signs_differ, lhs_sign, unsigned_less)
+    }
+
+    fn shift_left(&mut self, input: &[NetId], amount: &[NetId]) -> Vec<NetId> {
+        let zero = self.netlist.add_constant(false);
+        let mut result = input.to_vec();
+        for (stage, &select) in amount.iter().enumerate() {
+            let distance = shift_distance(stage, input.len());
+            let shifted = (0..input.len())
+                .map(|bit| {
+                    bit.checked_sub(distance)
+                        .map_or(zero, |source| result[source])
+                })
+                .collect::<Vec<_>>();
+            result = shifted
+                .into_iter()
+                .zip(result)
+                .map(|(shifted, original)| self.netlist.add_mux(select, shifted, original))
+                .collect();
+        }
+        result
+    }
+
+    fn shift_right(&mut self, input: &[NetId], amount: &[NetId], arithmetic: bool) -> Vec<NetId> {
+        let zero = self.netlist.add_constant(false);
+        let mut result = input.to_vec();
+        for (stage, &select) in amount.iter().enumerate() {
+            let distance = shift_distance(stage, input.len());
+            let fill = if arithmetic {
+                result[result.len() - 1]
+            } else {
+                zero
+            };
+            let shifted = (0..input.len())
+                .map(|bit| {
+                    bit.checked_add(distance)
+                        .filter(|source| *source < input.len())
+                        .map_or(fill, |source| result[source])
+                })
+                .collect::<Vec<_>>();
+            result = shifted
+                .into_iter()
+                .zip(result)
+                .map(|(shifted, original)| self.netlist.add_mux(select, shifted, original))
+                .collect();
+        }
+        result
     }
 
     fn bitwise(
@@ -378,11 +481,26 @@ impl<'a> Lowering<'a> {
             })
     }
 
+    fn reduce_and(&mut self, bits: &[NetId]) -> NetId {
+        bits.iter()
+            .fold(self.netlist.add_constant(true), |result, &bit| {
+                self.netlist.add_and(result, bit)
+            })
+    }
+
     fn reduce_xor(&mut self, bits: &[NetId]) -> NetId {
         bits.iter()
             .fold(self.netlist.add_constant(false), |result, &bit| {
                 self.netlist.add_xor(result, bit)
             })
+    }
+}
+
+fn shift_distance(stage: usize, width: usize) -> usize {
+    if stage >= usize::BITS as usize {
+        width
+    } else {
+        (1usize << stage).min(width)
     }
 }
 
@@ -557,7 +675,7 @@ mod tests {
     use struo_ir::{Netlist, NodeKind};
     use struo_rtl::{
         BinaryOp, BitWidth, ClockEdge, Constant, Design, Module, Polarity, Port, PortDirection,
-        Register, Reset, ResetMode, StateDomain, ValueType,
+        Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
     };
 
     use super::{default_pipeline, synthesize};
@@ -679,6 +797,161 @@ mod tests {
     }
 
     #[test]
+    fn lowers_unsigned_and_signed_comparisons() {
+        let operations = [
+            ("eq", BinaryOp::Equal),
+            ("ne", BinaryOp::NotEqual),
+            ("ltu", BinaryOp::LessThanUnsigned),
+            ("lts", BinaryOp::LessThanSigned),
+            ("leu", BinaryOp::LessOrEqualUnsigned),
+            ("les", BinaryOp::LessOrEqualSigned),
+            ("gtu", BinaryOp::GreaterThanUnsigned),
+            ("gts", BinaryOp::GreaterThanSigned),
+            ("geu", BinaryOp::GreaterOrEqualUnsigned),
+            ("ges", BinaryOp::GreaterOrEqualSigned),
+        ];
+        let mut module = Module::new("Comparator");
+        let lhs_signal = module.add_port(Port {
+            name: "lhs".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        let rhs_signal = module.add_port(Port {
+            name: "rhs".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        let outputs = operations
+            .iter()
+            .map(|(name, _)| {
+                module.add_port(Port {
+                    name: (*name).into(),
+                    direction: PortDirection::Output,
+                    r#type: bits(1),
+                })
+            })
+            .collect::<Vec<_>>();
+        let lhs = module.read(lhs_signal).unwrap();
+        let rhs = module.read(rhs_signal).unwrap();
+        for ((_, operation), output) in operations.into_iter().zip(outputs) {
+            let value = module.binary(operation, lhs, rhs).unwrap();
+            let target = module.whole(output).unwrap();
+            module.assign(target, value).unwrap();
+        }
+        let mut design = Design::new("Comparator");
+        design.add_module(module);
+        let synthesized = synthesize(&design).unwrap();
+
+        for lhs in 0..16 {
+            for rhs in 0..16 {
+                let inputs = input_word("lhs", 4, lhs)
+                    .into_iter()
+                    .chain(input_word("rhs", 4, rhs))
+                    .collect();
+                let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+                let lhs_signed = signed_nibble(lhs);
+                let rhs_signed = signed_nibble(rhs);
+                assert_eq!(outputs["eq"], lhs == rhs);
+                assert_eq!(outputs["ne"], lhs != rhs);
+                assert_eq!(outputs["ltu"], lhs < rhs);
+                assert_eq!(outputs["lts"], lhs_signed < rhs_signed);
+                assert_eq!(outputs["leu"], lhs <= rhs);
+                assert_eq!(outputs["les"], lhs_signed <= rhs_signed);
+                assert_eq!(outputs["gtu"], lhs > rhs);
+                assert_eq!(outputs["gts"], lhs_signed > rhs_signed);
+                assert_eq!(outputs["geu"], lhs >= rhs);
+                assert_eq!(outputs["ges"], lhs_signed >= rhs_signed);
+            }
+        }
+    }
+
+    #[test]
+    fn lowers_variable_barrel_shifts() {
+        let operations = [
+            ("left", BinaryOp::ShiftLeft),
+            ("logical", BinaryOp::ShiftRightLogical),
+            ("arithmetic", BinaryOp::ShiftRightArithmetic),
+        ];
+        let mut module = Module::new("Shifter");
+        let value_signal = module.add_port(Port {
+            name: "value".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        let amount_signal = module.add_port(Port {
+            name: "amount".into(),
+            direction: PortDirection::Input,
+            r#type: bits(3),
+        });
+        let outputs = operations
+            .iter()
+            .map(|(name, _)| {
+                module.add_port(Port {
+                    name: (*name).into(),
+                    direction: PortDirection::Output,
+                    r#type: bits(4),
+                })
+            })
+            .collect::<Vec<_>>();
+        let value = module.read(value_signal).unwrap();
+        let amount = module.read(amount_signal).unwrap();
+        for ((_, operation), output) in operations.into_iter().zip(outputs) {
+            let shifted = module.binary(operation, value, amount).unwrap();
+            let target = module.whole(output).unwrap();
+            module.assign(target, shifted).unwrap();
+        }
+        let mut design = Design::new("Shifter");
+        design.add_module(module);
+        let synthesized = synthesize(&design).unwrap();
+
+        for value in 0..16 {
+            for amount in 0..8 {
+                let inputs = input_word("value", 4, value)
+                    .into_iter()
+                    .chain(input_word("amount", 3, amount))
+                    .collect();
+                let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+                let arithmetic = if amount >= 4 {
+                    u64::from(value & 8 != 0) * 0xf
+                } else {
+                    (signed_nibble(value) >> amount).cast_unsigned() & 0xf
+                };
+                assert_eq!(output_word(&outputs, "left", 4), (value << amount) & 0xf);
+                assert_eq!(output_word(&outputs, "logical", 4), value >> amount);
+                assert_eq!(output_word(&outputs, "arithmetic", 4), arithmetic);
+            }
+        }
+    }
+
+    #[test]
+    fn lowers_and_reduction() {
+        let mut module = Module::new("Reduction");
+        let input_signal = module.add_port(Port {
+            name: "input".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        let output = module.add_port(Port {
+            name: "all".into(),
+            direction: PortDirection::Output,
+            r#type: bits(1),
+        });
+        let input = module.read(input_signal).unwrap();
+        let reduced = module.unary(UnaryOp::ReduceAnd, input).unwrap();
+        let target = module.whole(output).unwrap();
+        module.assign(target, reduced).unwrap();
+        let mut design = Design::new("Reduction");
+        design.add_module(module);
+        let synthesized = synthesize(&design).unwrap();
+
+        for input in 0..16 {
+            let inputs = input_word("input", 4, input);
+            let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+            assert_eq!(outputs["all"], input == 0xf);
+        }
+    }
+
+    #[test]
     fn default_pipeline_validates_a_design() {
         let mut design = Netlist::new("inverter");
         let input = design.add_input("a");
@@ -695,6 +968,14 @@ mod tests {
         (0..width)
             .map(|bit| (format!("{name}[{bit}]"), value & (1 << bit) != 0))
             .collect()
+    }
+
+    fn signed_nibble(value: u64) -> i64 {
+        if value & 8 == 0 {
+            value.cast_signed()
+        } else {
+            value.cast_signed() - 16
+        }
     }
 
     fn output_word(outputs: &HashMap<String, bool>, name: &str, width: usize) -> u64 {
