@@ -465,7 +465,7 @@ mod tests {
         source.add_output("value", value);
         let mapped = map_to_ecp5(&source).unwrap();
 
-        let mut simulator = ecp5_simulator(&mapped).unwrap().build_cranelift().unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
         let lhs = simulator.signal("lhs");
         let rhs = simulator.signal("rhs");
         let value = simulator.signal("value");
@@ -538,7 +538,7 @@ mod tests {
 
         let synthesized = synthesize(&design).unwrap();
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
-        let mut simulator = ecp5_simulator(&mapped).unwrap().build_cranelift().unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
         let address = simulator.signal("address");
         let valid = simulator.signal("valid");
         let route = simulator.signal("route");

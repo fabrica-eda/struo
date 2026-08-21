@@ -3062,9 +3062,21 @@ name = "struo-cli"
 version = "0.1.0"
 dependencies = [
  "struo-celox",
+ "struo-example-axi4-smartconnect",
  "struo-rtl",
- "struo-sample-axi4",
  "struo-sim",
+ "struo-synth",
+ "struo-target-ecp5",
+]
+
+[[package]]
+name = "struo-example-axi4-smartconnect"
+version = "0.1.0"
+dependencies = [
+ "celox",
+ "struo-celox",
+ "struo-frontend-veryl",
+ "struo-rtl",
  "struo-synth",
  "struo-target-ecp5",
 ]
@@ -3090,18 +3102,6 @@ version = "0.1.0"
 [[package]]
 name = "struo-rtl"
 version = "0.1.0"
-
-[[package]]
-name = "struo-sample-axi4"
-version = "0.1.0"
-dependencies = [
- "celox",
- "struo-celox",
- "struo-frontend-veryl",
- "struo-rtl",
- "struo-synth",
- "struo-target-ecp5",
-]
 
 [[package]]
 name = "struo-sim"

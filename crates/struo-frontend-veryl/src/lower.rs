@@ -1,13 +1,14 @@
 use std::collections::{BTreeSet, HashMap};
 
 use struo_rtl::{
-    BinaryOp, BitWidth, ClockEdge, Constant, Design, ExprId, Module as RtlModule, Polarity, Port,
-    PortDirection, Register, Reset, ResetMode, SignalId, StateDomain, UnaryOp, ValueType,
+    BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Module as RtlModule,
+    Polarity, Port, PortDirection, Register, Reset, ResetMode, SignalId, SignalSlice, StateDomain,
+    UnaryOp, ValueType,
 };
 use veryl_analyzer::ir::{
     AssignDestination, Component, Declaration, Expression, Factor, FfDeclaration, IfResetStatement,
-    Ir, Module, Op, Statement, Type, TypeKind, ValueVariant, VarId, VarKind, VarSelect,
-    VarSelectOp,
+    InstDeclaration, Ir, Module, Op, Statement, Type, TypeKind, ValueVariant, VarId, VarKind,
+    VarSelect, VarSelectOp,
 };
 
 use crate::{ImportError, resolve_name};
@@ -32,7 +33,8 @@ struct ModuleLowerer<'a> {
 
 /// Lowers analyzed Veryl AIR into Struo RTL without generated Verilog.
 ///
-/// The current semantic boundary supports scalar packed variables,
+/// The current semantic boundary supports scalar packed variables, recursively
+/// flattened module instances, analyzer-expanded interface/modport connections,
 /// combinational and sequential assignments, static packed selects,
 /// conditionals, concatenations, arithmetic, comparisons, shifts, and reset
 /// branches. Unsupported AIR is rejected rather than silently discarded.
@@ -153,11 +155,7 @@ impl<'a> ModuleLowerer<'a> {
                     }
                 }
                 Declaration::Null => {}
-                Declaration::Inst(_) => {
-                    return Err(ImportError::UnsupportedBehavior(
-                        "module instances require hierarchy lowering".into(),
-                    ));
-                }
+                Declaration::Inst(instance) => self.lower_instance(instance)?,
                 Declaration::External(_) => {
                     return Err(ImportError::UnsupportedBehavior(
                         "external components are not synthesizable".into(),
@@ -176,6 +174,173 @@ impl<'a> ModuleLowerer<'a> {
             }
         }
         Ok(())
+    }
+
+    fn lower_instance(&mut self, instance: &InstDeclaration) -> Result<(), ImportError> {
+        let Component::Module(child_source) = instance.component.as_ref() else {
+            return Err(ImportError::UnsupportedBehavior(
+                "only synthesizable module instances can be flattened".into(),
+            ));
+        };
+        let mut child = ModuleLowerer::new(child_source)?;
+        child.lower_declarations()?;
+        child.rtl.validate()?;
+
+        let prefix = instance
+            .hierarchy
+            .iter()
+            .map(ToString::to_string)
+            .chain(std::iter::once(resolve_name(instance.name)?))
+            .collect::<Vec<_>>()
+            .join(".");
+        let inline_signals = self.inline_module(&child.rtl, &prefix)?;
+        let parent_env = self.read_env()?;
+
+        for input in &instance.inputs {
+            let child_signal = child.signal(input.id)?;
+            let target = inline_signals[&child_signal];
+            let width = child.width(input.id)?;
+            let value = self.lower_expression(&input.expr, &parent_env)?;
+            let value = self.resize(value, width, child.is_signed(input.id))?;
+            self.rtl.assign(self.rtl.whole(target)?, value.id)?;
+        }
+
+        for output in &instance.outputs {
+            let child_signal = child.signal(output.id)?;
+            let source = inline_signals[&child_signal];
+            let source_width = child.width(output.id)?;
+            let source_expr = self.rtl.read(source)?;
+            let destinations = output
+                .dst
+                .iter()
+                .map(|destination| {
+                    self.destination_slice(destination)
+                        .map(|slice| (destination, slice))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let destination_width = destinations
+                .iter()
+                .map(|(_, slice)| slice.width.get())
+                .sum::<u32>();
+            if destination_width != source_width {
+                return Err(ImportError::UnsupportedBehavior(format!(
+                    "instance output {} connects {source_width} bits to {destination_width} bits",
+                    child.variable_name(output.id)
+                )));
+            }
+            let mut remaining = source_width;
+            for (_, destination) in destinations {
+                remaining -= destination.width.get();
+                let value = if remaining == 0 && destination.width.get() == source_width {
+                    source_expr
+                } else {
+                    self.rtl
+                        .expression_slice(source_expr, remaining, destination.width)?
+                };
+                self.rtl.assign(destination, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn inline_module(
+        &mut self,
+        child: &RtlModule,
+        prefix: &str,
+    ) -> Result<HashMap<SignalId, SignalId>, ImportError> {
+        if !child.memories().is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "memories in flattened module instances".into(),
+            ));
+        }
+        if !child.instances().is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "unflattened nested module instance".into(),
+            ));
+        }
+
+        let mut signals = HashMap::new();
+        for signal in child.signals() {
+            let mapped = self
+                .rtl
+                .add_signal(format!("{prefix}.{}", signal.name()), signal.r#type());
+            signals.insert(signal.id(), mapped);
+        }
+
+        let mut expressions = HashMap::new();
+        for expression in child.expressions() {
+            let mapped = match expression.kind() {
+                ExprKind::Signal(slice) => self.rtl.read_slice(SignalSlice {
+                    signal: signals[&slice.signal],
+                    lsb: slice.lsb,
+                    width: slice.width,
+                })?,
+                ExprKind::Constant(value) => self.rtl.constant(copy_constant(value)),
+                ExprKind::Unary { op, input } => self.rtl.unary(*op, expressions[input])?,
+                ExprKind::Binary { op, lhs, rhs } => {
+                    self.rtl.binary(*op, expressions[lhs], expressions[rhs])?
+                }
+                ExprKind::Mux {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => self.rtl.mux(
+                    expressions[condition],
+                    expressions[then_expr],
+                    expressions[else_expr],
+                )?,
+                ExprKind::Concat(parts) => self
+                    .rtl
+                    .concat(parts.iter().map(|part| expressions[part]).collect())?,
+                ExprKind::Slice { input, lsb } => self.rtl.expression_slice(
+                    expressions[input],
+                    *lsb,
+                    expression.r#type().width,
+                )?,
+            };
+            expressions.insert(expression.id(), mapped);
+        }
+
+        for assignment in child.assignments() {
+            self.rtl.assign(
+                SignalSlice {
+                    signal: signals[&assignment.target.signal],
+                    lsb: assignment.target.lsb,
+                    width: assignment.target.width,
+                },
+                expressions[&assignment.value],
+            )?;
+        }
+        for register in child.registers() {
+            self.rtl.add_register(Register {
+                name: format!("{prefix}.{}", register.name),
+                target: signals[&register.target],
+                next: expressions[&register.next],
+                clock: signals[&register.clock],
+                edge: register.edge,
+                enable: register.enable.map(|enable| Enable {
+                    signal: signals[&enable.signal],
+                    polarity: enable.polarity,
+                }),
+                reset: register.reset.map(|reset| Reset {
+                    signal: signals[&reset.signal],
+                    mode: reset.mode,
+                    polarity: reset.polarity,
+                    value: expressions[&reset.value],
+                }),
+            })?;
+        }
+        Ok(signals)
+    }
+
+    fn destination_slice(
+        &self,
+        destination: &AssignDestination,
+    ) -> Result<SignalSlice, ImportError> {
+        self.ensure_scalar_destination(destination)?;
+        let signal = self.signal(destination.id)?;
+        let (lsb, width) = static_select(&destination.select, self.width(destination.id)?)?;
+        Ok(self.rtl.slice(signal, lsb, BitWidth::new(width)?)?)
     }
 
     fn lower_ff(&mut self, ff: &FfDeclaration) -> Result<BTreeSet<VarId>, ImportError> {
@@ -789,6 +954,16 @@ impl<'a> ModuleLowerer<'a> {
     }
 }
 
+fn copy_constant(value: &Constant) -> Constant {
+    let mut words = vec![0; value.width().get().div_ceil(64) as usize];
+    for bit in 0..value.width().get() {
+        if value.bit(bit) {
+            words[bit as usize / 64] |= 1 << (bit % 64);
+        }
+    }
+    Constant::new(value.width(), words)
+}
+
 fn value_type(r#type: &Type, name: &str) -> Result<ValueType, ImportError> {
     Ok(ValueType {
         width: BitWidth::new(concrete_width(r#type, name)?)?,
@@ -865,7 +1040,7 @@ fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), Im
 
 #[cfg(test)]
 mod tests {
-    use celox::{JitBackend, Simulator};
+    use celox::{NativeBackend, Simulator};
     use struo_celox::ecp5_simulator;
     use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
@@ -903,12 +1078,51 @@ module Top (
 }
 ";
 
+    const HIERARCHY_SOURCE: &str = r"
+interface ByteBus {
+    var request : logic<8>;
+    var response: logic<8>;
+
+    modport initiator {
+        request : output,
+        response: input ,
+    }
+    modport target {
+        request : input ,
+        response: output,
+    }
+}
+
+module Increment (
+    bus: modport ByteBus::target,
+) {
+    always_comb {
+        bus.response = bus.request + 8'h01;
+    }
+}
+
+module HierarchyTop (
+    value : input  logic<8>,
+    result: output logic<8>,
+) {
+    inst bus: ByteBus;
+    inst increment: Increment (
+        bus: bus,
+    );
+
+    always_comb {
+        bus.request = value;
+        result      = bus.response;
+    }
+}
+";
+
     #[test]
     fn lowers_analyzed_comb_and_ff_through_ecp5_and_celox() {
         let design = analyze_and_lower(SOURCE, "air_lowering", "Top").unwrap();
         let synthesized = synthesize(&design).unwrap();
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
-        let mut simulator = ecp5_simulator(&mapped).unwrap().build_cranelift().unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
 
         reset(&mut simulator);
         set(&mut simulator, "a", 100);
@@ -923,22 +1137,43 @@ module Top (
         assert_value(&mut simulator, "flag", 0);
     }
 
-    fn reset(simulator: &mut Simulator<JitBackend>) {
+    #[test]
+    fn flattens_analyzer_expanded_interface_instances() {
+        let design =
+            analyze_and_lower(HIERARCHY_SOURCE, "interface_lowering", "HierarchyTop").unwrap();
+        let top = design.top_module().unwrap();
+        assert!(top.instances().is_empty());
+        assert!(
+            top.signals()
+                .iter()
+                .any(|signal| signal.name() == "increment.bus.request")
+        );
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        set(&mut simulator, "value", 0x7e);
+        assert_value(&mut simulator, "result", 0x7f);
+        set(&mut simulator, "value", 0xff);
+        assert_value(&mut simulator, "result", 0x00);
+    }
+
+    fn reset(simulator: &mut Simulator<NativeBackend>) {
         set(simulator, "rst_n", 0);
         tick(simulator);
         set(simulator, "rst_n", 1);
     }
 
-    fn tick(simulator: &mut Simulator<JitBackend>) {
+    fn tick(simulator: &mut Simulator<NativeBackend>) {
         simulator.tick(simulator.event("clk")).unwrap();
     }
 
-    fn set(simulator: &mut Simulator<JitBackend>, name: &str, value: u8) {
+    fn set(simulator: &mut Simulator<NativeBackend>, name: &str, value: u8) {
         let signal = simulator.signal(name);
         simulator.modify(|io| io.set(signal, value)).unwrap();
     }
 
-    fn assert_value(simulator: &mut Simulator<JitBackend>, name: &str, expected: u64) {
+    fn assert_value(simulator: &mut Simulator<NativeBackend>, name: &str, expected: u64) {
         assert_eq!(
             simulator.get(simulator.signal(name)),
             expected.into(),

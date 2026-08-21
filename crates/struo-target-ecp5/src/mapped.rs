@@ -187,7 +187,10 @@ pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
 
     for register in netlist.registers() {
         cells.push(Ecp5Cell::FlipFlop {
-            name: register.name().into(),
+            // nextpnr rejects a cell whose name is also a top-level IO name.
+            // Keep primitive cells in a dedicated namespace even when an RTL
+            // output is directly registered.
+            name: format!("ff_{}", register.name()),
             data: mapped_bit(&bits, register.data()),
             output: wire_number(register.output()),
             clock: mapped_bit(&bits, register.clock()),
@@ -500,7 +503,6 @@ fn json_flip_flop(
             ("LSR".into(), "input"),
             ("CE".into(), "input"),
             ("DI".into(), "input"),
-            ("M".into(), "input"),
             ("Q".into(), "output"),
         ]
         .into_iter()
@@ -516,7 +518,6 @@ fn json_flip_flop(
                 vec![enable.map_or(Bit::One, |enable| enable.signal)],
             ),
             ("DI".into(), vec![data]),
-            ("M".into(), vec![Bit::Zero]),
             ("Q".into(), vec![Bit::Wire(output)]),
         ]
         .into_iter()
@@ -597,6 +598,11 @@ mod tests {
         assert!(json.contains("\"type\": \"TRELLIS_FF\""));
         assert!(json.contains("\"SRMODE\": \"ASYNC\""));
         assert!(json.contains("\"LSRMUX\": \"INV\""));
+
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let connections = &json["modules"]["counter_bit"]["cells"]["ff_state"]["connections"];
+        assert!(connections.get("DI").is_some());
+        assert!(connections.get("M").is_none());
     }
 
     #[test]
