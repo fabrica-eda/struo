@@ -120,10 +120,12 @@ AW and W independently, streams W and R beats through backpressure, and uses
 QoS-first read/write arbitration with round-robin fairness for ties. A reusable
 parameterized decoder bank uses Veryl's parameter-bounded generate-for to
 elaborate one burst decoder per input directly in analyzer AIR; no template
-engine or generated HDL is involved. Each decoder validates FIXED, INCR, and
-WRAP footprints, transfer width, WRAP length and alignment, address overflow,
-target-window containment, and the AXI4 4 KiB rule. Invalid or unmapped bursts
-complete locally with `DECERR`. Tests
+engine or generated HDL is involved. A parameterized QoS arbiter compares every
+request pair after elaboration and accepts a caller-provided tie-break order, so
+the same block supports round-robin policies beyond two inputs. Each decoder
+validates FIXED, INCR, and WRAP footprints, transfer width, WRAP length and
+alignment, address overflow, target-window containment, and the AXI4 4 KiB
+rule. Invalid or unmapped bursts complete locally with `DECERR`. Tests
 take only the analyzed Veryl path through synthesis, ECP5 technology mapping,
 and Celox post-map simulation, with Celox's native Veryl frontend as the
 reference. Each initiator has two read and two write outstanding slots. A fifth
