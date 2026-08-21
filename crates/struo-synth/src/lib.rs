@@ -371,28 +371,73 @@ impl<'a> Lowering<'a> {
     }
 
     fn equal_words(&mut self, lhs: &[NetId], rhs: &[NetId]) -> NetId {
-        let mut result = self.netlist.add_constant(true);
-        for (&lhs, &rhs) in lhs.iter().zip(rhs) {
-            let different = self.netlist.add_xor(lhs, rhs);
-            let same = self.netlist.add_not(different);
-            result = self.netlist.add_and(result, same);
-        }
-        result
+        let same = lhs
+            .iter()
+            .zip(rhs)
+            .map(|(&lhs, &rhs)| {
+                let different = self.netlist.add_xor(lhs, rhs);
+                self.netlist.add_not(different)
+            })
+            .collect::<Vec<_>>();
+        self.reduce_tree(&same, true, Netlist::add_and)
     }
 
     fn less_unsigned(&mut self, lhs: &[NetId], rhs: &[NetId]) -> NetId {
-        let mut less = self.netlist.add_constant(false);
-        let mut equal = self.netlist.add_constant(true);
-        for (&lhs, &rhs) in lhs.iter().zip(rhs).rev() {
-            let lhs_zero = self.netlist.add_not(lhs);
-            let lhs_zero_rhs_one = self.netlist.add_and(lhs_zero, rhs);
-            let first_difference_is_less = self.netlist.add_and(equal, lhs_zero_rhs_one);
-            less = self.netlist.add_or(less, first_difference_is_less);
-            let different = self.netlist.add_xor(lhs, rhs);
-            let same = self.netlist.add_not(different);
-            equal = self.netlist.add_and(equal, same);
+        let mut segments = lhs
+            .iter()
+            .zip(rhs)
+            .rev()
+            .map(|(&lhs, &rhs)| {
+                let lhs_zero = self.netlist.add_not(lhs);
+                let less = self.netlist.add_and(lhs_zero, rhs);
+                let different = self.netlist.add_xor(lhs, rhs);
+                let equal = self.netlist.add_not(different);
+                (equal, less)
+            })
+            .collect::<Vec<_>>();
+
+        while segments.len() > 1 {
+            let mut next = Vec::with_capacity(segments.len().div_ceil(2));
+            for pair in segments.chunks(2) {
+                if let [higher, lower] = pair {
+                    let equal = self.netlist.add_and(higher.0, lower.0);
+                    let lower_less = self.netlist.add_and(higher.0, lower.1);
+                    let less = self.netlist.add_or(higher.1, lower_less);
+                    next.push((equal, less));
+                } else {
+                    next.push(pair[0]);
+                }
+            }
+            segments = next;
         }
-        less
+
+        segments
+            .first()
+            .map_or_else(|| self.netlist.add_constant(false), |segment| segment.1)
+    }
+
+    fn reduce_tree(
+        &mut self,
+        bits: &[NetId],
+        identity: bool,
+        operation: fn(&mut Netlist, NetId, NetId) -> NetId,
+    ) -> NetId {
+        if bits.is_empty() {
+            return self.netlist.add_constant(identity);
+        }
+        let mut level = bits.to_vec();
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                if let [lhs, rhs] = pair {
+                    next.push(operation(&mut self.netlist, *lhs, *rhs));
+                } else {
+                    next.push(pair[0]);
+                }
+            }
+            level = next;
+        }
+        level[0]
     }
 
     fn less_signed(&mut self, lhs: &[NetId], rhs: &[NetId]) -> NetId {
@@ -475,24 +520,15 @@ impl<'a> Lowering<'a> {
     }
 
     fn reduce_or(&mut self, bits: &[NetId]) -> NetId {
-        bits.iter()
-            .fold(self.netlist.add_constant(false), |result, &bit| {
-                self.netlist.add_or(result, bit)
-            })
+        self.reduce_tree(bits, false, Netlist::add_or)
     }
 
     fn reduce_and(&mut self, bits: &[NetId]) -> NetId {
-        bits.iter()
-            .fold(self.netlist.add_constant(true), |result, &bit| {
-                self.netlist.add_and(result, bit)
-            })
+        self.reduce_tree(bits, true, Netlist::add_and)
     }
 
     fn reduce_xor(&mut self, bits: &[NetId]) -> NetId {
-        bits.iter()
-            .fold(self.netlist.add_constant(false), |result, &bit| {
-                self.netlist.add_xor(result, bit)
-            })
+        self.reduce_tree(bits, false, Netlist::add_xor)
     }
 }
 
@@ -744,6 +780,31 @@ mod tests {
                 assert_eq!(output_word(&outputs, "sum", 4), (lhs + rhs) & 0xf);
             }
         }
+    }
+
+    #[test]
+    fn balances_wide_reduction_logic() {
+        let mut module = Module::new("WideReduction");
+        let input_signal = module.add_port(Port {
+            name: "input".into(),
+            direction: PortDirection::Input,
+            r#type: bits(32),
+        });
+        let output = module.add_port(Port {
+            name: "all".into(),
+            direction: PortDirection::Output,
+            r#type: bits(1),
+        });
+        let input = module.read(input_signal).unwrap();
+        let reduced = module.unary(UnaryOp::ReduceAnd, input).unwrap();
+        module
+            .assign(module.whole(output).unwrap(), reduced)
+            .unwrap();
+        let mut design = Design::new("WideReduction");
+        design.add_module(module);
+
+        let synthesized = synthesize(&design).unwrap();
+        assert!(max_combinational_depth(&synthesized.netlist) <= 5);
     }
 
     #[test]
@@ -1024,5 +1085,27 @@ mod tests {
             values[node.output().index() as usize] = value;
         }
         outputs
+    }
+
+    fn max_combinational_depth(netlist: &Netlist) -> usize {
+        let mut depths = vec![0; netlist.nodes().len()];
+        let mut maximum = 0;
+        for node in netlist.nodes() {
+            let depth = match node.kind() {
+                NodeKind::Input(_) | NodeKind::Constant(_) | NodeKind::RegisterOutput(_) => 0,
+                NodeKind::Output(_) => depths[node.inputs()[0].index() as usize],
+                NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not | NodeKind::Mux => {
+                    node.inputs()
+                        .iter()
+                        .map(|input| depths[input.index() as usize])
+                        .max()
+                        .unwrap_or(0)
+                        + 1
+                }
+            };
+            depths[node.output().index() as usize] = depth;
+            maximum = maximum.max(depth);
+        }
+        maximum
     }
 }

@@ -6,9 +6,9 @@ use struo_rtl::{
     UnaryOp, ValueType,
 };
 use veryl_analyzer::ir::{
-    AssignDestination, Component, Declaration, Expression, Factor, FfDeclaration, IfResetStatement,
-    InstDeclaration, Ir, Module, Op, Statement, Type, TypeKind, ValueVariant, VarId, VarKind,
-    VarSelect, VarSelectOp,
+    AssignDestination, CasePattern, CaseStatement, Component, Declaration, Expression, Factor,
+    FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module, Op, Statement, Type, TypeKind,
+    ValueVariant, VarId, VarKind, VarSelect, VarSelectOp,
 };
 
 use crate::{ImportError, resolve_name};
@@ -36,8 +36,9 @@ struct ModuleLowerer<'a> {
 /// The current semantic boundary supports scalar packed variables, recursively
 /// flattened module instances, analyzer-expanded interface/modport connections,
 /// combinational and sequential assignments, static packed selects,
-/// conditionals, concatenations, arithmetic, comparisons, shifts, and reset
-/// branches. Unsupported AIR is rejected rather than silently discarded.
+/// conditionals, case statements, concatenations, arithmetic, comparisons,
+/// shifts, and reset branches. Unsupported AIR is rejected rather than
+/// silently discarded.
 ///
 /// # Errors
 ///
@@ -512,9 +513,7 @@ impl<'a> ModuleLowerer<'a> {
                 "nested if_reset statements".into(),
             )),
             Statement::Null => Ok(BTreeSet::new()),
-            Statement::Case(_) => Err(ImportError::UnsupportedBehavior(
-                "case statements are not lowered yet".into(),
-            )),
+            Statement::Case(case_statement) => self.lower_case(case_statement, env, sequential),
             Statement::For(_) => Err(ImportError::UnsupportedBehavior(
                 "runtime and unrolled for statements are not lowered yet".into(),
             )),
@@ -534,6 +533,78 @@ impl<'a> ModuleLowerer<'a> {
                 "if_reset outside always_ff".into(),
             )),
         }
+    }
+
+    fn lower_case(
+        &mut self,
+        statement: &CaseStatement,
+        env: &mut Env,
+        sequential: bool,
+    ) -> Result<BTreeSet<VarId>, ImportError> {
+        let target = self.lower_expression(&statement.case_target, env)?;
+        let base = env.clone();
+        let mut else_env = base.clone();
+        let mut changed = self.lower_statements(&statement.default, &mut else_env, sequential)?;
+
+        for arm in statement.arms.iter().rev() {
+            let mut then_env = base.clone();
+            let arm_changed = self.lower_statements(&arm.body, &mut then_env, sequential)?;
+            let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
+            let mut merged_changed = changed.clone();
+            merged_changed.extend(&arm_changed);
+            let mut merged_env = base.clone();
+            for id in &merged_changed {
+                let width = self.width(*id)?;
+                let signed = self.is_signed(*id);
+                let then_value = self.resize(then_env[id], width, signed)?;
+                let else_value = self.resize(else_env[id], width, signed)?;
+                let value = self.rtl.mux(condition.id, then_value.id, else_value.id)?;
+                merged_env.insert(
+                    *id,
+                    LoweredExpr {
+                        id: value,
+                        width,
+                        signed,
+                    },
+                );
+            }
+            else_env = merged_env;
+            changed = merged_changed;
+        }
+
+        *env = else_env;
+        Ok(changed)
+    }
+
+    fn lower_case_patterns(
+        &mut self,
+        target: LoweredExpr,
+        patterns: &[CasePattern],
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut condition = None;
+        for pattern in patterns {
+            let matches = match pattern {
+                CasePattern::Eq(value) => {
+                    let value = self.lower_expression(value, env)?;
+                    self.lower_binary(Op::Eq, target, value, 1, false)?
+                }
+                CasePattern::Range { lo, hi, inclusive } => {
+                    let lo = self.lower_expression(lo, env)?;
+                    let hi = self.lower_expression(hi, env)?;
+                    let lower = self.lower_binary(Op::LessEq, lo, target, 1, false)?;
+                    let upper_op = if *inclusive { Op::LessEq } else { Op::Less };
+                    let upper = self.lower_binary(upper_op, target, hi, 1, false)?;
+                    self.lower_binary(Op::LogicAnd, lower, upper, 1, false)?
+                }
+            };
+            condition = Some(match condition {
+                Some(previous) => self.lower_binary(Op::LogicOr, previous, matches, 1, false)?,
+                None => matches,
+            });
+        }
+        condition
+            .ok_or_else(|| ImportError::UnsupportedBehavior("case arm without a pattern".into()))
     }
 
     fn lower_expression(
@@ -1117,6 +1188,22 @@ module HierarchyTop (
 }
 ";
 
+    const CASE_SOURCE: &str = r"
+module CaseTop (
+    select : input  logic<3>,
+    value  : input  logic<8>,
+    decoded: output logic<8>,
+) {
+    always_comb {
+        case select {
+            3'd0, 3'd2: decoded = value;
+            3'd3..=3'd5: decoded = value + 8'h01;
+            default: decoded = 8'hff;
+        }
+    }
+}
+";
+
     #[test]
     fn lowers_analyzed_comb_and_ff_through_ecp5_and_celox() {
         let design = analyze_and_lower(SOURCE, "air_lowering", "Top").unwrap();
@@ -1156,6 +1243,27 @@ module HierarchyTop (
         assert_value(&mut simulator, "result", 0x7f);
         set(&mut simulator, "value", 0xff);
         assert_value(&mut simulator, "result", 0x00);
+    }
+
+    #[test]
+    fn lowers_case_patterns_to_synthesizable_priority_muxes() {
+        let design = analyze_and_lower(CASE_SOURCE, "case_lowering", "CaseTop").unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "value", 0x20);
+        for (select, expected) in [
+            (0, 0x20),
+            (1, 0xff),
+            (2, 0x20),
+            (3, 0x21),
+            (5, 0x21),
+            (6, 0xff),
+        ] {
+            set(&mut simulator, "select", select);
+            assert_value(&mut simulator, "decoded", expected);
+        }
     }
 
     fn reset(simulator: &mut Simulator<NativeBackend>) {
