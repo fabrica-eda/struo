@@ -433,6 +433,22 @@ pub struct Memory {
     pub depth: u32,
     /// Registered read latency in cycles.
     pub read_latency: u8,
+    /// Address sampled by the synchronous read port.
+    pub read_address: ExprId,
+    /// Whole signal driven by the read port.
+    pub read_data: SignalId,
+    /// Optional read clock enable.
+    pub read_enable: Option<Enable>,
+    /// Address sampled by the synchronous write port.
+    pub write_address: ExprId,
+    /// Word written when `write_enable` is asserted.
+    pub write_data: ExprId,
+    /// Write-port enable and polarity.
+    pub write_enable: Enable,
+    /// Clock shared by the read and write ports.
+    pub clock: SignalId,
+    /// Active edge shared by the read and write ports.
+    pub edge: ClockEdge,
 }
 
 /// A preserved module or black-box instance.
@@ -886,15 +902,71 @@ impl Module {
                 self.expression(reset.value)?;
             }
         }
-        for memory in &self.memories {
-            validate_unique_name(&memory.name, "memory", &mut names)?;
-            if memory.depth == 0 {
-                return Err(RtlError::ZeroDepth(memory.name.clone()));
-            }
-        }
+        self.validate_memories(&mut names, &mut driven_bits)?;
         for instance in &self.instances {
             validate_unique_name(&instance.name, "instance", &mut names)?;
             validate_name(&instance.module, "instantiated module")?;
+        }
+        Ok(())
+    }
+
+    fn validate_memories<'a>(
+        &'a self,
+        names: &mut HashSet<&'a str>,
+        driven_bits: &mut HashSet<(SignalId, u32)>,
+    ) -> Result<(), RtlError> {
+        for memory in &self.memories {
+            validate_unique_name(&memory.name, "memory", names)?;
+            if memory.depth == 0 {
+                return Err(RtlError::ZeroDepth(memory.name.clone()));
+            }
+            if memory.read_latency != 1 {
+                return Err(RtlError::UnsupportedMemoryReadLatency {
+                    memory: memory.name.clone(),
+                    latency: memory.read_latency,
+                });
+            }
+            let address_width =
+                BitWidth::new((u32::BITS - (memory.depth - 1).leading_zeros()).max(1))?;
+            for address in [memory.read_address, memory.write_address] {
+                let actual = self.expression(address)?.r#type.width;
+                if actual != address_width {
+                    return Err(RtlError::WidthMismatch {
+                        expected: address_width,
+                        actual,
+                    });
+                }
+            }
+            let read_data = self.signal(memory.read_data)?;
+            if read_data.direction == Some(PortDirection::Input) {
+                return Err(RtlError::DriveInput(read_data.name.clone()));
+            }
+            if read_data.r#type.width != memory.word.width {
+                return Err(RtlError::WidthMismatch {
+                    expected: memory.word.width,
+                    actual: read_data.r#type.width,
+                });
+            }
+            let write_width = self.expression(memory.write_data)?.r#type.width;
+            if write_width != memory.word.width {
+                return Err(RtlError::WidthMismatch {
+                    expected: memory.word.width,
+                    actual: write_width,
+                });
+            }
+            self.validate_control(memory.clock, "memory clock")?;
+            self.validate_control(memory.write_enable.signal, "memory write enable")?;
+            if let Some(enable) = memory.read_enable {
+                self.validate_control(enable.signal, "memory read enable")?;
+            }
+            for bit in 0..read_data.r#type.width.get() {
+                if !driven_bits.insert((memory.read_data, bit)) {
+                    return Err(RtlError::MultipleDrivers {
+                        signal: read_data.name.clone(),
+                        bit,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -1150,6 +1222,13 @@ pub enum RtlError {
     UnknownModule(String),
     /// A memory has no entries.
     ZeroDepth(String),
+    /// A memory read latency cannot be implemented by the inference path.
+    UnsupportedMemoryReadLatency {
+        /// Memory name.
+        memory: String,
+        /// Requested latency in clock cycles.
+        latency: u8,
+    },
     /// A signal identity does not exist.
     UnknownSignal(u32),
     /// An expression identity does not exist.
@@ -1208,6 +1287,10 @@ impl Display for RtlError {
             Self::MissingTop(name) => write!(formatter, "top module `{name}` does not exist"),
             Self::UnknownModule(name) => write!(formatter, "unknown module `{name}`"),
             Self::ZeroDepth(name) => write!(formatter, "memory `{name}` has zero depth"),
+            Self::UnsupportedMemoryReadLatency { memory, latency } => write!(
+                formatter,
+                "memory `{memory}` has unsupported read latency {latency}; expected 1"
+            ),
             Self::UnknownSignal(id) => write!(formatter, "unknown signal id {id}"),
             Self::UnknownExpression(id) => write!(formatter, "unknown expression id {id}"),
             Self::InvalidSignalIdentity(id) => write!(formatter, "invalid signal identity {id}"),
