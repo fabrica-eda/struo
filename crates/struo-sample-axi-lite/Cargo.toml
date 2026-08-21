@@ -1,21 +1,18 @@
 [package]
-name = "struo-cli"
-description = "Command-line interface for Struo"
+name = "struo-sample-axi-lite"
+description = "AXI4-Lite crossbar synthesis stress design for Struo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "struo"
-path = "src/main.rs"
-
 [dependencies]
-struo-celox = { path = "../struo-celox" }
 struo-rtl = { path = "../struo-rtl" }
-struo-sample-axi-lite = { path = "../struo-sample-axi-lite" }
-struo-sim = { path = "../struo-sim" }
+
+[dev-dependencies]
+celox = "=0.3.1"
+struo-celox = { path = "../struo-celox" }
 struo-synth = { path = "../struo-synth" }
 struo-target-ecp5 = { path = "../struo-target-ecp5" }
 

@@ -3063,6 +3063,7 @@ version = "0.1.0"
 dependencies = [
  "struo-celox",
  "struo-rtl",
+ "struo-sample-axi-lite",
  "struo-sim",
  "struo-synth",
  "struo-target-ecp5",
@@ -3084,6 +3085,17 @@ version = "0.1.0"
 [[package]]
 name = "struo-rtl"
 version = "0.1.0"
+
+[[package]]
+name = "struo-sample-axi-lite"
+version = "0.1.0"
+dependencies = [
+ "celox",
+ "struo-celox",
+ "struo-rtl",
+ "struo-synth",
+ "struo-target-ecp5",
+]
 
 [[package]]
 name = "struo-sim"

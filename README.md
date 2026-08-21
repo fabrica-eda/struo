@@ -28,6 +28,7 @@ Crate responsibilities:
 
 - `struo-frontend-veryl`: adapter pinned to an exact `veryl-analyzer` version
 - `struo-rtl`: frontend-independent RTL that preserves hardware semantics
+- `struo-sample-axi-lite`: protocol-level synthesis stress design
 - `struo-ir`: low-level netlist manipulated by synthesis passes
 - `struo-synth`: RTL validation, lowering, and optimization pipeline
 - `struo-sim`: equivalence policy and release gates
@@ -87,6 +88,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo run -- demo /tmp/struo-blinky.nextpnr.json
+cargo run -- axi-lite-demo /tmp/struo-axi-lite.nextpnr.json
 ```
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
@@ -99,3 +101,18 @@ structural hashing, then maps Boolean nodes to `LUT4` and registers to
 The next frontend unit is complete lowering of Veryl analyzer `Comb`, `Ff`, and
 `Inst` nodes into `struo-rtl`; the synthesis and ECP5 mapping path no longer
 depends on generated Verilog.
+
+## AXI4-Lite synthesis stress design
+
+`struo-sample-axi-lite` builds a two-initiator, two-target crossbar with
+independent AW and W buffering, all five ready/valid channels, target response
+ownership, round-robin contention handling, backpressure, and local `DECERR`
+completion. Its tests synthesize and technology-map the design, compile the
+mapped object directly with Celox, and exercise independent write channels,
+stalled responses, unmapped reads, and arbitration fairness.
+
+The standalone crossbar exposes every AXI signal for simulation and therefore
+exceeds the evaluation board's physical IO count. Place-and-route coverage will
+use an internal self-test wrapper once hierarchy and instance-port lowering are
+implemented; reducing the protocol widths merely to satisfy top-level IO would
+not be a representative AXI4-Lite design.

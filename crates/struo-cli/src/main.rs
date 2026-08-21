@@ -11,6 +11,7 @@ use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Module, Polarity, Port, PortDirection,
     Register, Reset, ResetMode, StateDomain, ValueType,
 };
+use struo_sample_axi_lite::axi_lite_crossbar_2x2;
 use struo_sim::VerificationPolicy;
 use struo_synth::synthesize;
 use struo_target_ecp5::{Ecp5Flow, map_to_ecp5};
@@ -21,6 +22,8 @@ Struo FPGA synthesis playground
 Usage:
   struo demo [NEXTPNR_JSON]
                        synthesize and simulate the ECP5 EVN blinky
+  struo axi-lite-demo [MAPPED_JSON]
+                       synthesize and compile the 2x2 AXI4-Lite crossbar
   struo help    show this help
 ";
 
@@ -37,12 +40,35 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn Error>> {
     match env::args().nth(1).as_deref() {
         Some("demo") => run_demo(env::args().nth(2).as_deref()),
+        Some("axi-lite-demo") => run_axi_lite_demo(env::args().nth(2).as_deref()),
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())
         }
         Some(command) => Err(format!("unknown command `{command}`\n\n{USAGE}").into()),
     }
+}
+
+fn run_axi_lite_demo(mapped_path: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let design = axi_lite_crossbar_2x2()?;
+    let synthesized = synthesize(&design)?;
+    for report in &synthesized.reports {
+        println!("{}: {}", report.pass, report.message);
+    }
+    let mapped = map_to_ecp5(&synthesized.netlist)?;
+    println!(
+        "AXI4-Lite crossbar: {} Boolean nodes, {} registers, {} ECP5 cells",
+        synthesized.netlist.nodes().len(),
+        synthesized.netlist.registers().len(),
+        mapped.cells().len()
+    );
+    ecp5_simulator(&mapped)?.build_cranelift()?;
+    println!("Celox post-map compile: passed without JSON serialization");
+    if let Some(path) = mapped_path {
+        fs::write(path, mapped.to_nextpnr_json()?)?;
+        println!("mapped JSON: {path}");
+    }
+    Ok(())
 }
 
 fn run_demo(nextpnr_path: Option<&str>) -> Result<(), Box<dyn Error>> {
