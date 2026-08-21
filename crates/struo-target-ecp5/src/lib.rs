@@ -9,13 +9,6 @@ pub use mapped::{
 
 use struo_sim::{ReleaseBlocked, VerificationPolicy, VerificationReport, VerificationStage};
 
-/// Board constraints distributed with this crate.
-pub const LFE5UM5G_85F_EVN_LPF: &str = include_str!("../../../boards/lfe5um5g-85f-evn/base.lpf");
-
-/// Board constraints for the closed-system AXI4 crossbar self-test.
-pub const LFE5UM5G_85F_EVN_AXI4_SELF_TEST_LPF: &str =
-    include_str!("../../../boards/lfe5um5g-85f-evn/axi4-self-test.lpf");
-
 /// Immutable target identity used in artifact manifests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoardProfile {
@@ -163,18 +156,13 @@ impl Ecp5Flow {
 mod tests {
     use struo_sim::{VerificationPolicy, VerificationReport};
 
-    use super::{
-        Ecp5Flow, LFE5UM5G_85F_EVN, LFE5UM5G_85F_EVN_AXI4_SELF_TEST_LPF, LFE5UM5G_85F_EVN_LPF,
-    };
+    use super::{Ecp5Flow, LFE5UM5G_85F_EVN};
 
     #[test]
     fn board_profile_selects_the_exact_fpga() {
         assert_eq!(LFE5UM5G_85F_EVN.device, "LFE5UM5G-85F-8BG381");
         assert_eq!(LFE5UM5G_85F_EVN.nextpnr_device, "--um5g-85k");
         assert_eq!(LFE5UM5G_85F_EVN.nextpnr_package, "CABGA381");
-        assert!(LFE5UM5G_85F_EVN_LPF.contains("SITE \"A10\""));
-        assert!(LFE5UM5G_85F_EVN_AXI4_SELF_TEST_LPF.contains("COMP \"passed\""));
-        assert!(LFE5UM5G_85F_EVN_AXI4_SELF_TEST_LPF.contains("COMP \"failed\""));
     }
 
     #[test]

@@ -129,7 +129,7 @@ initiator, a target response model, and a result scoreboard. Its physical top
 exposes only clock, reset, pass, and fail, avoiding the evaluation board's IO
 limit without reducing the protocol widths. The corresponding constraints are
 in
-[`boards/lfe5um5g-85f-evn/axi4-self-test.lpf`](boards/lfe5um5g-85f-evn/axi4-self-test.lpf).
+[`examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf`](examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf).
 
 The complete open-source hardware smoke flow is:
 
@@ -138,7 +138,7 @@ mkdir -p build/axi4-self-test
 cargo run -- axi4-self-test build/axi4-self-test/design.json
 nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
   --json build/axi4-self-test/design.json \
-  --lpf boards/lfe5um5g-85f-evn/axi4-self-test.lpf \
+  --lpf examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf \
   --textcfg build/axi4-self-test/design.config \
   --report build/axi4-self-test/nextpnr-report.json --freq 12
 ecppack --svf build/axi4-self-test/design.svf \

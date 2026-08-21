@@ -1,6 +1,7 @@
 [package]
 name = "struo-example-axi4-smartconnect"
 description = "Veryl AXI4 SmartConnect synthesis and verification example for Struo"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
