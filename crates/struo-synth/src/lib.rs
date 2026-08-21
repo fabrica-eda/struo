@@ -314,12 +314,62 @@ impl<'a> Lowering<'a> {
                 bits
             }
             ExprKind::Slice { input, lsb } => {
-                let input = self.lower_expression(input)?;
-                input[lsb as usize..lsb as usize + width].to_vec()
+                self.lower_expression_range(input, lsb as usize, width)?
             }
         };
         self.expression_bits[index] = Some(bits.clone());
         Ok(bits)
+    }
+
+    fn lower_expression_range(
+        &mut self,
+        id: ExprId,
+        lsb: usize,
+        width: usize,
+    ) -> Result<Vec<NetId>, SynthesisError> {
+        let expression = &self.module.expressions()[id.index() as usize];
+        debug_assert!(lsb + width <= expression.r#type().width.get() as usize);
+        match expression.kind().clone() {
+            ExprKind::Signal(slice) => (0..width)
+                .map(|offset| {
+                    self.resolve_signal_bit(slice.signal, slice.lsb as usize + lsb + offset)
+                })
+                .collect(),
+            ExprKind::Slice {
+                input,
+                lsb: inner_lsb,
+            } => self.lower_expression_range(input, inner_lsb as usize + lsb, width),
+            ExprKind::Concat(parts) => {
+                let range_end = lsb + width;
+                let mut part_lsb = 0;
+                let mut bits = Vec::with_capacity(width);
+                for part in parts.into_iter().rev() {
+                    let part_width = self.module.expressions()[part.index() as usize]
+                        .r#type()
+                        .width
+                        .get() as usize;
+                    let part_end = part_lsb + part_width;
+                    let overlap_lsb = lsb.max(part_lsb);
+                    let overlap_end = range_end.min(part_end);
+                    if overlap_lsb < overlap_end {
+                        bits.extend(self.lower_expression_range(
+                            part,
+                            overlap_lsb - part_lsb,
+                            overlap_end - overlap_lsb,
+                        )?);
+                    }
+                    part_lsb = part_end;
+                    if part_lsb >= range_end {
+                        break;
+                    }
+                }
+                Ok(bits)
+            }
+            _ => {
+                let bits = self.lower_expression(id)?;
+                Ok(bits[lsb..lsb + width].to_vec())
+            }
+        }
     }
 
     fn lower_binary(&mut self, op: BinaryOp, lhs: &[NetId], rhs: &[NetId]) -> Vec<NetId> {
@@ -780,6 +830,51 @@ mod tests {
                 assert_eq!(output_word(&outputs, "sum", 4), (lhs + rhs) & 0xf);
             }
         }
+    }
+
+    #[test]
+    fn ignores_discarded_self_references_beneath_slices() {
+        let mut module = Module::new("FullyAssignedSlices");
+        let low = module.add_port(Port {
+            name: "low".into(),
+            direction: PortDirection::Input,
+            r#type: bits(8),
+        });
+        let high = module.add_port(Port {
+            name: "high".into(),
+            direction: PortDirection::Input,
+            r#type: bits(8),
+        });
+        let output = module.add_port(Port {
+            name: "output".into(),
+            direction: PortDirection::Output,
+            r#type: bits(16),
+        });
+
+        let previous = module.read(output).unwrap();
+        let previous_high = module
+            .expression_slice(previous, 8, BitWidth::new(8).unwrap())
+            .unwrap();
+        let low = module.read(low).unwrap();
+        let partially_assigned = module.concat(vec![previous_high, low]).unwrap();
+        let assigned_low = module
+            .expression_slice(partially_assigned, 0, BitWidth::new(8).unwrap())
+            .unwrap();
+        let high = module.read(high).unwrap();
+        let fully_assigned = module.concat(vec![high, assigned_low]).unwrap();
+        module
+            .assign(module.whole(output).unwrap(), fully_assigned)
+            .unwrap();
+        let mut design = Design::new("FullyAssignedSlices");
+        design.add_module(module);
+
+        let synthesized = synthesize(&design).unwrap();
+        let inputs = input_word("low", 8, 0xaa)
+            .into_iter()
+            .chain(input_word("high", 8, 0xbb))
+            .collect();
+        let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+        assert_eq!(output_word(&outputs, "output", 16), 0xbbaa);
     }
 
     #[test]
