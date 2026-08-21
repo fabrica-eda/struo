@@ -58,6 +58,10 @@ mod tests {
             exercise_write_burst(&mut simulator);
             exercise_read_burst(&mut simulator);
             exercise_decode_errors(&mut simulator);
+            reset(&mut simulator);
+            exercise_burst_footprint_validation(&mut simulator);
+            reset(&mut simulator);
+            exercise_qos_arbitration(&mut simulator);
         }
     }
 
@@ -330,6 +334,144 @@ mod tests {
         tick(simulator);
         set_u8(simulator, "s1.bready", 0);
         assert_value(simulator, "s1.bvalid", 0);
+    }
+
+    fn exercise_burst_footprint_validation(simulator: &mut Simulator<NativeBackend>) {
+        // A legal four-beat WRAP burst remains entirely in target 0.
+        set_u8(simulator, "s0.arid", 7);
+        set_u16(simulator, "s0.araddr", 0x3ffc);
+        set_u8(simulator, "s0.arlen", 3);
+        set_u8(simulator, "s0.arsize", 2);
+        set_u8(simulator, "s0.arburst", 2);
+        set_u8(simulator, "s0.arvalid", 1);
+        assert_value(simulator, "s0.arready", 1);
+        tick(simulator);
+        set_u8(simulator, "s0.arvalid", 0);
+        assert_value(simulator, "m0.arvalid", 1);
+        assert_value(simulator, "m0.araddr", 0x3ffc);
+        assert_value(simulator, "m0.arlen", 3);
+        assert_value(simulator, "m0.arburst", 2);
+        set_u8(simulator, "m0.arready", 1);
+        tick(simulator);
+        set_u8(simulator, "m0.arready", 0);
+
+        set_u8(simulator, "m0.rid", 7);
+        set_u8(simulator, "m0.rvalid", 1);
+        set_u8(simulator, "s0.rready", 1);
+        for beat in 0..4 {
+            let data = 0x7000_0000 | u32::try_from(beat).unwrap();
+            set_u32(simulator, "m0.rdata", data);
+            set_u8(simulator, "m0.rlast", u8::from(beat == 3));
+            assert_value(simulator, "s0.rid", 7);
+            assert_value(simulator, "s0.rdata", u64::from(data));
+            tick(simulator);
+        }
+        set_u8(simulator, "m0.rvalid", 0);
+        set_u8(simulator, "m0.rlast", 0);
+        set_u8(simulator, "s0.rready", 0);
+
+        // The same start address with INCR would cross the target and 4 KiB
+        // boundaries, so it must complete locally instead of reaching m0.
+        set_u8(simulator, "s0.arid", 8);
+        set_u16(simulator, "s0.araddr", 0x3ffc);
+        set_u8(simulator, "s0.arlen", 1);
+        set_u8(simulator, "s0.arburst", 1);
+        set_u8(simulator, "s0.arvalid", 1);
+        assert_value(simulator, "s0.arready", 1);
+        tick(simulator);
+        set_u8(simulator, "s0.arvalid", 0);
+        assert_value(simulator, "m0.arvalid", 0);
+        assert_value(simulator, "m1.arvalid", 0);
+        consume_decode_error_read(simulator, 8, 2);
+
+        // WRAP lengths other than 2, 4, 8, or 16 beats are illegal.
+        set_u8(simulator, "s0.arid", 9);
+        set_u16(simulator, "s0.araddr", 0x0100);
+        set_u8(simulator, "s0.arlen", 2);
+        set_u8(simulator, "s0.arburst", 2);
+        set_u8(simulator, "s0.arvalid", 1);
+        assert_value(simulator, "s0.arready", 1);
+        tick(simulator);
+        set_u8(simulator, "s0.arvalid", 0);
+        assert_value(simulator, "m0.arvalid", 0);
+        consume_decode_error_read(simulator, 9, 3);
+    }
+
+    fn consume_decode_error_read(simulator: &mut Simulator<NativeBackend>, id: u8, beats: usize) {
+        set_u8(simulator, "s0.rready", 1);
+        for beat in 0..beats {
+            assert_value(simulator, "s0.rvalid", 1);
+            assert_value(simulator, "s0.rid", u64::from(id));
+            assert_value(simulator, "s0.rresp", 0b11);
+            assert_value(simulator, "s0.rlast", u64::from(beat + 1 == beats));
+            tick(simulator);
+        }
+        set_u8(simulator, "s0.rready", 0);
+        assert_value(simulator, "s0.rvalid", 0);
+    }
+
+    fn exercise_qos_arbitration(simulator: &mut Simulator<NativeBackend>) {
+        // A higher ARQOS request wins before the round-robin tie breaker.
+        set_u8(simulator, "s0.arid", 1);
+        set_u16(simulator, "s0.araddr", 0x0100);
+        set_u8(simulator, "s0.arsize", 2);
+        set_u8(simulator, "s0.arburst", 1);
+        set_u8(simulator, "s0.arqos", 1);
+        set_u8(simulator, "s0.arvalid", 1);
+        set_u8(simulator, "s1.arid", 2);
+        set_u16(simulator, "s1.araddr", 0x0104);
+        set_u8(simulator, "s1.arsize", 2);
+        set_u8(simulator, "s1.arburst", 1);
+        set_u8(simulator, "s1.arqos", 9);
+        set_u8(simulator, "s1.arvalid", 1);
+        assert_value(simulator, "s0.arready", 0);
+        assert_value(simulator, "s1.arready", 1);
+        tick(simulator);
+        set_u8(simulator, "s0.arvalid", 0);
+        set_u8(simulator, "s1.arvalid", 0);
+        assert_value(simulator, "m0.arvalid", 1);
+        assert_value(simulator, "m0.arid", 0x12);
+        assert_value(simulator, "m0.araddr", 0x0104);
+        set_u8(simulator, "m0.arready", 1);
+        tick(simulator);
+        set_u8(simulator, "m0.arready", 0);
+
+        set_u8(simulator, "m0.rid", 0x12);
+        set_u8(simulator, "m0.rlast", 1);
+        set_u8(simulator, "m0.rvalid", 1);
+        set_u8(simulator, "s1.rready", 1);
+        tick(simulator);
+        set_u8(simulator, "m0.rvalid", 0);
+        set_u8(simulator, "m0.rlast", 0);
+        set_u8(simulator, "s1.rready", 0);
+
+        // AWQOS applies the same policy to contended write streams.
+        set_u8(simulator, "s0.awid", 3);
+        set_u16(simulator, "s0.awaddr", 0x8100);
+        set_u8(simulator, "s0.awsize", 2);
+        set_u8(simulator, "s0.awburst", 1);
+        set_u8(simulator, "s0.awqos", 2);
+        set_u8(simulator, "s0.awvalid", 1);
+        set_write_beat(simulator, 0, 0x3000_0003, true);
+        set_u8(simulator, "s1.awid", 4);
+        set_u16(simulator, "s1.awaddr", 0x8104);
+        set_u8(simulator, "s1.awsize", 2);
+        set_u8(simulator, "s1.awburst", 1);
+        set_u8(simulator, "s1.awqos", 10);
+        set_u8(simulator, "s1.awvalid", 1);
+        set_write_beat(simulator, 1, 0x4000_0004, true);
+        assert_value(simulator, "s0.awready", 1);
+        assert_value(simulator, "s1.awready", 1);
+        tick(simulator);
+        set_u8(simulator, "s0.awvalid", 0);
+        set_u8(simulator, "s0.wvalid", 0);
+        set_u8(simulator, "s1.awvalid", 0);
+        set_u8(simulator, "s1.wvalid", 0);
+        tick(simulator);
+        assert_value(simulator, "m1.awvalid", 1);
+        assert_value(simulator, "m1.awid", 0x14);
+        assert_value(simulator, "m1.awaddr", 0x8104);
+        assert_value(simulator, "m1.wdata", 0x4000_0004);
     }
 
     fn exercise_out_of_order_reads(simulator: &mut Simulator<NativeBackend>) {

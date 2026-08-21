@@ -41,8 +41,9 @@ Crate responsibilities:
 `struo-frontend-veryl` lowers analyzed Veryl `Comb`, `Ff`, and `Inst`
 declarations, including recursively flattened hierarchy, analyzer-expanded
 interface/modport connections, procedural conditionals, static packed selects,
-arithmetic, comparisons, shifts, concatenations, and synchronous or
-asynchronous resets. Unsupported constructs such as memories fail explicitly.
+procedural case statements with value or range arms, arithmetic, comparisons,
+shifts, concatenations, and synchronous or asynchronous resets. Unsupported
+constructs such as memories fail explicitly.
 
 ## First hardware target
 
@@ -101,9 +102,10 @@ The implemented synthesis subset includes bitwise logic, reductions, wrapping
 addition and subtraction, signed and unsigned comparisons, variable logical
 and arithmetic shifts, muxes, concatenation, slicing, registers, enables, and
 synchronous or asynchronous constant resets. It performs constant folding and
-structural hashing, then maps Boolean nodes to `LUT4` and registers to
-`TRELLIS_FF`. Memories and inout ports are rejected explicitly. Module
-instances are flattened before synthesis; the implemented path consumes
+structural hashing, balances associative reductions, and uses parallel-prefix
+comparison networks before mapping Boolean nodes to `LUT4` and registers to
+`TRELLIS_FF`. Memories and inout ports are rejected explicitly.
+Module instances are flattened before synthesis; the implemented path consumes
 analyzer AIR directly and does not depend on generated Verilog.
 
 ## Veryl AXI4 synthesis stress design
@@ -113,16 +115,19 @@ Veryl source. Its Rust harness invokes the Veryl analyzer and lowers AIR into
 Struo RTL. The
 two-initiator, two-target fabric uses a parameterized Veryl `Axi4Interface` and
 modports, forwards AXI4 burst metadata and IDs, buffers
-AW and W independently, streams W and R beats through backpressure, uses
-separate read/write round-robin arbitration, and locally completes unmapped
-bursts with `DECERR`. Tests take only the analyzed Veryl path through synthesis,
-ECP5 technology mapping, and Celox post-map simulation, with Celox's native
-Veryl frontend as the reference. Each initiator has two read and two write
-outstanding slots. A fifth downstream ID bit records the initiator, allowing
-responses for different IDs to return out of order; a repeated ID is held until
-its earlier transaction completes to preserve AXI ordering. The simulation
-tests exercise reverse-order B/R completion and full-slot backpressure through
-both the reference and post-map paths.
+AW and W independently, streams W and R beats through backpressure, and uses
+QoS-first read/write arbitration with round-robin fairness for ties. A reusable
+burst decoder validates FIXED, INCR, and WRAP footprints, transfer width, WRAP
+length and alignment, address overflow, target-window containment, and the AXI4
+4 KiB rule. Invalid or unmapped bursts complete locally with `DECERR`. Tests
+take only the analyzed Veryl path through synthesis, ECP5 technology mapping,
+and Celox post-map simulation, with Celox's native Veryl frontend as the
+reference. Each initiator has two read and two write outstanding slots. A fifth
+downstream ID bit records the initiator, allowing responses for different IDs
+to return out of order; a repeated ID is held until its earlier transaction
+completes to preserve AXI ordering. The simulation tests exercise reverse-order
+B/R completion, full-slot backpressure, QoS contention, legal WRAP traffic, and
+local error completion through both the reference and post-map paths.
 
 `Axi4CrossbarSelfTest` instantiates the interface-based crossbar, an internal
 initiator, a target response model, and a result scoreboard. Its physical top
