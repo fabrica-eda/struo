@@ -1,5 +1,5 @@
 /// AXI4 channels shared by initiators, targets, and verification wrappers.
-interface Axi4Interface::<ADDR_WIDTH: u32 = 16, DATA_WIDTH: u32 = 32, ID_WIDTH: u32 = 4,> {
+interface Axi4Interface::<ADDR_WIDTH: u32 = 16, DATA_WIDTH: u32 = 32, ID_WIDTH: u32 = 4> {
     var awid    : logic<ID_WIDTH>      ;
     var awaddr  : logic<ADDR_WIDTH>    ;
     var awlen   : logic<8>             ;
@@ -252,8 +252,10 @@ module Axi4Crossbar2x2 (
 
     always_comb {
         // Write address admission reserves one of two per-initiator ID slots.
-        s0_w_id_busy    = (s0_w_slot0_valid && (s0_w_slot0_id == s0.awid)) || (s0_w_slot1_valid && (s0_w_slot1_id == s0.awid));
-        s1_w_id_busy    = (s1_w_slot0_valid && (s1_w_slot0_id == s1.awid)) || (s1_w_slot1_valid && (s1_w_slot1_id == s1.awid));
+        s0_w_id_busy    = (s0_w_slot0_valid && (s0_w_slot0_id == s0.awid))
+            || (s0_w_slot1_valid && (s0_w_slot1_id == s0.awid));
+        s1_w_id_busy    = (s1_w_slot0_valid && (s1_w_slot0_id == s1.awid))
+            || (s1_w_slot1_valid && (s1_w_slot1_id == s1.awid));
         s0_w_can_accept = (!s0_w_slot0_valid || !s0_w_slot1_valid) && !s0_w_id_busy;
         s1_w_can_accept = (!s1_w_slot0_valid || !s1_w_slot1_valid) && !s1_w_id_busy;
         s0.awready      = !s0_aw_full && s0_w_can_accept;
@@ -261,13 +263,22 @@ module Axi4Crossbar2x2 (
 
         // A target owns a W stream only through the final W beat. B responses
         // are routed independently by the owner bit added to the downstream ID.
-        wg01 = !wm0_active && s1_aw_full && s1_w_full && !s1_w_busy && (s1_aw_payload[44:29] <: 16'h4000) && (!(s0_aw_full && s0_w_full && !s0_w_busy && (s0_aw_payload[44:29] <: 16'h4000)) || wm0_rr);
+        wg01 = !wm0_active && s1_aw_full && s1_w_full && !s1_w_busy && (s1_aw_payload[44:29] <: 16'h4000)
+            && (!(s0_aw_full && s0_w_full && !s0_w_busy && (s0_aw_payload[44:29] <: 16'h4000)) || wm0_rr);
         wg00 = !wm0_active && s0_aw_full && s0_w_full && !s0_w_busy && (s0_aw_payload[44:29] <: 16'h4000) && !wg01;
-        wg11 = !wm1_active && s1_aw_full && s1_w_full && !s1_w_busy && (s1_aw_payload[44:29] >= 16'h8000) && (s1_aw_payload[44:29] <: 16'hc000) && (!(s0_aw_full && s0_w_full && !s0_w_busy && (s0_aw_payload[44:29] >= 16'h8000) && (s0_aw_payload[44:29] <: 16'hc000)) || wm1_rr);
-        wg10 = !wm1_active && s0_aw_full && s0_w_full && !s0_w_busy && (s0_aw_payload[44:29] >= 16'h8000) && (s0_aw_payload[44:29] <: 16'hc000) && !wg11;
+        wg11 = !wm1_active && s1_aw_full && s1_w_full && !s1_w_busy && (s1_aw_payload[44:29] >= 16'h8000)
+            && (s1_aw_payload[44:29] <: 16'hc000)
+            && (!(s0_aw_full && s0_w_full && !s0_w_busy && (s0_aw_payload[44:29] >= 16'h8000)
+                    && (s0_aw_payload[44:29] <: 16'hc000)) || wm1_rr);
+        wg10 = !wm1_active && s0_aw_full && s0_w_full && !s0_w_busy && (s0_aw_payload[44:29] >= 16'h8000)
+            && (s0_aw_payload[44:29] <: 16'hc000) && !wg11;
 
-        w_error_grant0 = s0_aw_full && s0_w_full && !s0_w_busy && !s0_w_error_active && !s0_w_error_valid && !((s0_aw_payload[44:29] <: 16'h4000) || ((s0_aw_payload[44:29] >= 16'h8000) && (s0_aw_payload[44:29] <: 16'hc000)));
-        w_error_grant1 = s1_aw_full && s1_w_full && !s1_w_busy && !s1_w_error_active && !s1_w_error_valid && !((s1_aw_payload[44:29] <: 16'h4000) || ((s1_aw_payload[44:29] >= 16'h8000) && (s1_aw_payload[44:29] <: 16'hc000)));
+        w_error_grant0 = s0_aw_full && s0_w_full && !s0_w_busy && !s0_w_error_active && !s0_w_error_valid
+            && !((s0_aw_payload[44:29] <: 16'h4000)
+                || ((s0_aw_payload[44:29] >= 16'h8000) && (s0_aw_payload[44:29] <: 16'hc000)));
+        w_error_grant1 = s1_aw_full && s1_w_full && !s1_w_busy && !s1_w_error_active && !s1_w_error_valid
+            && !((s1_aw_payload[44:29] <: 16'h4000)
+                || ((s1_aw_payload[44:29] >= 16'h8000) && (s1_aw_payload[44:29] <: 16'hc000)));
         w_dispatch0    = wg00 || wg10 || w_error_grant0;
         w_dispatch1    = wg01 || wg11 || w_error_grant1;
 
@@ -288,7 +299,8 @@ module Axi4Crossbar2x2 (
         m0.wvalid        = wm0_active && !wm0_w_done && (if wm0_owner ? s1_w_full : s0_w_full);
         wm0_aw_handshake = m0.awvalid && m0.awready;
         wm0_w_handshake  = m0.wvalid && m0.wready;
-        wm0_issue_done   = wm0_active && (wm0_aw_sent || wm0_aw_handshake) && (wm0_w_done || (wm0_w_handshake && m0.wlast));
+        wm0_issue_done   = wm0_active && (wm0_aw_sent || wm0_aw_handshake)
+            && (wm0_w_done || (wm0_w_handshake && m0.wlast));
 
         m1.awid          = {wm1_owner, wm1_aw_payload[48:45]};
         m1.awaddr        = wm1_aw_payload[44:29];
@@ -307,7 +319,8 @@ module Axi4Crossbar2x2 (
         m1.wvalid        = wm1_active && !wm1_w_done && (if wm1_owner ? s1_w_full : s0_w_full);
         wm1_aw_handshake = m1.awvalid && m1.awready;
         wm1_w_handshake  = m1.wvalid && m1.wready;
-        wm1_issue_done   = wm1_active && (wm1_aw_sent || wm1_aw_handshake) && (wm1_w_done || (wm1_w_handshake && m1.wlast));
+        wm1_issue_done   = wm1_active && (wm1_aw_sent || wm1_aw_handshake)
+            && (wm1_w_done || (wm1_w_handshake && m1.wlast));
 
         w_error_consume0 = s0_w_error_active && s0_w_full;
         w_error_consume1 = s1_w_error_active && s1_w_full;
@@ -326,21 +339,35 @@ module Axi4Crossbar2x2 (
         s1.bvalid    = s1_w_error_valid || s1_b_from_m0 || s1_b_from_m1;
         s1.bid       = if s1_w_error_valid ? s1_w_error_id : if s1_b_from_m0 ? m0.bid[3:0] : m1.bid[3:0];
         s1.bresp     = if s1_w_error_valid ? 2'b11 : if s1_b_from_m0 ? m0.bresp : m1.bresp;
-        m0.bready    = m0.bvalid && (if m0.bid[4] ? (!s1_w_error_valid && s1.bready) : (!s0_w_error_valid && s0.bready));
-        m1.bready    = m1.bvalid && (if m1.bid[4] ? (!s1_w_error_valid && !s1_b_from_m0 && s1.bready) : (!s0_w_error_valid && !s0_b_from_m0 && s0.bready));
+        m0.bready    = m0.bvalid
+            && (if m0.bid[4] ? (!s1_w_error_valid && s1.bready) : (!s0_w_error_valid && s0.bready));
+        m1.bready    = m1.bvalid
+            && (if m1.bid[4] ?
+                (!s1_w_error_valid && !s1_b_from_m0 && s1.bready)
+            :
+                (!s0_w_error_valid && !s0_b_from_m0 && s0.bready)
+            );
 
         // Read address admission also reserves two unique-ID slots. The target
         // address skid registers are released after AR, not after the R burst.
-        s0_r_id_busy    = (s0_r_slot0_valid && (s0_r_slot0_id == s0.arid)) || (s0_r_slot1_valid && (s0_r_slot1_id == s0.arid));
-        s1_r_id_busy    = (s1_r_slot0_valid && (s1_r_slot0_id == s1.arid)) || (s1_r_slot1_valid && (s1_r_slot1_id == s1.arid));
+        s0_r_id_busy    = (s0_r_slot0_valid && (s0_r_slot0_id == s0.arid))
+            || (s0_r_slot1_valid && (s0_r_slot1_id == s0.arid));
+        s1_r_id_busy    = (s1_r_slot0_valid && (s1_r_slot0_id == s1.arid))
+            || (s1_r_slot1_valid && (s1_r_slot1_id == s1.arid));
         s0_r_can_accept = (!s0_r_slot0_valid || !s0_r_slot1_valid) && !s0_r_id_busy;
         s1_r_can_accept = (!s1_r_slot0_valid || !s1_r_slot1_valid) && !s1_r_id_busy;
-        rg01            = !rm0_active && s1.arvalid && s1_r_can_accept && (s1.araddr <: 16'h4000) && (!(s0.arvalid && s0_r_can_accept && (s0.araddr <: 16'h4000)) || rm0_rr);
+        rg01            = !rm0_active && s1.arvalid && s1_r_can_accept && (s1.araddr <: 16'h4000)
+            && (!(s0.arvalid && s0_r_can_accept && (s0.araddr <: 16'h4000)) || rm0_rr);
         rg00            = !rm0_active && s0.arvalid && s0_r_can_accept && (s0.araddr <: 16'h4000) && !rg01;
-        rg11            = !rm1_active && s1.arvalid && s1_r_can_accept && (s1.araddr >= 16'h8000) && (s1.araddr <: 16'hc000) && (!(s0.arvalid && s0_r_can_accept && (s0.araddr >= 16'h8000) && (s0.araddr <: 16'hc000)) || rm1_rr);
-        rg10            = !rm1_active && s0.arvalid && s0_r_can_accept && (s0.araddr >= 16'h8000) && (s0.araddr <: 16'hc000) && !rg11;
-        r_error_accept0 = s0.arvalid && s0_r_can_accept && !s0_r_error_valid && !((s0.araddr <: 16'h4000) || ((s0.araddr >= 16'h8000) && (s0.araddr <: 16'hc000)));
-        r_error_accept1 = s1.arvalid && s1_r_can_accept && !s1_r_error_valid && !((s1.araddr <: 16'h4000) || ((s1.araddr >= 16'h8000) && (s1.araddr <: 16'hc000)));
+        rg11            = !rm1_active && s1.arvalid && s1_r_can_accept && (s1.araddr >= 16'h8000)
+            && (s1.araddr <: 16'hc000)
+            && (!(s0.arvalid && s0_r_can_accept && (s0.araddr >= 16'h8000) && (s0.araddr <: 16'hc000)) || rm1_rr);
+        rg10            = !rm1_active && s0.arvalid && s0_r_can_accept && (s0.araddr >= 16'h8000)
+            && (s0.araddr <: 16'hc000) && !rg11;
+        r_error_accept0 = s0.arvalid && s0_r_can_accept && !s0_r_error_valid
+            && !((s0.araddr <: 16'h4000) || ((s0.araddr >= 16'h8000) && (s0.araddr <: 16'hc000)));
+        r_error_accept1 = s1.arvalid && s1_r_can_accept && !s1_r_error_valid
+            && !((s1.araddr <: 16'h4000) || ((s1.araddr >= 16'h8000) && (s1.araddr <: 16'hc000)));
         r_accept0       = rg00 || rg10 || r_error_accept0;
         r_accept1       = rg01 || rg11 || r_error_accept1;
         s0.arready      = r_accept0;
@@ -380,14 +407,32 @@ module Axi4Crossbar2x2 (
         s0.rid             = if s0_r_error_valid ? s0_r_error_id : if s0_r_from_m0 ? m0.rid[3:0] : m1.rid[3:0];
         s0.rdata           = if s0_r_error_valid ? 32'h00000000 : if s0_r_from_m0 ? m0.rdata : m1.rdata;
         s0.rresp           = if s0_r_error_valid ? 2'b11 : if s0_r_from_m0 ? m0.rresp : m1.rresp;
-        s0.rlast           = if s0_r_error_valid ? (s0_r_error_remaining == 8'h00) : if s0_r_from_m0 ? m0.rlast : m1.rlast;
+        s0.rlast           = if s0_r_error_valid ?
+            (s0_r_error_remaining == 8'h00)
+        : if s0_r_from_m0 ?
+            m0.rlast
+        :
+            m1.rlast
+        ;
         s1.rvalid          = s1_r_error_valid || s1_r_from_m0 || s1_r_from_m1;
         s1.rid             = if s1_r_error_valid ? s1_r_error_id : if s1_r_from_m0 ? m0.rid[3:0] : m1.rid[3:0];
         s1.rdata           = if s1_r_error_valid ? 32'h00000000 : if s1_r_from_m0 ? m0.rdata : m1.rdata;
         s1.rresp           = if s1_r_error_valid ? 2'b11 : if s1_r_from_m0 ? m0.rresp : m1.rresp;
-        s1.rlast           = if s1_r_error_valid ? (s1_r_error_remaining == 8'h00) : if s1_r_from_m0 ? m0.rlast : m1.rlast;
-        m0.rready          = m0.rvalid && (if m0.rid[4] ? (!s1_r_error_valid && s1.rready) : (!s0_r_error_valid && s0.rready));
-        m1.rready          = m1.rvalid && (if m1.rid[4] ? (!s1_r_error_valid && !s1_r_from_m0 && s1.rready) : (!s0_r_error_valid && !s0_r_from_m0 && s0.rready));
+        s1.rlast           = if s1_r_error_valid ?
+            (s1_r_error_remaining == 8'h00)
+        : if s1_r_from_m0 ?
+            m0.rlast
+        :
+            m1.rlast
+        ;
+        m0.rready          = m0.rvalid
+            && (if m0.rid[4] ? (!s1_r_error_valid && s1.rready) : (!s0_r_error_valid && s0.rready));
+        m1.rready          = m1.rvalid
+            && (if m1.rid[4] ?
+                (!s1_r_error_valid && !s1_r_from_m0 && s1.rready)
+            :
+                (!s0_r_error_valid && !s0_r_from_m0 && s0.rready)
+            );
         r_error_handshake0 = s0_r_error_valid && s0.rready;
         r_error_handshake1 = s1_r_error_valid && s1.rready;
     }
@@ -456,9 +501,8 @@ module Axi4Crossbar2x2 (
             if s0.awvalid && s0.awready {
                 s0_aw_full    = 1'b1;
                 s0_aw_payload = {
-                    s0.awid, s0.awaddr, s0.awlen, s0.awsize,
-                    s0.awburst, s0.awlock, s0.awcache, s0.awprot,
-                    s0.awqos, s0.awregion
+                    s0.awid, s0.awaddr, s0.awlen, s0.awsize, s0.awburst, s0.awlock, s0.awcache, s0.awprot, s0.awqos,
+                    s0.awregion
                 };
                 if !s0_w_slot0_valid {
                     s0_w_slot0_valid = 1'b1;
@@ -471,9 +515,8 @@ module Axi4Crossbar2x2 (
             if s1.awvalid && s1.awready {
                 s1_aw_full    = 1'b1;
                 s1_aw_payload = {
-                    s1.awid, s1.awaddr, s1.awlen, s1.awsize,
-                    s1.awburst, s1.awlock, s1.awcache, s1.awprot,
-                    s1.awqos, s1.awregion
+                    s1.awid, s1.awaddr, s1.awlen, s1.awsize, s1.awburst, s1.awlock, s1.awcache, s1.awprot, s1.awqos,
+                    s1.awregion
                 };
                 if !s1_w_slot0_valid {
                     s1_w_slot0_valid = 1'b1;
@@ -651,15 +694,9 @@ module Axi4Crossbar2x2 (
                 rm0_active     = 1'b1;
                 rm0_owner      = rg01;
                 rm0_ar_payload = if rg01 ?
-                    {
-                        s1.arid, s1.araddr, s1.arlen, s1.arsize, s1.arburst,
-                        s1.arlock, s1.arcache, s1.arprot, s1.arqos, s1.arregion
-                    }
+                    {s1.arid, s1.araddr, s1.arlen, s1.arsize, s1.arburst, s1.arlock, s1.arcache, s1.arprot, s1.arqos, s1.arregion}
                 :
-                    {
-                        s0.arid, s0.araddr, s0.arlen, s0.arsize, s0.arburst,
-                        s0.arlock, s0.arcache, s0.arprot, s0.arqos, s0.arregion
-                    }
+                    {s0.arid, s0.araddr, s0.arlen, s0.arsize, s0.arburst, s0.arlock, s0.arcache, s0.arprot, s0.arqos, s0.arregion}
                 ;
             }
             if rm0_ar_handshake {
@@ -670,15 +707,9 @@ module Axi4Crossbar2x2 (
                 rm1_active     = 1'b1;
                 rm1_owner      = rg11;
                 rm1_ar_payload = if rg11 ?
-                    {
-                        s1.arid, s1.araddr, s1.arlen, s1.arsize, s1.arburst,
-                        s1.arlock, s1.arcache, s1.arprot, s1.arqos, s1.arregion
-                    }
+                    {s1.arid, s1.araddr, s1.arlen, s1.arsize, s1.arburst, s1.arlock, s1.arcache, s1.arprot, s1.arqos, s1.arregion}
                 :
-                    {
-                        s0.arid, s0.araddr, s0.arlen, s0.arsize, s0.arburst,
-                        s0.arlock, s0.arcache, s0.arprot, s0.arqos, s0.arregion
-                    }
+                    {s0.arid, s0.araddr, s0.arlen, s0.arsize, s0.arburst, s0.arlock, s0.arcache, s0.arprot, s0.arqos, s0.arregion}
                 ;
             }
             if rm1_ar_handshake {
@@ -696,10 +727,10 @@ module Axi4CrossbarSelfTest (
     passed: output logic          ,
     failed: output logic          ,
 ) {
-    inst s0: Axi4Interface::<16, 32, 4>;
-    inst s1: Axi4Interface::<16, 32, 4>;
-    inst m0: Axi4Interface::<16, 32, 5>;
-    inst m1: Axi4Interface::<16, 32, 5>;
+    inst s0      : Axi4Interface::<16, 32, 4>;
+    inst s1      : Axi4Interface::<16, 32, 4>;
+    inst m0      : Axi4Interface::<16, 32, 5>;
+    inst m1      : Axi4Interface::<16, 32, 5>;
     inst crossbar: Axi4Crossbar2x2 (
         clk  : clk  ,
         rst_n: rst_n,

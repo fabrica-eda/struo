@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Rust, Veryl, and ECP5 flow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+
+      - name: Cache Cargo data
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Veryl
+        env:
+          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.20.3/veryl-x86_64-linux.zip
+          VERYL_SHA256: 8e4f36919dcb676afa037867dd80e98172e2d19487825423f1fdedd1e87e9ab7
+        run: |
+          curl --fail --location --silent --show-error \
+            "$VERYL_URL" --output "$RUNNER_TEMP/veryl.zip"
+          echo "$VERYL_SHA256  $RUNNER_TEMP/veryl.zip" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/veryl-bin"
+          unzip -q "$RUNNER_TEMP/veryl.zip" veryl -d "$RUNNER_TEMP/veryl-bin"
+          chmod 0755 "$RUNNER_TEMP/veryl-bin/veryl"
+          echo "$RUNNER_TEMP/veryl-bin" >> "$GITHUB_PATH"
+
+      - name: Verify tool versions
+        run: |
+          rustc --version
+          cargo --version
+          veryl --version
+
+      - name: Check repository language policy
+        run: |
+          if rg --hidden --glob '!target/**' --glob '!.git/**' \
+            '[\p{Han}\p{Hiragana}\p{Katakana}]' .; then
+            echo "Repository text must be written in English." >&2
+            exit 1
+          fi
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Check Veryl source
+        working-directory: examples/axi4-smartconnect
+        run: |
+          veryl fmt --check
+          veryl check
+
+      - name: Install ECP5 implementation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            fpga-trellis nextpnr-ecp5
+
+      - name: Generate technology-mapped AXI4 self-test
+        run: |
+          mkdir -p build/ci/axi4-smartconnect
+          cargo run --locked -- axi4-self-test \
+            build/ci/axi4-smartconnect/design.json
+
+      - name: Place and route AXI4 self-test
+        run: |
+          nextpnr-ecp5 \
+            --um5g-85k \
+            --package CABGA381 \
+            --speed 8 \
+            --json build/ci/axi4-smartconnect/design.json \
+            --lpf boards/lfe5um5g-85f-evn/axi4-self-test.lpf \
+            --textcfg build/ci/axi4-smartconnect/design.config \
+            --report build/ci/axi4-smartconnect/nextpnr-report.json \
+            --freq 12
+
+      - name: Pack and validate bitstream
+        run: |
+          ecppack \
+            --svf build/ci/axi4-smartconnect/design.svf \
+            build/ci/axi4-smartconnect/design.config \
+            build/ci/axi4-smartconnect/design.bit
+          test -s build/ci/axi4-smartconnect/design.bit
+          ecpunpack \
+            build/ci/axi4-smartconnect/design.bit \
+            build/ci/axi4-smartconnect/unpacked.config

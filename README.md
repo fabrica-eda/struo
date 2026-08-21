@@ -1,5 +1,7 @@
 # Struo
 
+[![CI](https://github.com/fabrica-eda/struo/actions/workflows/ci.yml/badge.svg)](https://github.com/fabrica-eda/struo/actions/workflows/ci.yml)
+
 A Rust workspace implementing logic synthesis from Veryl to Lattice ECP5.
 Frontend-specific types do not leak into the synthesis core. Post-synthesis
 simulation and equivalence checking are mandatory gates for bitstream release.
