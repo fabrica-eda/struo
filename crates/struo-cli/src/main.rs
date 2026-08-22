@@ -305,7 +305,7 @@ fn print_retiming_decision(mapped: &struo_target_ecp5::Ecp5Netlist) {
         "kept original"
     };
     println!(
-        "retiming: {action}; LUT depth {} -> {}, critical register inputs {} -> {}, data period {} -> {} ps, overall period {} -> {} ps, registers {} -> {}, certified moves {}, register merges {}, dead cells {}, equivalence sign-off {}",
+        "retiming: {action}; LUT depth {} -> {}, critical register inputs {} -> {}, data period {} -> {} ps, overall period {} -> {} ps, registers {} -> {}, certified moves {}, register merges {}, logic replicas {}, dead cells {}, equivalence sign-off {}",
         decision.original_lut_depth,
         decision.selected_lut_depth,
         decision.original_critical_registers,
@@ -318,6 +318,7 @@ fn print_retiming_decision(mapped: &struo_target_ecp5::Ecp5Netlist) {
         decision.selected_registers,
         decision.certified_primitive_moves,
         decision.equivalent_register_merges,
+        decision.equivalent_logic_replications,
         decision.unobservable_cells_removed,
         if decision.equivalence_signed_off {
             "passed"

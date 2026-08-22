@@ -116,15 +116,19 @@ forward moves score a complete registered carry chain as one candidate so an
 unprofitable half-moved chain is never selected. Both directions preserve clock
 enables and derive every new reset value from the primitive truth table.
 Equivalent generated FFs are shared only up to fanout two, retaining useful
-physical replication for routing. The search reduces timing cutsets without
-increasing the worst mapped data, clock-enable, or output period and caps cell
-and FF growth. Each accepted primitive move contributes its checked certificate
-to a proof ledger; exact equivalent-FF merges and unobservable-cell removal are
-recorded as constructive equivalence steps. Final driver/connectivity validation
-signs off the composed chain, and an unsigned candidate cannot replace the
-original mapped netlist. This is part of normal mapping; callers do not choose
-an optimization mode. Unsupported proof cases fail construction instead of
-being accepted as equivalent.
+physical replication for routing. LUT-driven clock enables with moderate
+fanout are replicated once into groups of at most 16 sinks; blanket replication
+of larger control nets is avoided because it destabilizes placement. The
+search reduces timing cutsets without increasing the worst mapped data,
+clock-enable, or output period and caps cell and FF growth. Each accepted
+primitive move contributes its checked certificate
+to a proof ledger; exact equivalent-FF merges, truth-table-identical logic
+replication, and unobservable-cell removal are recorded as constructive
+equivalence steps. Final driver/connectivity validation signs off the composed
+chain, and an unsigned candidate cannot replace the original mapped netlist.
+This is part of normal mapping; callers do not choose an optimization mode.
+Unsupported proof cases fail construction instead of being accepted as
+equivalent.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under
@@ -225,15 +229,18 @@ traffic, and local error completion through both the reference and post-map
 paths.
 
 On nextpnr 0.6, LFE5UM5G-85F speed grade 8, and seeds 1 through 10, the 300 MHz
-flow passes all ten seeds and reaches 300.48--318.78 MHz (307.56 MHz mean). The
+flow passes all ten seeds and reaches 302.30--319.80 MHz (307.36 MHz mean). The
 burst decoder is natural three-cycle RTL: its registered operands feed the
 17-bit address addition and the output holding state directly, without a
 hand-written carry-result pipeline stage. Its single-flight handshake keeps the
 address and protocol metadata stable until the result is consumed. Removing
 that explicit boundary reduces the RTL from 1,365 to 1,293 registers. Automatic
 post-map retiming reconstructs a balanced physical boundary with 1,361
-`TRELLIS_FF` and 1,201 `TRELLIS_COMB` sites; the fanout cap prevents equivalent
-retimed state from becoming a routing hotspot. The mapped timing model scores
+`TRELLIS_FF` and 1,205 `TRELLIS_COMB` sites; four replicated decoder-enable
+LUTs reduce the worst 320 MHz stress-run seed from 297.71 to 306.84 MHz while
+keeping the 300 MHz release gate at ten of ten seeds. The fanout caps prevent
+equivalent retimed state or control logic from becoming a routing hotspot. The
+mapped timing model scores
 both CCU2C carry hops and ordinary LUT routing, including a post-map routing
 guard calibrated against the routed AXI paths. The qualified-payload pass
 removes 69 inferred clock enables and makes the eight QoS comparison
