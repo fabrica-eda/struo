@@ -117,9 +117,14 @@ unprofitable half-moved chain is never selected. Both directions preserve clock
 enables and derive every new reset value from the primitive truth table.
 Equivalent generated FFs are shared only up to fanout two, retaining useful
 physical replication for routing. The search reduces timing cutsets without
-increasing the overall mapped period and caps cell and FF growth. This is part
-of normal mapping; callers do not choose an optimization mode. Unsupported
-proof cases fail construction instead of being accepted as equivalent.
+increasing the worst mapped data, clock-enable, or output period and caps cell
+and FF growth. Each accepted primitive move contributes its checked certificate
+to a proof ledger; exact equivalent-FF merges and unobservable-cell removal are
+recorded as constructive equivalence steps. Final driver/connectivity validation
+signs off the composed chain, and an unsigned candidate cannot replace the
+original mapped netlist. This is part of normal mapping; callers do not choose
+an optimization mode. Unsupported proof cases fail construction instead of
+being accepted as equivalent.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under
