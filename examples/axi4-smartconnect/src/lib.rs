@@ -4,7 +4,7 @@ use struo_frontend_veryl::{ImportError, analyze_and_lower};
 use struo_rtl::Design;
 
 /// Source text of the two-by-two AXI4 crossbar.
-pub const AXI4_CROSSBAR_SOURCE: &str = include_str!("../veryl/Axi4Crossbar2x2.veryl");
+pub const AXI4_CROSSBAR_SOURCE: &str = include_str!("../veryl/axi4_crossbar_2x2.veryl");
 
 /// Analyzes the committed Veryl source and lowers its AIR into Struo RTL.
 ///
@@ -441,6 +441,18 @@ mod tests {
         set_u8(simulator, "s0.arvalid", 0);
         assert_value(simulator, "m0.arvalid", 0);
         consume_decode_error_read(simulator, 9, 3);
+
+        // AXI4 limits FIXED bursts to 16 beats.
+        set_u8(simulator, "s0.arid", 10);
+        set_u16(simulator, "s0.araddr", 0x0100);
+        set_u8(simulator, "s0.arlen", 16);
+        set_u8(simulator, "s0.arburst", 0);
+        set_u8(simulator, "s0.arvalid", 1);
+        assert_value(simulator, "s0.arready", 1);
+        tick(simulator);
+        set_u8(simulator, "s0.arvalid", 0);
+        assert_value(simulator, "m0.arvalid", 0);
+        consume_decode_error_read(simulator, 10, 17);
     }
 
     fn consume_decode_error_read(simulator: &mut Simulator<NativeBackend>, id: u8, beats: usize) {

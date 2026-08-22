@@ -122,9 +122,9 @@ instead of being lowered to flip-flops silently.
 
 ## Veryl AXI4 synthesis stress design
 
-`examples/axi4-smartconnect` keeps the synthesizable crossbar in committed
-Veryl source. Its Rust harness invokes the Veryl analyzer and lowers AIR into
-Struo RTL. The
+[axi4_crossbar_2x2.veryl](examples/axi4-smartconnect/veryl/axi4_crossbar_2x2.veryl)
+keeps the synthesizable crossbar in committed Veryl source. Its Rust harness
+invokes the Veryl analyzer and lowers AIR into Struo RTL. The
 two-initiator, two-target fabric uses a parameterized Veryl `Axi4Interface` and
 modports, forwards AXI4 burst metadata and IDs, buffers
 AW and W independently, streams W and R beats through backpressure, and uses
@@ -134,9 +134,10 @@ elaborate one burst decoder per input directly in analyzer AIR; no template
 engine or generated HDL is involved. A parameterized QoS arbiter compares every
 request pair after elaboration and accepts a caller-provided tie-break order, so
 the same block supports round-robin policies beyond two inputs. Each decoder
-validates FIXED, INCR, and WRAP footprints, transfer width, WRAP length and
-alignment, address overflow, target-window containment, and the AXI4 4 KiB
-rule. Invalid or unmapped bursts complete locally with `DECERR`. Tests
+validates FIXED, INCR, and WRAP footprints, transfer width, FIXED and WRAP
+length rules, WRAP alignment, address overflow, target-window containment, and
+the AXI4 4 KiB rule. Invalid or unmapped bursts complete locally with `DECERR`.
+Tests
 take only the analyzed Veryl path through synthesis, ECP5 technology mapping,
 and Celox post-map simulation, with Celox's native Veryl frontend as the
 reference. Each initiator has two read and two write outstanding slots. A fifth
