@@ -35,33 +35,39 @@ pub fn axi4_qos_arbiter_4() -> Result<Design, ImportError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::OnceLock;
 
-    use celox::{NativeBackend, SignalRef, Simulator, SimulatorBuilder};
+    use celox::{NativeBackend, NativeProgramImage, SignalRef, Simulator, SimulatorBuilder};
     use struo_celox::ecp5_simulator;
     use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
 
     use super::{axi4_crossbar_2x2, axi4_crossbar_self_test, axi4_qos_arbiter_4};
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    static CROSSBAR_IMAGES: OnceLock<CrossbarImages> = OnceLock::new();
+
+    struct CrossbarImages {
+        reference: NativeProgramImage,
+        mapped: NativeProgramImage,
+        boolean_nodes: usize,
+        registers: usize,
+        mapped_cells: usize,
+    }
 
     #[test]
     fn lowers_synthesizes_and_maps_committed_veryl() {
-        let _guard = TEST_LOCK.lock().unwrap();
         let design = axi4_crossbar_2x2().unwrap();
         assert_eq!(design, axi4_crossbar_2x2().unwrap());
-        let synthesized = synthesize(&design).unwrap();
-        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let images = crossbar_images();
 
-        assert!(synthesized.netlist.registers().len() >= 400);
-        assert!(mapped.cells().len() > synthesized.netlist.registers().len());
-        ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        assert!(images.boolean_nodes > images.registers);
+        assert!(images.registers >= 400);
+        assert!(images.mapped_cells > images.registers);
+        assert!(!images.mapped.code_image().is_empty());
     }
 
     #[test]
     fn arbitrates_four_inputs_by_qos_and_tie_order() {
-        let _guard = TEST_LOCK.lock().unwrap();
         for mut simulator in [reference_qos_arbiter_simulator(), qos_arbiter_simulator()] {
             // Equal-QoS order is port 2, port 3, port 0, then port 1.
             set_u16(&mut simulator, "tie_break", 0x3b02);
@@ -85,8 +91,7 @@ mod tests {
 
     #[test]
     fn preserves_axi4_bursts_ids_sidebands_and_backpressure() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        for mut simulator in [reference_simulator(), crossbar_simulator()] {
+        for mut simulator in crossbar_simulators() {
             reset(&mut simulator);
             exercise_write_burst(&mut simulator);
             exercise_read_burst(&mut simulator);
@@ -100,8 +105,7 @@ mod tests {
 
     #[test]
     fn alternates_contended_read_grants() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        for mut simulator in [reference_simulator(), crossbar_simulator()] {
+        for mut simulator in crossbar_simulators() {
             reset(&mut simulator);
             set_u16(&mut simulator, "s0.araddr", 0x0020);
             set_u16(&mut simulator, "s1.araddr", 0x0024);
@@ -133,8 +137,7 @@ mod tests {
 
     #[test]
     fn routes_multiple_outstanding_transactions_by_extended_id() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        for mut simulator in [reference_simulator(), crossbar_simulator()] {
+        for mut simulator in crossbar_simulators() {
             reset(&mut simulator);
             exercise_out_of_order_reads(&mut simulator);
             exercise_out_of_order_writes(&mut simulator);
@@ -143,7 +146,6 @@ mod tests {
 
     #[test]
     fn self_test_wrapper_passes_before_and_after_mapping() {
-        let _guard = TEST_LOCK.lock().unwrap();
         let design = axi4_crossbar_self_test().unwrap();
         assert!(design.top_module().unwrap().instances().is_empty());
         let synthesized = synthesize(&design).unwrap();
@@ -167,17 +169,42 @@ mod tests {
         }
     }
 
-    fn crossbar_simulator() -> Simulator<NativeBackend> {
-        let design = axi4_crossbar_2x2().unwrap();
-        let synthesized = synthesize(&design).unwrap();
-        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
-        ecp5_simulator(&mapped).unwrap().build_native().unwrap()
+    fn crossbar_images() -> &'static CrossbarImages {
+        CROSSBAR_IMAGES.get_or_init(|| {
+            let design = axi4_crossbar_2x2().unwrap();
+            let synthesized = synthesize(&design).unwrap();
+            let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+            let mapped_image = ecp5_simulator(&mapped)
+                .unwrap()
+                .compile_native()
+                .unwrap()
+                .into_program_image();
+            let reference_image =
+                SimulatorBuilder::new(super::AXI4_CROSSBAR_SOURCE, "Axi4Crossbar2x2")
+                    .compile_native()
+                    .unwrap()
+                    .into_program_image();
+
+            CrossbarImages {
+                reference: reference_image,
+                mapped: mapped_image,
+                boolean_nodes: synthesized.netlist.nodes().len(),
+                registers: synthesized.netlist.registers().len(),
+                mapped_cells: mapped.cells().len(),
+            }
+        })
     }
 
-    fn reference_simulator() -> Simulator<NativeBackend> {
-        SimulatorBuilder::new(super::AXI4_CROSSBAR_SOURCE, "Axi4Crossbar2x2")
-            .build_native()
-            .unwrap()
+    fn crossbar_simulators() -> [Simulator<NativeBackend>; 2] {
+        let images = crossbar_images();
+        [
+            Simulator::from_sources(Vec::new(), "Axi4Crossbar2x2")
+                .build_native_from_image(images.reference.clone())
+                .unwrap(),
+            Simulator::from_sources(Vec::new(), "Axi4Crossbar2x2")
+                .build_native_from_image(images.mapped.clone())
+                .unwrap(),
+        ]
     }
 
     fn qos_arbiter_simulator() -> Simulator<NativeBackend> {
