@@ -65,7 +65,7 @@ and are based on the Project Trellis `ecp5_evn` example and the Lattice board
 manual.
 
 The 12 MHz value describes the no-PLL board smoke-test clock, not an ECP5
-performance target. Struo targets 250 MHz for ECP5 implementation QoR; designs
+performance target. Struo targets 300 MHz for ECP5 implementation QoR; designs
 that use this frequency in hardware still require an explicit PLL clock path.
 
 ## Mandatory verification
@@ -115,7 +115,7 @@ comparison networks. Addition and subtraction remain word-level cells until
 technology mapping. ECP5 maps operations wider than four bits to `CCU2C` carry
 chains by default; explicit carry-chain and LUT-ripple modes are also available
 for regression tests and A/B measurements. ECP5 technology mapping enumerates
-bounded four-input cuts and selects a cover using a 250 MHz required-time
+bounded four-input cuts and selects a cover using a 300 MHz required-time
 model. The estimate includes LUT, routing, carry-chain, BRAM, and setup arcs;
 fanout-weighted timing selection is enabled for cones that consume about half
 the available period before exact referenced-area recovery. Unreachable
@@ -174,39 +174,25 @@ rule. Invalid or unmapped bursts complete locally with `DECERR`.
 Tests
 take only the analyzed Veryl path through synthesis, ECP5 technology mapping,
 and Celox post-map simulation, with Celox's native Veryl frontend as the
-reference. Each initiator has two read and two write outstanding slots. A fifth
-downstream ID bit records the initiator, allowing responses for different IDs
-to return out of order; a repeated ID is held until its earlier transaction
-completes to preserve AXI ordering. The simulation tests exercise reverse-order
-B/R completion, full-slot backpressure, QoS contention, legal WRAP traffic, and
-local error completion through both the reference and post-map paths.
+reference. Each initiator has two issued-read slots plus one queued AR, and two
+write outstanding slots. A fifth downstream ID bit records the initiator,
+allowing responses for different IDs to return out of order; a repeated ID may
+enter the AR skid register but is not issued until its earlier transaction
+completes, preserving AXI ordering. The simulation tests exercise reverse-order
+B/R completion, queued and repeated read IDs, QoS contention, legal WRAP
+traffic, and local error completion through both the reference and post-map
+paths.
 
-On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seeds 1 through 10, and a 250 MHz
-constraint, the routed self-test averages 269.11 MHz and passes timing in 9 of
-10 seeds, with a 243.66--290.44 MHz range. Register-enable inference converts
-1,090 self-hold muxes to dedicated FF clock enables and reduces the routed
-design from 2,148 to 1,133 `TRELLIS_COMB` sites while retaining 1,411
-`TRELLIS_FF` sites. Before enable inference, the same ten seeds averaged 268.81
-MHz, passed in 9 of 10 seeds, and ranged from 247.10 to 282.89 MHz. Before the
-registered crossbar boundaries it reached 68.77 MHz under the same constraint.
-Retaining eight ordering comparisons through synthesis and mapping them to
-`CCU2C` raises the ten-seed average to 273.34 MHz, passes all ten seeds, and
-ranges from 256.15 to 300.75 MHz. This delay-first mapping increases
-`TRELLIS_COMB` use from 1,133 to 1,181 sites. Required-depth-constrained LUT
-area recovery then reduces that to 1,163 sites while raising the ten-seed
-average to 274.89 MHz; all ten seeds pass and range from 260.35 to 288.02 MHz.
-Replacing the global LUT-depth budget with the ECP5 required-time model keeps
-the same 1,163-site area and passes all ten seeds; the observed distribution is
-273.14 MHz average and 255.43--296.21 MHz range. nextpnr timing remains the
-sign-off result because placement-dependent routing cannot be predicted by the
-pre-route mapper.
-With both mapping and nextpnr driven at 300 MHz, the cover adds six logic LUTs
-(1,169 `TRELLIS_COMB`) and raises the ten-seed average to 284.08 MHz, with a
-256.48--311.43 MHz range and one seed meeting 300 MHz. Applying the 300 MHz
-place-and-route constraint to the unchanged 250 MHz cover averaged 273.14 MHz
-and passed no seeds. The target-driven cover therefore helps, but reliable
-300 MHz operation still requires another pipeline or placement-aware
-optimization rather than more pre-route cut pressure.
+On nextpnr 0.6, LFE5UM5G-85F speed grade 8, and seeds 1 through 10, the 300 MHz
+flow passes all ten seeds and reaches 301.93--324.36 MHz (308.18 MHz mean). The
+mapped self-test uses 1,159 `TRELLIS_COMB` and 1,441 `TRELLIS_FF` sites. The
+result combines the mapper's 300 MHz required-time cover with registered
+write-completion, read-slot reservation, scoreboard, and QoS-arbitration
+boundaries in the RTL. nextpnr uses timing budgets, a heap timing weight of 30,
+and timing-driven routing rip-up for every seed; no successful seed is selected
+after the fact. The CI timing gate repeats all ten fixed seeds and requires each
+one to reach 300 MHz. nextpnr timing remains the sign-off result because
+placement-dependent routing cannot be predicted by the pre-route mapper.
 The timing tradeoff is additional address/control latency. Address decode
 admits one request at a time per address channel and initiator, while W and R
 data still stream at one beat per cycle; place and route should be repeated for
@@ -228,7 +214,8 @@ nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
   --json build/axi4-self-test/design.json \
   --lpf examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf \
   --textcfg build/axi4-self-test/design.config \
-  --report build/axi4-self-test/nextpnr-report.json --freq 12
+  --report build/axi4-self-test/nextpnr-report.json \
+  --freq 300 --placer-budgets --placer-heap-timingweight 30 --tmg-ripup
 ecppack --svf build/axi4-self-test/design.svf \
   build/axi4-self-test/design.config build/axi4-self-test/design.bit
 ```

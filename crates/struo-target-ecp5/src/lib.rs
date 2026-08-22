@@ -44,7 +44,7 @@ pub const LFE5UM5G_85F_EVN: BoardProfile = BoardProfile {
 ///
 /// This constrains place-and-route quality independently of the 12 MHz
 /// reference clock used by the no-PLL evaluation-board smoke test.
-pub const ECP5_QOR_TARGET_MHZ: u32 = 250;
+pub const ECP5_QOR_TARGET_MHZ: u32 = 300;
 
 /// A subprocess invocation represented without a shell.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +131,10 @@ impl Ecp5Flow {
                 self.artifacts.routed_config.clone(),
                 "--freq".into(),
                 self.timing_goal_mhz.to_string(),
+                "--placer-budgets".into(),
+                "--placer-heap-timingweight".into(),
+                "30".into(),
+                "--tmg-ripup".into(),
             ],
             evidence: Some(VerificationStage::PlaceAndRoute),
         }
@@ -191,9 +195,17 @@ mod tests {
             command
                 .args
                 .windows(2)
-                .any(|args| args == ["--freq", "250"])
+                .any(|args| args == ["--freq", "300"])
         );
-        assert_eq!(ECP5_QOR_TARGET_MHZ, 250);
+        assert!(command.args.iter().any(|arg| arg == "--placer-budgets"));
+        assert!(command.args.iter().any(|arg| arg == "--tmg-ripup"));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--placer-heap-timingweight", "30"])
+        );
+        assert_eq!(ECP5_QOR_TARGET_MHZ, 300);
     }
 
     #[test]

@@ -185,7 +185,7 @@ mod tests {
 
         for mut simulator in [reference_simulator, mapped_simulator] {
             reset(&mut simulator);
-            for _ in 0..12 {
+            for _ in 0..24 {
                 if simulator.get(signal(&simulator, "passed")) == 1u8.into() {
                     break;
                 }
@@ -600,7 +600,10 @@ mod tests {
         set_u8(simulator, "s0.arid", 3);
         set_u16(simulator, "s0.araddr", 0x0200);
         set_u8(simulator, "s0.arvalid", 1);
-        assert_value(simulator, "s0.arready", 0);
+        assert_value(simulator, "s0.arready", 1);
+        tick(simulator);
+        set_u8(simulator, "s0.arvalid", 0);
+        assert_value(simulator, "m0.arvalid", 0);
 
         set_u8(simulator, "m1.rid", 2);
         set_u32(simulator, "m1.rdata", 0x2222_2222);
@@ -617,9 +620,6 @@ mod tests {
         set_u8(simulator, "m1.rvalid", 0);
         set_u8(simulator, "s0.rready", 0);
 
-        wait_until(simulator, "s0.arready", 1, 8);
-        tick(simulator);
-        set_u8(simulator, "s0.arvalid", 0);
         wait_until(simulator, "m0.arvalid", 1, 16);
         assert_value(simulator, "m0.arvalid", 1);
         assert_value(simulator, "m0.arid", 3);
@@ -630,8 +630,10 @@ mod tests {
         set_u8(simulator, "s0.arid", 3);
         set_u16(simulator, "s0.araddr", 0x8200);
         set_u8(simulator, "s0.arvalid", 1);
-        assert_value(simulator, "s0.arready", 0);
+        assert_value(simulator, "s0.arready", 1);
+        tick(simulator);
         set_u8(simulator, "s0.arvalid", 0);
+        assert_value(simulator, "m1.arvalid", 0);
 
         set_u8(simulator, "m0.rid", 1);
         set_u32(simulator, "m0.rdata", 0x1111_1111);
@@ -650,6 +652,12 @@ mod tests {
         set_u8(simulator, "m0.rvalid", 0);
         set_u8(simulator, "m0.rlast", 0);
         set_u8(simulator, "s0.rready", 0);
+
+        // A duplicate ID may be accepted into the skid register, but it must
+        // not be issued downstream until the earlier transaction completes.
+        wait_until(simulator, "m1.arvalid", 1, 16);
+        assert_value(simulator, "m1.arid", 3);
+        assert_value(simulator, "m1.araddr", 0x8200);
     }
 
     fn exercise_out_of_order_writes(simulator: &mut Simulator<NativeBackend>) {
