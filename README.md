@@ -115,8 +115,12 @@ comparison networks. Addition and subtraction remain word-level cells until
 technology mapping. ECP5 maps operations wider than four bits to `CCU2C` carry
 chains by default; explicit carry-chain and LUT-ripple modes are also available
 for regression tests and A/B measurements. ECP5 technology mapping enumerates
-bounded four-input cuts, selects them by logic depth and area, omits unreachable Boolean logic,
-and maps the selected cover to `LUT4`; registers map to `TRELLIS_FF`.
+bounded four-input cuts and selects a cover using a 250 MHz required-time
+model. The estimate includes LUT, routing, carry-chain, BRAM, and setup arcs;
+fanout-weighted timing selection is enabled for cones that consume about half
+the available period before exact referenced-area recovery. Unreachable
+Boolean logic is omitted and the selected cover maps to `LUT4`; registers map
+to `TRELLIS_FF`.
 Synchronous 1R1W memories map directly to ECP5 `DP16KD`
 primitives, including width tiling across multiple blocks; inout ports are
 rejected explicitly.
@@ -191,6 +195,11 @@ ranges from 256.15 to 300.75 MHz. This delay-first mapping increases
 `TRELLIS_COMB` use from 1,133 to 1,181 sites. Required-depth-constrained LUT
 area recovery then reduces that to 1,163 sites while raising the ten-seed
 average to 274.89 MHz; all ten seeds pass and range from 260.35 to 288.02 MHz.
+Replacing the global LUT-depth budget with the ECP5 required-time model keeps
+the same 1,163-site area and passes all ten seeds; the observed distribution is
+273.14 MHz average and 255.43--296.21 MHz range. nextpnr timing remains the
+sign-off result because placement-dependent routing cannot be predicted by the
+pre-route mapper.
 The timing tradeoff is additional address/control latency. Address decode
 admits one request at a time per address channel and initiator, while W and R
 data still stream at one beat per cycle; place and route should be repeated for

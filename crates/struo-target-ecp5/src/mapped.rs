@@ -97,12 +97,65 @@ pub enum ArithmeticMapping {
 pub struct MappingOptions {
     /// Arithmetic implementation strategy.
     pub arithmetic: ArithmeticMapping,
+    /// Clock frequency used by timing-driven LUT covering.
+    pub timing_goal_mhz: u32,
 }
 
 impl Default for MappingOptions {
     fn default() -> Self {
         Self {
             arithmetic: ArithmeticMapping::Auto,
+            timing_goal_mhz: crate::ECP5_QOR_TARGET_MHZ,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MappingDemand {
+    roots: Vec<NetId>,
+}
+
+impl MappingDemand {
+    fn collect(netlist: &Netlist) -> Self {
+        let output_roots = netlist
+            .ports()
+            .iter()
+            .filter(|port| port.direction() == IrPortDirection::Output)
+            .flat_map(struo_ir::Port::bits)
+            .map(|output| node_for(netlist, *output).inputs()[0]);
+        let register_roots = netlist.registers().iter().flat_map(|register| {
+            [register.data(), register.clock()]
+                .into_iter()
+                .chain(register.enable().map(|enable| enable.signal))
+                .chain(register.reset().map(|reset| reset.signal))
+        });
+        let memory_roots = netlist.memories().iter().flat_map(|memory| {
+            memory
+                .read_address()
+                .iter()
+                .chain(memory.write_address())
+                .chain(memory.write_data())
+                .copied()
+                .chain([memory.clock(), memory.write_enable().signal])
+                .chain(memory.read_enable().map(|enable| enable.signal))
+        });
+        let arithmetic_roots = netlist
+            .arithmetic()
+            .iter()
+            .flat_map(|cell| cell.lhs().iter().chain(cell.rhs()).copied());
+        let comparison_roots = netlist
+            .comparisons()
+            .iter()
+            .flat_map(|cell| cell.lhs().iter().chain(cell.rhs()).copied());
+        Self {
+            // Preserve duplicates: they are distinct physical sink pins and
+            // therefore contribute to the fanout estimate used by covering.
+            roots: output_roots
+                .chain(register_roots)
+                .chain(memory_roots)
+                .chain(arithmetic_roots)
+                .chain(comparison_roots)
+                .collect(),
         }
     }
 }
@@ -241,11 +294,16 @@ pub fn map_to_ecp5_with_options(
     options: MappingOptions,
 ) -> Result<Ecp5Netlist, MappingError> {
     netlist.validate()?;
+    let demand = MappingDemand::collect(netlist);
     let cuts = CutDatabase::analyze(netlist);
-    let cover = LutCover::select(netlist, &cuts);
+    let cover = LutCover::select(netlist, &cuts, &demand.roots, options);
     let mut emitter = LutEmitter::new(netlist, &cover);
 
     map_retained_cells(netlist, options, &mut emitter);
+
+    for root in &demand.roots {
+        emitter.map_net(*root);
+    }
 
     for port in netlist
         .ports()
@@ -255,33 +313,8 @@ pub fn map_to_ecp5_with_options(
         for output in port.bits() {
             let node = node_for(netlist, *output);
             let source = node.inputs()[0];
-            let output_bit = emitter.map_net(source);
+            let output_bit = emitter.mapped_net(source);
             emitter.alias_net(*output, output_bit);
-        }
-    }
-
-    for register in netlist.registers() {
-        emitter.map_net(register.data());
-        emitter.map_net(register.clock());
-        if let Some(enable) = register.enable() {
-            emitter.map_net(enable.signal);
-        }
-        if let Some(reset) = register.reset() {
-            emitter.map_net(reset.signal);
-        }
-    }
-
-    for memory in netlist.memories() {
-        for net in memory
-            .read_address()
-            .iter()
-            .chain(memory.write_address())
-            .chain(memory.write_data())
-            .copied()
-            .chain([memory.clock(), memory.write_enable().signal])
-            .chain(memory.read_enable().map(|enable| enable.signal))
-        {
-            emitter.map_net(net);
         }
     }
 
@@ -1233,6 +1266,7 @@ mod tests {
             &arithmetic_netlist(8, ArithmeticOp::Subtract),
             MappingOptions {
                 arithmetic: ArithmeticMapping::Lut4,
+                ..MappingOptions::default()
             },
         )
         .unwrap();
