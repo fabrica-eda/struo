@@ -8,7 +8,10 @@ pub use mapped::{
     MappingOptions, PortDirection as MappedPortDirection, Reset, RetimingSelection, map_to_ecp5,
     map_to_ecp5_with_options,
 };
-pub use physical::{PhysicalFeedback, PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint};
+pub use physical::{
+    PhysicalCriticalPath, PhysicalFeedback, PhysicalLocation, PhysicalNetTiming,
+    PhysicalTimingEndpoint,
+};
 
 use struo_sim::{ReleaseBlocked, VerificationPolicy, VerificationReport, VerificationStage};
 
@@ -72,6 +75,12 @@ pub struct FlowArtifacts {
     pub draft_config: String,
     /// Equivalent mapped netlist refined using draft physical feedback.
     pub refined_json: String,
+    /// Post-route candidate netlist produced from the refined mapping.
+    pub refined_placed_json: String,
+    /// Detailed timing report for the refined implementation candidate.
+    pub refined_report: String,
+    /// Routed configuration for the refined implementation candidate.
+    pub refined_config: String,
     /// nextpnr textual configuration.
     pub routed_config: String,
     /// Packed FPGA bitstream.
@@ -93,6 +102,9 @@ impl FlowArtifacts {
             draft_report: format!("{root}/design.draft-report.json"),
             draft_config: format!("{root}/design.draft.config"),
             refined_json: format!("{root}/design.refined.json"),
+            refined_placed_json: format!("{root}/design.refined-placed.json"),
+            refined_report: format!("{root}/design.refined-report.json"),
+            refined_config: format!("{root}/design.refined.config"),
             routed_config: format!("{root}/design.config"),
             bitstream: format!("{root}/design.bit"),
             svf: format!("{root}/design.svf"),
@@ -154,10 +166,35 @@ impl Ecp5Flow {
     /// deterministic draft run.
     #[must_use]
     pub fn refined_place_and_route_command(&self) -> ToolCommand {
-        self.place_and_route_command_for(
+        let mut command = self.place_and_route_command_for(
             &self.artifacts.refined_json,
-            &self.artifacts.routed_config,
-        )
+            &self.artifacts.refined_config,
+        );
+        command.args.extend([
+            "--write".into(),
+            self.artifacts.refined_placed_json.clone(),
+            "--report".into(),
+            self.artifacts.refined_report.clone(),
+            "--detailed-timing-report".into(),
+            "--timing-allow-fail".into(),
+        ]);
+        command.evidence = None;
+        command
+    }
+
+    /// Selects the routed draft unless the refined candidate improves every
+    /// clock that changed and regresses none of them.
+    #[must_use]
+    pub fn select_physical_config(
+        &self,
+        draft: &PhysicalFeedback,
+        refined: &PhysicalFeedback,
+    ) -> &str {
+        if refined.improves_timing_over(draft) {
+            &self.artifacts.refined_config
+        } else {
+            &self.artifacts.draft_config
+        }
     }
 
     fn place_and_route_command_for(&self, json: &str, config: &str) -> ToolCommand {
@@ -201,16 +238,37 @@ impl Ecp5Flow {
         policy: &VerificationPolicy,
     ) -> Result<ToolCommand, ReleaseBlocked> {
         report.authorize_bitstream(policy)?;
-        Ok(ToolCommand {
+        Ok(self.pack_command_for_config(&self.artifacts.routed_config))
+    }
+
+    /// Packs the faster of a routed draft and its equivalent refined
+    /// candidate, automatically rolling back a timing regression.
+    ///
+    /// # Errors
+    ///
+    /// Returns the missing, skipped, or failed release gates.
+    pub fn pack_physical_command(
+        &self,
+        report: &VerificationReport,
+        policy: &VerificationPolicy,
+        draft: &PhysicalFeedback,
+        refined: &PhysicalFeedback,
+    ) -> Result<ToolCommand, ReleaseBlocked> {
+        report.authorize_bitstream(policy)?;
+        Ok(self.pack_command_for_config(self.select_physical_config(draft, refined)))
+    }
+
+    fn pack_command_for_config(&self, config: &str) -> ToolCommand {
+        ToolCommand {
             program: "ecppack",
             args: vec![
                 "--svf".into(),
                 self.artifacts.svf.clone(),
-                self.artifacts.routed_config.clone(),
+                config.into(),
                 self.artifacts.bitstream.clone(),
             ],
             evidence: None,
-        })
+        }
     }
 }
 
@@ -288,7 +346,58 @@ mod tests {
                 .windows(2)
                 .any(|args| { args == ["--json", "build/Top/design.refined.json"] })
         );
+        assert!(
+            final_run
+                .args
+                .windows(2)
+                .any(|args| { args == ["--textcfg", "build/Top/design.refined.config"] })
+        );
+        assert!(
+            final_run
+                .args
+                .windows(2)
+                .any(|args| { args == ["--report", "build/Top/design.refined-report.json"] })
+        );
+        assert!(
+            final_run
+                .args
+                .windows(2)
+                .any(|args| { args == ["--write", "build/Top/design.refined-placed.json"] })
+        );
         assert_eq!(draft.evidence, None);
+        assert_eq!(final_run.evidence, None);
+    }
+
+    #[test]
+    fn physical_flow_rolls_back_a_slower_candidate() {
+        use super::PhysicalFeedback;
+
+        let flow = Ecp5Flow::evaluation_board("Top", "build/Top");
+        let placed = r#"{"modules":{"Top":{"cells":{}}}}"#;
+        let draft = PhysicalFeedback::from_nextpnr_json(
+            r#"{"fmax":{"clk":{"achieved":310.0,"constraint":320.0}}}"#,
+            placed,
+        )
+        .unwrap();
+        let slower = PhysicalFeedback::from_nextpnr_json(
+            r#"{"fmax":{"clk":{"achieved":305.0,"constraint":320.0}}}"#,
+            placed,
+        )
+        .unwrap();
+        let faster = PhysicalFeedback::from_nextpnr_json(
+            r#"{"fmax":{"clk":{"achieved":315.0,"constraint":320.0}}}"#,
+            placed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            flow.select_physical_config(&draft, &slower),
+            "build/Top/design.draft.config"
+        );
+        assert_eq!(
+            flow.select_physical_config(&draft, &faster),
+            "build/Top/design.refined.config"
+        );
     }
 
     #[test]

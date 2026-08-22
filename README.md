@@ -136,13 +136,19 @@ per-sink timing budgets; synthesis then clones truth-table-identical LUTs and
 moves only the branches that exceeded their routed budget. Existing cells keep
 their draft BELs while the new replicas remain free for placement. The local
 rewrite is attempted only when every clock is already within 98 percent of its
-goal, where a small routing repair is appropriate; designs farther from closure
-are left unchanged for structural optimization. Clock, reset, and enable nets
-are excluded from generic data rewrites. Every rewire is added to the same
-constructive equivalence ledger, and the draft and final runs use the same fixed
-seed. `Ecp5Flow::draft_place_and_route_command` and
-`Ecp5Flow::refined_place_and_route_command` provide the two implementation
-steps; this is feedback-directed physical synthesis rather than seed selection.
+goal, where a small routing repair is appropriate. If no such branch exists and
+the design is within 95 percent, the reported register-to-register critical
+path guides a whole-LUT boundary move at its sink. The move is checked by the
+retiming certificate machinery, including reset derivation, before it becomes
+an implementation candidate. Clock, reset, and enable nets are excluded from
+generic data rewrites. LUT replication retains compatible draft BELs; retiming
+changes packing boundaries and therefore receives a fresh placement with the
+same fixed seed. `Ecp5Flow::draft_place_and_route_command` and
+`Ecp5Flow::refined_place_and_route_command` produce both configurations. The
+refined result is accepted only when every reported clock is no worse and at
+least one is strictly faster; `pack_physical_command` otherwise rolls back to
+the already-routed draft. Designs that already meet timing are not rewritten.
+This is feedback-directed physical synthesis rather than seed selection.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under
@@ -269,8 +275,10 @@ placement-dependent routing cannot be predicted by the pre-route mapper.
 At the separate 320 MHz stress target, the routed drafts reach
 306.84--325.10 MHz (318.01 MHz mean) and pass five of ten seeds. Physical
 feedback qualifies only seed 2, adds two LUT replicas, and improves that same
-seed from 317.46 to 324.15 MHz; the resulting set passes six of ten with a
-318.68 MHz mean and leaves the other nine implementations unchanged.
+seed from 317.46 to 324.15 MHz. Route-guided certified retiming improves seed 3
+from 316.26 to 320.51 MHz and seed 4 from 306.84 to 313.28 MHz. Slower candidates
+for seeds 8 and 10 are rolled back to their drafts. The selected set reaches
+308.55--325.10 MHz (319.75 MHz mean) and passes seven of ten seeds.
 The timing tradeoff is additional address/control latency. Address decode
 admits one request at a time per address channel and initiator, while W and R
 data still stream at one beat per cycle; place and route should be repeated for

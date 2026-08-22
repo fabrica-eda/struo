@@ -1,6 +1,6 @@
 //! ECP5 technology mapping and nextpnr serialization.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -34,6 +34,8 @@ const RETIMING_PERIOD_MARGIN_DENOMINATOR: u32 = 10;
 const MAPPED_ROUTE_GUARD_PS: u32 = 100;
 const MAX_ENABLE_FANOUT_PER_REPLICA: usize = 16;
 const PHYSICAL_REWRITE_MIN_GOAL_PERCENT: u32 = 98;
+const PHYSICAL_RETIME_MIN_GOAL_PERCENT: u32 = 95;
+const PHYSICAL_RETIME_MODEL_BRIDGE_PS: u32 = 400;
 
 /// A constant or numbered wire in a mapped ECP5 design.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -357,39 +359,129 @@ impl Ecp5Netlist {
     #[must_use]
     pub fn apply_physical_feedback(&self, feedback: &PhysicalFeedback) -> Self {
         let mut refined = self.clone();
-        if !feedback.is_near_timing_closure(PHYSICAL_REWRITE_MIN_GOAL_PERCENT)
-            || !physical_feedback_matches_netlist(&refined, feedback)
-        {
+        if feedback.meets_timing_goal() || !physical_feedback_matches_netlist(&refined, feedback) {
             return refined;
         }
-        let (replicas, critical_rewires) =
-            replicate_physically_critical_luts(&mut refined, feedback);
-        let cluster_rewires = recluster_replicated_enable_sinks(&mut refined, feedback);
+        let (replicas, critical_rewires, cluster_rewires) =
+            if feedback.is_near_timing_closure(PHYSICAL_REWRITE_MIN_GOAL_PERCENT) {
+                let (replicas, critical_rewires) =
+                    replicate_physically_critical_luts(&mut refined, feedback);
+                let cluster_rewires = recluster_replicated_enable_sinks(&mut refined, feedback);
+                (replicas, critical_rewires, cluster_rewires)
+            } else {
+                (0, 0, 0)
+            };
         let rewires = critical_rewires + cluster_rewires;
-        if rewires == 0 {
+        let physical_retiming_moves =
+            if rewires == 0 && feedback.is_near_timing_closure(PHYSICAL_RETIME_MIN_GOAL_PERCENT) {
+                physically_retime_reported_cones(&mut refined, feedback)
+            } else {
+                0
+            };
+        if rewires == 0 && physical_retiming_moves == 0 {
             return refined;
         }
-        refined.placement_hints = refined
-            .cells
-            .iter()
-            .filter_map(|cell| {
-                let name = mapped_cell_name(cell);
-                let bel = feedback.bel(name)?;
-                physical_bel_is_compatible(cell, bel).then(|| (name.to_owned(), bel.to_owned()))
-            })
-            .collect();
+        refined.placement_hints = if physical_retiming_moves == 0 {
+            refined
+                .cells
+                .iter()
+                .filter_map(|cell| {
+                    let name = mapped_cell_name(cell);
+                    let bel = feedback.bel(name)?;
+                    physical_bel_is_compatible(cell, bel).then(|| (name.to_owned(), bel.to_owned()))
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         refined.equivalence_proof.equivalent_logic_replications += replicas;
         refined.equivalence_proof.equivalent_physical_rewires += rewires;
-        refined.retiming.equivalent_logic_replications += replicas;
-        refined.retiming.equivalent_physical_rewires += rewires;
+        let profile = mapped_lut_profile(&refined);
+        refined.retiming.applied |= physical_retiming_moves > 0;
+        refined.retiming.selected_lut_depth = profile.data_depth;
+        refined.retiming.selected_critical_registers = profile.critical_depth.len();
+        refined.retiming.selected_period_ps = profile.data_period_ps;
+        refined.retiming.selected_overall_period_ps = profile.overall_period_ps;
+        refined.retiming.selected_registers = mapped_register_count(&refined);
+        refined.retiming.certified_primitive_moves =
+            refined.equivalence_proof.certified_primitive_moves;
+        refined.retiming.equivalent_register_merges =
+            refined.equivalence_proof.equivalent_register_merges;
+        refined.retiming.equivalent_logic_replications =
+            refined.equivalence_proof.equivalent_logic_replications;
+        refined.retiming.equivalent_physical_rewires =
+            refined.equivalence_proof.equivalent_physical_rewires;
+        refined.retiming.unobservable_cells_removed =
+            refined.equivalence_proof.unobservable_cells_removed;
         refined.retiming.equivalence_signed_off =
-            verify_mapped_equivalence_proof(&refined, refined.retiming.applied || rewires > 0);
+            verify_mapped_equivalence_proof(&refined, refined.retiming.applied);
         if refined.retiming.equivalence_signed_off {
             refined
         } else {
             self.clone()
         }
     }
+}
+
+fn physically_retime_reported_cones(
+    netlist: &mut Ecp5Netlist,
+    feedback: &PhysicalFeedback,
+) -> usize {
+    const MAX_PHYSICAL_RETIMING_MOVES: usize = 4;
+
+    let sink_names = feedback
+        .critical_paths()
+        .iter()
+        .filter(|path| path.register_to_register)
+        .filter_map(|path| {
+            path.cells.iter().rev().find(|name| {
+                netlist.cells.iter().any(|cell| {
+                    mapped_cell_name(cell) == name.as_str()
+                        && matches!(cell, Ecp5Cell::FlipFlop { .. })
+                })
+            })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut moves = 0usize;
+    for sink_name in sink_names {
+        if moves >= MAX_PHYSICAL_RETIMING_MOVES {
+            break;
+        }
+        let Some(register) = netlist
+            .cells
+            .iter()
+            .position(|cell| mapped_cell_name(cell) == sink_name)
+        else {
+            continue;
+        };
+        let before_profile = mapped_lut_profile(netlist);
+        let before_cells = netlist.cells.len();
+        let before_registers = mapped_register_count(netlist);
+        let Some(mut candidate) = backward_retime_primitive(netlist, register) else {
+            continue;
+        };
+        merge_equivalent_flip_flops(&mut candidate);
+        let candidate_profile = mapped_lut_profile(&candidate);
+        let candidate_registers = mapped_register_count(&candidate);
+        if candidate.cells.len() > before_cells + 8
+            || candidate_registers > before_registers + 4
+            || candidate_profile.data_period_ps
+                > before_profile
+                    .data_period_ps
+                    .saturating_add(PHYSICAL_RETIME_MODEL_BRIDGE_PS)
+            || candidate_profile.overall_period_ps
+                > before_profile
+                    .overall_period_ps
+                    .saturating_add(PHYSICAL_RETIME_MODEL_BRIDGE_PS)
+            || !verify_mapped_equivalence_proof(&candidate, true)
+        {
+            continue;
+        }
+        *netlist = candidate;
+        moves += 1;
+    }
+    moves
 }
 
 fn physical_feedback_matches_netlist(netlist: &Ecp5Netlist, feedback: &PhysicalFeedback) -> bool {
@@ -3794,8 +3886,9 @@ mod tests {
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, backward_retime_ccu2c,
         backward_retime_lut, ccu_chain_names, forward_retime_ccu2c, map_once, map_to_ecp5,
-        map_to_ecp5_with_options, mapped_wire_fanout, merge_equivalent_flip_flops,
-        replicate_high_fanout_enable_luts, verify_mapped_equivalence_proof,
+        map_to_ecp5_with_options, mapped_cell_name, mapped_wire_fanout,
+        merge_equivalent_flip_flops, replicate_high_fanout_enable_luts,
+        verify_mapped_equivalence_proof,
     };
     use crate::PhysicalFeedback;
 
@@ -4015,6 +4108,100 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mapped.apply_physical_feedback(&incompatible), mapped);
+
+        let passing =
+            PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "321.0"), &placed)
+                .unwrap();
+        assert_eq!(mapped.apply_physical_feedback(&passing), mapped);
+    }
+
+    #[test]
+    fn physical_critical_path_guides_a_certified_cone_retime() {
+        let mut source = Netlist::new("physical_retime");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let lhs = source.add_input("lhs");
+        let rhs = source.add_input("rhs");
+        let data = source.add_and(lhs, rhs);
+        let output = source.add_register_output("value");
+        source.add_register(RegisterCell::new(
+            "value",
+            output,
+            data,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: false,
+            }),
+        ));
+        let result = source.add_register_output("result");
+        source.add_register(RegisterCell::new(
+            "result",
+            result,
+            output,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: false,
+            }),
+        ));
+        source.add_output("output", result);
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let driver = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::Lut4 { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let sink = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::FlipFlop { name, .. } if name == "ff_value" => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let result_sink = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::FlipFlop { name, .. } if name == "ff_result" => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let report = format!(
+            r#"{{"critical_paths":[{{"from":"posedge clk","path":[{{"delay":3.2,"from":{{"cell":"source_ff"}},"to":{{"cell":"{driver}"}}}},{{"delay":0.1,"from":{{"cell":"{driver}"}},"to":{{"cell":"{sink}"}}}}],"to":"posedge clk"}}],"fmax":{{"clock":{{"achieved":310.0,"constraint":320.0}}}}}}"#
+        );
+        let placed = format!(
+            r#"{{"modules":{{"physical_retime":{{"cells":{{"{driver}":{{"attributes":{{"NEXTPNR_BEL":"X1/Y1/SLICEA.K0"}}}},"{sink}":{{"attributes":{{"NEXTPNR_BEL":"X2/Y2/SLICEA.FF0"}}}},"{result_sink}":{{"attributes":{{"NEXTPNR_BEL":"X3/Y3/SLICEA.FF1"}}}}}}}}}}}}"#
+        );
+        let feedback = PhysicalFeedback::from_nextpnr_json(&report, &placed).unwrap();
+
+        let refined = mapped.apply_physical_feedback(&feedback);
+
+        assert_eq!(
+            refined.retiming.certified_primitive_moves,
+            mapped.retiming.certified_primitive_moves + 1
+        );
+        assert_eq!(refined.retiming.equivalent_physical_rewires, 0);
+        assert!(refined.retiming.applied);
+        assert!(refined.retiming.equivalence_signed_off);
+        assert!(
+            refined
+                .cells
+                .iter()
+                .any(|cell| mapped_cell_name(cell).starts_with("retime_ff_value"))
+        );
     }
 
     #[test]
