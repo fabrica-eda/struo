@@ -1,6 +1,6 @@
 //! Technology-independent synthesis for Struo.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU32;
@@ -656,6 +656,7 @@ impl Pipeline {
 pub fn default_pipeline() -> Pipeline {
     let mut pipeline = Pipeline::new();
     pipeline.push(InferRegisterEnables);
+    pipeline.push(RelaxQualifiedRegisterEnables);
     pipeline.push(ValidateNetlist);
     pipeline
 }
@@ -717,6 +718,297 @@ impl Pass for InferRegisterEnables {
                 rewrites.len()
             ),
         })
+    }
+}
+
+/// Removes a payload clock enable when a companion valid register proves that
+/// the payload is unobservable while the enable is inactive.
+///
+/// This is a conservative sequential don't-care optimization. A candidate is
+/// only rewritten when its enable is also the D input of a same-clock,
+/// reset-to-zero valid register, and a structural influence analysis proves
+/// that every state or output sink masks the candidate while that valid bit is
+/// low. Candidates whose next value depends on their old value are retained.
+pub struct RelaxQualifiedRegisterEnables;
+
+impl Pass for RelaxQualifiedRegisterEnables {
+    fn name(&self) -> &'static str {
+        "relax-qualified-register-enables"
+    }
+
+    fn run(&self, design: &mut Netlist) -> Result<PassReport, SynthesisError> {
+        let potential = design
+            .registers()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, register)| {
+                let enable = register.enable()?;
+                if enable.active != ActiveLevel::High {
+                    return None;
+                }
+                let qualifiers = design
+                    .registers()
+                    .iter()
+                    .filter(|qualifier| {
+                        qualifier.output() != register.output()
+                            && qualifier.data() == enable.signal
+                            && qualifier.enable().is_none()
+                            && qualifier.clock() == register.clock()
+                            && qualifier.edge() == register.edge()
+                            && qualifier.reset() == register.reset()
+                            && qualifier.reset().is_some_and(|reset| !reset.value)
+                    })
+                    .map(RegisterCell::output)
+                    .collect::<Vec<_>>();
+                (!qualifiers.is_empty()).then_some((index, register.data(), qualifiers))
+            })
+            .collect::<Vec<_>>();
+        let potentially_relaxed = potential
+            .iter()
+            .map(|(index, _, _)| *index)
+            .collect::<HashSet<_>>();
+        let candidates = potential
+            .into_iter()
+            .filter(|(index, _, qualifiers)| {
+                let payload = &design.registers()[*index];
+                qualifiers.iter().any(|qualifier| {
+                    qualified_payload_is_unobservable(
+                        design,
+                        payload,
+                        *qualifier,
+                        &potentially_relaxed,
+                    )
+                })
+            })
+            .map(|(index, data, _)| (index, data))
+            .collect::<Vec<_>>();
+
+        for (index, data) in &candidates {
+            design.registers_mut()[*index].set_data_and_enable(*data, None);
+        }
+
+        Ok(PassReport {
+            pass: self.name(),
+            message: format!(
+                "removed {} clock enables from valid-qualified payload registers",
+                candidates.len()
+            ),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Influence {
+    known: Option<bool>,
+    tainted: bool,
+}
+
+fn qualified_payload_is_unobservable(
+    design: &Netlist,
+    payload: &RegisterCell,
+    qualifier: NetId,
+    potentially_relaxed: &HashSet<usize>,
+) -> bool {
+    let influence = influence_with_qualifier_low(design, payload.output(), qualifier);
+
+    if net_is_tainted(&influence, payload.data()) {
+        return false;
+    }
+
+    if design
+        .registers()
+        .iter()
+        .enumerate()
+        .any(|(index, register)| {
+            net_is_tainted(&influence, register.clock())
+                || register
+                    .reset()
+                    .is_some_and(|reset| net_is_tainted(&influence, reset.signal))
+                || register
+                    .enable()
+                    .is_some_and(|enable| net_is_tainted(&influence, enable.signal))
+                || ((potentially_relaxed.contains(&index)
+                    || !register_enable_is_inactive(register, &influence))
+                    && net_is_tainted(&influence, register.data()))
+        })
+    {
+        return false;
+    }
+
+    if design.memories().iter().any(|memory| {
+        net_is_tainted(&influence, memory.clock())
+            || net_is_tainted(&influence, memory.write_enable().signal)
+            || memory
+                .read_enable()
+                .is_some_and(|enable| net_is_tainted(&influence, enable.signal))
+            || (!control_is_inactive(memory.write_enable(), &influence)
+                && memory
+                    .write_address()
+                    .iter()
+                    .chain(memory.write_data())
+                    .any(|net| net_is_tainted(&influence, *net)))
+            || (!memory
+                .read_enable()
+                .is_some_and(|enable| control_is_inactive(enable, &influence))
+                && memory
+                    .read_address()
+                    .iter()
+                    .any(|net| net_is_tainted(&influence, *net)))
+    }) {
+        return false;
+    }
+
+    !design.nodes().iter().any(|node| {
+        matches!(node.kind(), NodeKind::Output(_)) && net_is_tainted(&influence, node.output())
+    })
+}
+
+fn register_enable_is_inactive(register: &RegisterCell, influence: &[Influence]) -> bool {
+    register
+        .enable()
+        .is_some_and(|enable| control_is_inactive(enable, influence))
+}
+
+fn control_is_inactive(control: EnableControl, influence: &[Influence]) -> bool {
+    influence[control.signal.index() as usize]
+        .known
+        .is_some_and(|value| value != (control.active == ActiveLevel::High))
+}
+
+fn net_is_tainted(influence: &[Influence], net: NetId) -> bool {
+    influence[net.index() as usize].tainted
+}
+
+fn influence_with_qualifier_low(
+    design: &Netlist,
+    payload: NetId,
+    qualifier: NetId,
+) -> Vec<Influence> {
+    let mut cell_inputs = HashMap::<NetId, Vec<NetId>>::new();
+    for cell in design.arithmetic() {
+        let inputs = cell
+            .lhs()
+            .iter()
+            .chain(cell.rhs())
+            .copied()
+            .collect::<Vec<NetId>>();
+        for output in cell.outputs() {
+            cell_inputs.insert(*output, inputs.clone());
+        }
+    }
+    for cell in design.comparisons() {
+        cell_inputs.insert(
+            cell.output(),
+            cell.lhs().iter().chain(cell.rhs()).copied().collect(),
+        );
+    }
+
+    let mut result = vec![Influence::default(); design.nodes().len()];
+    for node in design.nodes() {
+        let output = node.output();
+        let value = if output == qualifier {
+            Influence {
+                known: Some(false),
+                tainted: false,
+            }
+        } else if output == payload {
+            Influence {
+                known: None,
+                tainted: true,
+            }
+        } else {
+            match node.kind() {
+                NodeKind::Constant(value) => Influence {
+                    known: Some(*value),
+                    tainted: false,
+                },
+                NodeKind::Not => {
+                    let input = result[node.inputs()[0].index() as usize];
+                    Influence {
+                        known: input.known.map(|value| !value),
+                        tainted: input.tainted,
+                    }
+                }
+                NodeKind::And => influence_and(
+                    result[node.inputs()[0].index() as usize],
+                    result[node.inputs()[1].index() as usize],
+                ),
+                NodeKind::Or => influence_or(
+                    result[node.inputs()[0].index() as usize],
+                    result[node.inputs()[1].index() as usize],
+                ),
+                NodeKind::Xor => influence_xor(
+                    result[node.inputs()[0].index() as usize],
+                    result[node.inputs()[1].index() as usize],
+                ),
+                NodeKind::Mux => influence_mux(
+                    result[node.inputs()[0].index() as usize],
+                    result[node.inputs()[1].index() as usize],
+                    result[node.inputs()[2].index() as usize],
+                ),
+                NodeKind::Output(_) => result[node.inputs()[0].index() as usize],
+                NodeKind::ArithmeticOutput(_) | NodeKind::ComparisonOutput(_) => Influence {
+                    known: None,
+                    tainted: cell_inputs.get(&output).is_none_or(|inputs| {
+                        inputs
+                            .iter()
+                            .any(|net| result[net.index() as usize].tainted)
+                    }),
+                },
+                NodeKind::Input(_) | NodeKind::RegisterOutput(_) | NodeKind::MemoryOutput(_) => {
+                    Influence::default()
+                }
+            }
+        };
+        result[output.index() as usize] = value;
+    }
+    result
+}
+
+fn influence_and(lhs: Influence, rhs: Influence) -> Influence {
+    let known = if lhs.known == Some(false) || rhs.known == Some(false) {
+        Some(false)
+    } else if lhs.known == Some(true) && rhs.known == Some(true) {
+        Some(true)
+    } else {
+        None
+    };
+    Influence {
+        known,
+        tainted: known != Some(false) && (lhs.tainted || rhs.tainted),
+    }
+}
+
+fn influence_or(lhs: Influence, rhs: Influence) -> Influence {
+    let known = if lhs.known == Some(true) || rhs.known == Some(true) {
+        Some(true)
+    } else if lhs.known == Some(false) && rhs.known == Some(false) {
+        Some(false)
+    } else {
+        None
+    };
+    Influence {
+        known,
+        tainted: known != Some(true) && (lhs.tainted || rhs.tainted),
+    }
+}
+
+fn influence_xor(lhs: Influence, rhs: Influence) -> Influence {
+    Influence {
+        known: lhs.known.zip(rhs.known).map(|(lhs, rhs)| lhs ^ rhs),
+        tainted: lhs.tainted || rhs.tainted,
+    }
+}
+
+fn influence_mux(condition: Influence, then_value: Influence, else_value: Influence) -> Influence {
+    if let Some(condition) = condition.known {
+        return if condition { then_value } else { else_value };
+    }
+    Influence {
+        known: (then_value.known == else_value.known)
+            .then_some(then_value.known)
+            .flatten(),
+        tainted: condition.tainted || then_value.tainted || else_value.tainted,
     }
 }
 
@@ -815,7 +1107,10 @@ impl From<ValidationError> for SynthesisError {
 mod tests {
     use std::collections::HashMap;
 
-    use struo_ir::{ActiveLevel, ArithmeticOp, ComparisonOp, NetId, Netlist, NodeKind};
+    use struo_ir::{
+        ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, ComparisonOp, NetId, Netlist,
+        NodeKind, RegisterCell, ResetControl,
+    };
     use struo_rtl::{
         BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, Memory, Module, Polarity, Port,
         PortDirection, Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
@@ -1391,9 +1686,137 @@ mod tests {
 
         let reports = default_pipeline().run(&mut design).unwrap();
 
-        assert_eq!(reports.len(), 2);
+        assert_eq!(reports.len(), 3);
         assert_eq!(reports[0].pass, "infer-register-enables");
-        assert_eq!(reports[1].pass, "validate");
+        assert_eq!(reports[1].pass, "relax-qualified-register-enables");
+        assert_eq!(reports[2].pass, "validate");
+    }
+
+    #[test]
+    fn removes_enable_from_valid_qualified_payload() {
+        let mut design = qualified_payload_netlist(false, false);
+
+        let reports = default_pipeline().run(&mut design).unwrap();
+        let payload = design
+            .registers()
+            .iter()
+            .find(|register| register.name() == "payload")
+            .unwrap();
+
+        assert_eq!(payload.enable(), None);
+        assert_eq!(
+            reports[1].message,
+            "removed 1 clock enables from valid-qualified payload registers"
+        );
+    }
+
+    #[test]
+    fn retains_qualified_enable_when_payload_is_observable_or_self_dependent() {
+        for (direct_output, self_dependent) in [(true, false), (false, true)] {
+            let mut design = qualified_payload_netlist(direct_output, self_dependent);
+
+            let reports = default_pipeline().run(&mut design).unwrap();
+            let payload = design
+                .registers()
+                .iter()
+                .find(|register| register.name() == "payload")
+                .unwrap();
+
+            assert!(payload.enable().is_some());
+            assert_eq!(
+                reports[1].message,
+                "removed 0 clock enables from valid-qualified payload registers"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_treat_payload_as_its_own_qualifier() {
+        let mut design = Netlist::new("self_qualified_payload");
+        let clock = design.add_input("clock");
+        let reset = design.add_input("reset");
+        let update = design.add_input("update");
+        let payload = design.add_register_output("payload");
+        let payload_next = design.add_mux(update, update, payload);
+        design.add_register(RegisterCell::new(
+            "payload",
+            payload,
+            payload_next,
+            clock,
+            IrClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: false,
+            }),
+        ));
+        design.add_output("payload_out", payload);
+
+        let reports = default_pipeline().run(&mut design).unwrap();
+
+        assert!(design.registers()[0].enable().is_some());
+        assert_eq!(
+            reports[1].message,
+            "removed 0 clock enables from valid-qualified payload registers"
+        );
+    }
+
+    fn qualified_payload_netlist(direct_output: bool, self_dependent: bool) -> Netlist {
+        let mut design = Netlist::new("qualified_payload");
+        let clock = design.add_input("clock");
+        let reset = design.add_input("reset");
+        let update = design.add_input("update");
+        let data = design.add_input("data");
+        let valid = design.add_register_output("valid");
+        let payload = design.add_register_output("payload");
+        let observed = design.add_register_output("observed");
+        let reset_control = Some(ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: false,
+        });
+        let payload_data = if self_dependent {
+            design.add_not(payload)
+        } else {
+            data
+        };
+        let payload_next = design.add_mux(update, payload_data, payload);
+        let observed_next = design.add_mux(valid, payload, observed);
+        design.add_register(RegisterCell::new(
+            "valid",
+            valid,
+            update,
+            clock,
+            IrClockEdge::Rising,
+            None,
+            reset_control,
+        ));
+        design.add_register(RegisterCell::new(
+            "payload",
+            payload,
+            payload_next,
+            clock,
+            IrClockEdge::Rising,
+            None,
+            reset_control,
+        ));
+        design.add_register(RegisterCell::new(
+            "observed",
+            observed,
+            observed_next,
+            clock,
+            IrClockEdge::Rising,
+            None,
+            reset_control,
+        ));
+        design.add_output("observed_out", observed);
+        if direct_output {
+            design.add_output("payload_out", payload);
+        }
+        design
     }
 
     fn input_word(name: &str, width: usize, value: u64) -> HashMap<String, bool> {

@@ -600,32 +600,14 @@ module Axi4QosArbiterRegister (
     tie_break: input  logic          <4>,
     grant    : output logic          <2>,
 ) {
-    var next_grant  : logic<2>;
-    var qos1_greater: logic   ;
-    var qos_equal   : logic   ;
-    var prefer1     : logic   ;
+    var next_grant: logic<2>;
 
-    always_comb {
-        prefer1 = qos1_greater || (qos_equal && tie_break[2]);
-        if request == 2'b11 {
-            next_grant = if prefer1 ? 2'b10 : 2'b01;
-        } else {
-            next_grant = request;
-        }
-    }
-
-    // Payload QoS and the round-robin order settle several decoder stages
-    // before a request can arrive. Register their comparison so the grant
-    // pulse only contains request gating and a two-way selection.
-    always_ff (clk, rst_n) {
-        if_reset {
-            qos1_greater = 1'b0;
-            qos_equal    = 1'b0;
-        } else {
-            qos1_greater = qos[7:4] >: qos[3:0];
-            qos_equal    = qos[7:4] == qos[3:0];
-        }
-    }
+    inst arbiter: Axi4QosArbiter::<2> (
+        request  : request   ,
+        qos      : qos       ,
+        tie_break: tie_break ,
+        grant    : next_grant,
+    );
 
     always_ff (clk, rst_n) {
         if_reset {
@@ -989,6 +971,8 @@ module Axi4Crossbar2x2 (
     // Capture read-slot allocation as a one-cycle event. The address skid
     // register blocks another AR immediately, while this register boundary
     // removes the outstanding-ID comparison from the slot state feedback.
+    // Synthesis may update the qualified payload bits unconditionally because
+    // they are only observed while the reserve pulse is high.
     always_ff (clk, rst_n) {
         if_reset {
             s0_r_reserve       = 1'b0;
@@ -998,12 +982,16 @@ module Axi4Crossbar2x2 (
             s1_r_reserve_slot1 = 1'b0;
             s1_r_reserve_id    = 4'b0;
         } else {
-            s0_r_reserve       = s0_ar_full && !s0_ar_reserved && s0_r_can_accept;
-            s0_r_reserve_slot1 = s0_r_slot0_valid;
-            s0_r_reserve_id    = s0_ar_payload[48:45];
-            s1_r_reserve       = s1_ar_full && !s1_ar_reserved && s1_r_can_accept;
-            s1_r_reserve_slot1 = s1_r_slot0_valid;
-            s1_r_reserve_id    = s1_ar_payload[48:45];
+            s0_r_reserve = s0_ar_full && !s0_ar_reserved && s0_r_can_accept;
+            if s0_ar_full && !s0_ar_reserved && s0_r_can_accept {
+                s0_r_reserve_slot1 = s0_r_slot0_valid;
+                s0_r_reserve_id    = s0_ar_payload[48:45];
+            }
+            s1_r_reserve = s1_ar_full && !s1_ar_reserved && s1_r_can_accept;
+            if s1_ar_full && !s1_ar_reserved && s1_r_can_accept {
+                s1_r_reserve_slot1 = s1_r_slot0_valid;
+                s1_r_reserve_id    = s1_ar_payload[48:45];
+            }
         }
     }
 
