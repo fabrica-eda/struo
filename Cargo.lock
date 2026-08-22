@@ -3075,10 +3075,19 @@ version = "0.1.0"
 dependencies = [
  "celox",
  "struo-celox",
+ "struo-formal",
  "struo-frontend-veryl",
+ "struo-ir",
  "struo-rtl",
  "struo-synth",
  "struo-target-ecp5",
+]
+
+[[package]]
+name = "struo-formal"
+version = "0.1.0"
+dependencies = [
+ "struo-ir",
 ]
 
 [[package]]

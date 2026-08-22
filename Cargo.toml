@@ -2,6 +2,7 @@
 members = [
     "crates/struo-cli",
     "crates/struo-celox",
+    "crates/struo-formal",
     "crates/struo-frontend-veryl",
     "crates/struo-ir",
     "crates/struo-rtl",

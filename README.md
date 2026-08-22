@@ -31,6 +31,8 @@ Crate responsibilities:
 - `struo-frontend-veryl`: adapter pinned to an exact `veryl-analyzer` version
 - `struo-rtl`: frontend-independent RTL that preserves hardware semantics
 - `struo-ir`: low-level netlist manipulated by synthesis passes
+- `struo-formal`: native transition systems, AIG/SAT equivalence, and
+  transformation-certificate checking
 - `struo-synth`: RTL validation, lowering, and optimization pipeline
 - `struo-sim`: equivalence policy and release gates
 - `struo-celox`: Celox SDK adapter for technology-mapped netlists
@@ -88,6 +90,19 @@ independent nextpnr branch writes Yosys-compatible JSON. Verilog is not an
 intermediate representation in this path. Reference simulation continues to
 use Celox's Veryl frontend and native execution backend; Struo's internal
 synthesis IR is not exported back to Celox.
+
+`struo-formal` owns the equivalence semantics without a Verilog, Yosys, EQY,
+or ABC round trip. It bit-blasts Struo Boolean, arithmetic, comparison,
+register-enable, and reset semantics into a structurally hashed AIG, solves the
+resulting miters with an internal CDCL SAT kernel, and combines complete base
+checks with k-induction. Matching state names are used as correspondence hints
+only after their reachable base cases are proved; invalid hints are discarded.
+Non-equivalence returns a named input trace through the first mismatching
+output cycle. The initial transition-system path requires one clock domain,
+known reset-derived state, and no retained memory. A separate linear-time
+certificate checker validates boundary-preserving, reset-to-zero retiming over
+zero-preserving truth-table vertices. Unsupported proof cases remain
+inconclusive or fail construction instead of being accepted as equivalent.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under

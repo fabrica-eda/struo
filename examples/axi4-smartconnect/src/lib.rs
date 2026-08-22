@@ -48,6 +48,8 @@ mod tests {
 
     use celox::{NativeBackend, NativeProgramImage, SignalRef, Simulator, SimulatorBuilder};
     use struo_celox::ecp5_simulator;
+    use struo_formal::{EquivalenceStatus, TransitionSystem, prove_sequential_equivalence};
+    use struo_ir::ActiveLevel;
     use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
 
@@ -122,6 +124,32 @@ mod tests {
             tick(&mut simulator);
             assert_value(&mut simulator, "match", 0);
         }
+    }
+
+    #[test]
+    fn proves_axi4_control_pipeline_across_equivalent_state_encodings() {
+        let design = axi4_crossbar_2x2().unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let gold = TransitionSystem::from_netlist(&synthesized.netlist).unwrap();
+        let mut rewritten = synthesized.netlist;
+        let register_index = rewritten
+            .registers()
+            .iter()
+            .position(|register| register.enable().is_some())
+            .unwrap();
+        let register = rewritten.registers()[register_index].clone();
+        let enable = register.enable().unwrap();
+        let feedback = if enable.active == ActiveLevel::High {
+            rewritten.add_mux(enable.signal, register.data(), register.output())
+        } else {
+            rewritten.add_mux(enable.signal, register.output(), register.data())
+        };
+        rewritten.registers_mut()[register_index].set_data_and_enable(feedback, None);
+        let gate = TransitionSystem::from_netlist(&rewritten).unwrap();
+
+        let result = prove_sequential_equivalence(&gold, &gate, 2).unwrap();
+
+        assert_eq!(result.status(), EquivalenceStatus::Equivalent);
     }
 
     #[test]

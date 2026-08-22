@@ -1,0 +1,14 @@
+[package]
+name = "struo-formal"
+description = "Native equivalence checking and transformation certificates for Struo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+struo-ir = { path = "../struo-ir" }
+
+[lints]
+workspace = true
