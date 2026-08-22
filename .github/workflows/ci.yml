@@ -109,7 +109,10 @@ jobs:
               --textcfg "build/ci/axi4-smartconnect/seed-${seed}.config" \
               --report "build/ci/axi4-smartconnect/seed-${seed}-report.json" \
               --log "build/ci/axi4-smartconnect/seed-${seed}.log" \
-              --freq 250 \
+              --freq 300 \
+              --placer-budgets \
+              --placer-heap-timingweight 30 \
+              --tmg-ripup \
               --timing-allow-fail \
               --seed "$seed"
           done
@@ -157,11 +160,11 @@ jobs:
               done
           } | tee --append "$GITHUB_STEP_SUMMARY"
 
-      - name: Require board-clock timing
+      - name: Require stable 300 MHz timing
         run: |
           awk -F '\t' '
-            NR > 1 && $3 < 12 {
-              printf "seed %s failed the 12 MHz board-clock requirement (%.2f MHz)\n", \
+            NR > 1 && $3 < 300 {
+              printf "seed %s failed the 300 MHz QoR requirement (%.2f MHz)\n", \
                 $1, $3 > "/dev/stderr"
               failed = 1
             }
