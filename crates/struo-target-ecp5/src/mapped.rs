@@ -344,6 +344,38 @@ impl Ecp5Netlist {
         self.retiming
     }
 
+    /// Returns source netlist register names for physically critical sink FFs
+    /// that still retain their original `ff_` mapping identity.
+    ///
+    /// Physically retimed/generated FFs deliberately have no source-level
+    /// answer here. Callers can therefore use this set to request a local
+    /// source-netlist alternative without guessing at state provenance.
+    #[must_use]
+    pub fn physically_critical_original_registers(
+        &self,
+        feedback: &PhysicalFeedback,
+    ) -> BTreeSet<String> {
+        feedback
+            .critical_paths()
+            .iter()
+            .filter(|path| path.register_to_register)
+            .filter_map(|path| {
+                path.cells.iter().rev().find_map(|physical_name| {
+                    self.cells.iter().find_map(|cell| {
+                        let Ecp5Cell::FlipFlop { name, .. } = cell else {
+                            return None;
+                        };
+                        if physical_path_matches_mapped_cell(physical_name, name) {
+                            name.strip_prefix("ff_").map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+            .collect()
+    }
+
     /// Serializes this exact mapped object to the Yosys JSON schema consumed by
     /// nextpnr-ecp5.
     ///
@@ -4184,7 +4216,7 @@ fn block_ram_parameters(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::num::NonZeroU32;
 
     use struo_ir::{
@@ -4209,6 +4241,41 @@ mod tests {
         let result = source.add_arithmetic(operation, &lhs, &rhs).unwrap();
         source.add_output_port("result", &result).unwrap();
         source
+    }
+
+    #[test]
+    fn maps_physical_critical_sink_back_to_original_register_name() {
+        let mut source = Netlist::new("critical_origin");
+        let clock = source.add_input("clock");
+        let data = source.add_input("data");
+        let state = source.add_register_output("state_q");
+        source.add_register(RegisterCell::new(
+            "state_q",
+            state,
+            data,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        let mapped = map_to_ecp5(&source).unwrap();
+        let report = r#"{
+            "critical_paths": [{
+                "from": "posedge clock",
+                "path": [{
+                    "delay": 3.0,
+                    "from": {"cell": "driver"},
+                    "to": {"cell": "ff_state_q$nextpnr_suffix"}
+                }],
+                "to": "posedge clock"
+            }]
+        }"#;
+        let feedback = PhysicalFeedback::from_nextpnr_json(report, r#"{"modules":{}}"#).unwrap();
+
+        assert_eq!(
+            mapped.physically_critical_original_registers(&feedback),
+            BTreeSet::from(["state_q".to_owned()])
+        );
     }
 
     #[test]

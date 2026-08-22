@@ -1,11 +1,11 @@
 //! Command-line entry point for Struo.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
-use std::process::ExitCode;
-
 use std::fs;
 use std::path::Path;
+use std::process::ExitCode;
 
 use struo_celox::ecp5_simulator;
 use struo_example_axi4_smartconnect::{axi4_crossbar_2x2, axi4_crossbar_self_test};
@@ -14,10 +14,10 @@ use struo_rtl::{
     Register, Reset, ResetMode, StateDomain, ValueType,
 };
 use struo_sim::VerificationPolicy;
-use struo_synth::synthesize;
+use struo_synth::{InferTargetedNestedRegisterEnables, Pass, synthesize};
 use struo_target_ecp5::{
-    ArithmeticMapping, ECP5_QOR_TARGET_MHZ, Ecp5Cell, Ecp5Flow, MappingOptions, PhysicalFeedback,
-    map_to_ecp5, map_to_ecp5_with_options,
+    ArithmeticMapping, ECP5_QOR_TARGET_MHZ, Ecp5Cell, Ecp5Flow, MAX_PHYSICAL_CANDIDATES,
+    MappingOptions, PhysicalFeedback, map_to_ecp5, map_to_ecp5_with_options,
 };
 
 const USAGE: &str = "\
@@ -163,20 +163,42 @@ fn run_axi4_self_test(
     for report in &synthesized.reports {
         println!("{}: {}", report.pass, report.message);
     }
-    let mapped = map_to_ecp5_with_options(
-        &synthesized.netlist,
-        MappingOptions {
-            timing_goal_mhz,
-            ..MappingOptions::default()
-        },
-    )?;
+    let mapping_options = MappingOptions {
+        timing_goal_mhz,
+        ..MappingOptions::default()
+    };
+    let mapped = map_to_ecp5_with_options(&synthesized.netlist, mapping_options)?;
     let (mapped, additional_candidates) = match (draft_report, draft_placed_json) {
         (Some(report), Some(placed)) => {
             let feedback = PhysicalFeedback::from_nextpnr_json(
                 &fs::read_to_string(report)?,
                 &fs::read_to_string(placed)?,
             )?;
-            let mut candidates = mapped.physical_feedback_candidates(&feedback).into_iter();
+            let mut physical_candidates = mapped.physical_feedback_candidates(&feedback);
+            let critical_registers = if feedback.meets_timing_goal() {
+                BTreeSet::new()
+            } else {
+                mapped.physically_critical_original_registers(&feedback)
+            };
+            if !critical_registers.is_empty() {
+                let mut enable_netlist = synthesized.netlist.clone();
+                let before = enable_netlist.clone();
+                let report = InferTargetedNestedRegisterEnables::new(critical_registers)
+                    .run(&mut enable_netlist)?;
+                println!("{}: {}", report.pass, report.message);
+                if enable_netlist != before {
+                    let enable_candidate =
+                        map_to_ecp5_with_options(&enable_netlist, mapping_options)?;
+                    if enable_candidate != mapped
+                        && !physical_candidates.contains(&enable_candidate)
+                    {
+                        let index = usize::from(!physical_candidates.is_empty());
+                        physical_candidates.insert(index, enable_candidate);
+                        physical_candidates.truncate(MAX_PHYSICAL_CANDIDATES);
+                    }
+                }
+            }
+            let mut candidates = physical_candidates.into_iter();
             let refined = candidates.next().unwrap_or_else(|| mapped.clone());
             let additional_candidates = candidates.collect::<Vec<_>>();
             println!(

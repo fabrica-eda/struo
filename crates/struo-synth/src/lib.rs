@@ -2,7 +2,7 @@
 
 mod retiming;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU32;
@@ -725,6 +725,207 @@ impl Pass for InferRegisterEnables {
     }
 }
 
+/// Infers clock enables from nested register self-hold mux trees, restricted
+/// to the named registers selected by physical timing feedback.
+///
+/// Unlike [`InferRegisterEnables`], this is not part of the default pipeline.
+/// It exists to construct an equivalent implementation candidate for bounded
+/// same-seed physical evaluation. Every rewrite carries a structural
+/// certificate whose leaves distinguish the register's exact Q output from
+/// ordinary update expressions. Update data and selects may depend on Q; the
+/// reconstructed enable/data pair still denotes the same transition relation.
+pub struct InferTargetedNestedRegisterEnables {
+    register_names: BTreeSet<String>,
+}
+
+impl InferTargetedNestedRegisterEnables {
+    /// Creates a targeted inference pass for stable bit-level register names.
+    #[must_use]
+    pub fn new(register_names: BTreeSet<String>) -> Self {
+        Self { register_names }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TransitionCertificate {
+    Hold(NetId),
+    Update(NetId),
+    Mux {
+        output: NetId,
+        condition: NetId,
+        then_transition: Box<Self>,
+        else_transition: Box<Self>,
+    },
+}
+
+impl TransitionCertificate {
+    fn mux_count(&self) -> usize {
+        match self {
+            Self::Hold(_) | Self::Update(_) => 0,
+            Self::Mux {
+                then_transition,
+                else_transition,
+                ..
+            } => 1 + then_transition.mux_count() + else_transition.mux_count(),
+        }
+    }
+}
+
+impl Pass for InferTargetedNestedRegisterEnables {
+    fn name(&self) -> &'static str {
+        "infer-targeted-nested-register-enables"
+    }
+
+    fn run(&self, design: &mut Netlist) -> Result<PassReport, SynthesisError> {
+        let mut rewrites = Vec::new();
+        for (index, register) in design.registers().iter().enumerate() {
+            if !self.register_names.contains(register.name()) || register.enable().is_some() {
+                continue;
+            }
+            let Some(certificate) =
+                certify_self_hold_mux_tree(design, register.data(), register.output())
+            else {
+                continue;
+            };
+            if certificate.mux_count() < 2
+                || !verify_transition_certificate(
+                    design,
+                    &certificate,
+                    register.data(),
+                    register.output(),
+                )
+            {
+                continue;
+            }
+            rewrites.push((index, certificate));
+        }
+
+        let mut converted = 0usize;
+        for (index, certificate) in rewrites {
+            let Some((enable, Some(data))) = materialize_transition(design, &certificate) else {
+                continue;
+            };
+            if design.constant_value(enable).is_some() {
+                continue;
+            }
+            design.registers_mut()[index].set_data_and_enable(
+                data,
+                Some(EnableControl {
+                    signal: enable,
+                    active: ActiveLevel::High,
+                }),
+            );
+            converted += 1;
+        }
+        design.validate()?;
+        Ok(PassReport {
+            pass: self.name(),
+            message: format!(
+                "proved and converted {converted} physically targeted nested feedback muxes to clock enables"
+            ),
+        })
+    }
+}
+
+fn certify_self_hold_mux_tree(
+    design: &Netlist,
+    net: NetId,
+    register_output: NetId,
+) -> Option<TransitionCertificate> {
+    if net == register_output {
+        return Some(TransitionCertificate::Hold(net));
+    }
+    let node = design.nodes().get(net.index() as usize)?;
+    if !matches!(node.kind(), NodeKind::Mux) {
+        return Some(TransitionCertificate::Update(net));
+    }
+    let [condition, then_net, else_net] = node.inputs() else {
+        return None;
+    };
+    Some(TransitionCertificate::Mux {
+        output: net,
+        condition: *condition,
+        then_transition: Box::new(certify_self_hold_mux_tree(
+            design,
+            *then_net,
+            register_output,
+        )?),
+        else_transition: Box::new(certify_self_hold_mux_tree(
+            design,
+            *else_net,
+            register_output,
+        )?),
+    })
+}
+
+fn verify_transition_certificate(
+    design: &Netlist,
+    certificate: &TransitionCertificate,
+    expected: NetId,
+    register_output: NetId,
+) -> bool {
+    match certificate {
+        TransitionCertificate::Hold(net) => *net == expected && *net == register_output,
+        TransitionCertificate::Update(net) => *net == expected && *net != register_output,
+        TransitionCertificate::Mux {
+            output,
+            condition,
+            then_transition,
+            else_transition,
+        } => {
+            let Some(node) = design.nodes().get(output.index() as usize) else {
+                return false;
+            };
+            let [actual_condition, then_net, else_net] = node.inputs() else {
+                return false;
+            };
+            *output == expected
+                && matches!(node.kind(), NodeKind::Mux)
+                && condition == actual_condition
+                && verify_transition_certificate(
+                    design,
+                    then_transition,
+                    *then_net,
+                    register_output,
+                )
+                && verify_transition_certificate(
+                    design,
+                    else_transition,
+                    *else_net,
+                    register_output,
+                )
+        }
+    }
+}
+
+fn materialize_transition(
+    design: &mut Netlist,
+    certificate: &TransitionCertificate,
+) -> Option<(NetId, Option<NetId>)> {
+    match certificate {
+        TransitionCertificate::Hold(_) => Some((design.add_constant(false), None)),
+        TransitionCertificate::Update(data) => Some((design.add_constant(true), Some(*data))),
+        TransitionCertificate::Mux {
+            condition,
+            then_transition,
+            else_transition,
+            ..
+        } => {
+            let (then_enable, then_data) = materialize_transition(design, then_transition)?;
+            let (else_enable, else_data) = materialize_transition(design, else_transition)?;
+            let enable = design.add_mux(*condition, then_enable, else_enable);
+            let data = match (then_data, else_data) {
+                (Some(then_data), Some(else_data)) => {
+                    Some(design.add_mux(*condition, then_data, else_data))
+                }
+                (Some(data), None) | (None, Some(data)) => Some(data),
+                (None, None) => None,
+            };
+            Some((enable, data))
+        }
+    }
+}
+
 /// Removes a payload clock enable when a companion valid register proves that
 /// the payload is unobservable while the enable is inactive.
 ///
@@ -1115,8 +1316,9 @@ impl From<ValidationError> for SynthesisError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
+    use struo_formal::{EquivalenceStatus, TransitionSystem, prove_sequential_equivalence};
     use struo_ir::{
         ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, ComparisonOp, NetId, Netlist,
         NodeKind, RegisterCell, ResetControl,
@@ -1126,7 +1328,7 @@ mod tests {
         PortDirection, Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
     };
 
-    use super::{default_pipeline, synthesize};
+    use super::{InferTargetedNestedRegisterEnables, Pass, default_pipeline, synthesize};
 
     fn bits(width: u32) -> ValueType {
         ValueType {
@@ -1463,6 +1665,106 @@ mod tests {
                 "converted 1 register feedback muxes to clock enables"
             );
         }
+    }
+
+    #[test]
+    fn proves_targeted_nested_self_hold_tree_before_inferring_enable() {
+        let mut netlist = Netlist::new("nested_enable");
+        let clock = netlist.add_input("clock");
+        let reset = netlist.add_input("reset");
+        let first_select = netlist.add_input("first_select");
+        let second_select = netlist.add_input("second_select");
+        let first_data = netlist.add_input("first_data");
+        let second_data = netlist.add_input("second_data");
+        let state = netlist.add_register_output("state_q");
+        let other_state = netlist.add_register_output("other_q");
+        let inner = netlist.add_mux(second_select, second_data, state);
+        let next = netlist.add_mux(first_select, first_data, inner);
+        let other_inner = netlist.add_mux(second_select, second_data, other_state);
+        let other_next = netlist.add_mux(first_select, first_data, other_inner);
+        let reset_control = ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: false,
+        };
+        netlist.add_register(RegisterCell::new(
+            "state_q",
+            state,
+            next,
+            clock,
+            IrClockEdge::Rising,
+            None,
+            Some(reset_control),
+        ));
+        netlist.add_register(RegisterCell::new(
+            "other_q",
+            other_state,
+            other_next,
+            clock,
+            IrClockEdge::Rising,
+            None,
+            Some(reset_control),
+        ));
+        netlist.add_output("state", state);
+        let before = netlist.clone();
+
+        let report =
+            InferTargetedNestedRegisterEnables::new(BTreeSet::from(["state_q".to_owned()]))
+                .run(&mut netlist)
+                .unwrap();
+
+        let register = &netlist.registers()[0];
+        let enable = register.enable().unwrap();
+        assert_eq!(enable.active, ActiveLevel::High);
+        assert_ne!(enable.signal, next);
+        assert_ne!(register.data(), state);
+        assert!(netlist.registers()[1].enable().is_none());
+        let gold = TransitionSystem::from_netlist(&before).unwrap();
+        let gate = TransitionSystem::from_netlist(&netlist).unwrap();
+        assert_eq!(
+            prove_sequential_equivalence(&gold, &gate, 2)
+                .unwrap()
+                .status(),
+            EquivalenceStatus::Equivalent
+        );
+        assert_eq!(
+            report.message,
+            "proved and converted 1 physically targeted nested feedback muxes to clock enables"
+        );
+    }
+
+    #[test]
+    fn accepts_state_dependent_select_and_update_data() {
+        let mut netlist = Netlist::new("state_dependent_nested_enable");
+        let clock = netlist.add_input("clock");
+        let select = netlist.add_input("select");
+        let data = netlist.add_input("data");
+        let state = netlist.add_register_output("state_q");
+        let state_dependent_select = netlist.add_xor(state, select);
+        let state_dependent_data = netlist.add_xor(state, data);
+        let inner = netlist.add_mux(select, state_dependent_data, state);
+        let next = netlist.add_mux(state_dependent_select, data, inner);
+        netlist.add_register(RegisterCell::new(
+            "state_q",
+            state,
+            next,
+            clock,
+            IrClockEdge::Rising,
+            None,
+            None,
+        ));
+
+        let report =
+            InferTargetedNestedRegisterEnables::new(BTreeSet::from(["state_q".to_owned()]))
+                .run(&mut netlist)
+                .unwrap();
+
+        assert!(netlist.registers()[0].enable().is_some());
+        assert_eq!(
+            report.message,
+            "proved and converted 1 physically targeted nested feedback muxes to clock enables"
+        );
     }
 
     #[test]

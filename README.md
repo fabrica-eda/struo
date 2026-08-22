@@ -140,10 +140,15 @@ goal, where a small routing repair is appropriate. If no such branch exists and
 the design is within 95 percent, the reported register-to-register critical
 path guides a whole-LUT boundary move at its sink. The move is checked by the
 retiming certificate machinery, including reset derivation, before it becomes
-an implementation candidate. A bounded search also tries the opposite
+an implementation candidate. When the critical sink still has its original
+register identity, synthesis also clones the target-independent netlist and
+extracts a clock enable from that register's nested self-hold mux tree. A
+constructive transition certificate distinguishes exact Q-hold leaves from
+update leaves before the alternative is remapped. This is a physical candidate,
+not a blanket default rewrite. A bounded search also tries the opposite
 registered-input cut and one additional critical-cone move, emitting at most
-three proof-signed JSON candidates without another optimization switch. Clock,
-reset, and enable nets are excluded from
+three proof-checked JSON candidates without another optimization switch.
+Clock, reset, and enable nets are excluded from
 generic data rewrites. LUT replication retains compatible draft BELs; retiming
 changes packing boundaries and therefore receives a fresh placement with the
 same fixed seed. `Ecp5Flow::draft_place_and_route_command` and
