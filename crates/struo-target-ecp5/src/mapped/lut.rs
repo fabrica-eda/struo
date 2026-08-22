@@ -15,15 +15,15 @@ const CRITICALITY_DENOMINATOR: u32 = 32;
 // Conservative pre-route delay estimates for an ECP5 speed-grade 8. These
 // are deliberately architecture-level costs rather than sign-off numbers;
 // nextpnr remains the source of truth after placement and routing.
-const LUT_DELAY_PS: u32 = 100;
+pub(super) const LUT_DELAY_PS: u32 = 100;
 const ROUTE_BASE_PS: u32 = 300;
 const ROUTE_FANOUT_STEP_PS: u32 = 40;
-const CCU_INPUT_PS: u32 = 200;
-const CCU_CARRY_PS: u32 = 60;
-const CCU_SUM_PS: u32 = 100;
-const BRAM_CLOCK_TO_OUTPUT_PS: u32 = 850;
-const FLIP_FLOP_CLOCK_TO_OUTPUT_PS: u32 = 300;
-const FLIP_FLOP_SETUP_PS: u32 = 120;
+pub(super) const CCU_INPUT_PS: u32 = 200;
+pub(super) const CCU_CARRY_PS: u32 = 60;
+pub(super) const CCU_SUM_PS: u32 = 100;
+pub(super) const BRAM_CLOCK_TO_OUTPUT_PS: u32 = 850;
+pub(super) const FLIP_FLOP_CLOCK_TO_OUTPUT_PS: u32 = 300;
+pub(super) const FLIP_FLOP_SETUP_PS: u32 = 120;
 const BRAM_SETUP_PS: u32 = 300;
 
 #[derive(Clone, Debug)]
@@ -368,7 +368,7 @@ fn structural_fanouts(netlist: &Netlist) -> Vec<usize> {
     fanouts
 }
 
-fn wire_delay_ps(fanout: usize) -> u32 {
+pub(super) fn wire_delay_ps(fanout: usize) -> u32 {
     let fanout = fanout.max(1);
     let levels = usize::BITS - (fanout - 1).leading_zeros();
     ROUTE_BASE_PS + ROUTE_FANOUT_STEP_PS * levels

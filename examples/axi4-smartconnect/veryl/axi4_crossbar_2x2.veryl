@@ -253,9 +253,7 @@ module Axi4BurstDecoderPipeline (
     var stage1_last_mask     : logic<17>;
     var stage1_protocol_valid: logic    ;
     var stage2_valid         : logic    ;
-    var stage2_addr          : logic<16>;
     var stage2_last_address  : logic<17>;
-    var stage2_protocol_valid: logic    ;
     var input_beat_mask      : logic<17>;
     var input_burst_mask     : logic<17>;
     var input_size_valid     : logic    ;
@@ -318,8 +316,25 @@ module Axi4BurstDecoderPipeline (
         }
 
         stage1_last_address = stage1_last_base + stage1_last_mask;
-        stage2_within_4k    = !stage2_last_address[16] && (stage2_addr[15:12] == stage2_last_address[15:12]);
+        stage2_within_4k    = !stage2_last_address[16] && (stage1_addr[15:12] == stage2_last_address[15:12]);
         in_ready            = !pre_valid && !stage0_valid && !stage1_valid && !stage2_valid && !out_valid;
+    }
+
+    // Only the adder result needs another physical boundary. The single-flight
+    // handshake keeps stage1 metadata stable until this result is consumed.
+    always_ff (clk, rst_n) {
+        if_reset {
+            stage2_valid        = 1'b0;
+            stage2_last_address = 17'b0;
+        } else {
+            if stage2_valid {
+                stage2_valid = 1'b0;
+            }
+            if stage1_valid {
+                stage2_valid        = 1'b1;
+                stage2_last_address = stage1_last_address;
+            }
+        }
     }
 
     always_ff (clk, rst_n) {
@@ -412,25 +427,6 @@ module Axi4BurstDecoderPipeline (
 
     always_ff (clk, rst_n) {
         if_reset {
-            stage2_valid          = 1'b0;
-            stage2_addr           = 16'b0;
-            stage2_last_address   = 17'b0;
-            stage2_protocol_valid = 1'b0;
-        } else {
-            if stage2_valid {
-                stage2_valid = 1'b0;
-            }
-            if stage1_valid {
-                stage2_valid          = 1'b1;
-                stage2_addr           = stage1_addr;
-                stage2_last_address   = stage1_last_address;
-                stage2_protocol_valid = stage1_protocol_valid;
-            }
-        }
-    }
-
-    always_ff (clk, rst_n) {
-        if_reset {
             out_valid    = 1'b0;
             target0      = 1'b0;
             target1      = 1'b0;
@@ -441,13 +437,13 @@ module Axi4BurstDecoderPipeline (
             }
             if stage2_valid {
                 out_valid    = 1'b1;
-                target0      = stage2_protocol_valid && stage2_within_4k && (stage2_addr[15:14] == 2'b00)
+                target0      = stage1_protocol_valid && stage2_within_4k && (stage1_addr[15:14] == 2'b00)
                     && (stage2_last_address[15:14] == 2'b00);
-                target1      = stage2_protocol_valid && stage2_within_4k && (stage2_addr[15:14] == 2'b10)
+                target1      = stage1_protocol_valid && stage2_within_4k && (stage1_addr[15:14] == 2'b10)
                     && (stage2_last_address[15:14] == 2'b10);
-                decode_error = !(stage2_protocol_valid && stage2_within_4k
-                    && (((stage2_addr[15:14] == 2'b00) && (stage2_last_address[15:14] == 2'b00))
-                        || ((stage2_addr[15:14] == 2'b10) && (stage2_last_address[15:14] == 2'b10))));
+                decode_error = !(stage1_protocol_valid && stage2_within_4k
+                    && (((stage1_addr[15:14] == 2'b00) && (stage2_last_address[15:14] == 2'b00))
+                        || ((stage1_addr[15:14] == 2'b10) && (stage2_last_address[15:14] == 2'b10))));
             }
         }
     }

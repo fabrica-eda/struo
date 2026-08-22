@@ -1,6 +1,6 @@
 //! ECP5 technology mapping and nextpnr serialization.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -17,7 +17,19 @@ use struo_ir::{
 
 mod lut;
 
-use lut::{CutDatabase, LutCover, LutEmitter};
+use lut::{
+    BRAM_CLOCK_TO_OUTPUT_PS, CCU_CARRY_PS, CCU_INPUT_PS, CCU_SUM_PS, CutDatabase,
+    FLIP_FLOP_CLOCK_TO_OUTPUT_PS, FLIP_FLOP_SETUP_PS, LUT_DELAY_PS, LutCover, LutEmitter,
+    wire_delay_ps,
+};
+
+const RETIMING_PERIOD_MARGIN_NUMERATOR: u32 = 9;
+const RETIMING_PERIOD_MARGIN_DENOMINATOR: u32 = 10;
+// The pre-placement fanout model deliberately stays optimistic so LUT covering
+// does not overfit one device floorplan.  Once primitives are fixed, retiming
+// needs a routing guard per ordinary hop: measured ECP5 AXI paths average about
+// 100 ps more than that model, while dedicated carry hops bypass this charge.
+const MAPPED_ROUTE_GUARD_PS: u32 = 100;
 
 /// A constant or numbered wire in a mapped ECP5 design.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -327,15 +339,22 @@ pub fn map_to_ecp5_with_options(
     netlist: &Netlist,
     options: MappingOptions,
 ) -> Result<Ecp5Netlist, MappingError> {
-    let (mut selected, original_quality) = map_once(netlist, options)?;
+    let (mut selected, _) = map_once(netlist, options)?;
     let original_cells = selected.cells.len();
     let original_registers = netlist.registers().len();
     let mut selected_registers = original_registers;
     let mut applied = false;
     let mapped_original_profile = mapped_lut_profile(&selected);
-    if let Some(retimed) =
-        automatically_retime_mapped_luts(&selected, original_cells, original_registers)
-    {
+    let target_period_ps = 1_000_000u32
+        .div_ceil(options.timing_goal_mhz.max(1))
+        .saturating_mul(RETIMING_PERIOD_MARGIN_NUMERATOR)
+        / RETIMING_PERIOD_MARGIN_DENOMINATOR;
+    if let Some(retimed) = automatically_retime_mapped_luts(
+        &selected,
+        original_cells,
+        original_registers,
+        target_period_ps,
+    ) {
         selected = retimed;
         selected_registers = mapped_register_count(&selected);
         applied = true;
@@ -345,55 +364,65 @@ pub fn map_to_ecp5_with_options(
         applied,
         original_lut_depth: mapped_original_profile.data_depth,
         selected_lut_depth: mapped_selected_profile.data_depth,
-        original_critical_registers: mapped_original_profile.critical_data.len(),
-        selected_critical_registers: mapped_selected_profile.critical_data.len(),
-        original_period_ps: original_quality.period_ps,
-        selected_period_ps: original_quality.period_ps,
+        original_critical_registers: mapped_original_profile.critical_depth.len(),
+        selected_critical_registers: mapped_selected_profile.critical_depth.len(),
+        original_period_ps: mapped_original_profile.data_period_ps,
+        selected_period_ps: mapped_selected_profile.data_period_ps,
         original_registers,
         selected_registers,
     };
     Ok(selected)
 }
 
+#[allow(clippy::too_many_lines)]
 fn automatically_retime_mapped_luts(
     original: &Ecp5Netlist,
     original_cells: usize,
     original_registers: usize,
+    target_period_ps: u32,
 ) -> Option<Ecp5Netlist> {
     let original_profile = mapped_lut_profile(original);
     let original_depth = original_profile.data_depth;
+    let timing_driven = original_profile.data_period_ps > target_period_ps;
     let cell_limit = original_cells + original_cells.div_ceil(10);
     let register_limit = original_registers + original_registers.div_ceil(5);
     let mut frontier = original.clone();
+    let mut plateau_budget = 2usize;
     for _ in 0..64 {
         let profile = mapped_lut_profile(&frontier);
-        if profile.data_depth < original_depth {
+        if (timing_driven && profile.data_period_ps <= target_period_ps)
+            || (!timing_driven && profile.data_depth < original_depth)
+        {
             return Some(frontier);
         }
         let mut best = None;
-        for &register in &profile.critical_data {
+        let critical = if timing_driven {
+            profile.critical_timing.clone()
+        } else {
+            profile.critical_depth.clone()
+        };
+        for &register in &critical {
             let Some(candidate) = backward_retime_lut(&frontier, register) else {
                 continue;
             };
             let candidate_profile = mapped_lut_profile(&candidate);
             let candidate_registers = mapped_register_count(&candidate);
-            if candidate_profile.overall_depth > original_profile.overall_depth
+            if (!timing_driven && candidate_profile.overall_depth > original_profile.overall_depth)
+                || candidate_profile.overall_period_ps > original_profile.overall_period_ps
                 || candidate.cells.len() > cell_limit
                 || candidate_registers > register_limit
             {
                 continue;
             }
-            let score = (
-                candidate_profile.data_depth,
-                candidate_profile.critical_data.len(),
-                candidate_profile.overall_depth,
+            let score = retiming_score(
+                &candidate_profile,
+                timing_driven,
                 candidate.cells.len(),
                 candidate_registers,
             );
-            let frontier_score = (
-                profile.data_depth,
-                profile.critical_data.len(),
-                profile.overall_depth,
+            let frontier_score = retiming_score(
+                &profile,
+                timing_driven,
                 frontier.cells.len(),
                 mapped_register_count(&frontier),
             );
@@ -405,20 +434,111 @@ fn automatically_retime_mapped_luts(
                 best = Some((candidate, score));
             }
         }
-        let Some((candidate, _)) = best else {
+        // Equal-delay endpoints form a timing cutset: moving any one endpoint
+        // leaves the maximum unchanged, even though moving the whole cutset is
+        // profitable. Cell indices stay valid when transformed high-to-low.
+        let mut batch_registers = critical.clone();
+        batch_registers.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        let mut batch = frontier.clone();
+        let mut batch_moves = 0usize;
+        for register in batch_registers {
+            let Some(candidate) = backward_retime_lut(&batch, register) else {
+                continue;
+            };
+            let candidate_profile = mapped_lut_profile(&candidate);
+            let candidate_registers = mapped_register_count(&candidate);
+            if (timing_driven || candidate_profile.overall_depth <= original_profile.overall_depth)
+                && candidate_profile.overall_period_ps <= original_profile.overall_period_ps
+                && candidate.cells.len() <= cell_limit
+                && candidate_registers <= register_limit
+            {
+                batch = candidate;
+                batch_moves += 1;
+            }
+        }
+        let mut plateau_candidate = None;
+        if batch_moves > 0 {
+            let batch_profile = mapped_lut_profile(&batch);
+            let batch_score = retiming_score(
+                &batch_profile,
+                timing_driven,
+                batch.cells.len(),
+                mapped_register_count(&batch),
+            );
+            let frontier_score = retiming_score(
+                &profile,
+                timing_driven,
+                frontier.cells.len(),
+                mapped_register_count(&frontier),
+            );
+            if batch_score < frontier_score
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, best_score): &(Ecp5Netlist, _)| batch_score < *best_score)
+            {
+                best = Some((batch, batch_score));
+            } else if timing_driven
+                && profile.data_period_ps > target_period_ps
+                && batch_profile.data_period_ps == profile.data_period_ps
+                && batch_moves == critical.len()
+                && plateau_budget > 0
+            {
+                plateau_candidate = Some((batch, batch_score));
+            }
+        }
+        let selected_plateau = best.is_none() && plateau_candidate.is_some();
+        let Some((candidate, _)) = best.or(plateau_candidate) else {
             break;
         };
+        if selected_plateau {
+            plateau_budget -= 1;
+        }
         frontier = candidate;
     }
     let selected_profile = mapped_lut_profile(&frontier);
-    ((
-        selected_profile.data_depth,
-        selected_profile.critical_data.len(),
-    ) < (
-        original_profile.data_depth,
-        original_profile.critical_data.len(),
-    ))
-        .then_some(frontier)
+    let improved = if timing_driven {
+        (
+            selected_profile.data_period_ps,
+            selected_profile.critical_timing.len(),
+        ) < (
+            original_profile.data_period_ps,
+            original_profile.critical_timing.len(),
+        )
+    } else {
+        (
+            selected_profile.data_depth,
+            selected_profile.critical_depth.len(),
+        ) < (
+            original_profile.data_depth,
+            original_profile.critical_depth.len(),
+        )
+    };
+    improved.then_some(frontier)
+}
+
+fn retiming_score(
+    profile: &MappedLutProfile,
+    timing_driven: bool,
+    cells: usize,
+    registers: usize,
+) -> (u64, u64, usize, usize, usize) {
+    if timing_driven {
+        (
+            u64::from(profile.data_period_ps),
+            u64::try_from(profile.critical_timing.len()).unwrap_or(u64::MAX),
+            profile.data_depth,
+            cells,
+            registers,
+        )
+    } else {
+        (
+            u64::try_from(profile.data_depth).unwrap_or(u64::MAX),
+            u64::try_from(profile.critical_depth.len()).unwrap_or(u64::MAX),
+            usize::try_from(profile.data_period_ps).unwrap_or(usize::MAX),
+            cells,
+            registers,
+        )
+    }
 }
 
 fn mapped_register_count(netlist: &Ecp5Netlist) -> usize {
@@ -431,10 +551,14 @@ fn mapped_register_count(netlist: &Ecp5Netlist) -> usize {
 
 struct MappedLutProfile {
     data_depth: usize,
-    critical_data: Vec<usize>,
+    critical_depth: Vec<usize>,
     overall_depth: usize,
+    data_period_ps: u32,
+    critical_timing: Vec<usize>,
+    overall_period_ps: u32,
 }
 
+#[allow(clippy::too_many_lines)]
 fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
     let depths = mapped_lut_depths(netlist);
     let data_endpoints = netlist
@@ -478,14 +602,72 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         .chain(output_depths)
         .max()
         .unwrap_or(0);
-    let critical_data = data_endpoints
+    let critical_depth = data_endpoints
         .into_iter()
         .filter_map(|(index, depth)| (depth == data_depth && depth > 0).then_some(index))
         .collect();
+    let arrivals = mapped_timing_arrivals(netlist);
+    let fanouts = mapped_wire_fanouts(netlist);
+    let timing_endpoints = netlist
+        .cells
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cell)| match cell {
+            Ecp5Cell::FlipFlop { data, .. } => {
+                Some((index, mapped_setup_period(*data, &arrivals, &fanouts)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let data_period_ps = timing_endpoints
+        .iter()
+        .map(|(_, period)| *period)
+        .max()
+        .unwrap_or(0);
+    let critical_timing = timing_endpoints
+        .into_iter()
+        .filter_map(|(index, period)| (period == data_period_ps && period > 0).then_some(index))
+        .collect();
+    let control_periods = netlist.cells.iter().filter_map(|cell| match cell {
+        Ecp5Cell::FlipFlop { enable, .. } => {
+            enable.map(|control| mapped_setup_period(control.signal, &arrivals, &fanouts))
+        }
+        Ecp5Cell::BlockRam {
+            write_enable,
+            read_enable,
+            ..
+        } => Some(
+            read_enable
+                .map_or(0, |control| {
+                    mapped_setup_period(control.signal, &arrivals, &fanouts)
+                })
+                .max(mapped_setup_period(
+                    write_enable.signal,
+                    &arrivals,
+                    &fanouts,
+                )),
+        ),
+        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => None,
+    });
+    let output_periods = netlist
+        .ports
+        .iter()
+        .filter(|port| port.direction == PortDirection::Output)
+        .flat_map(|port| &port.bits)
+        .map(|bit| mapped_output_period(*bit, &arrivals, &fanouts));
+    let overall_period_ps = [data_period_ps]
+        .into_iter()
+        .chain(control_periods)
+        .chain(output_periods)
+        .max()
+        .unwrap_or(0);
     MappedLutProfile {
         data_depth,
-        critical_data,
+        critical_depth,
         overall_depth,
+        data_period_ps,
+        critical_timing,
+        overall_period_ps,
     }
 }
 
@@ -556,6 +738,172 @@ fn bit_lut_depth(bit: Bit, depths: &HashMap<u32, usize>) -> usize {
     }
 }
 
+fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> HashMap<u32, u32> {
+    let fanouts = mapped_wire_fanouts(netlist);
+    let carry_outputs = netlist
+        .cells
+        .iter()
+        .filter_map(|cell| match cell {
+            Ecp5Cell::Ccu2c { carry_out, .. } => Some(*carry_out),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut arrivals = HashMap::<u32, u32>::new();
+    for port in &netlist.ports {
+        if port.direction == PortDirection::Input {
+            for bit in &port.bits {
+                if let Bit::Wire(wire) = bit {
+                    arrivals.entry(*wire).or_insert(0);
+                }
+            }
+        }
+    }
+    for cell in &netlist.cells {
+        match cell {
+            Ecp5Cell::FlipFlop { output, .. } => {
+                arrivals.insert(*output, FLIP_FLOP_CLOCK_TO_OUTPUT_PS);
+            }
+            Ecp5Cell::BlockRam { read_data, .. } => {
+                for output in read_data {
+                    arrivals.insert(*output, BRAM_CLOCK_TO_OUTPUT_PS);
+                }
+            }
+            Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => {}
+        }
+    }
+    for _ in 0..netlist.cells.len() {
+        let mut progress = false;
+        for cell in &netlist.cells {
+            match cell {
+                Ecp5Cell::Lut4 { inputs, output, .. } => {
+                    let input_arrivals = inputs
+                        .iter()
+                        .map(|input| mapped_routed_arrival(*input, &arrivals, &fanouts))
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(input_arrivals) = input_arrivals {
+                        let arrival = input_arrivals
+                            .into_iter()
+                            .max()
+                            .unwrap_or(0)
+                            .saturating_add(LUT_DELAY_PS);
+                        progress |= arrivals.insert(*output, arrival) != Some(arrival);
+                    }
+                }
+                Ecp5Cell::Ccu2c {
+                    inputs,
+                    carry_in,
+                    sums,
+                    carry_out,
+                    ..
+                } => {
+                    let Some(first_inputs) = mapped_ccu_inputs(inputs[0], &arrivals, &fanouts)
+                    else {
+                        continue;
+                    };
+                    let Some(second_inputs) = mapped_ccu_inputs(inputs[1], &arrivals, &fanouts)
+                    else {
+                        continue;
+                    };
+                    let carry = match carry_in {
+                        Bit::Zero | Bit::One => Some(CCU_CARRY_PS),
+                        Bit::Wire(wire) if carry_outputs.contains(wire) => arrivals
+                            .get(wire)
+                            .map(|arrival| arrival.saturating_add(CCU_CARRY_PS)),
+                        bit @ Bit::Wire(_) => mapped_routed_arrival(*bit, &arrivals, &fanouts)
+                            .map(|arrival| arrival.saturating_add(CCU_INPUT_PS)),
+                    };
+                    let Some(carry) = carry else {
+                        continue;
+                    };
+                    let first = first_inputs.max(carry);
+                    let sum0 = first.saturating_add(CCU_SUM_PS);
+                    let internal_carry = first.saturating_add(CCU_CARRY_PS);
+                    let second = second_inputs.max(internal_carry);
+                    let sum1 = second.saturating_add(CCU_SUM_PS);
+                    let carry_out_arrival = second.saturating_add(CCU_CARRY_PS);
+                    progress |= arrivals.insert(sums[0], sum0) != Some(sum0);
+                    progress |= arrivals.insert(sums[1], sum1) != Some(sum1);
+                    progress |=
+                        arrivals.insert(*carry_out, carry_out_arrival) != Some(carry_out_arrival);
+                }
+                Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => {}
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    arrivals
+}
+
+fn mapped_ccu_inputs(
+    inputs: [Bit; 4],
+    arrivals: &HashMap<u32, u32>,
+    fanouts: &HashMap<u32, usize>,
+) -> Option<u32> {
+    inputs
+        .into_iter()
+        .map(|input| mapped_routed_arrival(input, arrivals, fanouts))
+        .collect::<Option<Vec<_>>>()
+        .map(|arrivals| {
+            arrivals
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+                .saturating_add(CCU_INPUT_PS)
+        })
+}
+
+fn mapped_routed_arrival(
+    bit: Bit,
+    arrivals: &HashMap<u32, u32>,
+    fanouts: &HashMap<u32, usize>,
+) -> Option<u32> {
+    match bit {
+        Bit::Zero | Bit::One => Some(0),
+        Bit::Wire(wire) => arrivals.get(&wire).map(|arrival| {
+            arrival
+                .saturating_add(wire_delay_ps(fanouts.get(&wire).copied().unwrap_or(1)))
+                .saturating_add(MAPPED_ROUTE_GUARD_PS)
+        }),
+    }
+}
+
+fn mapped_setup_period(
+    bit: Bit,
+    arrivals: &HashMap<u32, u32>,
+    fanouts: &HashMap<u32, usize>,
+) -> u32 {
+    mapped_routed_arrival(bit, arrivals, fanouts)
+        .unwrap_or(0)
+        .saturating_add(FLIP_FLOP_SETUP_PS)
+}
+
+fn mapped_output_period(
+    bit: Bit,
+    arrivals: &HashMap<u32, u32>,
+    fanouts: &HashMap<u32, usize>,
+) -> u32 {
+    mapped_routed_arrival(bit, arrivals, fanouts).unwrap_or(0)
+}
+
+fn mapped_wire_fanouts(netlist: &Ecp5Netlist) -> HashMap<u32, usize> {
+    let mut fanouts = HashMap::new();
+    for bit in netlist.cells.iter().flat_map(cell_input_bits).chain(
+        netlist
+            .ports
+            .iter()
+            .filter(|port| port.direction == PortDirection::Output)
+            .flat_map(|port| &port.bits)
+            .copied(),
+    ) {
+        if let Bit::Wire(wire) = bit {
+            *fanouts.entry(wire).or_insert(0) += 1;
+        }
+    }
+    fanouts
+}
+
 #[allow(clippy::too_many_lines)]
 fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<Ecp5Netlist> {
     let Ecp5Cell::FlipFlop {
@@ -570,7 +918,7 @@ fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<E
     else {
         return None;
     };
-    if mapped_wire_is_control(netlist, *register_output) {
+    if mapped_wire_is_clock_or_reset(netlist, *register_output) {
         return None;
     }
     let (lut_index, lut_name, lut_inputs, lut_init) =
@@ -630,9 +978,12 @@ fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<E
     let after = derive_retimed_graph(&before, &certificate).ok()?;
     verify_retiming_certificate(&before, &after, &certificate).ok()?;
 
+    // Allocate above the original maximum before removing the sink FF. If its
+    // Q is the maximum wire, measuring afterwards would reuse Q for a new FF
+    // and create two drivers when the retimed LUT takes over that same Q.
+    let mut next_wire = maximum_mapped_wire(netlist)?.checked_add(1)?;
     let mut candidate = netlist.clone();
     candidate.cells.remove(register_index);
-    let mut next_wire = maximum_mapped_wire(&candidate)?.checked_add(1)?;
     let mut replacements = HashMap::new();
     for (input, reset_edge) in input_wires.iter().zip(after.edges()) {
         let output = next_wire;
@@ -668,31 +1019,42 @@ fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<E
     } else {
         candidate.cells.push(retimed_lut);
     }
+    prune_unobservable_retiming_cells(&mut candidate);
     Some(candidate)
 }
 
-fn mapped_wire_is_control(netlist: &Ecp5Netlist, wire: u32) -> bool {
+fn prune_unobservable_retiming_cells(netlist: &mut Ecp5Netlist) {
+    loop {
+        let fanouts = mapped_wire_fanouts(netlist);
+        let previous_len = netlist.cells.len();
+        netlist.cells.retain(|cell| {
+            !mapped_cell_name(cell).starts_with("retime_")
+                || cell_output_bits(cell)
+                    .into_iter()
+                    .any(|bit| matches!(bit, Bit::Wire(wire) if fanouts.contains_key(&wire)))
+        });
+        if netlist.cells.len() == previous_len {
+            break;
+        }
+    }
+}
+
+fn mapped_cell_name(cell: &Ecp5Cell) -> &str {
+    match cell {
+        Ecp5Cell::Lut4 { name, .. }
+        | Ecp5Cell::Ccu2c { name, .. }
+        | Ecp5Cell::FlipFlop { name, .. }
+        | Ecp5Cell::BlockRam { name, .. } => name,
+    }
+}
+
+fn mapped_wire_is_clock_or_reset(netlist: &Ecp5Netlist, wire: u32) -> bool {
     netlist.cells.iter().any(|cell| match cell {
-        Ecp5Cell::FlipFlop {
-            clock,
-            enable,
-            reset,
-            ..
-        } => {
+        Ecp5Cell::FlipFlop { clock, reset, .. } => {
             *clock == Bit::Wire(wire)
-                || enable.is_some_and(|control| control.signal == Bit::Wire(wire))
                 || reset.is_some_and(|control| control.signal == Bit::Wire(wire))
         }
-        Ecp5Cell::BlockRam {
-            write_enable,
-            read_enable,
-            clock,
-            ..
-        } => {
-            *clock == Bit::Wire(wire)
-                || write_enable.signal == Bit::Wire(wire)
-                || read_enable.is_some_and(|control| control.signal == Bit::Wire(wire))
-        }
+        Ecp5Cell::BlockRam { clock, .. } => *clock == Bit::Wire(wire),
         Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => false,
     })
 }
@@ -1732,6 +2094,7 @@ fn block_ram_parameters(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::num::NonZeroU32;
 
     use struo_ir::{
@@ -1834,7 +2197,13 @@ mod tests {
             }),
         ));
         source.add_output("result", output);
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mut mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        mapped.cells.push(Ecp5Cell::Lut4 {
+            name: "retime_dead_lut".into(),
+            inputs: [Bit::Zero; 4],
+            output: 10_000,
+            init: 0,
+        });
         let register = mapped
             .cells
             .iter()
@@ -1858,6 +2227,25 @@ mod tests {
         assert!(!retimed.cells.iter().any(|cell| {
             matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name == "ff_result_q")
         }));
+        assert!(
+            !retimed.cells.iter().any(
+                |cell| matches!(cell, Ecp5Cell::Lut4 { name, .. } if name == "retime_dead_lut")
+            )
+        );
+        let outputs = retimed
+            .cells
+            .iter()
+            .flat_map(super::cell_output_bits)
+            .filter_map(|bit| match bit {
+                Bit::Wire(wire) => Some(wire),
+                Bit::Zero | Bit::One => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs.len(),
+            outputs.iter().copied().collect::<HashSet<_>>().len(),
+            "retiming must not reuse the removed maximum Q wire"
+        );
     }
 
     #[test]
