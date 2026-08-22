@@ -218,13 +218,17 @@ traffic, and local error completion through both the reference and post-map
 paths.
 
 On nextpnr 0.6, LFE5UM5G-85F speed grade 8, and seeds 1 through 10, the 300 MHz
-flow passes all ten seeds and reaches 302.94--319.59 MHz (309.80 MHz mean). The
-post-LUT retimer reduces four-LUT register endpoints from 15 to 6 and moves the
-former address-decoder critical path off the routed worst path, at a cost of 19
-FFs. The mapped self-test uses 1,193 `TRELLIS_COMB` and 1,452 `TRELLIS_FF` sites.
-Without post-LUT retiming the same seeds reached 303.03--316.66 MHz (307.62 MHz
-mean) with 1,433 FFs. The qualified-payload pass removes 69 of 1,109 inferred
-clock enables and makes the eight QoS comparison preregisters unnecessary. The
+flow passes all ten seeds and reaches 301.75--323.21 MHz (306.90 MHz mean). The
+burst decoder registers only its 17-bit carry result and valid bit at the
+arithmetic boundary; its single-flight handshake keeps the address and protocol
+metadata stable until that result is consumed. This removes 68 RTL registers
+from the former full-metadata stage. The mapped self-test uses 1,193
+`TRELLIS_COMB` and 1,367 `TRELLIS_FF` sites, 85 fewer FFs than the previous
+1,452-FF implementation; automatic post-LUT retiming adds only two FFs to the
+1,365-register RTL netlist. The mapped timing model scores both CCU2C carry hops
+and ordinary LUT routing, including a post-map routing guard calibrated against
+the routed AXI paths. The qualified-payload pass removes 69 inferred clock
+enables and makes the eight QoS comparison preregisters unnecessary. The
 remaining result combines the mapper's 300 MHz required-time cover with
 registered write-completion, read-slot reservation, scoreboard, and arbitration
 boundaries in the RTL.
