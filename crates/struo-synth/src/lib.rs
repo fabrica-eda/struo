@@ -6,7 +6,7 @@ use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU32;
 
 use struo_ir::{
-    ActiveLevel, ClockEdge as IrClockEdge, EnableControl, NetId, Netlist, RegisterCell,
+    ActiveLevel, ClockEdge as IrClockEdge, EnableControl, MemoryCell, NetId, Netlist, RegisterCell,
     ResetControl, ValidationError,
 };
 use struo_rtl::{
@@ -35,8 +35,9 @@ pub struct SynthesisResult {
 /// Synthesizes the selected top module into a bit-level logic netlist.
 ///
 /// Construction performs constant folding and structural hashing. Arithmetic
-/// is bit-blasted into Boolean logic. Memories, hierarchy, and inout ports are
-/// rejected until their semantics have dedicated lowering passes.
+/// is bit-blasted into Boolean logic. Synchronous simple-dual-port memories are
+/// retained as memory cells for target-specific block-RAM mapping. Hierarchy
+/// and inout ports are rejected until their semantics have dedicated passes.
 ///
 /// # Errors
 ///
@@ -52,6 +53,7 @@ pub fn synthesize(design: &Design) -> Result<SynthesisResult, SynthesisError> {
     let mut lowering = Lowering::new(module);
     lowering.reserve_sources();
     lowering.index_assignments();
+    lowering.connect_memories()?;
     lowering.connect_registers()?;
     lowering.connect_outputs()?;
     lowering.netlist.validate()?;
@@ -59,10 +61,11 @@ pub fn synthesize(design: &Design) -> Result<SynthesisResult, SynthesisError> {
     let reports = vec![PassReport {
         pass: "lower-rtl",
         message: format!(
-            "lowered {} expressions to {} Boolean nodes and {} registers",
+            "lowered {} expressions to {} Boolean nodes, {} registers, and {} memories",
             module.expressions().len(),
             lowering.netlist.nodes().len(),
-            lowering.netlist.registers().len()
+            lowering.netlist.registers().len(),
+            lowering.netlist.memories().len()
         ),
     }];
     Ok(SynthesisResult {
@@ -72,9 +75,6 @@ pub fn synthesize(design: &Design) -> Result<SynthesisResult, SynthesisError> {
 }
 
 fn reject_unsupported(module: &Module) -> Result<(), SynthesisError> {
-    if !module.memories().is_empty() {
-        return Err(SynthesisError::Unsupported("memory inference".into()));
-    }
     if !module.instances().is_empty() {
         return Err(SynthesisError::Unsupported(
             "hierarchy and black-box instances".into(),
@@ -148,6 +148,17 @@ impl<'a> Lowering<'a> {
                 self.signal_bits[register.target.index() as usize][bit] = Some(net);
             }
         }
+        for memory in self.module.memories() {
+            let target = &self.module.signals()[memory.read_data.index() as usize];
+            for bit in 0..target.r#type().width.get() as usize {
+                let net = self.netlist.add_memory_output(bit_name(
+                    &memory.name,
+                    target.r#type().width.get(),
+                    bit,
+                ));
+                self.signal_bits[memory.read_data.index() as usize][bit] = Some(net);
+            }
+        }
     }
 
     fn index_assignments(&mut self) {
@@ -212,6 +223,49 @@ impl<'a> Lowering<'a> {
                     reset,
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn connect_memories(&mut self) -> Result<(), SynthesisError> {
+        for memory in self.module.memories() {
+            let read_data = self.signal_bits[memory.read_data.index() as usize]
+                .iter()
+                .map(|net| net.expect("memory outputs were reserved"))
+                .collect();
+            let read_address = self.lower_expression(memory.read_address)?;
+            let write_address = self.lower_expression(memory.write_address)?;
+            let write_data = self.lower_expression(memory.write_data)?;
+            let clock = self.resolve_signal_bit(memory.clock, 0)?;
+            let write_enable = EnableControl {
+                signal: self.resolve_signal_bit(memory.write_enable.signal, 0)?,
+                active: lower_polarity(memory.write_enable.polarity),
+            };
+            let read_enable = memory
+                .read_enable
+                .map(|enable| {
+                    self.resolve_signal_bit(enable.signal, 0)
+                        .map(|signal| EnableControl {
+                            signal,
+                            active: lower_polarity(enable.polarity),
+                        })
+                })
+                .transpose()?;
+            self.netlist.add_memory(MemoryCell::new(
+                &memory.name,
+                memory.depth,
+                read_address,
+                read_data,
+                read_enable,
+                write_address,
+                write_data,
+                write_enable,
+                clock,
+                match memory.edge {
+                    ClockEdge::Rising => IrClockEdge::Rising,
+                    ClockEdge::Falling => IrClockEdge::Falling,
+                },
+            ));
         }
         Ok(())
     }
@@ -760,8 +814,8 @@ mod tests {
 
     use struo_ir::{Netlist, NodeKind};
     use struo_rtl::{
-        BinaryOp, BitWidth, ClockEdge, Constant, Design, Module, Polarity, Port, PortDirection,
-        Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
+        BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, Memory, Module, Polarity, Port,
+        PortDirection, Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
     };
 
     use super::{default_pipeline, synthesize};
@@ -798,6 +852,73 @@ mod tests {
         let mut design = Design::new("Adder");
         design.add_module(module);
         design
+    }
+
+    #[test]
+    fn retains_synchronous_memory_for_block_ram_mapping() {
+        let mut module = Module::new("Scratchpad");
+        let clock = module.add_port(Port {
+            name: "clk".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let write_enable = module.add_port(Port {
+            name: "write_enable".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let read_address_signal = module.add_port(Port {
+            name: "read_address".into(),
+            direction: PortDirection::Input,
+            r#type: bits(8),
+        });
+        let write_address_signal = module.add_port(Port {
+            name: "write_address".into(),
+            direction: PortDirection::Input,
+            r#type: bits(8),
+        });
+        let write_data_signal = module.add_port(Port {
+            name: "write_data".into(),
+            direction: PortDirection::Input,
+            r#type: bits(8),
+        });
+        let read_data = module.add_port(Port {
+            name: "read_data".into(),
+            direction: PortDirection::Output,
+            r#type: bits(8),
+        });
+        let read_address = module.read(read_address_signal).unwrap();
+        let write_address = module.read(write_address_signal).unwrap();
+        let write_data = module.read(write_data_signal).unwrap();
+        module.add_memory(Memory {
+            name: "words".into(),
+            word: bits(8),
+            depth: 256,
+            read_latency: 1,
+            read_address,
+            read_data,
+            read_enable: None,
+            write_address,
+            write_data,
+            write_enable: Enable {
+                signal: write_enable,
+                polarity: Polarity::ActiveHigh,
+            },
+            clock,
+            edge: ClockEdge::Rising,
+        });
+        let mut design = Design::new("Scratchpad");
+        design.add_module(module);
+
+        let synthesized = synthesize(&design).unwrap();
+
+        assert_eq!(synthesized.netlist.memories().len(), 1);
+        let memory = &synthesized.netlist.memories()[0];
+        assert_eq!(memory.name(), "words");
+        assert_eq!(memory.depth(), 256);
+        assert_eq!(memory.read_data().len(), 8);
+        assert_eq!(memory.write_data().len(), 8);
+        assert_eq!(synthesized.netlist.registers().len(), 0);
     }
 
     #[test]
@@ -1170,7 +1291,9 @@ mod tests {
                         values[node.inputs()[2].index() as usize]
                     }
                 }
-                NodeKind::RegisterOutput(_) => panic!("combinational test contains a register"),
+                NodeKind::RegisterOutput(_) | NodeKind::MemoryOutput(_) => {
+                    panic!("combinational test contains state")
+                }
                 NodeKind::Output(name) => {
                     let value = values[node.inputs()[0].index() as usize];
                     outputs.insert(name.clone(), value);
@@ -1187,7 +1310,10 @@ mod tests {
         let mut maximum = 0;
         for node in netlist.nodes() {
             let depth = match node.kind() {
-                NodeKind::Input(_) | NodeKind::Constant(_) | NodeKind::RegisterOutput(_) => 0,
+                NodeKind::Input(_)
+                | NodeKind::Constant(_)
+                | NodeKind::RegisterOutput(_)
+                | NodeKind::MemoryOutput(_) => 0,
                 NodeKind::Output(_) => depths[node.inputs()[0].index() as usize],
                 NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not | NodeKind::Mux => {
                     node.inputs()
