@@ -1,5 +1,7 @@
 //! Technology-independent synthesis for Struo.
 
+mod retiming;
+
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -13,6 +15,8 @@ use struo_rtl::{
     BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, Polarity, PortDirection, ResetMode,
     RtlError, SignalId, UnaryOp,
 };
+
+pub use retiming::TimingDrivenRetiming;
 
 /// Verifies hardware-semantic RTL before any information-losing lowering.
 ///
@@ -1059,6 +1063,8 @@ pub enum SynthesisError {
         /// Bit index.
         bit: usize,
     },
+    /// A checked synthesis transformation could not be constructed.
+    Transformation(String),
 }
 
 impl Display for SynthesisError {
@@ -1080,6 +1086,9 @@ impl Display for SynthesisError {
                 formatter,
                 "register `{register}` bit {bit} has a non-constant reset value"
             ),
+            Self::Transformation(message) => {
+                write!(formatter, "synthesis transformation failed: {message}")
+            }
         }
     }
 }
@@ -1092,7 +1101,8 @@ impl Error for SynthesisError {
             Self::Unsupported(_)
             | Self::UndrivenSignalBit { .. }
             | Self::CombinationalLoop { .. }
-            | Self::NonConstantReset { .. } => None,
+            | Self::NonConstantReset { .. }
+            | Self::Transformation(_) => None,
         }
     }
 }

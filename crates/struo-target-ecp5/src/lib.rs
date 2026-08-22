@@ -4,7 +4,7 @@ mod mapped;
 
 pub use mapped::{
     ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPort, MappingError,
-    MappingOptions, PortDirection as MappedPortDirection, Reset, map_to_ecp5,
+    MappingOptions, PortDirection as MappedPortDirection, Reset, RetimingSelection, map_to_ecp5,
     map_to_ecp5_with_options,
 };
 

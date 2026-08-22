@@ -71,6 +71,8 @@ struct LutPlan {
 /// Required-time-aware cover selected from a feasible-cut database.
 pub(super) struct LutCover {
     plans: Vec<Option<LutPlan>>,
+    arrivals: Vec<u32>,
+    fanouts: Vec<usize>,
 }
 
 impl LutCover {
@@ -130,11 +132,34 @@ impl LutCover {
             required = original_required;
         }
         debug_assert!(timing_is_valid(&arrivals, &required));
-        Self { plans }
+        Self {
+            plans,
+            arrivals,
+            fanouts,
+        }
     }
 
     fn plan(&self, net: NetId) -> Option<&LutPlan> {
         self.plans[net.index() as usize].as_ref()
+    }
+
+    pub(super) fn estimated_register_period_ps(&self, netlist: &Netlist) -> u32 {
+        netlist
+            .registers()
+            .iter()
+            .flat_map(|register| {
+                [register.data()]
+                    .into_iter()
+                    .chain(register.enable().map(|enable| enable.signal))
+            })
+            .map(|net| {
+                let index = net.index() as usize;
+                self.arrivals[index]
+                    .saturating_add(wire_delay_ps(self.fanouts[index]))
+                    .saturating_add(FLIP_FLOP_SETUP_PS)
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 

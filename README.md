@@ -101,8 +101,17 @@ Non-equivalence returns a named input trace through the first mismatching
 output cycle. The initial transition-system path requires one clock domain,
 known reset-derived state, and no retained memory. A separate linear-time
 certificate checker validates boundary-preserving, reset-to-zero retiming over
-zero-preserving truth-table vertices. Unsupported proof cases remain
-inconclusive or fail construction instead of being accepted as equivalent.
+zero-preserving truth-table vertices. `struo-synth::TimingDrivenRetiming`
+builds that register-weighted graph, searches forward and backward placements,
+checks the selected labels, and rebuilds the netlist. Clock enables are exposed
+as feedback muxes during the move and inferred again afterwards; unrelated
+clock/reset domains and their fan-in are fixed boundaries. ECP5 mapping runs
+the original placement and several certified candidates through the LUT4 cut
+and required-time model automatically. It selects retiming only for a strict
+estimated-period improvement with bounded cell/register growth, so callers do
+not choose an optimization mode and an unhelpful retiming falls back to the
+original netlist. Unsupported proof cases remain inconclusive or fail
+construction instead of being accepted as equivalent.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under

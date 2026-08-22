@@ -165,6 +165,7 @@ fn run_axi4_self_test(
             ..MappingOptions::default()
         },
     )?;
+    print_retiming_decision(&mapped);
     println!(
         "Veryl AXI4 self-test at {timing_goal_mhz} MHz: {} Boolean nodes, {} registers, {} ECP5 cells",
         synthesized.netlist.nodes().len(),
@@ -187,6 +188,7 @@ fn run_axi4_demo(mapped_path: Option<&str>) -> Result<(), Box<dyn Error>> {
         println!("{}: {}", report.pass, report.message);
     }
     let mapped = map_to_ecp5(&synthesized.netlist)?;
+    print_retiming_decision(&mapped);
     println!(
         "Veryl AXI4 crossbar: {} Boolean nodes, {} registers, {} ECP5 cells",
         synthesized.netlist.nodes().len(),
@@ -265,6 +267,7 @@ fn run_demo(nextpnr_path: Option<&str>) -> Result<(), Box<dyn Error>> {
         println!("{}: {}", report.pass, report.message);
     }
     let mapped = map_to_ecp5(&synthesized.netlist)?;
+    print_retiming_decision(&mapped);
     println!("mapped cells: {}", mapped.cells().len());
     if let Some(path) = nextpnr_path {
         fs::write(path, mapped.to_nextpnr_json()?)?;
@@ -292,4 +295,20 @@ fn run_demo(nextpnr_path: Option<&str>) -> Result<(), Box<dyn Error>> {
         VerificationPolicy::safety_critical().required().len()
     );
     Ok(())
+}
+
+fn print_retiming_decision(mapped: &struo_target_ecp5::Ecp5Netlist) {
+    let decision = mapped.retiming();
+    let action = if decision.applied {
+        "selected"
+    } else {
+        "kept original"
+    };
+    println!(
+        "retiming: {action}; estimated period {} -> {} ps, registers {} -> {}",
+        decision.original_period_ps,
+        decision.selected_period_ps,
+        decision.original_registers,
+        decision.selected_registers
+    );
 }

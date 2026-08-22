@@ -10,6 +10,7 @@ use struo_ir::{
     ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, ComparisonCell, MemoryCell, NetId,
     Netlist, PortDirection as IrPortDirection, ValidationError,
 };
+use struo_synth::{InferRegisterEnables, Pass, TimingDrivenRetiming};
 
 mod lut;
 
@@ -243,6 +244,22 @@ pub struct Ecp5Netlist {
     name: String,
     ports: Vec<MappedPort>,
     cells: Vec<Ecp5Cell>,
+    retiming: RetimingSelection,
+}
+
+/// Result of the automatic, technology-scored retiming search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetimingSelection {
+    /// Whether a certified retimed candidate beat the original mapped timing estimate.
+    pub applied: bool,
+    /// Estimated register-to-register period before retiming.
+    pub original_period_ps: u32,
+    /// Estimated register-to-register period selected for mapping.
+    pub selected_period_ps: u32,
+    /// Registers in the target-independent netlist before candidate selection.
+    pub original_registers: usize,
+    /// Registers in the selected target-independent netlist.
+    pub selected_registers: usize,
 }
 
 impl Ecp5Netlist {
@@ -262,6 +279,12 @@ impl Ecp5Netlist {
     #[must_use]
     pub fn cells(&self) -> &[Ecp5Cell] {
         &self.cells
+    }
+
+    /// Returns the technology-scored retiming decision made during mapping.
+    #[must_use]
+    pub const fn retiming(&self) -> RetimingSelection {
+        self.retiming
     }
 
     /// Serializes this exact mapped object to the Yosys JSON schema consumed by
@@ -293,10 +316,70 @@ pub fn map_to_ecp5_with_options(
     netlist: &Netlist,
     options: MappingOptions,
 ) -> Result<Ecp5Netlist, MappingError> {
+    let (mut selected, mut selected_quality) = map_once(netlist, options)?;
+    let original_quality = selected_quality;
+    let original_cells = selected.cells.len();
+    let original_registers = netlist.registers().len();
+    let mut selected_registers = original_registers;
+    let mut seen = Vec::new();
+    for target_depth in [4, 8, 12] {
+        let mut candidate = netlist.clone();
+        if TimingDrivenRetiming::new(target_depth)
+            .run(&mut candidate)
+            .is_err()
+        {
+            continue;
+        }
+        if candidate == *netlist {
+            continue;
+        }
+        if InferRegisterEnables.run(&mut candidate).is_err() {
+            continue;
+        }
+        if seen.iter().any(|prior| prior == &candidate) {
+            continue;
+        }
+        seen.push(candidate.clone());
+        let Ok((mapped, quality)) = map_once(&candidate, options) else {
+            continue;
+        };
+        let area_limit = original_cells + original_cells.div_ceil(10);
+        let register_limit = original_registers + original_registers.div_ceil(5);
+        if quality.period_ps.saturating_add(100) <= selected_quality.period_ps
+            && mapped.cells.len() <= area_limit
+            && candidate.registers().len() <= register_limit
+        {
+            selected = mapped;
+            selected_quality = quality;
+            selected_registers = candidate.registers().len();
+        }
+    }
+    selected.retiming = RetimingSelection {
+        applied: selected_quality != original_quality,
+        original_period_ps: original_quality.period_ps,
+        selected_period_ps: selected_quality.period_ps,
+        original_registers,
+        selected_registers,
+    };
+    Ok(selected)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MappingQuality {
+    period_ps: u32,
+}
+
+fn map_once(
+    netlist: &Netlist,
+    options: MappingOptions,
+) -> Result<(Ecp5Netlist, MappingQuality), MappingError> {
     netlist.validate()?;
     let demand = MappingDemand::collect(netlist);
     let cuts = CutDatabase::analyze(netlist);
     let cover = LutCover::select(netlist, &cuts, &demand.roots, options);
+    let quality = MappingQuality {
+        period_ps: cover.estimated_register_period_ps(netlist),
+    };
     let mut emitter = LutEmitter::new(netlist, &cover);
 
     map_retained_cells(netlist, options, &mut emitter);
@@ -364,11 +447,21 @@ pub fn map_to_ecp5_with_options(
         })
         .collect();
 
-    Ok(Ecp5Netlist {
-        name: netlist.name().into(),
-        ports,
-        cells,
-    })
+    Ok((
+        Ecp5Netlist {
+            name: netlist.name().into(),
+            ports,
+            cells,
+            retiming: RetimingSelection {
+                applied: false,
+                original_period_ps: quality.period_ps,
+                selected_period_ps: quality.period_ps,
+                original_registers: netlist.registers().len(),
+                selected_registers: netlist.registers().len(),
+            },
+        },
+        quality,
+    ))
 }
 
 const CCU2C_ARITH_INIT: u16 = 0x96aa;
@@ -1201,6 +1294,59 @@ mod tests {
         let result = source.add_arithmetic(operation, &lhs, &rhs).unwrap();
         source.add_output_port("result", &result).unwrap();
         source
+    }
+
+    #[test]
+    fn automatically_selects_retiming_only_when_lut_timing_improves() {
+        let mut source = Netlist::new("retimed_lut_chain");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let inputs = (0..8)
+            .map(|index| source.add_input(format!("input{index}")))
+            .collect::<Vec<_>>();
+        let reset_control = ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: false,
+        };
+        let registered = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                let name = format!("input_q{index}");
+                let output = source.add_register_output(&name);
+                source.add_register(RegisterCell::new(
+                    name,
+                    output,
+                    *input,
+                    clock,
+                    ClockEdge::Rising,
+                    None,
+                    Some(reset_control),
+                ));
+                output
+            })
+            .collect::<Vec<_>>();
+        let reduced = registered[1..]
+            .iter()
+            .fold(registered[0], |value, input| source.add_and(value, *input));
+        let output = source.add_register_output("result_q");
+        source.add_register(RegisterCell::new(
+            "result_q",
+            output,
+            reduced,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(reset_control),
+        ));
+        source.add_output("result", output);
+
+        let mapped = map_to_ecp5(&source).unwrap();
+
+        assert!(mapped.retiming().applied, "{:?}", mapped.retiming());
+        assert!(mapped.retiming().selected_period_ps < mapped.retiming().original_period_ps);
     }
 
     #[test]
