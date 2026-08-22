@@ -421,6 +421,184 @@ impl Ecp5Netlist {
             self.clone()
         }
     }
+
+    /// Returns a deterministic, bounded set of equivalent physical-synthesis
+    /// candidates. The first entry preserves the single-candidate behavior of
+    /// [`Self::apply_physical_feedback`]; later entries extend a routed
+    /// critical-cone retime by one additional certified primitive move.
+    #[must_use]
+    pub fn physical_feedback_candidates(&self, feedback: &PhysicalFeedback) -> Vec<Self> {
+        let first = self.apply_physical_feedback(feedback);
+        if first == *self {
+            return Vec::new();
+        }
+        let first_physical_moves = first
+            .equivalence_proof
+            .certified_primitive_moves
+            .saturating_sub(self.equivalence_proof.certified_primitive_moves);
+        let mut candidates = vec![first.clone()];
+        if first_physical_moves == 0 {
+            return candidates;
+        }
+        for forward in physically_forward_retime_reported_luts(self, feedback) {
+            if candidates.len() >= crate::MAX_PHYSICAL_CANDIDATES {
+                break;
+            }
+            if !candidates.contains(&forward) {
+                candidates.push(forward);
+            }
+        }
+        let original_names = self
+            .cells
+            .iter()
+            .map(mapped_cell_name)
+            .collect::<HashSet<_>>();
+        let critical_cells = feedback
+            .critical_paths()
+            .iter()
+            .filter(|path| path.register_to_register)
+            .flat_map(|path| &path.cells)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let path_driven_new_registers = first
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                let Ecp5Cell::FlipFlop {
+                    name,
+                    data: Bit::Wire(data),
+                    ..
+                } = cell
+                else {
+                    return None;
+                };
+                (!original_names.contains(name.as_str())
+                    && first.cells.iter().any(|driver| {
+                        critical_cells.iter().any(|physical| {
+                            physical_path_matches_mapped_cell(physical, mapped_cell_name(driver))
+                        }) && cell_output_bits(driver).contains(&Bit::Wire(*data))
+                    }))
+                .then_some((name.clone(), index))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (_, register) in path_driven_new_registers {
+            if candidates.len() >= crate::MAX_PHYSICAL_CANDIDATES {
+                break;
+            }
+            let Some(mut extended) = backward_retime_primitive(&first, register) else {
+                continue;
+            };
+            merge_equivalent_flip_flops(&mut extended);
+            if !physical_retime_step_is_bounded(
+                &first,
+                &extended,
+                2 * PHYSICAL_RETIME_MODEL_BRIDGE_PS,
+            ) {
+                continue;
+            }
+            let Some(extended) = finalize_physical_retiming_candidate(extended) else {
+                continue;
+            };
+            if !candidates.contains(&extended) {
+                candidates.push(extended);
+            }
+        }
+        candidates
+    }
+}
+
+fn physically_forward_retime_reported_luts(
+    netlist: &Ecp5Netlist,
+    feedback: &PhysicalFeedback,
+) -> Vec<Ecp5Netlist> {
+    let physical_cells = feedback
+        .critical_paths()
+        .iter()
+        .filter(|path| path.register_to_register)
+        .flat_map(|path| &path.cells)
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let lut_names = netlist
+        .cells
+        .iter()
+        .filter_map(|cell| match cell {
+            Ecp5Cell::Lut4 { name, .. } if physical_cells.contains(name.as_str()) => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    lut_names
+        .into_iter()
+        .filter_map(|name| {
+            let index = netlist
+                .cells
+                .iter()
+                .position(|cell| mapped_cell_name(cell) == name)?;
+            let mut candidate = forward_retime_lut(netlist, index)?;
+            merge_equivalent_flip_flops(&mut candidate);
+            physical_retime_step_is_bounded(
+                netlist,
+                &candidate,
+                2 * PHYSICAL_RETIME_MODEL_BRIDGE_PS,
+            )
+            .then(|| finalize_physical_retiming_candidate(candidate))?
+        })
+        .collect()
+}
+
+fn finalize_physical_retiming_candidate(mut candidate: Ecp5Netlist) -> Option<Ecp5Netlist> {
+    candidate.placement_hints.clear();
+    let profile = mapped_lut_profile(&candidate);
+    candidate.retiming.applied = true;
+    candidate.retiming.selected_lut_depth = profile.data_depth;
+    candidate.retiming.selected_critical_registers = profile.critical_depth.len();
+    candidate.retiming.selected_period_ps = profile.data_period_ps;
+    candidate.retiming.selected_overall_period_ps = profile.overall_period_ps;
+    candidate.retiming.selected_registers = mapped_register_count(&candidate);
+    candidate.retiming.certified_primitive_moves =
+        candidate.equivalence_proof.certified_primitive_moves;
+    candidate.retiming.equivalent_register_merges =
+        candidate.equivalence_proof.equivalent_register_merges;
+    candidate.retiming.equivalent_logic_replications =
+        candidate.equivalence_proof.equivalent_logic_replications;
+    candidate.retiming.equivalent_physical_rewires =
+        candidate.equivalence_proof.equivalent_physical_rewires;
+    candidate.retiming.unobservable_cells_removed =
+        candidate.equivalence_proof.unobservable_cells_removed;
+    candidate.retiming.equivalence_signed_off = verify_mapped_equivalence_proof(&candidate, true);
+    candidate
+        .retiming
+        .equivalence_signed_off
+        .then_some(candidate)
+}
+
+fn physical_path_matches_mapped_cell(physical: &str, mapped: &str) -> bool {
+    physical == mapped
+        || physical
+            .strip_prefix(mapped)
+            .is_some_and(|suffix| suffix.starts_with('$'))
+}
+
+fn physical_retime_step_is_bounded(
+    before: &Ecp5Netlist,
+    candidate: &Ecp5Netlist,
+    model_bridge_ps: u32,
+) -> bool {
+    let before_profile = mapped_lut_profile(before);
+    let candidate_profile = mapped_lut_profile(candidate);
+    candidate.cells.len() <= before.cells.len() + 8
+        && mapped_register_count(candidate) <= mapped_register_count(before) + 4
+        && candidate_profile.data_period_ps
+            <= before_profile
+                .data_period_ps
+                .saturating_add(model_bridge_ps)
+        && candidate_profile.overall_period_ps
+            <= before_profile
+                .overall_period_ps
+                .saturating_add(model_bridge_ps)
+        && verify_mapped_equivalence_proof(candidate, true)
 }
 
 fn physically_retime_reported_cones(
@@ -455,27 +633,11 @@ fn physically_retime_reported_cones(
         else {
             continue;
         };
-        let before_profile = mapped_lut_profile(netlist);
-        let before_cells = netlist.cells.len();
-        let before_registers = mapped_register_count(netlist);
         let Some(mut candidate) = backward_retime_primitive(netlist, register) else {
             continue;
         };
         merge_equivalent_flip_flops(&mut candidate);
-        let candidate_profile = mapped_lut_profile(&candidate);
-        let candidate_registers = mapped_register_count(&candidate);
-        if candidate.cells.len() > before_cells + 8
-            || candidate_registers > before_registers + 4
-            || candidate_profile.data_period_ps
-                > before_profile
-                    .data_period_ps
-                    .saturating_add(PHYSICAL_RETIME_MODEL_BRIDGE_PS)
-            || candidate_profile.overall_period_ps
-                > before_profile
-                    .overall_period_ps
-                    .saturating_add(PHYSICAL_RETIME_MODEL_BRIDGE_PS)
-            || !verify_mapped_equivalence_proof(&candidate, true)
-        {
+        if !physical_retime_step_is_bounded(netlist, &candidate, PHYSICAL_RETIME_MODEL_BRIDGE_PS) {
             continue;
         }
         *netlist = candidate;
@@ -1871,6 +2033,153 @@ fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<E
     } else {
         candidate.cells.push(retimed_lut);
     }
+    prune_unobservable_retiming_cells(&mut candidate);
+    Some(candidate)
+}
+
+#[allow(clippy::too_many_lines)]
+fn forward_retime_lut(netlist: &Ecp5Netlist, lut_index: usize) -> Option<Ecp5Netlist> {
+    let Ecp5Cell::Lut4 {
+        name: lut_name,
+        inputs: lut_inputs,
+        output: lut_output,
+        init: lut_init,
+    } = netlist.cells.get(lut_index)?
+    else {
+        return None;
+    };
+    let physical_uses = lut_inputs
+        .iter()
+        .filter_map(|input| match input {
+            Bit::Wire(wire) => Some(*wire),
+            Bit::Zero | Bit::One => None,
+        })
+        .fold(HashMap::<u32, usize>::new(), |mut uses, wire| {
+            *uses.entry(wire).or_insert(0) += 1;
+            uses
+        });
+    if physical_uses.is_empty() {
+        return None;
+    }
+    let mut input_data = HashMap::new();
+    let mut input_resets = HashMap::new();
+    let mut input_registers = HashSet::new();
+    let mut domain: Option<(Bit, ClockEdge, Option<Control>, Reset)> = None;
+    for (&wire, &local_uses) in &physical_uses {
+        if mapped_wire_fanout(netlist, wire) != local_uses {
+            return None;
+        }
+        let (index, data, clock, edge, enable, reset) =
+            netlist
+                .cells
+                .iter()
+                .enumerate()
+                .find_map(|(index, cell)| match cell {
+                    Ecp5Cell::FlipFlop {
+                        data,
+                        output,
+                        clock,
+                        edge,
+                        enable,
+                        reset: Some(reset),
+                        ..
+                    } if *output == wire => Some((index, *data, *clock, *edge, *enable, *reset)),
+                    _ => None,
+                })?;
+        if let Some((domain_clock, domain_edge, domain_enable, domain_reset)) = domain {
+            if (clock, edge, enable) != (domain_clock, domain_edge, domain_enable)
+                || (reset.signal, reset.active, reset.asynchronous)
+                    != (
+                        domain_reset.signal,
+                        domain_reset.active,
+                        domain_reset.asynchronous,
+                    )
+            {
+                return None;
+            }
+        } else {
+            domain = Some((clock, edge, enable, reset));
+        }
+        input_data.insert(wire, data);
+        input_resets.insert(wire, reset.value);
+        input_registers.insert(index);
+    }
+    let (clock, clock_edge, enable, reset) = domain?;
+    let mut input_wires = physical_uses.keys().copied().collect::<Vec<_>>();
+    input_wires.sort_unstable();
+    let function = reduced_lut_function(*lut_inputs, *lut_init, &input_wires);
+    let input_count = input_wires.len();
+    let mut vertices = input_wires
+        .iter()
+        .map(|wire| RetimingVertex::boundary(format!("wire{wire}"), LogicFunction::new(0, 0)))
+        .collect::<Vec<_>>();
+    vertices.push(RetimingVertex::logic("lut", function));
+    vertices.push(RetimingVertex::boundary("q", LogicFunction::new(1, 0b10)));
+    let lut_vertex = input_count;
+    let q_vertex = input_count + 1;
+    let mut edges = input_wires
+        .iter()
+        .enumerate()
+        .map(|(input, wire)| RetimingEdge::new(input, lut_vertex, vec![input_resets[wire]]))
+        .collect::<Vec<_>>();
+    edges.push(RetimingEdge::new(lut_vertex, q_vertex, Vec::new()));
+    let before = RetimingGraph::new(
+        RetimingDomain::new(
+            format!("{clock:?}"),
+            clock_edge,
+            format!("{:?}", reset.signal),
+            reset.active,
+            reset.asynchronous,
+        ),
+        vertices,
+        edges,
+    );
+    let mut labels = vec![0; input_count + 2];
+    labels[lut_vertex] = -1;
+    let certificate = RetimingCertificate::new(labels);
+    let after = derive_retimed_graph(&before, &certificate).ok()?;
+    verify_retiming_certificate(&before, &after, &certificate).ok()?;
+    let output_reset = after
+        .edges()
+        .iter()
+        .find(|edge| edge.source() == lut_vertex && edge.target() == q_vertex)?
+        .reset_values()
+        .first()
+        .copied()?;
+
+    let new_lut_output = maximum_mapped_wire(netlist)?.checked_add(1)?;
+    let mut candidate = netlist.clone();
+    candidate.equivalence_proof.certified_primitive_moves += 1;
+    let mut removed = input_registers.into_iter().collect::<Vec<_>>();
+    removed.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+    for index in removed {
+        candidate.cells.remove(index);
+    }
+    let lut_index = candidate
+        .cells
+        .iter()
+        .position(|cell| mapped_cell_name(cell) == lut_name)?;
+    candidate.cells[lut_index] = Ecp5Cell::Lut4 {
+        name: format!("forward_{lut_name}"),
+        inputs: lut_inputs.map(|input| match input {
+            Bit::Wire(wire) => input_data[&wire],
+            constant => constant,
+        }),
+        output: new_lut_output,
+        init: *lut_init,
+    };
+    candidate.cells.push(Ecp5Cell::FlipFlop {
+        name: format!("forward_ff_{lut_name}"),
+        data: Bit::Wire(new_lut_output),
+        output: *lut_output,
+        clock,
+        edge: clock_edge,
+        enable,
+        reset: Some(Reset {
+            value: output_reset,
+            ..reset
+        }),
+    });
     prune_unobservable_retiming_cells(&mut candidate);
     Some(candidate)
 }
@@ -3885,8 +4194,8 @@ mod tests {
 
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, backward_retime_ccu2c,
-        backward_retime_lut, ccu_chain_names, forward_retime_ccu2c, map_once, map_to_ecp5,
-        map_to_ecp5_with_options, mapped_cell_name, mapped_wire_fanout,
+        backward_retime_lut, ccu_chain_names, forward_retime_ccu2c, forward_retime_lut, map_once,
+        map_to_ecp5, map_to_ecp5_with_options, mapped_cell_name, mapped_wire_fanout,
         merge_equivalent_flip_flops, replicate_high_fanout_enable_luts,
         verify_mapped_equivalence_proof,
     };
@@ -4202,6 +4511,173 @@ mod tests {
                 .iter()
                 .any(|cell| mapped_cell_name(cell).starts_with("retime_ff_value"))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn physical_feedback_emits_bounded_opposite_direction_candidates() {
+        let mut source = Netlist::new("physical_candidates");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let lhs = source.add_input("lhs");
+        let rhs = source.add_input("rhs");
+        let reset_control = ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: false,
+        };
+        let lhs_q = source.add_register_output("lhs_q");
+        source.add_register(RegisterCell::new(
+            "lhs_q",
+            lhs_q,
+            lhs,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(reset_control),
+        ));
+        let rhs_q = source.add_register_output("rhs_q");
+        source.add_register(RegisterCell::new(
+            "rhs_q",
+            rhs_q,
+            rhs,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(reset_control),
+        ));
+        let data = source.add_and(lhs_q, rhs_q);
+        let result_q = source.add_register_output("result_q");
+        source.add_register(RegisterCell::new(
+            "result_q",
+            result_q,
+            data,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(reset_control),
+        ));
+        source.add_output("result", result_q);
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let lut = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::Lut4 { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let sink = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::FlipFlop { name, .. } if name == "ff_result_q" => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let placed_cells = mapped
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let bel = match cell {
+                    Ecp5Cell::Lut4 { .. } => format!("X{index}/Y1/SLICEA.K0"),
+                    Ecp5Cell::FlipFlop { .. } => format!("X{index}/Y1/SLICEA.FF0"),
+                    Ecp5Cell::Ccu2c { .. } | Ecp5Cell::BlockRam { .. } => unreachable!(),
+                };
+                format!(
+                    r#""{}":{{"attributes":{{"NEXTPNR_BEL":"{bel}"}}}}"#,
+                    mapped_cell_name(cell)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let report = format!(
+            r#"{{"critical_paths":[{{"from":"posedge clk","path":[{{"delay":2.8,"from":{{"cell":"ff_lhs_q"}},"to":{{"cell":"{lut}"}}}},{{"delay":0.4,"from":{{"cell":"{lut}"}},"to":{{"cell":"{sink}"}}}}],"to":"posedge clk"}}],"fmax":{{"clock":{{"achieved":310.0,"constraint":320.0}}}}}}"#
+        );
+        let placed = [
+            r#"{"modules":{"physical_candidates":{"cells":{"#,
+            &placed_cells,
+            r"}}}}",
+        ]
+        .concat();
+        let feedback = PhysicalFeedback::from_nextpnr_json(&report, &placed).unwrap();
+
+        let candidates = mapped.physical_feedback_candidates(&feedback);
+
+        assert_eq!(candidates.len(), 2);
+        assert_ne!(candidates[0], candidates[1]);
+        assert!(candidates.iter().all(|candidate| {
+            candidate.retiming.applied
+                && candidate.retiming.equivalence_signed_off
+                && verify_mapped_equivalence_proof(candidate, true)
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate
+                .cells
+                .iter()
+                .any(|cell| mapped_cell_name(cell).starts_with("forward_ff_"))
+        }));
+    }
+
+    #[test]
+    fn forward_lut_retiming_moves_a_registered_input_cut_to_the_output() {
+        let mut source = Netlist::new("forward_lut");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let lhs = source.add_input("lhs");
+        let rhs = source.add_input("rhs");
+        let reset_control = ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: false,
+        };
+        let lhs_q = source.add_register_output("lhs_q");
+        source.add_register(RegisterCell::new(
+            "lhs_q",
+            lhs_q,
+            lhs,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(reset_control),
+        ));
+        let rhs_q = source.add_register_output("rhs_q");
+        source.add_register(RegisterCell::new(
+            "rhs_q",
+            rhs_q,
+            rhs,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(reset_control),
+        ));
+        let result = source.add_and(lhs_q, rhs_q);
+        source.add_output("result", result);
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let lut = mapped
+            .cells
+            .iter()
+            .position(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+            .unwrap();
+
+        let retimed = forward_retime_lut(&mapped, lut).unwrap();
+
+        assert_eq!(
+            retimed
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::FlipFlop { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(retimed.equivalence_proof.certified_primitive_moves, 1);
+        assert!(verify_mapped_equivalence_proof(&retimed, true));
+        assert!(retimed.cells.iter().any(|cell| {
+            matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name.starts_with("forward_ff_"))
+        }));
     }
 
     #[test]

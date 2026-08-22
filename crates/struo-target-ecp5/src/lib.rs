@@ -51,6 +51,9 @@ pub const LFE5UM5G_85F_EVN: BoardProfile = BoardProfile {
 /// reference clock used by the no-PLL evaluation-board smoke test.
 pub const ECP5_QOR_TARGET_MHZ: u32 = 300;
 
+/// Maximum number of proof-signed physical-synthesis candidates per draft.
+pub const MAX_PHYSICAL_CANDIDATES: usize = 3;
+
 /// A subprocess invocation represented without a shell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolCommand {
@@ -166,20 +169,58 @@ impl Ecp5Flow {
     /// deterministic draft run.
     #[must_use]
     pub fn refined_place_and_route_command(&self) -> ToolCommand {
-        let mut command = self.place_and_route_command_for(
-            &self.artifacts.refined_json,
-            &self.artifacts.refined_config,
-        );
+        self.physical_candidate_place_and_route_command(0)
+    }
+
+    /// Returns same-seed implementation commands for the bounded physical
+    /// candidates emitted by synthesis. `candidate_count` is the number
+    /// reported by the synthesis command, not an optimization-mode choice.
+    #[must_use]
+    pub fn physical_candidate_place_and_route_commands(
+        &self,
+        candidate_count: usize,
+    ) -> Vec<ToolCommand> {
+        (0..candidate_count.min(MAX_PHYSICAL_CANDIDATES))
+            .map(|index| self.physical_candidate_place_and_route_command(index))
+            .collect()
+    }
+
+    fn physical_candidate_place_and_route_command(&self, index: usize) -> ToolCommand {
+        let (json, config, placed, report) = self.physical_candidate_artifacts(index);
+        let mut command = self.place_and_route_command_for(&json, &config);
         command.args.extend([
             "--write".into(),
-            self.artifacts.refined_placed_json.clone(),
+            placed,
             "--report".into(),
-            self.artifacts.refined_report.clone(),
+            report,
             "--detailed-timing-report".into(),
             "--timing-allow-fail".into(),
         ]);
         command.evidence = None;
         command
+    }
+
+    fn physical_candidate_artifacts(&self, index: usize) -> (String, String, String, String) {
+        if index == 0 {
+            return (
+                self.artifacts.refined_json.clone(),
+                self.artifacts.refined_config.clone(),
+                self.artifacts.refined_placed_json.clone(),
+                self.artifacts.refined_report.clone(),
+            );
+        }
+        let stem = self
+            .artifacts
+            .refined_json
+            .strip_suffix(".json")
+            .unwrap_or(&self.artifacts.refined_json);
+        let stem = format!("{stem}.candidate-{index}");
+        (
+            format!("{stem}.json"),
+            format!("{stem}.config"),
+            format!("{stem}-placed.json"),
+            format!("{stem}-report.json"),
+        )
     }
 
     /// Selects the routed draft unless the refined candidate improves every
@@ -195,6 +236,26 @@ impl Ecp5Flow {
         } else {
             &self.artifacts.draft_config
         }
+    }
+
+    /// Selects the best monotonically improving implementation from a routed
+    /// draft and the ordered bounded candidate set. Candidates that regress
+    /// any reported clock are ignored.
+    #[must_use]
+    pub fn select_physical_candidate_config(
+        &self,
+        draft: &PhysicalFeedback,
+        candidates: &[PhysicalFeedback],
+    ) -> String {
+        let mut best = draft;
+        let mut selected = self.artifacts.draft_config.clone();
+        for (index, candidate) in candidates.iter().take(MAX_PHYSICAL_CANDIDATES).enumerate() {
+            if candidate.improves_timing_over(best) {
+                best = candidate;
+                selected = self.physical_candidate_artifacts(index).1;
+            }
+        }
+        selected
     }
 
     fn place_and_route_command_for(&self, json: &str, config: &str) -> ToolCommand {
@@ -256,6 +317,24 @@ impl Ecp5Flow {
     ) -> Result<ToolCommand, ReleaseBlocked> {
         report.authorize_bitstream(policy)?;
         Ok(self.pack_command_for_config(self.select_physical_config(draft, refined)))
+    }
+
+    /// Packs the best same-seed physical candidate, or the draft when every
+    /// candidate is slower.
+    ///
+    /// # Errors
+    ///
+    /// Returns the missing, skipped, or failed release gates.
+    pub fn pack_physical_candidates_command(
+        &self,
+        report: &VerificationReport,
+        policy: &VerificationPolicy,
+        draft: &PhysicalFeedback,
+        candidates: &[PhysicalFeedback],
+    ) -> Result<ToolCommand, ReleaseBlocked> {
+        report.authorize_bitstream(policy)?;
+        let config = self.select_physical_candidate_config(draft, candidates);
+        Ok(self.pack_command_for_config(&config))
     }
 
     fn pack_command_for_config(&self, config: &str) -> ToolCommand {
@@ -369,6 +448,41 @@ mod tests {
     }
 
     #[test]
+    fn physical_flow_routes_the_bounded_candidate_set_at_the_same_seed() {
+        let flow = Ecp5Flow::evaluation_board("Top", "build/Top");
+
+        let commands = flow.physical_candidate_place_and_route_commands(3);
+
+        assert_eq!(commands.len(), 3);
+        for command in &commands {
+            assert!(command.args.windows(2).any(|args| args == ["--seed", "1"]));
+            assert!(command.args.iter().any(|arg| arg == "--timing-allow-fail"));
+        }
+        assert!(
+            commands[0]
+                .args
+                .windows(2)
+                .any(|args| args == ["--json", "build/Top/design.refined.json"])
+        );
+        assert!(
+            commands[1]
+                .args
+                .windows(2)
+                .any(|args| { args == ["--json", "build/Top/design.refined.candidate-1.json"] })
+        );
+        assert!(commands[2].args.windows(2).any(|args| {
+            args == [
+                "--report",
+                "build/Top/design.refined.candidate-2-report.json",
+            ]
+        }));
+        assert_eq!(
+            flow.physical_candidate_place_and_route_commands(99).len(),
+            3
+        );
+    }
+
+    #[test]
     fn physical_flow_rolls_back_a_slower_candidate() {
         use super::PhysicalFeedback;
 
@@ -397,6 +511,15 @@ mod tests {
         assert_eq!(
             flow.select_physical_config(&draft, &faster),
             "build/Top/design.refined.config"
+        );
+        let fastest = PhysicalFeedback::from_nextpnr_json(
+            r#"{"fmax":{"clk":{"achieved":318.0,"constraint":320.0}}}"#,
+            placed,
+        )
+        .unwrap();
+        assert_eq!(
+            flow.select_physical_candidate_config(&draft, &[slower, faster, fastest]),
+            "build/Top/design.refined.candidate-2.config"
         );
     }
 
