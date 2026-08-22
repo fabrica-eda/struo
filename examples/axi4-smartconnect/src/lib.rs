@@ -24,6 +24,15 @@ pub fn axi4_crossbar_self_test() -> Result<Design, ImportError> {
     analyze_and_lower(AXI4_CROSSBAR_SOURCE, "struo_axi4", "Axi4CrossbarSelfTest")
 }
 
+/// Analyzes the four-input specialization of the parameterized `QoS` arbiter.
+///
+/// # Errors
+///
+/// Returns an error if Veryl analysis, hierarchy flattening, or RTL validation fails.
+pub fn axi4_qos_arbiter_4() -> Result<Design, ImportError> {
+    analyze_and_lower(AXI4_CROSSBAR_SOURCE, "struo_axi4", "Axi4QosArbiter4")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -33,7 +42,7 @@ mod tests {
     use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
 
-    use super::{axi4_crossbar_2x2, axi4_crossbar_self_test};
+    use super::{axi4_crossbar_2x2, axi4_crossbar_self_test, axi4_qos_arbiter_4};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -48,6 +57,30 @@ mod tests {
         assert!(synthesized.netlist.registers().len() >= 400);
         assert!(mapped.cells().len() > synthesized.netlist.registers().len());
         ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+    }
+
+    #[test]
+    fn arbitrates_four_inputs_by_qos_and_tie_order() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for mut simulator in [reference_qos_arbiter_simulator(), qos_arbiter_simulator()] {
+            // Equal-QoS order is port 2, port 3, port 0, then port 1.
+            set_u16(&mut simulator, "tie_break", 0x3b02);
+            set_u16(&mut simulator, "qos", 0x5555);
+            set_u8(&mut simulator, "request", 0b1111);
+            assert_value(&mut simulator, "grant", 0b0100);
+
+            // QoS takes precedence over the tie order.
+            set_u16(&mut simulator, "qos", 0x5591);
+            assert_value(&mut simulator, "grant", 0b0010);
+
+            // The same ordering works for a sparse request set.
+            set_u16(&mut simulator, "qos", 0x5555);
+            set_u8(&mut simulator, "request", 0b1001);
+            assert_value(&mut simulator, "grant", 0b1000);
+
+            set_u8(&mut simulator, "request", 0);
+            assert_value(&mut simulator, "grant", 0);
+        }
     }
 
     #[test]
@@ -143,6 +176,19 @@ mod tests {
 
     fn reference_simulator() -> Simulator<NativeBackend> {
         SimulatorBuilder::new(super::AXI4_CROSSBAR_SOURCE, "Axi4Crossbar2x2")
+            .build_native()
+            .unwrap()
+    }
+
+    fn qos_arbiter_simulator() -> Simulator<NativeBackend> {
+        let design = axi4_qos_arbiter_4().unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        ecp5_simulator(&mapped).unwrap().build_native().unwrap()
+    }
+
+    fn reference_qos_arbiter_simulator() -> Simulator<NativeBackend> {
+        SimulatorBuilder::new(super::AXI4_CROSSBAR_SOURCE, "Axi4QosArbiter4")
             .build_native()
             .unwrap()
     }

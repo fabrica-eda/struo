@@ -45,12 +45,17 @@ pub enum NodeKind {
     RegisterOutput(String),
     /// A named primary output bit.
     Output(String),
+    /// A named output bit driven by a synchronous memory read port.
+    MemoryOutput(String),
 }
 
 impl NodeKind {
     const fn expected_input_count(&self) -> usize {
         match self {
-            Self::Input(_) | Self::Constant(_) | Self::RegisterOutput(_) => 0,
+            Self::Input(_)
+            | Self::Constant(_)
+            | Self::RegisterOutput(_)
+            | Self::MemoryOutput(_) => 0,
             Self::Not | Self::Output(_) => 1,
             Self::And | Self::Or | Self::Xor => 2,
             Self::Mux => 3,
@@ -175,6 +180,117 @@ pub struct RegisterCell {
     reset: Option<ResetControl>,
 }
 
+/// One synchronous, simple-dual-port memory retained for block-RAM mapping.
+///
+/// Addresses and words are stored least-significant bit first. The read and
+/// write ports share a clock and edge. A read samples its address on the active
+/// edge and updates `read_data` one cycle later. A simultaneous read and write
+/// to the same address has target-specific collision behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryCell {
+    name: String,
+    depth: u32,
+    read_address: Vec<NetId>,
+    read_data: Vec<NetId>,
+    read_enable: Option<EnableControl>,
+    write_address: Vec<NetId>,
+    write_data: Vec<NetId>,
+    write_enable: EnableControl,
+    clock: NetId,
+    edge: ClockEdge,
+}
+
+impl MemoryCell {
+    /// Creates a fully connected synchronous memory cell.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: impl Into<String>,
+        depth: u32,
+        read_address: Vec<NetId>,
+        read_data: Vec<NetId>,
+        read_enable: Option<EnableControl>,
+        write_address: Vec<NetId>,
+        write_data: Vec<NetId>,
+        write_enable: EnableControl,
+        clock: NetId,
+        edge: ClockEdge,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            depth,
+            read_address,
+            read_data,
+            read_enable,
+            write_address,
+            write_data,
+            write_enable,
+            clock,
+            edge,
+        }
+    }
+
+    /// Returns the stable diagnostic name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the logical number of words.
+    #[must_use]
+    pub const fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    /// Returns read-address bits least-significant first.
+    #[must_use]
+    pub fn read_address(&self) -> &[NetId] {
+        &self.read_address
+    }
+
+    /// Returns read-data bits least-significant first.
+    #[must_use]
+    pub fn read_data(&self) -> &[NetId] {
+        &self.read_data
+    }
+
+    /// Returns the optional read clock enable.
+    #[must_use]
+    pub const fn read_enable(&self) -> Option<EnableControl> {
+        self.read_enable
+    }
+
+    /// Returns write-address bits least-significant first.
+    #[must_use]
+    pub fn write_address(&self) -> &[NetId] {
+        &self.write_address
+    }
+
+    /// Returns write-data bits least-significant first.
+    #[must_use]
+    pub fn write_data(&self) -> &[NetId] {
+        &self.write_data
+    }
+
+    /// Returns the write enable.
+    #[must_use]
+    pub const fn write_enable(&self) -> EnableControl {
+        self.write_enable
+    }
+
+    /// Returns the shared clock.
+    #[must_use]
+    pub const fn clock(&self) -> NetId {
+        self.clock
+    }
+
+    /// Returns the active clock edge.
+    #[must_use]
+    pub const fn edge(&self) -> ClockEdge {
+        self.edge
+    }
+}
+
 impl RegisterCell {
     /// Creates a fully connected one-bit register.
     #[must_use]
@@ -260,6 +376,7 @@ pub struct Netlist {
     nodes: Vec<Node>,
     ports: Vec<Port>,
     registers: Vec<RegisterCell>,
+    memories: Vec<MemoryCell>,
     next_net: u32,
     constants: [Option<NetId>; 2],
     logic_cache: HashMap<LogicKey, NetId>,
@@ -274,6 +391,7 @@ impl Netlist {
             nodes: Vec::new(),
             ports: Vec::new(),
             registers: Vec::new(),
+            memories: Vec::new(),
             next_net: 0,
             constants: [None, None],
             logic_cache: HashMap::new(),
@@ -302,6 +420,12 @@ impl Netlist {
     #[must_use]
     pub fn registers(&self) -> &[RegisterCell] {
         &self.registers
+    }
+
+    /// Returns inferred synchronous memories.
+    #[must_use]
+    pub fn memories(&self) -> &[MemoryCell] {
+        &self.memories
     }
 
     /// Adds a primary input and returns its net.
@@ -351,9 +475,19 @@ impl Netlist {
         self.add_node(NodeKind::RegisterOutput(name.into()), Vec::new())
     }
 
+    /// Reserves one memory read-data output.
+    pub fn add_memory_output(&mut self, name: impl Into<String>) -> NetId {
+        self.add_node(NodeKind::MemoryOutput(name.into()), Vec::new())
+    }
+
     /// Connects a previously reserved register output to its D/control nets.
     pub fn add_register(&mut self, register: RegisterCell) {
         self.registers.push(register);
+    }
+
+    /// Connects previously reserved read outputs to a synchronous memory.
+    pub fn add_memory(&mut self, memory: MemoryCell) {
+        self.memories.push(memory);
     }
 
     /// Adds or reuses a two-input AND gate.
@@ -500,6 +634,7 @@ impl Netlist {
         let mut defined_nets = HashSet::new();
         let mut port_names = HashSet::new();
         let mut register_outputs = HashSet::new();
+        let mut memory_outputs = HashSet::new();
 
         for node in &self.nodes {
             let expected = node.kind.expected_input_count();
@@ -533,6 +668,12 @@ impl Netlist {
                     }
                     register_outputs.insert(node.output);
                 }
+                NodeKind::MemoryOutput(name) => {
+                    if name.trim().is_empty() {
+                        return Err(ValidationError::EmptyMemoryName);
+                    }
+                    memory_outputs.insert(node.output);
+                }
                 _ => {}
             }
         }
@@ -562,6 +703,17 @@ impl Netlist {
             }
         }
 
+        self.validate_registers(&defined_nets, &register_outputs)?;
+        self.validate_memories(&defined_nets, &memory_outputs)?;
+
+        Ok(())
+    }
+
+    fn validate_registers(
+        &self,
+        defined_nets: &HashSet<NetId>,
+        register_outputs: &HashSet<NetId>,
+    ) -> Result<(), ValidationError> {
         let mut connected_outputs = HashSet::new();
         let mut register_names = HashSet::new();
         for register in &self.registers {
@@ -589,7 +741,66 @@ impl Netlist {
         if let Some(output) = register_outputs.difference(&connected_outputs).next() {
             return Err(ValidationError::UnconnectedRegister(*output));
         }
+        Ok(())
+    }
 
+    fn validate_memories(
+        &self,
+        defined_nets: &HashSet<NetId>,
+        memory_outputs: &HashSet<NetId>,
+    ) -> Result<(), ValidationError> {
+        let mut connected_memory_outputs = HashSet::new();
+        let mut memory_names = HashSet::new();
+        for memory in &self.memories {
+            if memory.name.trim().is_empty() {
+                return Err(ValidationError::EmptyMemoryName);
+            }
+            if !memory_names.insert(memory.name.as_str()) {
+                return Err(ValidationError::DuplicateMemoryName(memory.name.clone()));
+            }
+            if memory.depth == 0 {
+                return Err(ValidationError::ZeroMemoryDepth(memory.name.clone()));
+            }
+            if memory.read_address.is_empty()
+                || memory.read_address.len() != memory.write_address.len()
+            {
+                return Err(ValidationError::MemoryAddressWidth(memory.name.clone()));
+            }
+            if memory.read_data.is_empty() || memory.read_data.len() != memory.write_data.len() {
+                return Err(ValidationError::MemoryWordWidth(memory.name.clone()));
+            }
+            let address_capacity = u32::try_from(memory.read_address.len())
+                .ok()
+                .and_then(|shift| 1u128.checked_shl(shift))
+                .unwrap_or(u128::MAX);
+            if u128::from(memory.depth) > address_capacity {
+                return Err(ValidationError::MemoryAddressWidth(memory.name.clone()));
+            }
+            for output in &memory.read_data {
+                if !memory_outputs.contains(output) {
+                    return Err(ValidationError::InvalidMemoryOutput(*output));
+                }
+                if !connected_memory_outputs.insert(*output) {
+                    return Err(ValidationError::MultipleDrivers(*output));
+                }
+            }
+            for input in memory
+                .read_address
+                .iter()
+                .chain(&memory.write_address)
+                .chain(&memory.write_data)
+                .copied()
+                .chain([memory.clock, memory.write_enable.signal])
+                .chain(memory.read_enable.map(|enable| enable.signal))
+            {
+                if !defined_nets.contains(&input) {
+                    return Err(ValidationError::UndefinedNet(input));
+                }
+            }
+        }
+        if let Some(output) = memory_outputs.difference(&connected_memory_outputs).next() {
+            return Err(ValidationError::UnconnectedMemory(*output));
+        }
         Ok(())
     }
 
@@ -646,10 +857,20 @@ pub enum ValidationError {
     PortWidthOverflow,
     /// A register name is empty.
     EmptyRegisterName,
+    /// A memory name is empty.
+    EmptyMemoryName,
     /// More than one port has the same name.
     DuplicatePortName(String),
     /// More than one register has the same name.
     DuplicateRegisterName(String),
+    /// More than one memory has the same name.
+    DuplicateMemoryName(String),
+    /// A memory has no words.
+    ZeroMemoryDepth(String),
+    /// A memory has invalid or mismatched address widths.
+    MemoryAddressWidth(String),
+    /// A memory has invalid or mismatched word widths.
+    MemoryWordWidth(String),
     /// A node consumes an undefined net.
     UndefinedNet(NetId),
     /// More than one object drives the same net.
@@ -658,6 +879,10 @@ pub enum ValidationError {
     InvalidRegisterOutput(NetId),
     /// A reserved state output has no register cell.
     UnconnectedRegister(NetId),
+    /// A memory does not reference a reserved read-data output.
+    InvalidMemoryOutput(NetId),
+    /// A reserved memory read-data output has no memory cell.
+    UnconnectedMemory(NetId),
     /// A grouped port references a node with the wrong direction.
     InvalidPortBit(NetId),
     /// A node has the wrong number of inputs.
@@ -679,9 +904,18 @@ impl Display for ValidationError {
             Self::EmptyPortWidth => formatter.write_str("port width must not be zero"),
             Self::PortWidthOverflow => formatter.write_str("port width exceeds the IR limit"),
             Self::EmptyRegisterName => formatter.write_str("register name must not be empty"),
+            Self::EmptyMemoryName => formatter.write_str("memory name must not be empty"),
             Self::DuplicatePortName(name) => write!(formatter, "duplicate port name: {name}"),
             Self::DuplicateRegisterName(name) => {
                 write!(formatter, "duplicate register name: {name}")
+            }
+            Self::DuplicateMemoryName(name) => write!(formatter, "duplicate memory name: {name}"),
+            Self::ZeroMemoryDepth(name) => write!(formatter, "memory {name} has zero depth"),
+            Self::MemoryAddressWidth(name) => {
+                write!(formatter, "memory {name} has an invalid address width")
+            }
+            Self::MemoryWordWidth(name) => {
+                write!(formatter, "memory {name} has an invalid word width")
             }
             Self::UndefinedNet(net) => write!(formatter, "net {net} is undefined"),
             Self::MultipleDrivers(net) => write!(formatter, "net {net} has multiple drivers"),
@@ -690,6 +924,12 @@ impl Display for ValidationError {
             }
             Self::UnconnectedRegister(net) => {
                 write!(formatter, "reserved register output {net} is not connected")
+            }
+            Self::InvalidMemoryOutput(net) => {
+                write!(formatter, "memory output {net} was not reserved")
+            }
+            Self::UnconnectedMemory(net) => {
+                write!(formatter, "reserved memory output {net} is not connected")
             }
             Self::InvalidPortBit(net) => {
                 write!(formatter, "net {net} has the wrong node kind for its port")

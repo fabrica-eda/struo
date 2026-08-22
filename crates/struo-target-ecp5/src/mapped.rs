@@ -7,7 +7,7 @@ use std::fmt::{self, Display, Formatter};
 use serde::Serialize;
 use serde::ser::Serializer;
 use struo_ir::{
-    ActiveLevel, ClockEdge, NetId, Netlist, NodeKind, PortDirection as IrPortDirection,
+    ActiveLevel, ClockEdge, MemoryCell, NetId, Netlist, NodeKind, PortDirection as IrPortDirection,
     ValidationError,
 };
 
@@ -108,6 +108,33 @@ pub enum Ecp5Cell {
         /// Optional local set/reset.
         reset: Option<Reset>,
     },
+    /// One ECP5 18-Kibit embedded block RAM in simple-dual-port mode.
+    BlockRam {
+        /// Stable cell name.
+        name: String,
+        /// Logical number of words represented by the cell.
+        depth: u32,
+        /// Logical word width.
+        word_width: u8,
+        /// Configured DP16KD port width (1, 2, 4, 9, or 18).
+        physical_width: u8,
+        /// Fourteen physical write-address pins.
+        write_address: Box<[Bit; 14]>,
+        /// Logical write-data bits, least-significant first.
+        write_data: Vec<Bit>,
+        /// Write enable.
+        write_enable: Control,
+        /// Fourteen physical read-address pins.
+        read_address: Box<[Bit; 14]>,
+        /// Logical read-data output wires, least-significant first.
+        read_data: Vec<u32>,
+        /// Optional read clock enable.
+        read_enable: Option<Control>,
+        /// Shared port clock.
+        clock: Bit,
+        /// Shared active clock edge.
+        edge: ClockEdge,
+    },
 }
 
 /// Technology-mapped ECP5 netlist used by both simulation and nextpnr.
@@ -160,7 +187,9 @@ pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
 
     for node in netlist.nodes() {
         let mapped = match node.kind() {
-            NodeKind::Input(_) | NodeKind::RegisterOutput(_) => wire_for(node.output()),
+            NodeKind::Input(_) | NodeKind::RegisterOutput(_) | NodeKind::MemoryOutput(_) => {
+                wire_for(node.output())
+            }
             NodeKind::Constant(value) => Bit::from(*value),
             NodeKind::Output(_) => mapped_bit(&bits, node.inputs()[0]),
             kind @ (NodeKind::And
@@ -208,6 +237,10 @@ pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
         });
     }
 
+    for memory in netlist.memories() {
+        map_memory(memory, &bits, &mut cells)?;
+    }
+
     let ports = netlist
         .ports()
         .iter()
@@ -232,6 +265,69 @@ pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
     })
 }
 
+fn map_memory(
+    memory: &MemoryCell,
+    bits: &[Option<Bit>],
+    cells: &mut Vec<Ecp5Cell>,
+) -> Result<(), MappingError> {
+    let geometry_error = || MappingError::UnsupportedMemoryGeometry {
+        memory: memory.name().into(),
+        depth: memory.depth(),
+        width: memory.write_data().len(),
+    };
+    let chunk_width = maximum_block_ram_width(memory.depth()).ok_or_else(&geometry_error)?;
+    let chunk_count = memory.write_data().len().div_ceil(usize::from(chunk_width));
+    for (chunk, (write_data, read_data)) in memory
+        .write_data()
+        .chunks(usize::from(chunk_width))
+        .zip(memory.read_data().chunks(usize::from(chunk_width)))
+        .enumerate()
+    {
+        let word_width = u8::try_from(write_data.len()).map_err(|_| geometry_error())?;
+        let physical_width =
+            block_ram_width(memory.depth(), word_width).ok_or_else(&geometry_error)?;
+        let mut write_address = physical_address(bits, memory.write_address(), physical_width);
+        if physical_width == 18 {
+            // In 18-bit mode ADA0/ADA1 are the two 9-bit byte enables rather
+            // than address pins. This IR writes whole words only.
+            write_address[0] = Bit::One;
+            write_address[1] = Bit::One;
+        }
+        cells.push(Ecp5Cell::BlockRam {
+            name: if chunk_count == 1 {
+                format!("bram_{}", memory.name())
+            } else {
+                format!("bram_{}_{chunk}", memory.name())
+            },
+            depth: memory.depth(),
+            word_width,
+            physical_width,
+            write_address: Box::new(write_address),
+            write_data: write_data
+                .iter()
+                .map(|net| mapped_bit(bits, *net))
+                .collect(),
+            write_enable: Control {
+                signal: mapped_bit(bits, memory.write_enable().signal),
+                active: memory.write_enable().active,
+            },
+            read_address: Box::new(physical_address(
+                bits,
+                memory.read_address(),
+                physical_width,
+            )),
+            read_data: read_data.iter().map(|net| wire_number(*net)).collect(),
+            read_enable: memory.read_enable().map(|enable| Control {
+                signal: mapped_bit(bits, enable.signal),
+                active: enable.active,
+            }),
+            clock: mapped_bit(bits, memory.clock()),
+            edge: memory.edge(),
+        });
+    }
+    Ok(())
+}
+
 impl From<bool> for Bit {
     fn from(value: bool) -> Self {
         if value { Self::One } else { Self::Zero }
@@ -250,6 +346,46 @@ fn wire_for(net: NetId) -> Bit {
 
 fn mapped_bit(bits: &[Option<Bit>], net: NetId) -> Bit {
     bits[net.index() as usize].expect("validated nodes are topologically ordered")
+}
+
+fn block_ram_width(depth: u32, word_width: u8) -> Option<u8> {
+    [
+        (1u8, 16_384u32),
+        (2, 8_192),
+        (4, 4_096),
+        (9, 2_048),
+        (18, 1_024),
+    ]
+    .into_iter()
+    .find_map(|(width, capacity)| (word_width <= width && depth <= capacity).then_some(width))
+}
+
+fn maximum_block_ram_width(depth: u32) -> Option<u8> {
+    [
+        (18u8, 1_024u32),
+        (9, 2_048),
+        (4, 4_096),
+        (2, 8_192),
+        (1, 16_384),
+    ]
+    .into_iter()
+    .find_map(|(width, capacity)| (depth <= capacity).then_some(width))
+}
+
+fn physical_address(bits: &[Option<Bit>], address: &[NetId], width: u8) -> [Bit; 14] {
+    let shift = match width {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        9 => 3,
+        18 => 4,
+        _ => unreachable!("validated DP16KD width"),
+    };
+    let mut physical = [Bit::Zero; 14];
+    for (target, source) in physical[shift..].iter_mut().zip(address) {
+        *target = mapped_bit(bits, *source);
+    }
+    physical
 }
 
 fn truth_table(kind: &NodeKind) -> u16 {
@@ -280,12 +416,29 @@ fn truth_table(kind: &NodeKind) -> u16 {
 pub enum MappingError {
     /// Source netlist is invalid.
     InvalidNetlist(ValidationError),
+    /// A logical memory cannot be width-tiled into DP16KD primitives.
+    UnsupportedMemoryGeometry {
+        /// Memory name.
+        memory: String,
+        /// Requested word count.
+        depth: u32,
+        /// Requested word width.
+        width: usize,
+    },
 }
 
 impl Display for MappingError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidNetlist(error) => write!(formatter, "invalid netlist: {error}"),
+            Self::UnsupportedMemoryGeometry {
+                memory,
+                depth,
+                width,
+            } => write!(
+                formatter,
+                "memory {memory} ({depth}x{width}) cannot be mapped to ECP5 DP16KD primitives"
+            ),
         }
     }
 }
@@ -294,6 +447,7 @@ impl Error for MappingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidNetlist(error) => Some(error),
+            Self::UnsupportedMemoryGeometry { .. } => None,
         }
     }
 }
@@ -394,6 +548,32 @@ impl From<&Ecp5Netlist> for JsonDesign {
                 } => (
                     name.clone(),
                     json_flip_flop(*data, *output, *clock, *edge, *enable, *reset),
+                ),
+                Ecp5Cell::BlockRam {
+                    name,
+                    physical_width,
+                    write_address,
+                    write_data,
+                    write_enable,
+                    read_address,
+                    read_data,
+                    read_enable,
+                    clock,
+                    edge,
+                    ..
+                } => (
+                    name.clone(),
+                    json_block_ram(
+                        *physical_width,
+                        **write_address,
+                        write_data,
+                        *write_enable,
+                        **read_address,
+                        read_data,
+                        *read_enable,
+                        *clock,
+                        *edge,
+                    ),
                 ),
             })
             .collect();
@@ -533,11 +713,140 @@ fn control_mux(control: Option<Control>) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn json_block_ram(
+    width: u8,
+    write_address: [Bit; 14],
+    write_data: &[Bit],
+    write_enable: Control,
+    read_address: [Bit; 14],
+    read_data: &[u32],
+    read_enable: Option<Control>,
+    clock: Bit,
+    edge: ClockEdge,
+) -> JsonCell {
+    let parameters = block_ram_parameters(width, write_enable, read_enable, edge);
+
+    let mut port_directions = BTreeMap::new();
+    let mut connections = BTreeMap::new();
+    let mut input = |name: String, bit: Bit| {
+        port_directions.insert(name.clone(), "input");
+        connections.insert(name, vec![bit]);
+    };
+    for (index, bit) in write_address.into_iter().enumerate() {
+        input(format!("ADA{index}"), bit);
+    }
+    for index in 0..18 {
+        input(
+            format!("DIA{index}"),
+            write_data.get(index).copied().unwrap_or(Bit::Zero),
+        );
+    }
+    input("CEA".into(), Bit::One);
+    input("OCEA".into(), Bit::One);
+    input("CLKA".into(), clock);
+    input("WEA".into(), write_enable.signal);
+    input("RSTA".into(), Bit::Zero);
+    for index in 0..3 {
+        input(format!("CSA{index}"), Bit::Zero);
+    }
+    for (index, bit) in read_address.into_iter().enumerate() {
+        input(format!("ADB{index}"), bit);
+    }
+    for index in 0..18 {
+        input(format!("DIB{index}"), Bit::Zero);
+    }
+    input(
+        "CEB".into(),
+        read_enable.map_or(Bit::One, |enable| enable.signal),
+    );
+    input("OCEB".into(), Bit::One);
+    input("CLKB".into(), clock);
+    input("WEB".into(), Bit::Zero);
+    input("RSTB".into(), Bit::Zero);
+    for index in 0..3 {
+        input(format!("CSB{index}"), Bit::Zero);
+    }
+    for (index, wire) in read_data.iter().enumerate() {
+        let name = format!("DOB{index}");
+        port_directions.insert(name.clone(), "output");
+        connections.insert(name, vec![Bit::Wire(*wire)]);
+    }
+    JsonCell {
+        hide_name: 0,
+        r#type: "DP16KD",
+        parameters,
+        attributes: BTreeMap::new(),
+        port_directions,
+        connections,
+    }
+}
+
+fn block_ram_parameters(
+    width: u8,
+    write_enable: Control,
+    read_enable: Option<Control>,
+    edge: ClockEdge,
+) -> BTreeMap<String, String> {
+    let mut parameters = BTreeMap::from([
+        ("DATA_WIDTH_A".into(), width.to_string()),
+        ("DATA_WIDTH_B".into(), width.to_string()),
+        ("REGMODE_A".into(), "NOREG".into()),
+        ("REGMODE_B".into(), "NOREG".into()),
+        ("RESETMODE".into(), "SYNC".into()),
+        ("ASYNC_RESET_RELEASE".into(), "SYNC".into()),
+        ("CSDECODE_A".into(), "0b000".into()),
+        ("CSDECODE_B".into(), "0b000".into()),
+        ("WRITEMODE_A".into(), "NORMAL".into()),
+        ("WRITEMODE_B".into(), "NORMAL".into()),
+        ("GSR".into(), "DISABLED".into()),
+        (
+            "CLKAMUX".into(),
+            if edge == ClockEdge::Rising {
+                "CLKA"
+            } else {
+                "INV"
+            }
+            .into(),
+        ),
+        (
+            "CLKBMUX".into(),
+            if edge == ClockEdge::Rising {
+                "CLKB"
+            } else {
+                "INV"
+            }
+            .into(),
+        ),
+        (
+            "WEAMUX".into(),
+            match write_enable.active {
+                ActiveLevel::High => "WEA",
+                ActiveLevel::Low => "INV",
+            }
+            .into(),
+        ),
+    ]);
+    parameters.insert("CEAMUX".into(), "1".into());
+    parameters.insert(
+        "CEBMUX".into(),
+        match read_enable.map(|enable| enable.active) {
+            None => "1",
+            Some(ActiveLevel::High) => "CEB",
+            Some(ActiveLevel::Low) => "INV",
+        }
+        .into(),
+    );
+    parameters
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
 
-    use struo_ir::{ActiveLevel, ClockEdge, Netlist, RegisterCell, ResetControl};
+    use struo_ir::{
+        ActiveLevel, ClockEdge, EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
+    };
 
     use super::{Ecp5Cell, map_to_ecp5};
 
@@ -564,7 +873,7 @@ mod tests {
             .iter()
             .filter_map(|cell| match cell {
                 Ecp5Cell::Lut4 { init, .. } => Some(*init),
-                Ecp5Cell::FlipFlop { .. } => None,
+                Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(truth_tables, [0x8888, 0xeeee, 0x6666, 0x5555, 0xd8d8]);
@@ -631,5 +940,53 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn maps_synchronous_memory_to_dp16kd() {
+        let mut source = Netlist::new("scratchpad");
+        let clock = source.add_input("clock");
+        let write_enable = source.add_input("write_enable");
+        let read_address = source.add_input_port("read_address", NonZeroU32::new(8).unwrap());
+        let write_address = source.add_input_port("write_address", NonZeroU32::new(8).unwrap());
+        let write_data = source.add_input_port("write_data", NonZeroU32::new(8).unwrap());
+        let read_data = (0..8)
+            .map(|bit| source.add_memory_output(format!("words[{bit}]")))
+            .collect::<Vec<_>>();
+        source.add_memory(MemoryCell::new(
+            "words",
+            256,
+            read_address,
+            read_data.clone(),
+            None,
+            write_address,
+            write_data,
+            EnableControl {
+                signal: write_enable,
+                active: ActiveLevel::High,
+            },
+            clock,
+            ClockEdge::Rising,
+        ));
+        source.add_output_port("read_data", &read_data).unwrap();
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        assert!(mapped.cells().iter().any(|cell| matches!(
+            cell,
+            Ecp5Cell::BlockRam {
+                physical_width: 9,
+                depth: 256,
+                word_width: 8,
+                ..
+            }
+        )));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let cell = &json["modules"]["scratchpad"]["cells"]["bram_words"];
+        assert_eq!(cell["type"], "DP16KD");
+        assert_eq!(cell["parameters"]["DATA_WIDTH_A"], "9");
+        assert_eq!(cell["connections"]["ADA3"][0], 12);
+        assert_eq!(cell["connections"]["DOB7"][0], 35);
     }
 }

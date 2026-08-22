@@ -1,19 +1,25 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use struo_rtl::{
-    BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Module as RtlModule,
-    Polarity, Port, PortDirection, Register, Reset, ResetMode, SignalId, SignalSlice, StateDomain,
-    UnaryOp, ValueType,
+    BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory,
+    Module as RtlModule, Polarity, Port, PortDirection, Register, Reset, ResetMode, SignalId,
+    SignalSlice, StateDomain, UnaryOp, ValueType,
 };
 use veryl_analyzer::ir::{
     AssignDestination, CasePattern, CaseStatement, Component, Declaration, Expression, Factor,
     FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module, Op, Statement, Type, TypeKind,
-    ValueVariant, VarId, VarKind, VarSelect, VarSelectOp,
+    ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
 };
 
 use crate::{ImportError, resolve_name};
 
-type Env = HashMap<VarId, LoweredExpr>;
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SignalKey {
+    id: VarId,
+    index: Vec<usize>,
+}
+
+type Env = HashMap<SignalKey, LoweredExpr>;
 
 #[derive(Clone, Copy)]
 struct LoweredExpr {
@@ -25,20 +31,45 @@ struct LoweredExpr {
 struct ModuleLowerer<'a> {
     source: &'a Module,
     rtl: RtlModule,
-    signals: HashMap<VarId, SignalId>,
-    signal_order: Vec<VarId>,
-    widths: HashMap<VarId, u32>,
-    signed: HashMap<VarId, bool>,
+    signals: HashMap<SignalKey, SignalId>,
+    signal_order: Vec<SignalKey>,
+    widths: HashMap<SignalKey, u32>,
+    signed: HashMap<SignalKey, bool>,
+    inferred_memories: HashSet<VarId>,
+}
+
+#[derive(Clone)]
+struct MemoryWritePattern {
+    clock: SignalKey,
+    edge: ClockEdge,
+    address: Expression,
+    data: Expression,
+    enable: Option<Expression>,
+}
+
+#[derive(Clone)]
+struct MemoryReadPattern {
+    clock: SignalKey,
+    edge: ClockEdge,
+    address: Expression,
+    data: VarId,
+    enable: Option<Expression>,
+}
+
+#[derive(Default)]
+struct PartialMemoryPattern {
+    write: Option<MemoryWritePattern>,
+    read: Option<MemoryReadPattern>,
 }
 
 /// Lowers analyzed Veryl AIR into Struo RTL without generated Verilog.
 ///
-/// The current semantic boundary supports scalar packed variables, recursively
-/// flattened module instances, analyzer-expanded interface/modport connections,
-/// combinational and sequential assignments, static packed selects,
-/// conditionals, case statements, concatenations, arithmetic, comparisons,
-/// shifts, and reset branches. Unsupported AIR is rejected rather than
-/// silently discarded.
+/// The current semantic boundary supports scalar packed variables, statically
+/// indexed unpacked arrays, recursively flattened module instances,
+/// analyzer-expanded interface/modport connections, combinational and
+/// sequential assignments, static packed selects, conditionals, case
+/// statements, concatenations, arithmetic, comparisons, shifts, and reset
+/// branches. Unsupported AIR is rejected rather than silently discarded.
 ///
 /// # Errors
 ///
@@ -71,6 +102,7 @@ impl<'a> ModuleLowerer<'a> {
         let mut signal_order = Vec::new();
         let mut widths = HashMap::new();
         let mut signed = HashMap::new();
+        let inferred_memories = memory_candidates(source);
 
         let mut ports = source.ports.iter().collect::<Vec<_>>();
         ports.sort_by_key(|(path, _)| path.to_string());
@@ -85,32 +117,44 @@ impl<'a> ModuleLowerer<'a> {
                 VarKind::Inout => PortDirection::Inout,
                 _ => return Err(ImportError::NonPort(path.to_string())),
             };
-            let r#type = value_type(&variable.r#type, &path.to_string())?;
-            let signal = rtl.add_port(Port {
-                name: path.to_string(),
-                direction,
-                r#type,
-            });
-            signals.insert(*id, signal);
-            signal_order.push(*id);
-            widths.insert(*id, r#type.width.get());
-            signed.insert(*id, r#type.signed);
+            let base_name = path.to_string();
+            let r#type = value_type(&variable.r#type, &base_name)?;
+            for index in array_indices(&variable.r#type, &base_name)? {
+                let key = SignalKey { id: *id, index };
+                let signal = rtl.add_port(Port {
+                    name: indexed_name(&base_name, &key.index),
+                    direction,
+                    r#type,
+                });
+                signals.insert(key.clone(), signal);
+                signal_order.push(key.clone());
+                widths.insert(key.clone(), r#type.width.get());
+                signed.insert(key, r#type.signed);
+            }
         }
 
         let mut internals = source
             .variables
             .values()
-            .filter(|variable| variable.kind == VarKind::Variable)
+            .filter(|variable| {
+                variable.kind == VarKind::Variable && !inferred_memories.contains(&variable.id)
+            })
             .collect::<Vec<_>>();
         internals.sort_by_key(|variable| variable.path.to_string());
         for variable in internals {
-            let name = variable.path.to_string();
-            let r#type = value_type(&variable.r#type, &name)?;
-            let signal = rtl.add_signal(name, r#type);
-            signals.insert(variable.id, signal);
-            signal_order.push(variable.id);
-            widths.insert(variable.id, r#type.width.get());
-            signed.insert(variable.id, r#type.signed);
+            let base_name = variable.path.to_string();
+            let r#type = value_type(&variable.r#type, &base_name)?;
+            for index in array_indices(&variable.r#type, &base_name)? {
+                let key = SignalKey {
+                    id: variable.id,
+                    index,
+                };
+                let signal = rtl.add_signal(indexed_name(&base_name, &key.index), r#type);
+                signals.insert(key.clone(), signal);
+                signal_order.push(key.clone());
+                widths.insert(key.clone(), r#type.width.get());
+                signed.insert(key, r#type.signed);
+            }
         }
 
         Ok(Self {
@@ -120,10 +164,222 @@ impl<'a> ModuleLowerer<'a> {
             signal_order,
             widths,
             signed,
+            inferred_memories,
         })
     }
 
+    fn infer_memories(&mut self) -> Result<(), ImportError> {
+        let candidates = self.inferred_memories.clone();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let mut patterns = self.collect_memory_patterns(&candidates)?;
+        for memory_id in candidates {
+            let pattern = patterns.remove(&memory_id).unwrap_or_default();
+            let (Some(write), Some(read)) = (pattern.write, pattern.read) else {
+                return Err(ImportError::UnsupportedBehavior(format!(
+                    "unpacked array {} is not a synchronous 1R1W memory",
+                    self.variable_name(memory_id)
+                )));
+            };
+            self.lower_inferred_memory(memory_id, write, read)?;
+        }
+        Ok(())
+    }
+
+    fn collect_memory_patterns(
+        &self,
+        candidates: &HashSet<VarId>,
+    ) -> Result<HashMap<VarId, PartialMemoryPattern>, ImportError> {
+        let mut patterns = HashMap::<VarId, PartialMemoryPattern>::new();
+        for declaration in &self.source.declarations {
+            let Declaration::Ff(ff) = declaration else {
+                continue;
+            };
+            let (clock, edge) = self.source_clock(ff)?;
+            for statement in &ff.statements {
+                let Some(pattern) = memory_statement_pattern(statement, candidates) else {
+                    continue;
+                };
+                match pattern {
+                    MemoryStatementPattern::Write {
+                        memory,
+                        address,
+                        data,
+                        enable,
+                    } => {
+                        let slot = &mut patterns.entry(memory).or_default().write;
+                        if slot.is_some() {
+                            return Err(ImportError::UnsupportedBehavior(format!(
+                                "memory {} has multiple write ports",
+                                self.variable_name(memory)
+                            )));
+                        }
+                        *slot = Some(MemoryWritePattern {
+                            clock: clock.clone(),
+                            edge,
+                            address,
+                            data,
+                            enable,
+                        });
+                    }
+                    MemoryStatementPattern::Read {
+                        memory,
+                        address,
+                        data,
+                        enable,
+                    } => {
+                        let slot = &mut patterns.entry(memory).or_default().read;
+                        if slot.is_some() {
+                            return Err(ImportError::UnsupportedBehavior(format!(
+                                "memory {} has multiple read ports",
+                                self.variable_name(memory)
+                            )));
+                        }
+                        *slot = Some(MemoryReadPattern {
+                            clock: clock.clone(),
+                            edge,
+                            address,
+                            data,
+                            enable,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(patterns)
+    }
+
+    fn lower_inferred_memory(
+        &mut self,
+        memory_id: VarId,
+        write: MemoryWritePattern,
+        read: MemoryReadPattern,
+    ) -> Result<(), ImportError> {
+        if write.clock != read.clock || write.edge != read.edge {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "memory {} read and write ports use different clocks",
+                self.variable_name(memory_id)
+            )));
+        }
+        let variable = &self.source.variables[&memory_id];
+        if variable.r#type.array.dims() != 1 {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "memory {} must have exactly one unpacked dimension",
+                self.variable_name(memory_id)
+            )));
+        }
+        let depth = variable
+            .r#type
+            .total_array()
+            .ok_or_else(|| ImportError::NonConcreteWidth(self.variable_name(memory_id)))?;
+        let depth = u32::try_from(depth)
+            .map_err(|_| ImportError::WidthTooLarge(self.variable_name(memory_id)))?;
+        if depth == 0 {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "memory {} has zero depth",
+                self.variable_name(memory_id)
+            )));
+        }
+        let word = value_type(&variable.r#type, &self.variable_name(memory_id))?;
+        let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1);
+        let env = self.read_env()?;
+        let read_address = self.lower_expression(&read.address, &env)?;
+        let read_address = self.resize(read_address, address_width, false)?;
+        let write_address = self.lower_expression(&write.address, &env)?;
+        let write_address = self.resize(write_address, address_width, false)?;
+        let write_data = self.lower_expression(&write.data, &env)?;
+        let write_data = self.resize(write_data, word.width.get(), word.signed)?;
+        let write_enable = self.lower_memory_enable(write.enable, &env)?;
+        let read_enable = read
+            .enable
+            .map(|enable| {
+                self.lower_expression(&enable, &env)
+                    .and_then(|x| self.boolean(x))
+            })
+            .transpose()?;
+        let write_enable = self.materialize_memory_enable(memory_id, "write", write_enable)?;
+        let read_enable = read_enable
+            .map(|enable| self.materialize_memory_enable(memory_id, "read", enable))
+            .transpose()?;
+        self.rtl.add_memory(Memory {
+            name: self.variable_name(memory_id),
+            word,
+            depth,
+            read_latency: 1,
+            read_address: read_address.id,
+            read_data: self.signal(&SignalKey {
+                id: read.data,
+                index: Vec::new(),
+            })?,
+            read_enable: read_enable.map(|signal| Enable {
+                signal,
+                polarity: Polarity::ActiveHigh,
+            }),
+            write_address: write_address.id,
+            write_data: write_data.id,
+            write_enable: Enable {
+                signal: write_enable,
+                polarity: Polarity::ActiveHigh,
+            },
+            clock: self.signal(&write.clock)?,
+            edge: write.edge,
+        });
+        Ok(())
+    }
+
+    fn lower_memory_enable(
+        &mut self,
+        enable: Option<Expression>,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        match enable {
+            Some(enable) => {
+                let enable = self.lower_expression(&enable, env)?;
+                self.boolean(enable)
+            }
+            None => Ok(self.constant(1, 1)),
+        }
+    }
+
+    fn source_clock(&self, ff: &FfDeclaration) -> Result<(SignalKey, ClockEdge), ImportError> {
+        if !ff.clock.select.is_empty() {
+            return Err(ImportError::UnsupportedBehavior("selected clocks".into()));
+        }
+        let clock = self.key_from_index(ff.clock.id, &ff.clock.index)?;
+        let edge = match self.variable_type(ff.clock.id)?.kind {
+            TypeKind::ClockNegedge => ClockEdge::Falling,
+            TypeKind::Clock | TypeKind::ClockPosedge => ClockEdge::Rising,
+            _ => {
+                return Err(ImportError::UnsupportedBehavior(
+                    "always_ff clock is not a clock type".into(),
+                ));
+            }
+        };
+        Ok((clock, edge))
+    }
+
+    fn materialize_memory_enable(
+        &mut self,
+        memory: VarId,
+        port: &str,
+        value: LoweredExpr,
+    ) -> Result<SignalId, ImportError> {
+        let signal = self.rtl.add_signal(
+            format!("__struo_{memory}_{port}_enable"),
+            ValueType {
+                width: BitWidth::new(1)?,
+                signed: false,
+                state: StateDomain::TwoState,
+            },
+        );
+        self.rtl.assign(self.rtl.whole(signal)?, value.id)?;
+        Ok(signal)
+    }
+
     fn lower_declarations(&mut self) -> Result<(), ImportError> {
+        self.infer_memories()?;
         let mut driven_comb = BTreeSet::new();
         let mut driven_ff = BTreeSet::new();
         for declaration in &self.source.declarations {
@@ -132,25 +388,25 @@ impl<'a> ModuleLowerer<'a> {
                     let initial = self.read_env()?;
                     let mut env = initial.clone();
                     let changed = self.lower_statements(&comb.statements, &mut env, false)?;
-                    for id in changed {
-                        if !driven_comb.insert(id) || driven_ff.contains(&id) {
+                    for key in changed {
+                        if !driven_comb.insert(key.clone()) || driven_ff.contains(&key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
                                 "multiple procedural drivers for {}",
-                                self.variable_name(id)
+                                self.signal_name(&key)
                             )));
                         }
-                        let signal = self.signal(id)?;
-                        let value = env[&id];
+                        let signal = self.signal(&key)?;
+                        let value = env[&key];
                         self.rtl.assign(self.rtl.whole(signal)?, value.id)?;
                     }
                 }
                 Declaration::Ff(ff) => {
                     let changed = self.lower_ff(ff)?;
-                    for id in changed {
-                        if !driven_ff.insert(id) || driven_comb.contains(&id) {
+                    for key in changed {
+                        if !driven_ff.insert(key.clone()) || driven_comb.contains(&key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
                                 "multiple procedural drivers for {}",
-                                self.variable_name(id)
+                                self.signal_name(&key)
                             )));
                         }
                     }
@@ -196,20 +452,105 @@ impl<'a> ModuleLowerer<'a> {
             .join(".");
         let inline_signals = self.inline_module(&child.rtl, &prefix)?;
         let parent_env = self.read_env()?;
+        self.lower_instance_inputs(instance, &child, &inline_signals, &parent_env)?;
+        self.lower_instance_outputs(instance, &child, &inline_signals)?;
+        Ok(())
+    }
+
+    fn lower_instance_inputs(
+        &mut self,
+        instance: &InstDeclaration,
+        child: &ModuleLowerer<'_>,
+        inline_signals: &HashMap<SignalId, SignalId>,
+        parent_env: &Env,
+    ) -> Result<(), ImportError> {
+        let mut input_elements = HashMap::new();
 
         for input in &instance.inputs {
-            let child_signal = child.signal(input.id)?;
+            if let Some(parent_id) = whole_array_variable(&input.expr) {
+                let child_keys = child.keys_for_id(input.id);
+                let parent_keys = self.keys_for_id(parent_id);
+                if child_keys.len() > 1 || parent_keys.len() > 1 {
+                    if child_keys.len() != parent_keys.len() {
+                        return Err(ImportError::UnsupportedBehavior(format!(
+                            "array instance input {} has {} child elements and {} parent elements",
+                            child.variable_name(input.id),
+                            child_keys.len(),
+                            parent_keys.len()
+                        )));
+                    }
+                    for (child_key, parent_key) in child_keys.iter().zip(&parent_keys) {
+                        let child_signal = child.signal(child_key)?;
+                        let target = inline_signals[&child_signal];
+                        let width = child.width(child_key)?;
+                        let value = parent_env[parent_key];
+                        let value = self.resize(value, width, child.is_signed(child_key))?;
+                        self.rtl.assign(self.rtl.whole(target)?, value.id)?;
+                    }
+                    input_elements.insert(input.id, child_keys.len());
+                    continue;
+                }
+            }
+            let element = input_elements.entry(input.id).or_insert(0);
+            let child_key = child.port_element_key(input.id, *element)?;
+            *element += 1;
+            let child_signal = child.signal(&child_key)?;
             let target = inline_signals[&child_signal];
-            let width = child.width(input.id)?;
-            let value = self.lower_expression(&input.expr, &parent_env)?;
-            let value = self.resize(value, width, child.is_signed(input.id))?;
+            let width = child.width(&child_key)?;
+            let value = self.lower_expression(&input.expr, parent_env)?;
+            let value = self.resize(value, width, child.is_signed(&child_key))?;
             self.rtl.assign(self.rtl.whole(target)?, value.id)?;
         }
+        Ok(())
+    }
 
+    fn lower_instance_outputs(
+        &mut self,
+        instance: &InstDeclaration,
+        child: &ModuleLowerer<'_>,
+        inline_signals: &HashMap<SignalId, SignalId>,
+    ) -> Result<(), ImportError> {
+        let mut output_elements = HashMap::new();
         for output in &instance.outputs {
-            let child_signal = child.signal(output.id)?;
+            if let [destination] = output.dst.as_slice()
+                && destination.index.0.is_empty()
+                && destination.select.is_empty()
+            {
+                let child_keys = child.keys_for_id(output.id);
+                let parent_keys = self.keys_for_id(destination.id);
+                if child_keys.len() > 1 || parent_keys.len() > 1 {
+                    if child_keys.len() != parent_keys.len() {
+                        return Err(ImportError::UnsupportedBehavior(format!(
+                            "array instance output {} has {} child elements and {} parent elements",
+                            child.variable_name(output.id),
+                            child_keys.len(),
+                            parent_keys.len()
+                        )));
+                    }
+                    for (child_key, parent_key) in child_keys.iter().zip(&parent_keys) {
+                        let child_signal = child.signal(child_key)?;
+                        let source = inline_signals[&child_signal];
+                        let source_width = child.width(child_key)?;
+                        let target = self.signal(parent_key)?;
+                        if source_width != self.width(parent_key)? {
+                            return Err(ImportError::UnsupportedBehavior(format!(
+                                "array instance output {} element width mismatch",
+                                child.variable_name(output.id)
+                            )));
+                        }
+                        let value = self.rtl.read(source)?;
+                        self.rtl.assign(self.rtl.whole(target)?, value)?;
+                    }
+                    output_elements.insert(output.id, child_keys.len());
+                    continue;
+                }
+            }
+            let element = output_elements.entry(output.id).or_insert(0);
+            let child_key = child.port_element_key(output.id, *element)?;
+            *element += 1;
+            let child_signal = child.signal(&child_key)?;
             let source = inline_signals[&child_signal];
-            let source_width = child.width(output.id)?;
+            let source_width = child.width(&child_key)?;
             let source_expr = self.rtl.read(source)?;
             let destinations = output
                 .dst
@@ -249,11 +590,6 @@ impl<'a> ModuleLowerer<'a> {
         child: &RtlModule,
         prefix: &str,
     ) -> Result<HashMap<SignalId, SignalId>, ImportError> {
-        if !child.memories().is_empty() {
-            return Err(ImportError::UnsupportedBehavior(
-                "memories in flattened module instances".into(),
-            ));
-        }
         if !child.instances().is_empty() {
             return Err(ImportError::UnsupportedBehavior(
                 "unflattened nested module instance".into(),
@@ -331,6 +667,28 @@ impl<'a> ModuleLowerer<'a> {
                 }),
             })?;
         }
+        for memory in child.memories() {
+            self.rtl.add_memory(Memory {
+                name: format!("{prefix}.{}", memory.name),
+                word: memory.word,
+                depth: memory.depth,
+                read_latency: memory.read_latency,
+                read_address: expressions[&memory.read_address],
+                read_data: signals[&memory.read_data],
+                read_enable: memory.read_enable.map(|enable| Enable {
+                    signal: signals[&enable.signal],
+                    polarity: enable.polarity,
+                }),
+                write_address: expressions[&memory.write_address],
+                write_data: expressions[&memory.write_data],
+                write_enable: Enable {
+                    signal: signals[&memory.write_enable.signal],
+                    polarity: memory.write_enable.polarity,
+                },
+                clock: signals[&memory.clock],
+                edge: memory.edge,
+            });
+        }
         Ok(signals)
     }
 
@@ -338,34 +696,24 @@ impl<'a> ModuleLowerer<'a> {
         &self,
         destination: &AssignDestination,
     ) -> Result<SignalSlice, ImportError> {
-        self.ensure_scalar_destination(destination)?;
-        let signal = self.signal(destination.id)?;
-        let (lsb, width) = static_select(&destination.select, self.width(destination.id)?)?;
+        let key = self.destination_key(destination)?;
+        let signal = self.signal(&key)?;
+        let (lsb, width) = static_select(&destination.select, self.width(&key)?)?;
         Ok(self.rtl.slice(signal, lsb, BitWidth::new(width)?)?)
     }
 
-    fn lower_ff(&mut self, ff: &FfDeclaration) -> Result<BTreeSet<VarId>, ImportError> {
-        if !ff.clock.index.0.is_empty() || !ff.clock.select.is_empty() {
-            return Err(ImportError::UnsupportedBehavior(
-                "selected or indexed clocks".into(),
-            ));
-        }
-        let clock = self.signal(ff.clock.id)?;
-        let edge = match self.variable_type(ff.clock.id)?.kind {
-            TypeKind::ClockNegedge => ClockEdge::Falling,
-            TypeKind::Clock | TypeKind::ClockPosedge => ClockEdge::Rising,
-            _ => {
-                return Err(ImportError::UnsupportedBehavior(
-                    "always_ff clock is not a clock type".into(),
-                ));
-            }
-        };
+    fn lower_ff(&mut self, ff: &FfDeclaration) -> Result<BTreeSet<SignalKey>, ImportError> {
+        let (clock_key, edge) = self.source_clock(ff)?;
+        let clock = self.signal(&clock_key)?;
         let initial = self.read_env()?;
         let mut next = initial.clone();
         let mut reset_values = None;
         let mut changed = BTreeSet::new();
 
         for statement in &ff.statements {
+            if memory_statement_pattern(statement, &self.inferred_memories).is_some() {
+                continue;
+            }
             if let Statement::IfReset(branch) = statement {
                 if reset_values.is_some() {
                     return Err(ImportError::UnsupportedBehavior(
@@ -383,10 +731,8 @@ impl<'a> ModuleLowerer<'a> {
         }
 
         let reset_control = if let Some(reset) = &ff.reset {
-            if !reset.index.0.is_empty() || !reset.select.is_empty() {
-                return Err(ImportError::UnsupportedBehavior(
-                    "selected or indexed resets".into(),
-                ));
+            if !reset.select.is_empty() {
+                return Err(ImportError::UnsupportedBehavior("selected resets".into()));
             }
             let (mode, polarity) = match self.variable_type(reset.id)?.kind {
                 TypeKind::ResetAsyncHigh => (ResetMode::Asynchronous, Polarity::ActiveHigh),
@@ -401,17 +747,18 @@ impl<'a> ModuleLowerer<'a> {
                     ));
                 }
             };
-            Some((self.signal(reset.id)?, mode, polarity))
+            let reset_key = self.key_from_index(reset.id, &reset.index)?;
+            Some((self.signal(&reset_key)?, mode, polarity))
         } else {
             None
         };
 
-        for id in &changed {
-            let signal = self.signal(*id)?;
+        for key in &changed {
+            let signal = self.signal(key)?;
             let reset = if let (Some(values), Some((reset_signal, mode, polarity))) =
                 (&reset_values, reset_control)
             {
-                let value = values.get(id).copied().unwrap_or(initial[id]);
+                let value = values.get(key).copied().unwrap_or(initial[key]);
                 Some(Reset {
                     signal: reset_signal,
                     mode,
@@ -422,9 +769,9 @@ impl<'a> ModuleLowerer<'a> {
                 None
             };
             self.rtl.add_register(Register {
-                name: self.variable_name(*id),
+                name: self.signal_name(key),
                 target: signal,
-                next: next.get(id).copied().unwrap_or(initial[id]).id,
+                next: next.get(key).copied().unwrap_or(initial[key]).id,
                 clock,
                 edge,
                 enable: None,
@@ -438,7 +785,7 @@ impl<'a> ModuleLowerer<'a> {
         &mut self,
         branch: &IfResetStatement,
         initial: &Env,
-    ) -> Result<(Env, Env, BTreeSet<VarId>), ImportError> {
+    ) -> Result<(Env, Env, BTreeSet<SignalKey>), ImportError> {
         let mut reset = initial.clone();
         let mut next = initial.clone();
         let mut changed = self.lower_statements(&branch.true_side, &mut reset, true)?;
@@ -451,7 +798,7 @@ impl<'a> ModuleLowerer<'a> {
         statements: &[Statement],
         env: &mut Env,
         sequential: bool,
-    ) -> Result<BTreeSet<VarId>, ImportError> {
+    ) -> Result<BTreeSet<SignalKey>, ImportError> {
         let mut changed = BTreeSet::new();
         for statement in statements {
             changed.extend(self.lower_statement(statement, env, sequential)?);
@@ -464,7 +811,7 @@ impl<'a> ModuleLowerer<'a> {
         statement: &Statement,
         env: &mut Env,
         sequential: bool,
-    ) -> Result<BTreeSet<VarId>, ImportError> {
+    ) -> Result<BTreeSet<SignalKey>, ImportError> {
         match statement {
             Statement::Assign(assign) => {
                 if assign.dst.len() != 1 {
@@ -473,10 +820,10 @@ impl<'a> ModuleLowerer<'a> {
                     ));
                 }
                 let destination = &assign.dst[0];
-                self.ensure_scalar_destination(destination)?;
+                let key = self.destination_key(destination)?;
                 let value = self.lower_expression(&assign.expr, env)?;
                 self.assign_env(destination, value, env)?;
-                Ok(BTreeSet::from([destination.id]))
+                Ok(BTreeSet::from([key]))
             }
             Statement::If(branch) => {
                 let condition = self.lower_expression(&branch.cond, env)?;
@@ -491,19 +838,19 @@ impl<'a> ModuleLowerer<'a> {
                     &mut false_env,
                     sequential,
                 )?);
-                for id in &changed {
-                    let then_value = true_env[id];
-                    let else_value = false_env[id];
-                    let width = self.width(*id)?;
-                    let then_value = self.resize(then_value, width, self.is_signed(*id))?;
-                    let else_value = self.resize(else_value, width, self.is_signed(*id))?;
+                for key in &changed {
+                    let then_value = true_env[key];
+                    let else_value = false_env[key];
+                    let width = self.width(key)?;
+                    let then_value = self.resize(then_value, width, self.is_signed(key))?;
+                    let else_value = self.resize(else_value, width, self.is_signed(key))?;
                     let value = self.rtl.mux(condition.id, then_value.id, else_value.id)?;
                     env.insert(
-                        *id,
+                        key.clone(),
                         LoweredExpr {
                             id: value,
                             width,
-                            signed: self.is_signed(*id),
+                            signed: self.is_signed(key),
                         },
                     );
                 }
@@ -540,7 +887,7 @@ impl<'a> ModuleLowerer<'a> {
         statement: &CaseStatement,
         env: &mut Env,
         sequential: bool,
-    ) -> Result<BTreeSet<VarId>, ImportError> {
+    ) -> Result<BTreeSet<SignalKey>, ImportError> {
         let target = self.lower_expression(&statement.case_target, env)?;
         let base = env.clone();
         let mut else_env = base.clone();
@@ -551,16 +898,16 @@ impl<'a> ModuleLowerer<'a> {
             let arm_changed = self.lower_statements(&arm.body, &mut then_env, sequential)?;
             let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
             let mut merged_changed = changed.clone();
-            merged_changed.extend(&arm_changed);
+            merged_changed.extend(arm_changed);
             let mut merged_env = base.clone();
-            for id in &merged_changed {
-                let width = self.width(*id)?;
-                let signed = self.is_signed(*id);
-                let then_value = self.resize(then_env[id], width, signed)?;
-                let else_value = self.resize(else_env[id], width, signed)?;
+            for key in &merged_changed {
+                let width = self.width(key)?;
+                let signed = self.is_signed(key);
+                let then_value = self.resize(then_env[key], width, signed)?;
+                let else_value = self.resize(else_env[key], width, signed)?;
                 let value = self.rtl.mux(condition.id, then_value.id, else_value.id)?;
                 merged_env.insert(
-                    *id,
+                    key.clone(),
                     LoweredExpr {
                         id: value,
                         width,
@@ -787,15 +1134,11 @@ impl<'a> ModuleLowerer<'a> {
     fn lower_factor(&mut self, factor: &Factor, env: &Env) -> Result<LoweredExpr, ImportError> {
         match factor {
             Factor::Variable(id, index, select, comptime) => {
-                if !index.0.is_empty() {
-                    return Err(ImportError::UnsupportedBehavior(
-                        "unpacked array indexing".into(),
-                    ));
-                }
-                let source = env.get(id).copied().ok_or_else(|| {
+                let key = self.key_from_index(*id, index)?;
+                let source = env.get(&key).copied().ok_or_else(|| {
                     ImportError::UnsupportedBehavior(format!(
                         "reference to non-runtime variable {}",
-                        self.variable_name(*id)
+                        self.signal_name(&key)
                     ))
                 })?;
                 let (lsb, width) = static_select(select, source.width)?;
@@ -847,14 +1190,15 @@ impl<'a> ModuleLowerer<'a> {
         value: LoweredExpr,
         env: &mut Env,
     ) -> Result<(), ImportError> {
-        let total_width = self.width(destination.id)?;
+        let key = self.destination_key(destination)?;
+        let total_width = self.width(&key)?;
         let (lsb, width) = static_select(&destination.select, total_width)?;
-        let value = self.resize(value, width, self.is_signed(destination.id))?;
+        let value = self.resize(value, width, self.is_signed(&key))?;
         if lsb == 0 && width == total_width {
-            env.insert(destination.id, value);
+            env.insert(key, value);
             return Ok(());
         }
-        let current = env[&destination.id];
+        let current = env[&key];
         let mut parts = Vec::new();
         let high_lsb = lsb + width;
         if high_lsb < total_width {
@@ -872,11 +1216,11 @@ impl<'a> ModuleLowerer<'a> {
             );
         }
         env.insert(
-            destination.id,
+            key.clone(),
             LoweredExpr {
                 id: self.rtl.concat(parts)?,
                 width: total_width,
-                signed: self.is_signed(destination.id),
+                signed: self.is_signed(&key),
             },
         );
         Ok(())
@@ -948,13 +1292,20 @@ impl<'a> ModuleLowerer<'a> {
         let entries = self
             .signal_order
             .iter()
-            .map(|id| (*id, self.signals[id], self.widths[id], self.signed[id]))
+            .map(|key| {
+                (
+                    key.clone(),
+                    self.signals[key],
+                    self.widths[key],
+                    self.signed[key],
+                )
+            })
             .collect::<Vec<_>>();
         entries
             .into_iter()
-            .map(|(id, signal, width, signed)| {
+            .map(|(key, signal, width, signed)| {
                 Ok((
-                    id,
+                    key,
                     LoweredExpr {
                         id: self.rtl.read(signal)?,
                         width,
@@ -965,44 +1316,89 @@ impl<'a> ModuleLowerer<'a> {
             .collect()
     }
 
-    fn ensure_scalar_destination(
-        &self,
-        destination: &AssignDestination,
-    ) -> Result<(), ImportError> {
-        if !destination.index.0.is_empty() {
-            return Err(ImportError::UnsupportedBehavior(
-                "unpacked array assignment".into(),
-            ));
-        }
-        if !self.signals.contains_key(&destination.id) {
+    fn destination_key(&self, destination: &AssignDestination) -> Result<SignalKey, ImportError> {
+        let key = self.key_from_index(destination.id, &destination.index)?;
+        if !self.signals.contains_key(&key) {
             return Err(ImportError::UnsupportedBehavior(format!(
                 "assignment to non-runtime variable {}",
-                self.variable_name(destination.id)
+                self.signal_name(&key)
             )));
         }
-        Ok(())
+        Ok(key)
     }
 
-    fn signal(&self, id: VarId) -> Result<SignalId, ImportError> {
-        self.signals.get(&id).copied().ok_or_else(|| {
+    fn signal(&self, key: &SignalKey) -> Result<SignalId, ImportError> {
+        self.signals.get(key).copied().ok_or_else(|| {
             ImportError::UnsupportedBehavior(format!(
                 "variable {} has no RTL signal",
-                self.variable_name(id)
+                self.signal_name(key)
             ))
         })
     }
 
-    fn width(&self, id: VarId) -> Result<u32, ImportError> {
-        self.widths.get(&id).copied().ok_or_else(|| {
+    fn width(&self, key: &SignalKey) -> Result<u32, ImportError> {
+        self.widths.get(key).copied().ok_or_else(|| {
             ImportError::UnsupportedBehavior(format!(
                 "variable {} has no width",
+                self.signal_name(key)
+            ))
+        })
+    }
+
+    fn is_signed(&self, key: &SignalKey) -> bool {
+        self.signed.get(key).copied().unwrap_or(false)
+    }
+
+    fn port_element_key(&self, id: VarId, element: usize) -> Result<SignalKey, ImportError> {
+        self.keys_for_id(id).get(element).cloned().ok_or_else(|| {
+            ImportError::UnsupportedBehavior(format!(
+                "module instance has too many connections for {}",
                 self.variable_name(id)
             ))
         })
     }
 
-    fn is_signed(&self, id: VarId) -> bool {
-        self.signed.get(&id).copied().unwrap_or(false)
+    fn keys_for_id(&self, id: VarId) -> Vec<SignalKey> {
+        self.signal_order
+            .iter()
+            .filter(|key| key.id == id)
+            .cloned()
+            .collect()
+    }
+
+    fn key_from_index(&self, id: VarId, index: &VarIndex) -> Result<SignalKey, ImportError> {
+        let variable = self
+            .source
+            .variables
+            .get(&id)
+            .ok_or_else(|| ImportError::MissingVariable(self.variable_name(id)))?;
+        let indices = index
+            .0
+            .iter()
+            .map(|value| {
+                usize::try_from(static_array_index(value)?).map_err(|_| {
+                    ImportError::UnsupportedBehavior("unpacked array index overflow".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if indices.len() != variable.r#type.array.dims() {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "whole or partially indexed unpacked array {}",
+                self.variable_name(id)
+            )));
+        }
+        for (index, dimension) in indices.iter().zip(variable.r#type.array.iter()) {
+            let Some(dimension) = dimension else {
+                return Err(ImportError::NonConcreteWidth(self.variable_name(id)));
+            };
+            if index >= dimension {
+                return Err(ImportError::UnsupportedBehavior(format!(
+                    "unpacked array index {index} exceeds dimension {dimension} of {}",
+                    self.variable_name(id)
+                )));
+            }
+        }
+        Ok(SignalKey { id, index: indices })
     }
 
     fn variable_type(&self, id: VarId) -> Result<&Type, ImportError> {
@@ -1020,9 +1416,115 @@ impl<'a> ModuleLowerer<'a> {
             .map_or_else(|| id.to_string(), |variable| variable.path.to_string())
     }
 
+    fn signal_name(&self, key: &SignalKey) -> String {
+        indexed_name(&self.variable_name(key.id), &key.index)
+    }
+
     fn unsupported_expression(op: Op) -> ImportError {
         ImportError::UnsupportedBehavior(format!("expression operator `{op}`"))
     }
+}
+
+fn memory_candidates(source: &Module) -> HashSet<VarId> {
+    let arrays = source
+        .variables
+        .values()
+        .filter(|variable| variable.kind == VarKind::Variable && !variable.r#type.array.is_empty())
+        .map(|variable| variable.id)
+        .collect::<HashSet<_>>();
+    let mut candidates = HashSet::new();
+    for declaration in &source.declarations {
+        let Declaration::Ff(ff) = declaration else {
+            continue;
+        };
+        for statement in &ff.statements {
+            let Some(pattern) = memory_statement_pattern(statement, &arrays) else {
+                continue;
+            };
+            let (memory, address) = match &pattern {
+                MemoryStatementPattern::Write {
+                    memory, address, ..
+                }
+                | MemoryStatementPattern::Read {
+                    memory, address, ..
+                } => (*memory, address),
+            };
+            if static_array_index(address).is_err() {
+                candidates.insert(memory);
+            }
+        }
+    }
+    candidates
+}
+
+enum MemoryStatementPattern {
+    Write {
+        memory: VarId,
+        address: Expression,
+        data: Expression,
+        enable: Option<Expression>,
+    },
+    Read {
+        memory: VarId,
+        address: Expression,
+        data: VarId,
+        enable: Option<Expression>,
+    },
+}
+
+fn memory_statement_pattern(
+    statement: &Statement,
+    memories: &HashSet<VarId>,
+) -> Option<MemoryStatementPattern> {
+    if let Statement::If(branch) = statement
+        && branch.false_side.is_empty()
+        && let [inner] = branch.true_side.as_slice()
+    {
+        return direct_memory_statement(inner, memories, Some(branch.cond.clone()));
+    }
+    direct_memory_statement(statement, memories, None)
+}
+
+fn direct_memory_statement(
+    statement: &Statement,
+    memories: &HashSet<VarId>,
+    enable: Option<Expression>,
+) -> Option<MemoryStatementPattern> {
+    let Statement::Assign(assign) = statement else {
+        return None;
+    };
+    let [destination] = assign.dst.as_slice() else {
+        return None;
+    };
+    if memories.contains(&destination.id)
+        && destination.index.0.len() == 1
+        && destination.select.is_empty()
+    {
+        return Some(MemoryStatementPattern::Write {
+            memory: destination.id,
+            address: destination.index.0[0].clone(),
+            data: assign.expr.clone(),
+            enable,
+        });
+    }
+    if !destination.index.0.is_empty() || !destination.select.is_empty() {
+        return None;
+    }
+    let Expression::Term(factor) = &assign.expr else {
+        return None;
+    };
+    let Factor::Variable(memory, index, select, _) = factor.as_ref() else {
+        return None;
+    };
+    if !memories.contains(memory) || index.0.len() != 1 || !select.is_empty() {
+        return None;
+    }
+    Some(MemoryStatementPattern::Read {
+        memory: *memory,
+        address: index.0[0].clone(),
+        data: destination.id,
+        enable,
+    })
 }
 
 fn copy_constant(value: &Constant) -> Constant {
@@ -1033,6 +1535,43 @@ fn copy_constant(value: &Constant) -> Constant {
         }
     }
     Constant::new(value.width(), words)
+}
+
+fn array_indices(r#type: &Type, name: &str) -> Result<Vec<Vec<usize>>, ImportError> {
+    let dimensions = r#type
+        .array
+        .iter()
+        .map(|dimension| dimension.ok_or_else(|| ImportError::NonConcreteWidth(name.into())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut indices = vec![Vec::new()];
+    for dimension in dimensions {
+        let mut expanded = Vec::with_capacity(indices.len().saturating_mul(dimension));
+        for prefix in indices {
+            for index in 0..dimension {
+                let mut element = prefix.clone();
+                element.push(index);
+                expanded.push(element);
+            }
+        }
+        indices = expanded;
+    }
+    Ok(indices)
+}
+
+fn indexed_name(name: &str, indices: &[usize]) -> String {
+    indices
+        .iter()
+        .fold(name.to_owned(), |name, index| format!("{name}[{index}]"))
+}
+
+fn whole_array_variable(expression: &Expression) -> Option<VarId> {
+    let Expression::Term(factor) = expression else {
+        return None;
+    };
+    let Factor::Variable(id, index, select, _) = factor.as_ref() else {
+        return None;
+    };
+    (index.0.is_empty() && select.is_empty()).then_some(*id)
 }
 
 fn value_type(r#type: &Type, name: &str) -> Result<ValueType, ImportError> {
@@ -1061,6 +1600,15 @@ fn constant_value(expression: &Expression) -> Result<u64, ImportError> {
         .ok()
         .and_then(veryl_analyzer::value::Value::to_u64)
         .ok_or_else(|| ImportError::UnsupportedBehavior("non-constant replication count".into()))
+}
+
+fn static_array_index(expression: &Expression) -> Result<u64, ImportError> {
+    expression
+        .comptime()
+        .get_value()
+        .ok()
+        .and_then(veryl_analyzer::value::Value::to_u64)
+        .ok_or_else(|| ImportError::UnsupportedBehavior("dynamic unpacked array index".into()))
 }
 
 fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), ImportError> {
@@ -1237,6 +1785,118 @@ module GenerateForTop (
 }
 ";
 
+    const UNPACKED_ARRAY_SOURCE: &str = r"
+interface ByteLane {
+    var request : logic<8>;
+    var response: logic<8>;
+
+    modport target {
+        request : input ,
+        response: output,
+    }
+}
+
+module UnpackedArrayTop::<PORTS: u32 = 4> (
+    clk   : input   clock_posedge            ,
+    rst_n : input   reset_async_low          ,
+    enable: input   logic [PORTS]            ,
+    lanes : modport ByteLane::target [PORTS],
+) {
+    var state: logic<8> [PORTS];
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            for i in 0..PORTS {
+                state[i] = 8'h00;
+            }
+        } else {
+            for i in 0..PORTS {
+                if enable[i] {
+                    state[i] = lanes[i].request + 8'h01;
+                }
+            }
+        }
+    }
+
+    always_comb {
+        for i in 0..PORTS {
+            lanes[i].response = state[i];
+        }
+    }
+}
+
+module UnpackedInterfaceArrayWrapper (
+    clk      : input  clock_posedge  ,
+    rst_n    : input  reset_async_low,
+    requests : input  logic<32>      ,
+    responses: output logic<32>      ,
+) {
+    inst lanes: ByteLane [4];
+    var enable: logic [4];
+
+    inst dut: UnpackedArrayTop::<4> (
+        clk   : clk   ,
+        rst_n : rst_n ,
+        enable: enable,
+        lanes : lanes ,
+    );
+
+    always_comb {
+        for i in 0..4 {
+            enable[i]             = 1'b1;
+            lanes[i].request      = requests[i * 8+:8];
+            responses[i * 8+:8] = lanes[i].response;
+        }
+    }
+}
+";
+
+    const MEMORY_SOURCE: &str = r"
+module MemoryTop (
+    clk          : input  clock_posedge,
+    write_enable : input  logic,
+    read_address : input  logic<4>,
+    write_address: input  logic<4>,
+    write_data   : input  logic<8>,
+    read_data    : output logic<8>,
+) {
+    var words: logic<8> [16];
+
+    always_ff (clk) {
+        if write_enable {
+            words[write_address] = write_data;
+        }
+    }
+
+    always_ff (clk) {
+        read_data = words[read_address];
+    }
+}
+";
+
+    const UNPACKED_ARRAY_INSTANCE_SOURCE: &str = r"
+module ArrayIncrement::<PORTS: u32 = 2> (
+    values : input  logic<8> [PORTS],
+    results: output logic<8> [PORTS],
+) {
+    always_comb {
+        for i in 0..PORTS {
+            results[i] = values[i] + 8'h01;
+        }
+    }
+}
+
+module UnpackedArrayInstanceTop (
+    values : input  logic<8> [4],
+    results: output logic<8> [4],
+) {
+    inst increment: ArrayIncrement::<4> (
+        values : values ,
+        results: results,
+    );
+}
+";
+
     #[test]
     fn lowers_analyzed_comb_and_ff_through_ecp5_and_celox() {
         let design = analyze_and_lower(SOURCE, "air_lowering", "Top").unwrap();
@@ -1309,7 +1969,7 @@ module GenerateForTop (
         .unwrap();
         let top = design.top_module().unwrap();
         assert!(top.instances().is_empty());
-        for lane in 0..4 {
+        for lane in 0_u8..4 {
             assert!(
                 top.signals().iter().any(|signal| {
                     signal.name() == format!("bank.lane[{lane}].increment.value")
@@ -1325,6 +1985,142 @@ module GenerateForTop (
             .modify(|io| io.set(values, 0xff7f_0100u32))
             .unwrap();
         assert_value(&mut simulator, "results", 0x0080_0201);
+    }
+
+    #[test]
+    fn flattens_statically_indexed_unpacked_and_interface_arrays() {
+        let design = analyze_and_lower(
+            UNPACKED_ARRAY_SOURCE,
+            "unpacked_array_lowering",
+            "UnpackedArrayTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+        for lane in 0_u8..4 {
+            for name in [
+                format!("enable[{lane}]"),
+                format!("lanes.request[{lane}]"),
+                format!("lanes.response[{lane}]"),
+                format!("state[{lane}]"),
+            ] {
+                assert!(
+                    top.signals().iter().any(|signal| signal.name() == name),
+                    "missing flattened signal {name}"
+                );
+            }
+        }
+
+        let synthesized = synthesize(&design).unwrap();
+        assert_eq!(synthesized.netlist.registers().len(), 32);
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        reset(&mut simulator);
+        for lane in 0_u8..4 {
+            set(&mut simulator, &format!("enable[{lane}]"), 1);
+            set(
+                &mut simulator,
+                &format!("lanes.request[{lane}]"),
+                0x10 + lane,
+            );
+        }
+        tick(&mut simulator);
+        for lane in 0_u8..4 {
+            assert_value(
+                &mut simulator,
+                &format!("lanes.response[{lane}]"),
+                0x11 + u64::from(lane),
+            );
+        }
+    }
+
+    #[test]
+    fn flattens_interface_arrays_across_module_instances() {
+        let design = analyze_and_lower(
+            UNPACKED_ARRAY_SOURCE,
+            "interface_array_instance_lowering",
+            "UnpackedInterfaceArrayWrapper",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+        assert!(top.instances().is_empty());
+        for lane in 0_u8..4 {
+            assert!(
+                top.signals()
+                    .iter()
+                    .any(|signal| { signal.name() == format!("dut.lanes.request[{lane}]") })
+            );
+        }
+
+        let synthesized = synthesize(&design).unwrap();
+        assert_eq!(synthesized.netlist.registers().len(), 32);
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        reset(&mut simulator);
+        let requests = simulator.signal("requests");
+        simulator
+            .modify(|io| io.set(requests, 0x4030_2010u32))
+            .unwrap();
+        tick(&mut simulator);
+        assert_value(&mut simulator, "responses", 0x4131_2111);
+    }
+
+    #[test]
+    fn flattens_unpacked_array_ports_across_module_instances() {
+        let design = analyze_and_lower(
+            UNPACKED_ARRAY_INSTANCE_SOURCE,
+            "unpacked_array_instance_lowering",
+            "UnpackedArrayInstanceTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+        assert!(top.instances().is_empty());
+        for lane in 0_u8..4 {
+            assert!(
+                top.signals()
+                    .iter()
+                    .any(|signal| { signal.name() == format!("increment.values[{lane}]") })
+            );
+        }
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        for lane in 0_u8..4 {
+            set(&mut simulator, &format!("values[{lane}]"), 0x20 + lane);
+            assert_value(
+                &mut simulator,
+                &format!("results[{lane}]"),
+                0x21 + u64::from(lane),
+            );
+        }
+    }
+
+    #[test]
+    fn infers_veryl_array_as_mapped_block_ram() {
+        let design = analyze_and_lower(MEMORY_SOURCE, "memory_lowering", "MemoryTop").unwrap();
+        let top = design.top_module().unwrap();
+        assert_eq!(top.memories().len(), 1);
+        assert_eq!(top.memories()[0].name, "words");
+        assert_eq!(top.memories()[0].depth, 16);
+
+        let synthesized = synthesize(&design).unwrap();
+        assert_eq!(synthesized.netlist.memories().len(), 1);
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let json = mapped.to_nextpnr_json().unwrap();
+        assert!(json.contains("\"type\": \"DP16KD\""));
+
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        set(&mut simulator, "write_enable", 1);
+        set(&mut simulator, "write_address", 3);
+        set(&mut simulator, "write_data", 0x5a);
+        set(&mut simulator, "read_address", 0);
+        tick(&mut simulator);
+        set(&mut simulator, "write_enable", 0);
+        set(&mut simulator, "read_address", 3);
+        tick(&mut simulator);
+        assert_value(&mut simulator, "read_data", 0x5a);
     }
 
     fn reset(simulator: &mut Simulator<NativeBackend>) {

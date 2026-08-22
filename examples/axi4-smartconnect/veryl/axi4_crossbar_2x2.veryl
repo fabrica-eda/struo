@@ -206,6 +206,49 @@ module Axi4BurstDecoderBank::<PORTS: u32 = 2> (
     }
 }
 
+/// Selects the highest-QoS request from a statically sized input set.
+///
+/// `tie_break[challenger * PORTS + candidate]` is asserted when the
+/// challenger precedes the candidate at equal QoS. The caller supplies a
+/// strict total order, which can be rotated after each grant for fairness.
+module Axi4QosArbiter::<PORTS: u32 = 2> (
+    request  : input  logic<PORTS>        ,
+    qos      : input  logic<PORTS * 4>    ,
+    tie_break: input  logic<PORTS * PORTS>,
+    grant    : output logic<PORTS>        ,
+) {
+    always_comb {
+        grant = request;
+        for candidate in 0..PORTS {
+            for challenger in 0..PORTS {
+                if candidate != challenger {
+                    if request[challenger]
+                        && ((qos[challenger * 4+:4] >: qos[candidate * 4+:4])
+                            || ((qos[challenger * 4+:4] == qos[candidate * 4+:4])
+                                && tie_break[challenger * PORTS + candidate])) {
+                        grant[candidate] = 1'b0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Four-input verification specialization for the parameterized arbiter.
+module Axi4QosArbiter4 (
+    request  : input  logic<4> ,
+    qos      : input  logic<16>,
+    tie_break: input  logic<16>,
+    grant    : output logic<4> ,
+) {
+    inst arbiter: Axi4QosArbiter::<4> (
+        request  : request  ,
+        qos      : qos      ,
+        tie_break: tie_break,
+        grant    : grant    ,
+    );
+}
+
 /// Fixed two-initiator, two-target AXI4 crossbar.
 ///
 /// Each initiator may have two reads and two writes outstanding, provided their
@@ -371,6 +414,31 @@ module Axi4Crossbar2x2 (
         decode_error: {s1_ar_decode_error, s0_ar_decode_error},
     );
 
+    inst wm0_arbiter: Axi4QosArbiter::<2> (
+        request  : {!wm0_active && wr01, !wm0_active && wr00},
+        qos      : {s1_aw_payload[7:4], s0_aw_payload[7:4]},
+        tie_break: if wm0_rr ? 4'b0100 : 4'b0010,
+        grant    : {wg01, wg00},
+    );
+    inst wm1_arbiter: Axi4QosArbiter::<2> (
+        request  : {!wm1_active && wr11, !wm1_active && wr10},
+        qos      : {s1_aw_payload[7:4], s0_aw_payload[7:4]},
+        tie_break: if wm1_rr ? 4'b0100 : 4'b0010,
+        grant    : {wg11, wg10},
+    );
+    inst rm0_arbiter: Axi4QosArbiter::<2> (
+        request  : {!rm0_active && rr01, !rm0_active && rr00},
+        qos      : {s1.arqos, s0.arqos},
+        tie_break: if rm0_rr ? 4'b0100 : 4'b0010,
+        grant    : {rg01, rg00},
+    );
+    inst rm1_arbiter: Axi4QosArbiter::<2> (
+        request  : {!rm1_active && rr11, !rm1_active && rr10},
+        qos      : {s1.arqos, s0.arqos},
+        tie_break: if rm1_rr ? 4'b0100 : 4'b0010,
+        grant    : {rg11, rg10},
+    );
+
     always_comb {
         // Write address admission reserves one of two per-initiator ID slots.
         s0_w_id_busy    = (s0_w_slot0_valid && (s0_w_slot0_id == s0.awid))
@@ -384,19 +452,10 @@ module Axi4Crossbar2x2 (
 
         // A target owns a W stream only through the final W beat. B responses
         // are routed independently by the owner bit added to the downstream ID.
-        wr00 = s0_aw_full && s0_w_full && !s0_w_busy && s0_aw_target0;
-        wr01 = s1_aw_full && s1_w_full && !s1_w_busy && s1_aw_target0;
-        wr10 = s0_aw_full && s0_w_full && !s0_w_busy && s0_aw_target1;
-        wr11 = s1_aw_full && s1_w_full && !s1_w_busy && s1_aw_target1;
-        wg01 = !wm0_active && wr01
-            && (!wr00 || (s1_aw_payload[7:4] >: s0_aw_payload[7:4])
-                || ((s1_aw_payload[7:4] == s0_aw_payload[7:4]) && wm0_rr));
-        wg00 = !wm0_active && wr00 && !wg01;
-        wg11 = !wm1_active && wr11
-            && (!wr10 || (s1_aw_payload[7:4] >: s0_aw_payload[7:4])
-                || ((s1_aw_payload[7:4] == s0_aw_payload[7:4]) && wm1_rr));
-        wg10 = !wm1_active && wr10 && !wg11;
-
+        wr00           = s0_aw_full && s0_w_full && !s0_w_busy && s0_aw_target0;
+        wr01           = s1_aw_full && s1_w_full && !s1_w_busy && s1_aw_target0;
+        wr10           = s0_aw_full && s0_w_full && !s0_w_busy && s0_aw_target1;
+        wr11           = s1_aw_full && s1_w_full && !s1_w_busy && s1_aw_target1;
         w_error_grant0 = s0_aw_full && s0_w_full && !s0_w_busy && !s0_w_error_active && !s0_w_error_valid
             && s0_aw_decode_error;
         w_error_grant1 = s1_aw_full && s1_w_full && !s1_w_busy && !s1_w_error_active && !s1_w_error_valid
@@ -482,12 +541,6 @@ module Axi4Crossbar2x2 (
         rr01            = s1.arvalid && s1_r_can_accept && s1_ar_target0;
         rr10            = s0.arvalid && s0_r_can_accept && s0_ar_target1;
         rr11            = s1.arvalid && s1_r_can_accept && s1_ar_target1;
-        rg01            = !rm0_active && rr01
-            && (!rr00 || (s1.arqos >: s0.arqos) || ((s1.arqos == s0.arqos) && rm0_rr));
-        rg00            = !rm0_active && rr00 && !rg01;
-        rg11            = !rm1_active && rr11
-            && (!rr10 || (s1.arqos >: s0.arqos) || ((s1.arqos == s0.arqos) && rm1_rr));
-        rg10            = !rm1_active && rr10 && !rg11;
         r_error_accept0 = s0.arvalid && s0_r_can_accept && !s0_r_error_valid && s0_ar_decode_error;
         r_error_accept1 = s1.arvalid && s1_r_can_accept && !s1_r_error_valid && s1_ar_decode_error;
         r_accept0       = rg00 || rg10 || r_error_accept0;

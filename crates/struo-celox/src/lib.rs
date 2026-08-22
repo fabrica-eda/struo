@@ -9,8 +9,8 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use celox::frontend_sdk::{
-    ActiveLevel as CeloxActiveLevel, BuildError, Constant, Edge, ExprId, FrontendArtifact,
-    ModuleBuilder, SignalId, UnaryOp, ValueType,
+    ActiveLevel as CeloxActiveLevel, BinaryOp as CeloxBinaryOp, BuildError, Constant, Edge, ExprId,
+    FrontendArtifact, ModuleBuilder, SignalId, UnaryOp, ValueType,
 };
 use celox::{Simulator, SimulatorBuilder};
 use struo_ir::{ActiveLevel, ClockEdge};
@@ -59,24 +59,7 @@ pub fn ecp5_frontend_artifact(
     }
 
     for cell in netlist.cells() {
-        let (wire, name) = match cell {
-            Ecp5Cell::Lut4 { name, output, .. } => {
-                (*output, format!("__struo_lut_{name}_{output}"))
-            }
-            Ecp5Cell::FlipFlop { name, output, .. } => {
-                (*output, format!("__struo_ff_{name}_{output}"))
-            }
-        };
-        let signal = builder.internal(name, bit_type)?;
-        insert_wire(
-            &mut wires,
-            Bit::Wire(wire),
-            WireRef {
-                signal,
-                lsb: 0,
-                signal_width: 1,
-            },
-        )?;
+        reserve_cell_output(&mut builder, &mut wires, cell, bit_type)?;
     }
 
     let constant_zero_signal = builder.internal("__struo_constant_zero", bit_type)?;
@@ -94,42 +77,7 @@ pub fn ecp5_frontend_artifact(
     };
 
     for cell in netlist.cells() {
-        match cell {
-            Ecp5Cell::Lut4 {
-                inputs,
-                output,
-                init,
-                ..
-            } => {
-                let input_expressions = inputs
-                    .iter()
-                    .map(|bit| bit_expression(&mut builder, &wires, constants, *bit))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let value =
-                    lut_expression(&mut builder, &input_expressions, *init, 0, 0, constants)?;
-                let target = builder.whole(wire_ref(&wires, *output)?.signal)?;
-                builder.assign(target, value)?;
-            }
-            Ecp5Cell::FlipFlop {
-                data,
-                output,
-                clock,
-                edge,
-                enable,
-                reset,
-                ..
-            } => emit_flip_flop(
-                &mut builder,
-                &wires,
-                constants,
-                *data,
-                *output,
-                *clock,
-                *edge,
-                *enable,
-                *reset,
-            )?,
-        }
+        emit_cell(&mut builder, &wires, constants, cell)?;
     }
 
     emit_outputs(&mut builder, &wires, constants, outputs)?;
@@ -155,6 +103,121 @@ fn finish_artifact(builder: ModuleBuilder) -> Result<FrontendArtifact, CeloxAdap
     let artifact = builder.finish();
     artifact.validate()?;
     Ok(artifact)
+}
+
+fn reserve_cell_output(
+    builder: &mut ModuleBuilder,
+    wires: &mut BTreeMap<u32, WireRef>,
+    cell: &Ecp5Cell,
+    bit_type: ValueType,
+) -> Result<(), CeloxAdapterError> {
+    let scalar = match cell {
+        Ecp5Cell::Lut4 { name, output, .. } => {
+            Some((*output, format!("__struo_lut_{name}_{output}")))
+        }
+        Ecp5Cell::FlipFlop { name, output, .. } => {
+            Some((*output, format!("__struo_ff_{name}_{output}")))
+        }
+        Ecp5Cell::BlockRam {
+            name, read_data, ..
+        } => {
+            let signal = builder.internal(
+                format!("__struo_{name}_read"),
+                ValueType::bits(read_data.len())?,
+            )?;
+            for (lsb, wire) in read_data.iter().enumerate() {
+                insert_wire(
+                    wires,
+                    Bit::Wire(*wire),
+                    WireRef {
+                        signal,
+                        lsb,
+                        signal_width: read_data.len(),
+                    },
+                )?;
+            }
+            None
+        }
+    };
+    if let Some((wire, name)) = scalar {
+        let signal = builder.internal(name, bit_type)?;
+        insert_wire(
+            wires,
+            Bit::Wire(wire),
+            WireRef {
+                signal,
+                lsb: 0,
+                signal_width: 1,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_cell(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    cell: &Ecp5Cell,
+) -> Result<(), CeloxAdapterError> {
+    match cell {
+        Ecp5Cell::Lut4 {
+            inputs,
+            output,
+            init,
+            ..
+        } => {
+            let input_expressions = inputs
+                .iter()
+                .map(|bit| bit_expression(builder, wires, constants, *bit))
+                .collect::<Result<Vec<_>, _>>()?;
+            let value = lut_expression(builder, &input_expressions, *init, 0, 0, constants)?;
+            let target = builder.whole(wire_ref(wires, *output)?.signal)?;
+            builder.assign(target, value)?;
+            Ok(())
+        }
+        Ecp5Cell::FlipFlop {
+            data,
+            output,
+            clock,
+            edge,
+            enable,
+            reset,
+            ..
+        } => emit_flip_flop(
+            builder, wires, constants, *data, *output, *clock, *edge, *enable, *reset,
+        ),
+        Ecp5Cell::BlockRam {
+            name,
+            depth,
+            word_width,
+            physical_width,
+            write_address,
+            write_data,
+            write_enable,
+            read_address,
+            read_data,
+            read_enable,
+            clock,
+            edge,
+        } => emit_block_ram(
+            builder,
+            wires,
+            constants,
+            name,
+            *depth,
+            *word_width,
+            *physical_width,
+            **write_address,
+            write_data,
+            *write_enable,
+            **read_address,
+            read_data,
+            *read_enable,
+            *clock,
+            *edge,
+        ),
+    }
 }
 
 fn emit_outputs(
@@ -382,6 +445,113 @@ fn active_level(active: ActiveLevel) -> CeloxActiveLevel {
     }
 }
 
+fn bits_expression(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    bits: &[Bit],
+) -> Result<ExprId, CeloxAdapterError> {
+    let parts = bits
+        .iter()
+        .rev()
+        .map(|bit| bit_expression(builder, wires, constants, *bit))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(match parts.as_slice() {
+        [expression] => *expression,
+        _ => builder.concat(parts)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_block_ram(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    name: &str,
+    depth: u32,
+    word_width: u8,
+    physical_width: u8,
+    write_address: [Bit; 14],
+    write_data: &[Bit],
+    write_enable: Control,
+    read_address: [Bit; 14],
+    read_data: &[u32],
+    read_enable: Option<Control>,
+    clock: Bit,
+    edge: ClockEdge,
+) -> Result<(), CeloxAdapterError> {
+    let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1) as usize;
+    let shift = match physical_width {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        9 => 3,
+        18 => 4,
+        _ => unreachable!("mapped DP16KD width"),
+    };
+    let write_address = bits_expression(
+        builder,
+        wires,
+        constants,
+        &write_address[shift..shift + address_width],
+    )?;
+    let read_address = bits_expression(
+        builder,
+        wires,
+        constants,
+        &read_address[shift..shift + address_width],
+    )?;
+    let write_data = bits_expression(builder, wires, constants, write_data)?;
+    let write_asserted = asserted_expression(builder, wires, constants, write_enable)?;
+    let word_type = ValueType::bits(usize::from(word_width))?;
+    let one_bit = ValueType::bits(1)?;
+    let clock = bit_signal(wires, constants, clock)?;
+    let edge = match edge {
+        ClockEdge::Rising => Edge::Posedge,
+        ClockEdge::Falling => Edge::Negedge,
+    };
+    let zero_word = Constant::two_state(0u8, usize::from(word_width))?;
+    let mut words = Vec::with_capacity(depth as usize);
+
+    for index in 0..depth {
+        let signal = builder.internal(format!("__struo_{name}_word_{index}"), word_type)?;
+        builder.set_initial(signal, zero_word.clone())?;
+        let current = builder.read(signal)?;
+        let address_constant = builder.constant(Constant::two_state(index, address_width)?);
+        let selected = builder.binary(
+            CeloxBinaryOp::Equal,
+            write_address,
+            address_constant,
+            one_bit,
+        )?;
+        let write = builder.binary(CeloxBinaryOp::LogicAnd, write_asserted, selected, one_bit)?;
+        let next = builder.mux(write, write_data, current)?;
+        builder.register(builder.whole(signal)?, next, clock, edge, None, None)?;
+        words.push(current);
+    }
+
+    let mut selected = builder.constant(zero_word);
+    for (index, word) in (0..depth).zip(words) {
+        let address_constant = builder.constant(Constant::two_state(index, address_width)?);
+        let matches = builder.binary(
+            CeloxBinaryOp::Equal,
+            read_address,
+            address_constant,
+            one_bit,
+        )?;
+        selected = builder.mux(matches, word, selected)?;
+    }
+    let output = wire_ref(wires, read_data[0])?.signal;
+    let enable = read_enable
+        .map(|enable| {
+            bit_signal(wires, constants, enable.signal)
+                .and_then(|signal| Ok(builder.enable(signal, active_level(enable.active))?))
+        })
+        .transpose()?;
+    builder.register(builder.whole(output)?, selected, clock, edge, None, enable)?;
+    Ok(())
+}
+
 /// Failure while converting a mapped target object into a Celox artifact.
 #[derive(Debug)]
 pub enum CeloxAdapterError {
@@ -432,12 +602,21 @@ mod tests {
 
     use struo_ir::{ActiveLevel, ClockEdge, EnableControl, Netlist, RegisterCell, ResetControl};
     use struo_rtl::{
-        BinaryOp, BitWidth, Constant, Design, Module, Port, PortDirection, StateDomain, ValueType,
+        BinaryOp, BitWidth, ClockEdge as RtlClockEdge, Constant, Design, Enable, Memory, Module,
+        Polarity, Port, PortDirection, StateDomain, ValueType,
     };
     use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
 
     use super::{ecp5_frontend_artifact, ecp5_simulator};
+
+    fn bits(width: u32) -> ValueType {
+        ValueType {
+            width: BitWidth::new(width).unwrap(),
+            signed: false,
+            state: StateDomain::TwoState,
+        }
+    }
 
     #[test]
     fn emits_lut_logic_as_a_valid_celox_artifact() {
@@ -561,6 +740,91 @@ mod tests {
         }
         simulator.modify(|io| io.set(valid, 0u8)).unwrap();
         assert_eq!(simulator.get(route), 0u8.into());
+    }
+
+    #[test]
+    fn simulates_mapped_block_ram_without_json_round_trip() {
+        let mut module = Module::new("Scratchpad");
+        let clock = module.add_port(Port {
+            name: "clock".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let write_enable = module.add_port(Port {
+            name: "write_enable".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let read_address_signal = module.add_port(Port {
+            name: "read_address".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        let write_address_signal = module.add_port(Port {
+            name: "write_address".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        let write_data_signal = module.add_port(Port {
+            name: "write_data".into(),
+            direction: PortDirection::Input,
+            r#type: bits(8),
+        });
+        let read_data = module.add_port(Port {
+            name: "read_data".into(),
+            direction: PortDirection::Output,
+            r#type: bits(8),
+        });
+        let read_address = module.read(read_address_signal).unwrap();
+        let write_address = module.read(write_address_signal).unwrap();
+        let write_data = module.read(write_data_signal).unwrap();
+        module.add_memory(Memory {
+            name: "words".into(),
+            word: bits(8),
+            depth: 16,
+            read_latency: 1,
+            read_address,
+            read_data,
+            read_enable: None,
+            write_address,
+            write_data,
+            write_enable: Enable {
+                signal: write_enable,
+                polarity: Polarity::ActiveHigh,
+            },
+            clock,
+            edge: RtlClockEdge::Rising,
+        });
+        let mut design = Design::new("Scratchpad");
+        design.add_module(module);
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let clock_event = simulator.event("clock");
+        let write_enable = simulator.signal("write_enable");
+        let read_address = simulator.signal("read_address");
+        let write_address = simulator.signal("write_address");
+        let write_data = simulator.signal("write_data");
+        let read_data = simulator.signal("read_data");
+
+        simulator
+            .modify(|io| {
+                io.set(write_enable, 1u8);
+                io.set(write_address, 5u8);
+                io.set(write_data, 0xa5u8);
+                io.set(read_address, 0u8);
+            })
+            .unwrap();
+        simulator.tick(clock_event).unwrap();
+        simulator
+            .modify(|io| {
+                io.set(write_enable, 0u8);
+                io.set(read_address, 5u8);
+            })
+            .unwrap();
+        simulator.tick(clock_event).unwrap();
+
+        assert_eq!(simulator.get(read_data), 0xa5u8.into());
     }
 
     #[test]
