@@ -3120,6 +3120,7 @@ version = "0.1.0"
 name = "struo-synth"
 version = "0.1.0"
 dependencies = [
+ "struo-formal",
  "struo-ir",
  "struo-rtl",
 ]
@@ -3132,6 +3133,7 @@ dependencies = [
  "serde_json",
  "struo-ir",
  "struo-sim",
+ "struo-synth",
 ]
 
 [[package]]

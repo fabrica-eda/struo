@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+struo-formal = { path = "../struo-formal" }
 struo-ir = { path = "../struo-ir" }
 struo-rtl = { path = "../struo-rtl" }
 

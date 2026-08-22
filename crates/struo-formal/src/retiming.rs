@@ -37,7 +37,9 @@ impl LogicFunction {
         self.truth_table
     }
 
-    const fn preserves_zero(self) -> bool {
+    /// Returns whether the function maps all-zero inputs to zero.
+    #[must_use]
+    pub const fn preserves_zero(self) -> bool {
         self.truth_table & 1 == 0
     }
 }
@@ -75,6 +77,18 @@ impl RetimingVertex {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the vertex function.
+    #[must_use]
+    pub const fn function(&self) -> LogicFunction {
+        self.function
+    }
+
+    /// Returns whether the vertex is fixed at the external or unsupported boundary.
+    #[must_use]
+    pub const fn is_boundary(&self) -> bool {
+        self.boundary
     }
 }
 
