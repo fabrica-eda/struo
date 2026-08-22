@@ -1338,6 +1338,33 @@ mod tests {
     }
 
     #[test]
+    fn recovers_area_by_reusing_an_already_mapped_cone() {
+        let mut source = Netlist::new("shared_cone");
+        let input_a = source.add_input("a");
+        let input_b = source.add_input("b");
+        let input_c = source.add_input("c");
+        let input_d = source.add_input("d");
+        let input_x = source.add_input("x");
+        let shared = source.add_and(input_a, input_b);
+        let other = source.add_and(input_c, input_d);
+        let selected = source.add_and(shared, input_x);
+        let result = source.add_or(selected, other);
+        source.add_output("shared", shared);
+        source.add_output("result", result);
+
+        let mapped = map_to_ecp5(&source).unwrap();
+
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn omits_unreachable_boolean_nodes() {
         let mut source = Netlist::new("dead_logic");
         let a = source.add_input("a");
