@@ -404,6 +404,15 @@ impl RegisterCell {
         self.enable
     }
 
+    /// Replaces the D input and optional clock enable.
+    ///
+    /// Transformations must preserve the original state-transition behavior;
+    /// [`Netlist::validate`] checks that the replacement nets exist.
+    pub fn set_data_and_enable(&mut self, data: NetId, enable: Option<EnableControl>) {
+        self.data = data;
+        self.enable = enable;
+    }
+
     /// Returns the optional reset control.
     #[must_use]
     pub const fn reset(&self) -> Option<ResetControl> {
@@ -476,6 +485,12 @@ impl Netlist {
     #[must_use]
     pub fn registers(&self) -> &[RegisterCell] {
         &self.registers
+    }
+
+    /// Returns mutable one-bit registers for synthesis transformations.
+    #[must_use]
+    pub fn registers_mut(&mut self) -> &mut [RegisterCell] {
+        &mut self.registers
     }
 
     /// Returns inferred synchronous memories.

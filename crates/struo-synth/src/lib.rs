@@ -7,7 +7,7 @@ use std::num::NonZeroU32;
 
 use struo_ir::{
     ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, EnableControl, MemoryCell, NetId, Netlist,
-    RegisterCell, ResetControl, ValidationError,
+    NodeKind, RegisterCell, ResetControl, ValidationError,
 };
 use struo_rtl::{
     BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, Polarity, PortDirection, ResetMode,
@@ -28,7 +28,7 @@ pub fn validate_rtl(design: &Design) -> Result<(), SynthesisError> {
 pub struct SynthesisResult {
     /// Flat, bit-level logic ready for technology mapping.
     pub netlist: Netlist,
-    /// Reports produced while lowering the design.
+    /// Reports produced while lowering and optimizing the design.
     pub reports: Vec<PassReport>,
 }
 
@@ -56,23 +56,20 @@ pub fn synthesize(design: &Design) -> Result<SynthesisResult, SynthesisError> {
     lowering.connect_memories()?;
     lowering.connect_registers()?;
     lowering.connect_outputs()?;
-    lowering.netlist.validate()?;
-
-    let reports = vec![PassReport {
+    let mut netlist = lowering.netlist;
+    let mut reports = vec![PassReport {
         pass: "lower-rtl",
         message: format!(
             "lowered {} expressions to {} nodes, {} arithmetic cells, {} registers, and {} memories",
             module.expressions().len(),
-            lowering.netlist.nodes().len(),
-            lowering.netlist.arithmetic().len(),
-            lowering.netlist.registers().len(),
-            lowering.netlist.memories().len()
+            netlist.nodes().len(),
+            netlist.arithmetic().len(),
+            netlist.registers().len(),
+            netlist.memories().len()
         ),
     }];
-    Ok(SynthesisResult {
-        netlist: lowering.netlist,
-        reports,
-    })
+    reports.extend(default_pipeline().run(&mut netlist)?);
+    Ok(SynthesisResult { netlist, reports })
 }
 
 fn reject_unsupported(module: &Module) -> Result<(), SynthesisError> {
@@ -701,8 +698,69 @@ impl Pipeline {
 #[must_use]
 pub fn default_pipeline() -> Pipeline {
     let mut pipeline = Pipeline::new();
+    pipeline.push(InferRegisterEnables);
     pipeline.push(ValidateNetlist);
     pipeline
+}
+
+/// Replaces a direct register self-hold mux with the equivalent clock enable.
+pub struct InferRegisterEnables;
+
+impl Pass for InferRegisterEnables {
+    fn name(&self) -> &'static str {
+        "infer-register-enables"
+    }
+
+    fn run(&self, design: &mut Netlist) -> Result<PassReport, SynthesisError> {
+        let rewrites = design
+            .registers()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, register)| {
+                if register.enable().is_some() {
+                    return None;
+                }
+                let node = design.nodes().get(register.data().index() as usize)?;
+                if node.output() != register.data() || !matches!(node.kind(), NodeKind::Mux) {
+                    return None;
+                }
+                let [condition, then_net, else_net] = node.inputs() else {
+                    unreachable!("validated mux nodes have three inputs");
+                };
+                if *else_net == register.output() {
+                    Some((
+                        index,
+                        *then_net,
+                        EnableControl {
+                            signal: *condition,
+                            active: ActiveLevel::High,
+                        },
+                    ))
+                } else if *then_net == register.output() {
+                    Some((
+                        index,
+                        *else_net,
+                        EnableControl {
+                            signal: *condition,
+                            active: ActiveLevel::Low,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for (index, data, enable) in &rewrites {
+            design.registers_mut()[*index].set_data_and_enable(*data, Some(*enable));
+        }
+        Ok(PassReport {
+            pass: self.name(),
+            message: format!(
+                "converted {} register feedback muxes to clock enables",
+                rewrites.len()
+            ),
+        })
+    }
 }
 
 /// Verifies the structural invariants of a design.
@@ -800,7 +858,7 @@ impl From<ValidationError> for SynthesisError {
 mod tests {
     use std::collections::HashMap;
 
-    use struo_ir::{ArithmeticOp, Netlist, NodeKind};
+    use struo_ir::{ActiveLevel, ArithmeticOp, Netlist, NodeKind};
     use struo_rtl::{
         BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, Memory, Module, Polarity, Port,
         PortDirection, Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
@@ -1080,6 +1138,139 @@ mod tests {
     }
 
     #[test]
+    fn infers_clock_enables_from_register_self_hold_muxes() {
+        for (polarity, hold_when_true) in [(ActiveLevel::High, false), (ActiveLevel::Low, true)] {
+            let mut module = Module::new("EnabledRegister");
+            let clock = module.add_port(Port {
+                name: "clk".into(),
+                direction: PortDirection::Input,
+                r#type: bits(1),
+            });
+            let update_signal = module.add_port(Port {
+                name: "update".into(),
+                direction: PortDirection::Input,
+                r#type: bits(1),
+            });
+            let data_signal = module.add_port(Port {
+                name: "data".into(),
+                direction: PortDirection::Input,
+                r#type: bits(1),
+            });
+            let state_signal = module.add_port(Port {
+                name: "state".into(),
+                direction: PortDirection::Output,
+                r#type: bits(1),
+            });
+            let update = module.read(update_signal).unwrap();
+            let data = module.read(data_signal).unwrap();
+            let state = module.read(state_signal).unwrap();
+            let next = if hold_when_true {
+                module.mux(update, state, data).unwrap()
+            } else {
+                module.mux(update, data, state).unwrap()
+            };
+            module
+                .add_register(Register {
+                    name: "state_reg".into(),
+                    target: state_signal,
+                    next,
+                    clock,
+                    edge: ClockEdge::Rising,
+                    enable: None,
+                    reset: None,
+                })
+                .unwrap();
+            let mut design = Design::new("EnabledRegister");
+            design.add_module(module);
+
+            let synthesized = synthesize(&design).unwrap();
+            let register = &synthesized.netlist.registers()[0];
+            let enable = register.enable().unwrap();
+
+            assert_eq!(enable.active, polarity);
+            assert!(matches!(
+                synthesized.netlist.nodes()[enable.signal.index() as usize].kind(),
+                NodeKind::Input(name) if name == "update"
+            ));
+            assert!(matches!(
+                synthesized.netlist.nodes()[register.data().index() as usize].kind(),
+                NodeKind::Input(name) if name == "data"
+            ));
+            assert_eq!(
+                synthesized.reports[1].message,
+                "converted 1 register feedback muxes to clock enables"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_clock_enable_over_feedback_mux_inference() {
+        let mut module = Module::new("ExplicitEnable");
+        let clock = module.add_port(Port {
+            name: "clk".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let outer_enable = module.add_port(Port {
+            name: "outer_enable".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let inner_enable = module.add_port(Port {
+            name: "inner_enable".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let data_signal = module.add_port(Port {
+            name: "data".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let state_signal = module.add_port(Port {
+            name: "state".into(),
+            direction: PortDirection::Output,
+            r#type: bits(1),
+        });
+        let inner_enable_value = module.read(inner_enable).unwrap();
+        let data = module.read(data_signal).unwrap();
+        let state = module.read(state_signal).unwrap();
+        let next = module.mux(inner_enable_value, data, state).unwrap();
+        module
+            .add_register(Register {
+                name: "state_reg".into(),
+                target: state_signal,
+                next,
+                clock,
+                edge: ClockEdge::Rising,
+                enable: Some(Enable {
+                    signal: outer_enable,
+                    polarity: Polarity::ActiveHigh,
+                }),
+                reset: None,
+            })
+            .unwrap();
+        let mut design = Design::new("ExplicitEnable");
+        design.add_module(module);
+
+        let synthesized = synthesize(&design).unwrap();
+        let register = &synthesized.netlist.registers()[0];
+        let enable = register.enable().unwrap();
+
+        assert!(matches!(
+            synthesized.netlist.nodes()[enable.signal.index() as usize].kind(),
+            NodeKind::Input(name) if name == "outer_enable"
+        ));
+        assert!(matches!(
+            synthesized.netlist.nodes()[register.data().index() as usize].kind(),
+            NodeKind::Mux
+        ));
+        assert_eq!(
+            synthesized.reports[1].message,
+            "converted 0 register feedback muxes to clock enables"
+        );
+    }
+
+    #[test]
     fn lowers_unsigned_and_signed_comparisons() {
         let operations = [
             ("eq", BinaryOp::Equal),
@@ -1243,8 +1434,9 @@ mod tests {
 
         let reports = default_pipeline().run(&mut design).unwrap();
 
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].pass, "validate");
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].pass, "infer-register-enables");
+        assert_eq!(reports[1].pass, "validate");
     }
 
     fn input_word(name: &str, width: usize, value: u64) -> HashMap<String, bool> {
