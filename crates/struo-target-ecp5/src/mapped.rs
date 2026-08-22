@@ -30,6 +30,7 @@ const RETIMING_PERIOD_MARGIN_DENOMINATOR: u32 = 10;
 // needs a routing guard per ordinary hop: measured ECP5 AXI paths average about
 // 100 ps more than that model, while dedicated carry hops bypass this charge.
 const MAPPED_ROUTE_GUARD_PS: u32 = 100;
+const MAX_ENABLE_FANOUT_PER_REPLICA: usize = 16;
 
 /// A constant or numbered wire in a mapped ECP5 design.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -267,6 +268,7 @@ pub struct Ecp5Netlist {
 struct MappedEquivalenceProof {
     certified_primitive_moves: usize,
     equivalent_register_merges: usize,
+    equivalent_logic_replications: usize,
     unobservable_cells_removed: usize,
     valid: bool,
 }
@@ -300,6 +302,8 @@ pub struct RetimingSelection {
     pub certified_primitive_moves: usize,
     /// Structurally equivalent generated registers merged in the selected result.
     pub equivalent_register_merges: usize,
+    /// Combinational cells replicated without changing their truth tables.
+    pub equivalent_logic_replications: usize,
     /// Unobservable cells removed after certified retiming moves.
     pub unobservable_cells_removed: usize,
     /// Whether the complete selected transformation chain passed sign-off.
@@ -398,6 +402,7 @@ pub fn map_to_ecp5_with_options(
         selected_registers,
         certified_primitive_moves: selected.equivalence_proof.certified_primitive_moves,
         equivalent_register_merges: selected.equivalence_proof.equivalent_register_merges,
+        equivalent_logic_replications: selected.equivalence_proof.equivalent_logic_replications,
         unobservable_cells_removed: selected.equivalence_proof.unobservable_cells_removed,
         equivalence_signed_off,
     };
@@ -416,7 +421,34 @@ fn automatically_retime_mapped_luts(
     let timing_driven = original_profile.overall_period_ps > target_period_ps;
     let cell_limit = original_cells + original_cells.div_ceil(10);
     let register_limit = original_registers + original_registers.div_ceil(5);
-    let forward_candidate = forward_retime_registered_ccu_chains(original, timing_driven);
+    let control_candidate =
+        replicate_high_fanout_enable_luts(original, MAX_ENABLE_FANOUT_PER_REPLICA);
+    let control_profile = mapped_lut_profile(&control_candidate);
+    let control_registers = mapped_register_count(&control_candidate);
+    let original_enable_fanout =
+        maximum_replicable_enable_fanout(original, MAX_ENABLE_FANOUT_PER_REPLICA);
+    let control_enable_fanout =
+        maximum_replicable_enable_fanout(&control_candidate, MAX_ENABLE_FANOUT_PER_REPLICA);
+    let use_control = control_candidate.cells.len() <= cell_limit
+        && control_registers <= register_limit
+        && control_profile.overall_period_ps <= original_profile.overall_period_ps
+        && (retiming_score(
+            &control_profile,
+            timing_driven,
+            control_candidate.cells.len(),
+            control_registers,
+        ) < retiming_score(
+            &original_profile,
+            timing_driven,
+            original.cells.len(),
+            mapped_register_count(original),
+        ) || control_enable_fanout < original_enable_fanout);
+    let seed = if use_control {
+        &control_candidate
+    } else {
+        original
+    };
+    let forward_candidate = forward_retime_registered_ccu_chains(seed, timing_driven);
     let forward_profile = mapped_lut_profile(&forward_candidate);
     let forward_registers = mapped_register_count(&forward_candidate);
     let use_forward = forward_candidate.cells.len() <= cell_limit
@@ -436,7 +468,7 @@ fn automatically_retime_mapped_luts(
     let mut frontier = if use_forward {
         forward_candidate
     } else {
-        original.clone()
+        seed.clone()
     };
     let mut best_seen = frontier.clone();
     let mut bridge_budget = 2usize;
@@ -650,16 +682,29 @@ fn automatically_retime_mapped_luts(
     ) {
         best_seen = frontier;
     }
+    let replicated = replicate_high_fanout_enable_luts(&best_seen, MAX_ENABLE_FANOUT_PER_REPLICA);
+    let best_profile = mapped_lut_profile(&best_seen);
+    let replicated_profile = mapped_lut_profile(&replicated);
+    if replicated.cells.len() <= cell_limit
+        && mapped_register_count(&replicated) <= register_limit
+        && replicated_profile.overall_period_ps <= best_profile.overall_period_ps
+        && maximum_replicable_enable_fanout(&replicated, MAX_ENABLE_FANOUT_PER_REPLICA)
+            < maximum_replicable_enable_fanout(&best_seen, MAX_ENABLE_FANOUT_PER_REPLICA)
+    {
+        best_seen = replicated;
+    }
     let selected_profile = mapped_lut_profile(&best_seen);
     let improved = if timing_driven {
         (
             selected_profile.overall_period_ps,
             selected_profile.data_period_ps,
             selected_profile.critical_timing.len(),
+            maximum_replicable_enable_fanout(&best_seen, MAX_ENABLE_FANOUT_PER_REPLICA),
         ) < (
             original_profile.overall_period_ps,
             original_profile.data_period_ps,
             original_profile.critical_timing.len(),
+            maximum_replicable_enable_fanout(original, MAX_ENABLE_FANOUT_PER_REPLICA),
         )
     } else {
         (
@@ -710,7 +755,9 @@ fn mapped_register_count(netlist: &Ecp5Netlist) -> usize {
 
 fn verify_mapped_equivalence_proof(netlist: &Ecp5Netlist, applied: bool) -> bool {
     if !netlist.equivalence_proof.valid
-        || (applied && netlist.equivalence_proof.certified_primitive_moves == 0)
+        || (applied
+            && netlist.equivalence_proof.certified_primitive_moves == 0
+            && netlist.equivalence_proof.equivalent_logic_replications == 0)
     {
         return false;
     }
@@ -749,6 +796,118 @@ fn verify_mapped_equivalence_proof(netlist: &Ecp5Netlist, applied: bool) -> bool
             Bit::Wire(wire) => driven.contains(&wire),
             Bit::Zero | Bit::One => true,
         })
+}
+
+fn replicate_high_fanout_enable_luts(netlist: &Ecp5Netlist, max_fanout: usize) -> Ecp5Netlist {
+    let max_fanout = max_fanout.max(1);
+    let fanouts = mapped_wire_fanouts(netlist);
+    let mut enable_sinks = BTreeMap::<u32, Vec<usize>>::new();
+    for (index, cell) in netlist.cells.iter().enumerate() {
+        let Ecp5Cell::FlipFlop {
+            enable: Some(enable),
+            ..
+        } = cell
+        else {
+            continue;
+        };
+        let Bit::Wire(wire) = enable.signal else {
+            continue;
+        };
+        let wire_fanout = fanouts.get(&wire).copied().unwrap_or(0);
+        if wire_fanout > max_fanout && wire_fanout <= max_fanout.saturating_mul(2) {
+            enable_sinks.entry(wire).or_default().push(index);
+        }
+    }
+
+    let mut candidate = netlist.clone();
+    let mut next_wire = maximum_mapped_wire(netlist)
+        .and_then(|wire| wire.checked_add(1))
+        .unwrap_or(1);
+    for (wire, sinks) in enable_sinks {
+        if sinks.len() <= max_fanout {
+            continue;
+        }
+        let Some((driver_name, inputs, init)) = netlist.cells.iter().find_map(|cell| match cell {
+            Ecp5Cell::Lut4 {
+                name,
+                inputs,
+                output,
+                init,
+            } if *output == wire => Some((name.clone(), *inputs, *init)),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let non_enable_fanout = fanouts
+            .get(&wire)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(sinks.len());
+        let retained = max_fanout
+            .saturating_sub(non_enable_fanout)
+            .min(sinks.len());
+        for (replica, chunk) in sinks[retained..].chunks(max_fanout).enumerate() {
+            let output = next_wire;
+            let Some(allocated) = next_wire.checked_add(1) else {
+                return netlist.clone();
+            };
+            next_wire = allocated;
+            for &sink in chunk {
+                let Ecp5Cell::FlipFlop {
+                    enable: Some(enable),
+                    ..
+                } = &mut candidate.cells[sink]
+                else {
+                    return netlist.clone();
+                };
+                if enable.signal != Bit::Wire(wire) {
+                    return netlist.clone();
+                }
+                enable.signal = Bit::Wire(output);
+            }
+            candidate.cells.push(Ecp5Cell::Lut4 {
+                name: format!("replicate_enable_{driver_name}_{replica}"),
+                inputs,
+                output,
+                init,
+            });
+            candidate.equivalence_proof.equivalent_logic_replications += 1;
+        }
+    }
+    candidate
+}
+
+fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) -> usize {
+    let fanouts = mapped_wire_fanouts(netlist);
+    let lut_outputs = netlist
+        .cells
+        .iter()
+        .filter_map(|cell| match cell {
+            Ecp5Cell::Lut4 { output, .. } => Some(*output),
+            Ecp5Cell::Ccu2c { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+        })
+        .collect::<HashSet<_>>();
+    netlist
+        .cells
+        .iter()
+        .filter_map(|cell| match cell {
+            Ecp5Cell::FlipFlop {
+                enable: Some(enable),
+                ..
+            } => match enable.signal {
+                Bit::Wire(wire) if lut_outputs.contains(&wire) => fanouts
+                    .get(&wire)
+                    .copied()
+                    .filter(|fanout| *fanout <= max_fanout.saturating_mul(2)),
+                Bit::Wire(_) | Bit::Zero | Bit::One => None,
+            },
+            Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::Ccu2c { .. }
+            | Ecp5Cell::FlipFlop { .. }
+            | Ecp5Cell::BlockRam { .. } => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn register_data_is_driven_by_ccu(netlist: &Ecp5Netlist, register_index: usize) -> bool {
@@ -2405,6 +2564,7 @@ fn map_once(
                 selected_registers: netlist.registers().len(),
                 certified_primitive_moves: 0,
                 equivalent_register_merges: 0,
+                equivalent_logic_replications: 0,
                 unobservable_cells_removed: 0,
                 equivalence_signed_off: true,
             },
@@ -3240,7 +3400,7 @@ mod tests {
         ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, backward_retime_ccu2c,
         backward_retime_lut, ccu_chain_names, forward_retime_ccu2c, map_once, map_to_ecp5,
         map_to_ecp5_with_options, mapped_wire_fanout, merge_equivalent_flip_flops,
-        verify_mapped_equivalence_proof,
+        replicate_high_fanout_enable_luts, verify_mapped_equivalence_proof,
     };
 
     fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
@@ -3322,6 +3482,61 @@ mod tests {
         mapped.cells.push(duplicate);
 
         assert!(!verify_mapped_equivalence_proof(&mapped, false));
+    }
+
+    #[test]
+    fn replicates_high_fanout_enable_logic_once() {
+        let mut source = Netlist::new("replicated_enable");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let enable_lhs = source.add_input("enable_lhs");
+        let enable_rhs = source.add_input("enable_rhs");
+        let enable = source.add_and(enable_lhs, enable_rhs);
+        let data = source.add_input("data");
+        for index in 0..10 {
+            let name = format!("value{index}");
+            let output = source.add_register_output(&name);
+            source.add_register(RegisterCell::new(
+                name.clone(),
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                Some(EnableControl {
+                    signal: enable,
+                    active: ActiveLevel::High,
+                }),
+                Some(ResetControl {
+                    signal: reset,
+                    active: ActiveLevel::High,
+                    asynchronous: true,
+                    value: false,
+                }),
+            ));
+            source.add_output(format!("output{index}"), output);
+        }
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+
+        let replicated = replicate_high_fanout_enable_luts(&mapped, 5);
+
+        assert_eq!(
+            replicated.equivalence_proof.equivalent_logic_replications,
+            1
+        );
+        assert!(verify_mapped_equivalence_proof(&replicated, true));
+        assert!(replicated.cells.iter().all(|cell| {
+            let Ecp5Cell::FlipFlop {
+                enable: Some(enable),
+                ..
+            } = cell
+            else {
+                return true;
+            };
+            let Bit::Wire(wire) = enable.signal else {
+                return true;
+            };
+            mapped_wire_fanout(&replicated, wire) <= 5
+        }));
     }
 
     #[test]
