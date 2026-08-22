@@ -15,13 +15,14 @@ const CRITICALITY_DENOMINATOR: u32 = 32;
 // Conservative pre-route delay estimates for an ECP5 speed-grade 8. These
 // are deliberately architecture-level costs rather than sign-off numbers;
 // nextpnr remains the source of truth after placement and routing.
-const LUT_DELAY_PS: u32 = 150;
-const ROUTE_BASE_PS: u32 = 200;
-const ROUTE_FANOUT_STEP_PS: u32 = 30;
+const LUT_DELAY_PS: u32 = 100;
+const ROUTE_BASE_PS: u32 = 300;
+const ROUTE_FANOUT_STEP_PS: u32 = 40;
 const CCU_INPUT_PS: u32 = 200;
 const CCU_CARRY_PS: u32 = 60;
 const CCU_SUM_PS: u32 = 100;
 const BRAM_CLOCK_TO_OUTPUT_PS: u32 = 850;
+const FLIP_FLOP_CLOCK_TO_OUTPUT_PS: u32 = 300;
 const FLIP_FLOP_SETUP_PS: u32 = 120;
 const BRAM_SETUP_PS: u32 = 300;
 
@@ -83,42 +84,34 @@ impl LutCover {
         let retained = RetainedTiming::new(netlist);
         let critical_arrival_ps = timing_period_ps(options).saturating_mul(CRITICALITY_NUMERATOR)
             / CRITICALITY_DENOMINATOR;
-        let mut plans = vec![None; netlist.nodes().len()];
-        let mut arrivals = vec![0; netlist.nodes().len()];
-        for node in netlist.nodes() {
-            let index = node.output().index() as usize;
-            match node.kind() {
-                NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not | NodeKind::Mux => {
-                    let plan = best_plan(
-                        &plans,
-                        &arrivals,
-                        &fanouts,
-                        cuts.for_net(node.output()),
-                        critical_arrival_ps,
-                    );
-                    arrivals[index] = plan.arrival_ps;
-                    plans[index] = Some(plan);
-                }
-                NodeKind::MemoryOutput(_) => arrivals[index] = BRAM_CLOCK_TO_OUTPUT_PS,
-                NodeKind::ArithmeticOutput(_) | NodeKind::ComparisonOutput(_) => {
-                    arrivals[index] = retained.output_arrival(
-                        netlist,
-                        node.output(),
-                        &arrivals,
-                        &fanouts,
-                        options.arithmetic,
-                    );
-                }
-                NodeKind::Output(_) => {
-                    arrivals[index] = arrivals[node.inputs()[0].index() as usize];
-                }
-                NodeKind::Input(_) | NodeKind::Constant(_) | NodeKind::RegisterOutput(_) => {}
-            }
+        let (mut plans, mut arrivals) = select_initial_plans(
+            netlist,
+            cuts,
+            &fanouts,
+            &retained,
+            options,
+            critical_arrival_ps,
+        );
+        let strict_required = required_times(
+            netlist, &plans, &arrivals, &fanouts, &retained, options, false,
+        );
+        if !timing_is_valid(&arrivals, &strict_required) {
+            (plans, arrivals) =
+                select_initial_plans(netlist, cuts, &fanouts, &retained, options, 0);
         }
 
         let original_plans = plans.clone();
         let original_arrivals = arrivals.clone();
-        let mut required = required_times(netlist, &plans, &arrivals, &fanouts, &retained, options);
+        let strict_required = required_times(
+            netlist, &plans, &arrivals, &fanouts, &retained, options, false,
+        );
+        let mut required = if timing_is_valid(&arrivals, &strict_required) {
+            strict_required
+        } else {
+            required_times(
+                netlist, &plans, &arrivals, &fanouts, &retained, options, true,
+            )
+        };
         let original_required = required.clone();
         RecoveryContext {
             netlist,
@@ -143,6 +136,48 @@ impl LutCover {
     fn plan(&self, net: NetId) -> Option<&LutPlan> {
         self.plans[net.index() as usize].as_ref()
     }
+}
+
+fn select_initial_plans(
+    netlist: &Netlist,
+    cuts: &CutDatabase,
+    fanouts: &[usize],
+    retained: &RetainedTiming,
+    options: MappingOptions,
+    critical_arrival_ps: u32,
+) -> (Vec<Option<LutPlan>>, Vec<u32>) {
+    let mut plans = vec![None; netlist.nodes().len()];
+    let mut arrivals = vec![0; netlist.nodes().len()];
+    for node in netlist.nodes() {
+        let index = node.output().index() as usize;
+        match node.kind() {
+            NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not | NodeKind::Mux => {
+                let plan = best_plan(
+                    &plans,
+                    &arrivals,
+                    fanouts,
+                    cuts.for_net(node.output()),
+                    critical_arrival_ps,
+                );
+                arrivals[index] = plan.arrival_ps;
+                plans[index] = Some(plan);
+            }
+            NodeKind::MemoryOutput(_) => arrivals[index] = BRAM_CLOCK_TO_OUTPUT_PS,
+            NodeKind::ArithmeticOutput(_) | NodeKind::ComparisonOutput(_) => {
+                arrivals[index] = retained.output_arrival(
+                    netlist,
+                    node.output(),
+                    &arrivals,
+                    fanouts,
+                    options.arithmetic,
+                );
+            }
+            NodeKind::Output(_) => arrivals[index] = arrivals[node.inputs()[0].index() as usize],
+            NodeKind::RegisterOutput(_) => arrivals[index] = FLIP_FLOP_CLOCK_TO_OUTPUT_PS,
+            NodeKind::Input(_) | NodeKind::Constant(_) => {}
+        }
+    }
+    (plans, arrivals)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -356,12 +391,18 @@ fn required_times(
     fanouts: &[usize],
     retained: &RetainedTiming,
     options: MappingOptions,
+    preserve_initial: bool,
 ) -> Vec<u32> {
     let period_ps = timing_period_ps(options);
     let mut required = vec![u32::MAX; netlist.nodes().len()];
     let mut constrain = |net: NetId, sink_delay: u32| {
         let index = net.index() as usize;
-        let deadline = period_ps.saturating_sub(sink_delay).max(arrivals[index]);
+        let deadline = period_ps.saturating_sub(sink_delay);
+        let deadline = if preserve_initial {
+            deadline.max(arrivals[index])
+        } else {
+            deadline
+        };
         required[index] = required[index].min(deadline);
     };
 
@@ -574,7 +615,8 @@ fn refresh_arrivals(
                 );
             }
             NodeKind::Output(_) => arrivals[index] = arrivals[node.inputs()[0].index() as usize],
-            NodeKind::Input(_) | NodeKind::Constant(_) | NodeKind::RegisterOutput(_) => {}
+            NodeKind::RegisterOutput(_) => arrivals[index] = FLIP_FLOP_CLOCK_TO_OUTPUT_PS,
+            NodeKind::Input(_) | NodeKind::Constant(_) => {}
         }
     }
 }
@@ -736,28 +778,32 @@ fn best_plan(
         .map(|plan| plan.depth)
         .min()
         .expect("a Boolean node always has a direct-input cut");
-    let minimum_arrival = candidates
+    let minimum_depth_arrival = candidates
         .iter()
         .filter(|plan| plan.depth == minimum_depth)
         .map(|plan| plan.arrival_ps)
         .min()
         .expect("the minimum-depth set is non-empty");
-    candidates
-        .into_iter()
-        .filter(|plan| plan.depth == minimum_depth)
-        .min_by_key(|plan| {
-            if minimum_arrival >= critical_arrival_ps {
+    if minimum_depth_arrival >= critical_arrival_ps {
+        candidates
+            .into_iter()
+            .min_by_key(|plan| {
                 (
                     plan.arrival_ps,
+                    plan.depth,
                     plan.area,
                     plan.leaves.len(),
                     plan.leaves.clone(),
                 )
-            } else {
-                (0, plan.area, plan.leaves.len(), plan.leaves.clone())
-            }
-        })
-        .expect("the minimum-depth set is non-empty")
+            })
+            .expect("the candidate set is non-empty")
+    } else {
+        candidates
+            .into_iter()
+            .filter(|plan| plan.depth == minimum_depth)
+            .min_by_key(|plan| (plan.area, plan.leaves.len(), plan.leaves.clone()))
+            .expect("the minimum-depth set is non-empty")
+    }
 }
 
 fn plan_for_cut(
@@ -969,5 +1015,40 @@ mod tests {
         let selected = best_plan(&plans, &arrivals, &fanouts, &cuts, 0);
 
         assert_eq!(selected.leaves, vec![shared, local]);
+    }
+
+    #[test]
+    fn critical_timing_can_choose_a_faster_deeper_cut() {
+        let mut netlist = Netlist::new("critical_cut");
+        let slow_source = netlist.add_input("slow_source");
+        let fast_source = netlist.add_input("fast_source");
+        let internal = netlist.add_not(fast_source);
+        let mut plans = vec![None; netlist.nodes().len()];
+        plans[internal.index() as usize] = Some(super::LutPlan {
+            leaves: vec![fast_source],
+            depth: 1,
+            arrival_ps: 500,
+            area: 1,
+        });
+        let mut arrivals = vec![0; netlist.nodes().len()];
+        arrivals[slow_source.index() as usize] = 1_500;
+        arrivals[internal.index() as usize] = 500;
+        let fanouts = vec![1; netlist.nodes().len()];
+        let cuts = [
+            Cut {
+                leaves: vec![slow_source],
+            },
+            Cut {
+                leaves: vec![internal],
+            },
+        ];
+
+        let area_driven = best_plan(&plans, &arrivals, &fanouts, &cuts, u32::MAX);
+        let timing_driven = best_plan(&plans, &arrivals, &fanouts, &cuts, 0);
+
+        assert_eq!(area_driven.leaves, vec![slow_source]);
+        assert_eq!(timing_driven.leaves, vec![internal]);
+        assert!(timing_driven.depth > area_driven.depth);
+        assert!(timing_driven.arrival_ps < area_driven.arrival_ps);
     }
 }

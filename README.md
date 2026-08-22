@@ -200,6 +200,13 @@ the same 1,163-site area and passes all ten seeds; the observed distribution is
 273.14 MHz average and 255.43--296.21 MHz range. nextpnr timing remains the
 sign-off result because placement-dependent routing cannot be predicted by the
 pre-route mapper.
+With both mapping and nextpnr driven at 300 MHz, the cover adds six logic LUTs
+(1,169 `TRELLIS_COMB`) and raises the ten-seed average to 284.08 MHz, with a
+256.48--311.43 MHz range and one seed meeting 300 MHz. Applying the 300 MHz
+place-and-route constraint to the unchanged 250 MHz cover averaged 273.14 MHz
+and passed no seeds. The target-driven cover therefore helps, but reliable
+300 MHz operation still requires another pipeline or placement-aware
+optimization rather than more pre-route cut pressure.
 The timing tradeoff is additional address/control latency. Address decode
 admits one request at a time per address channel and initiator, while W and R
 data still stream at one beat per cycle; place and route should be repeated for

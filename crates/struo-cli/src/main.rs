@@ -28,7 +28,7 @@ Usage:
                        synthesize and simulate the ECP5 EVN blinky
   struo axi4-demo [MAPPED_JSON]
                        analyze, synthesize, and compile the 2x2 AXI4 crossbar
-  struo axi4-self-test [MAPPED_JSON]
+  struo axi4-self-test [MAPPED_JSON] [TIMING_GOAL_MHZ]
                        synthesize the closed-system AXI4 board wrapper
   struo carry-benchmark [DIRECTORY]
                        emit 32-bit CCU2C and LUT ripple comparison designs
@@ -49,7 +49,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     match env::args().nth(1).as_deref() {
         Some("demo") => run_demo(env::args().nth(2).as_deref()),
         Some("axi4-demo") => run_axi4_demo(env::args().nth(2).as_deref()),
-        Some("axi4-self-test") => run_axi4_self_test(env::args().nth(2).as_deref()),
+        Some("axi4-self-test") => {
+            run_axi4_self_test(env::args().nth(2).as_deref(), env::args().nth(3).as_deref())
+        }
         Some("carry-benchmark") => run_carry_benchmark(
             env::args()
                 .nth(2)
@@ -140,15 +142,31 @@ fn run_carry_benchmark(directory: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_axi4_self_test(mapped_path: Option<&str>) -> Result<(), Box<dyn Error>> {
+fn run_axi4_self_test(
+    mapped_path: Option<&str>,
+    timing_goal_mhz: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let timing_goal_mhz = timing_goal_mhz
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(ECP5_QOR_TARGET_MHZ);
+    if timing_goal_mhz == 0 {
+        return Err("timing goal must be greater than zero".into());
+    }
     let design = axi4_crossbar_self_test()?;
     let synthesized = synthesize(&design)?;
     for report in &synthesized.reports {
         println!("{}: {}", report.pass, report.message);
     }
-    let mapped = map_to_ecp5(&synthesized.netlist)?;
+    let mapped = map_to_ecp5_with_options(
+        &synthesized.netlist,
+        MappingOptions {
+            timing_goal_mhz,
+            ..MappingOptions::default()
+        },
+    )?;
     println!(
-        "Veryl AXI4 self-test: {} Boolean nodes, {} registers, {} ECP5 cells",
+        "Veryl AXI4 self-test at {timing_goal_mhz} MHz: {} Boolean nodes, {} registers, {} ECP5 cells",
         synthesized.netlist.nodes().len(),
         synthesized.netlist.registers().len(),
         mapped.cells().len()
