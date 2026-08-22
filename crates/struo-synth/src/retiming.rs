@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 
 use struo_formal::{
     LogicFunction, RetimingCertificate, RetimingDomain, RetimingEdge, RetimingGraph,
-    RetimingVertex, verify_retiming_certificate,
+    RetimingVertex, derive_retimed_graph, verify_retiming_certificate,
 };
 use struo_ir::{
     ActiveLevel, ClockEdge, EnableControl, NetId, Netlist, NodeKind, PortDirection, RegisterCell,
@@ -14,21 +14,56 @@ use struo_ir::{
 
 use crate::{Pass, PassReport, SynthesisError};
 
-/// Moves reset-to-zero registers across Boolean logic to cap unregistered depth.
+/// Moves resettable registers across Boolean logic to cap unregistered depth.
 ///
 /// Primary ports, retained word cells, memories, inverters, clocks, and resets
 /// are fixed boundaries. Clock enables are represented as feedback muxes while
 /// retiming and recovered by [`crate::InferRegisterEnables`] afterwards.
 pub struct TimingDrivenRetiming {
     target_depth: usize,
+    net_delays: HashMap<NetId, usize>,
+    movable_nets: Option<HashSet<NetId>>,
 }
 
 impl TimingDrivenRetiming {
     /// Creates a pass targeting at most `target_depth` Boolean nodes between
     /// registers. A zero target is accepted but cannot move logic through I/O.
     #[must_use]
-    pub const fn new(target_depth: usize) -> Self {
-        Self { target_depth }
+    pub fn new(target_depth: usize) -> Self {
+        Self {
+            target_depth,
+            net_delays: HashMap::new(),
+            movable_nets: None,
+        }
+    }
+
+    /// Creates a pass with target-provided combinational delay annotations.
+    /// Unannotated Boolean nodes retain the unit-delay model.
+    #[must_use]
+    pub fn with_net_delays(
+        target_depth: usize,
+        delays: impl IntoIterator<Item = (NetId, usize)>,
+    ) -> Self {
+        Self {
+            target_depth,
+            net_delays: delays.into_iter().collect(),
+            movable_nets: None,
+        }
+    }
+
+    /// Restricts target-annotated retiming to selected nets and their explicit
+    /// register-output vertices.
+    #[must_use]
+    pub fn with_net_delays_and_focus(
+        target_depth: usize,
+        delays: impl IntoIterator<Item = (NetId, usize)>,
+        movable_nets: impl IntoIterator<Item = NetId>,
+    ) -> Self {
+        Self {
+            target_depth,
+            net_delays: delays.into_iter().collect(),
+            movable_nets: Some(movable_nets.into_iter().collect()),
+        }
     }
 }
 
@@ -38,10 +73,13 @@ impl Pass for TimingDrivenRetiming {
     }
 
     fn run(&self, design: &mut Netlist) -> Result<PassReport, SynthesisError> {
-        let Some(mut model) = Model::from_netlist(design) else {
+        let Some(mut model) =
+            Model::from_netlist(design, &self.net_delays, self.movable_nets.as_ref())
+        else {
             return Ok(PassReport {
                 pass: self.name(),
-                message: "kept registers fixed: retiming requires one reset-to-zero domain and no memories".into(),
+                message: "kept registers fixed: retiming requires one reset domain and no memories"
+                    .into(),
             });
         };
         let before_depth = model.maximum_depth();
@@ -62,17 +100,16 @@ impl Pass for TimingDrivenRetiming {
             });
         }
 
-        let after_graph = model.formal_graph();
-        verify_retiming_certificate(
-            &model.before_graph,
-            &after_graph,
-            &RetimingCertificate::new(model.labels.clone()),
-        )
-        .map_err(|error| {
-            SynthesisError::Transformation(format!("invalid retiming certificate: {error}"))
-        })?;
+        let certificate = RetimingCertificate::new(model.labels.clone());
+        let after_graph = derive_retimed_graph(&model.before_graph, &certificate)
+            .map_err(|error| SynthesisError::Transformation(error.to_string()))?;
+        verify_retiming_certificate(&model.before_graph, &after_graph, &certificate).map_err(
+            |error| {
+                SynthesisError::Transformation(format!("invalid retiming certificate: {error}"))
+            },
+        )?;
 
-        let rebuilt = model.rebuild(design)?;
+        let rebuilt = model.rebuild(design, &after_graph)?;
         let after_depth = model.maximum_depth();
         let after_registers = model.register_count() + fixed_registers;
         rebuilt.validate()?;
@@ -99,6 +136,7 @@ struct Vertex {
     kind: VertexKind,
     formal: RetimingVertex,
     delay: usize,
+    movable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +148,6 @@ struct Edge {
 }
 
 struct Model {
-    domain: RetimingDomain,
     vertices: Vec<Vertex>,
     edges: Vec<Edge>,
     labels: Vec<i32>,
@@ -124,7 +161,11 @@ struct Model {
 
 impl Model {
     #[allow(clippy::too_many_lines)]
-    fn from_netlist(design: &Netlist) -> Option<Self> {
+    fn from_netlist(
+        design: &Netlist,
+        net_delays: &HashMap<NetId, usize>,
+        movable_nets: Option<&HashSet<NetId>>,
+    ) -> Option<Self> {
         if !design.memories().is_empty() || design.registers().is_empty() {
             return None;
         }
@@ -136,7 +177,7 @@ impl Model {
             .registers()
             .iter()
             .filter(|register| {
-                register.reset().is_some_and(|reset| !reset.value)
+                register.reset().is_some()
                     && signal_name(register.clock()).is_some()
                     && register
                         .reset()
@@ -211,7 +252,11 @@ impl Model {
         let mut vertices = Vec::with_capacity(design.nodes().len() + design.registers().len());
         let mut vertex_for_net = HashMap::new();
         for node in design.nodes() {
-            let (function, mut boundary, delay) = vertex_properties(node.kind());
+            let (function, mut boundary, default_delay) = vertex_properties(node.kind());
+            let delay = net_delays
+                .get(&node.output())
+                .copied()
+                .unwrap_or(default_delay);
             boundary |= fixed_fanin.contains(&node.output());
             let name = match node.kind() {
                 NodeKind::Input(name)
@@ -232,6 +277,7 @@ impl Model {
                 kind: VertexKind::Net(node.output()),
                 formal,
                 delay,
+                movable: movable_nets.is_none_or(|nets| nets.contains(&node.output())),
             });
             vertex_for_net.insert(node.output(), index);
         }
@@ -247,6 +293,7 @@ impl Model {
                         mux_function(),
                     ),
                     delay: 1,
+                    movable: movable_nets.is_none_or(|nets| nets.contains(&register.output())),
                 });
             }
         }
@@ -306,9 +353,8 @@ impl Model {
             }
         }
 
-        let before_graph = make_formal_graph(&domain, &vertices, &edges, &vec![0; vertices.len()]);
+        let before_graph = make_formal_graph(&domain, &vertices, &edges, reset.value);
         Some(Self {
-            domain,
             labels: vec![0; vertices.len()],
             vertices,
             edges,
@@ -458,8 +504,8 @@ impl Model {
             let mut candidates = (0..self.vertices.len())
                 .filter(|vertex| {
                     let formal = &self.vertices[*vertex].formal;
-                    !formal.is_boundary()
-                        && formal.function().preserves_zero()
+                    self.vertices[*vertex].movable
+                        && !formal.is_boundary()
                         && !incoming[*vertex].is_empty()
                         && incoming[*vertex].iter().all(|edge| weights[*edge] > 0)
                         && incoming[*vertex]
@@ -518,8 +564,8 @@ impl Model {
             let mut candidates = (0..self.vertices.len())
                 .filter(|vertex| {
                     let formal = &self.vertices[*vertex].formal;
-                    !formal.is_boundary()
-                        && formal.function().preserves_zero()
+                    self.vertices[*vertex].movable
+                        && !formal.is_boundary()
                         && !outgoing[*vertex].is_empty()
                         && outgoing[*vertex].iter().all(|edge| weights[*edge] > 0)
                         && arrival[*vertex] > target
@@ -575,12 +621,8 @@ impl Model {
         }
     }
 
-    fn formal_graph(&self) -> RetimingGraph {
-        make_formal_graph(&self.domain, &self.vertices, &self.edges, &self.labels)
-    }
-
     #[allow(clippy::too_many_lines)]
-    fn rebuild(&self, old: &Netlist) -> Result<Netlist, SynthesisError> {
+    fn rebuild(&self, old: &Netlist, retimed: &RetimingGraph) -> Result<Netlist, SynthesisError> {
         let weights = self.weights();
         let order = self.topological_order(&weights).ok_or_else(|| {
             SynthesisError::Transformation("retiming produced a combinational cycle".into())
@@ -725,6 +767,7 @@ impl Model {
                     None,
                     Some(ResetControl {
                         signal: new_reset,
+                        value: retimed.edges()[edge_index].reset_values()[stage],
                         ..self.reset
                     }),
                 ));
@@ -822,19 +865,15 @@ fn make_formal_graph(
     domain: &RetimingDomain,
     vertices: &[Vertex],
     edges: &[Edge],
-    labels: &[i32],
+    reset_value: bool,
 ) -> RetimingGraph {
     let edges = edges
         .iter()
         .map(|edge| {
-            let weight = i64::try_from(edge.original_weight)
-                .expect("retiming edge weight fits i64")
-                + i64::from(labels[edge.target])
-                - i64::from(labels[edge.source]);
             RetimingEdge::new(
                 edge.source,
                 edge.target,
-                vec![false; usize::try_from(weight).expect("legal retiming weight")],
+                vec![reset_value; edge.original_weight],
             )
         })
         .collect();
@@ -854,7 +893,7 @@ fn vertex_properties(kind: &NodeKind) -> (LogicFunction, bool, usize) {
         NodeKind::And => (LogicFunction::new(2, 0b1000), false, 1),
         NodeKind::Or => (LogicFunction::new(2, 0b1110), false, 1),
         NodeKind::Xor => (LogicFunction::new(2, 0b0110), false, 1),
-        NodeKind::Not => (LogicFunction::new(1, 0b01), true, 1),
+        NodeKind::Not => (LogicFunction::new(1, 0b01), false, 1),
         NodeKind::Mux => (mux_function(), false, 1),
         NodeKind::RegisterOutput(_) => (LogicFunction::new(1, 0b10), false, 0),
         NodeKind::Output(_) => (LogicFunction::new(1, 0b10), true, 0),
@@ -911,6 +950,50 @@ mod tests {
         );
         assert_eq!(before.registers().len(), 4);
         assert!(after.registers().len() <= 4, "{}", report.message);
+        assert_eq!(
+            prove_sequential_equivalence(&gold, &gate, 3)
+                .unwrap()
+                .status(),
+            EquivalenceStatus::Equivalent
+        );
+    }
+
+    #[test]
+    fn derives_reset_preimages_when_retiming_reset_to_one_state() {
+        let mut before = Netlist::new("retime_reset_one");
+        let clock = before.add_input("clock");
+        let reset = before.add_input("reset");
+        let input = before.add_input("input");
+        let control = ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: true,
+        };
+        let input_q = add_register(&mut before, "input_q", input, clock, control);
+        let inverted = before.add_not(input_q);
+        let output_q = add_register(&mut before, "output_q", inverted, clock, control);
+        before.add_output("output", output_q);
+        before.validate().unwrap();
+
+        let gold = TransitionSystem::from_netlist(&before).unwrap();
+        let mut after = before.clone();
+        let report = TimingDrivenRetiming::with_net_delays_and_focus(0, [], [inverted])
+            .run(&mut after)
+            .unwrap();
+        let gate = TransitionSystem::from_netlist(&after).unwrap();
+
+        assert!(
+            report.message.contains("certified moves"),
+            "{}",
+            report.message
+        );
+        assert!(
+            after
+                .registers()
+                .iter()
+                .any(|register| { register.reset().is_some_and(|reset| !reset.value) })
+        );
         assert_eq!(
             prove_sequential_equivalence(&gold, &gate, 3)
                 .unwrap()
