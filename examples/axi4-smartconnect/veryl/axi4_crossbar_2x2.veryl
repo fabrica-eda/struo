@@ -206,7 +206,7 @@ module Axi4BurstDecoderBank::<PORTS: u32 = 2> (
     }
 }
 
-/// Four-cycle burst decoder with an output holding register.
+/// Three-cycle burst decoder with an output holding register.
 ///
 /// Only one request is in flight per instance. This deliberately trades
 /// address-channel latency for a short, predictable ECP5 critical path while
@@ -252,8 +252,6 @@ module Axi4BurstDecoderPipeline (
     var stage1_last_base     : logic<17>;
     var stage1_last_mask     : logic<17>;
     var stage1_protocol_valid: logic    ;
-    var stage2_valid         : logic    ;
-    var stage2_last_address  : logic<17>;
     var input_beat_mask      : logic<17>;
     var input_burst_mask     : logic<17>;
     var input_size_valid     : logic    ;
@@ -263,7 +261,7 @@ module Axi4BurstDecoderPipeline (
     var stage0_last_base     : logic<17>;
     var stage0_last_mask     : logic<17>;
     var stage1_last_address  : logic<17>;
-    var stage2_within_4k     : logic    ;
+    var stage1_within_4k     : logic    ;
 
     always_comb {
         // For a 32-bit data bus, legal transfer sizes are one, two, or four
@@ -316,25 +314,8 @@ module Axi4BurstDecoderPipeline (
         }
 
         stage1_last_address = stage1_last_base + stage1_last_mask;
-        stage2_within_4k    = !stage2_last_address[16] && (stage1_addr[15:12] == stage2_last_address[15:12]);
-        in_ready            = !pre_valid && !stage0_valid && !stage1_valid && !stage2_valid && !out_valid;
-    }
-
-    // Only the adder result needs another physical boundary. The single-flight
-    // handshake keeps stage1 metadata stable until this result is consumed.
-    always_ff (clk, rst_n) {
-        if_reset {
-            stage2_valid        = 1'b0;
-            stage2_last_address = 17'b0;
-        } else {
-            if stage2_valid {
-                stage2_valid = 1'b0;
-            }
-            if stage1_valid {
-                stage2_valid        = 1'b1;
-                stage2_last_address = stage1_last_address;
-            }
-        }
+        stage1_within_4k    = !stage1_last_address[16] && (stage1_addr[15:12] == stage1_last_address[15:12]);
+        in_ready            = !pre_valid && !stage0_valid && !stage1_valid && !out_valid;
     }
 
     always_ff (clk, rst_n) {
@@ -435,15 +416,15 @@ module Axi4BurstDecoderPipeline (
             if out_valid && out_ready {
                 out_valid = 1'b0;
             }
-            if stage2_valid {
+            if stage1_valid {
                 out_valid    = 1'b1;
-                target0      = stage1_protocol_valid && stage2_within_4k && (stage1_addr[15:14] == 2'b00)
-                    && (stage2_last_address[15:14] == 2'b00);
-                target1      = stage1_protocol_valid && stage2_within_4k && (stage1_addr[15:14] == 2'b10)
-                    && (stage2_last_address[15:14] == 2'b10);
-                decode_error = !(stage1_protocol_valid && stage2_within_4k
-                    && (((stage1_addr[15:14] == 2'b00) && (stage2_last_address[15:14] == 2'b00))
-                        || ((stage1_addr[15:14] == 2'b10) && (stage2_last_address[15:14] == 2'b10))));
+                target0      = stage1_protocol_valid && stage1_within_4k && (stage1_addr[15:14] == 2'b00)
+                    && (stage1_last_address[15:14] == 2'b00);
+                target1      = stage1_protocol_valid && stage1_within_4k && (stage1_addr[15:14] == 2'b10)
+                    && (stage1_last_address[15:14] == 2'b10);
+                decode_error = !(stage1_protocol_valid && stage1_within_4k
+                    && (((stage1_addr[15:14] == 2'b00) && (stage1_last_address[15:14] == 2'b00))
+                        || ((stage1_addr[15:14] == 2'b10) && (stage1_last_address[15:14] == 2'b10))));
             }
         }
     }
