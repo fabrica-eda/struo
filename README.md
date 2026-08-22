@@ -111,16 +111,20 @@ addition and subtraction, signed and unsigned comparisons, variable logical
 and arithmetic shifts, muxes, concatenation, slicing, registers, enables, and
 synchronous or asynchronous constant resets. It performs constant folding and
 structural hashing, balances associative reductions, and uses parallel-prefix
-comparison networks. Addition and subtraction remain word-level cells until
-technology mapping. ECP5 maps operations wider than four bits to `CCU2C` carry
-chains by default; explicit carry-chain and LUT-ripple modes are also available
-for regression tests and A/B measurements. ECP5 technology mapping enumerates
-bounded four-input cuts and selects a cover using a 300 MHz required-time
-model. The estimate includes LUT, routing, carry-chain, BRAM, and setup arcs;
-fanout-weighted timing selection is enabled for cones that consume about half
-the available period before exact referenced-area recovery. Unreachable
-Boolean logic is omitted and the selected cover maps to `LUT4`; registers map
-to `TRELLIS_FF`.
+comparison networks. A conservative sequential don't-care pass removes a
+payload register's clock enable when a same-clock valid register and structural
+influence analysis prove that the payload is unobservable while invalid. This
+lets source RTL retain natural conditional assignments without putting their
+hold muxes on timing-critical paths. Addition and subtraction remain
+word-level cells until technology mapping. ECP5 maps operations wider than
+four bits to `CCU2C` carry chains by default; explicit carry-chain and
+LUT-ripple modes are also available for regression tests and A/B measurements.
+ECP5 technology mapping enumerates bounded four-input cuts and selects a cover
+using a 300 MHz required-time model. The estimate includes LUT, routing,
+carry-chain, BRAM, and setup arcs; fanout-weighted timing selection is enabled
+for cones that consume about half the available period before exact
+referenced-area recovery. Unreachable Boolean logic is omitted and the
+selected cover maps to `LUT4`; registers map to `TRELLIS_FF`.
 Synchronous 1R1W memories map directly to ECP5 `DP16KD`
 primitives, including width tiling across multiple blocks; inout ports are
 rejected explicitly.
@@ -184,11 +188,13 @@ traffic, and local error completion through both the reference and post-map
 paths.
 
 On nextpnr 0.6, LFE5UM5G-85F speed grade 8, and seeds 1 through 10, the 300 MHz
-flow passes all ten seeds and reaches 301.93--324.36 MHz (308.18 MHz mean). The
-mapped self-test uses 1,159 `TRELLIS_COMB` and 1,441 `TRELLIS_FF` sites. The
-result combines the mapper's 300 MHz required-time cover with registered
-write-completion, read-slot reservation, scoreboard, and QoS-arbitration
-boundaries in the RTL. nextpnr uses timing budgets, a heap timing weight of 30,
+flow passes all ten seeds and reaches 303.03--316.66 MHz (307.62 MHz mean). The
+mapped self-test uses 1,193 `TRELLIS_COMB` and 1,433 `TRELLIS_FF` sites. The
+qualified-payload pass removes 69 of 1,109 inferred clock enables and makes the
+eight QoS comparison preregisters unnecessary. The remaining result combines
+the mapper's 300 MHz required-time cover with registered write-completion,
+read-slot reservation, scoreboard, and arbitration boundaries in the RTL.
+nextpnr uses timing budgets, a heap timing weight of 30,
 and timing-driven routing rip-up for every seed; no successful seed is selected
 after the fact. The CI timing gate repeats all ten fixed seeds and requires each
 one to reach 300 MHz. nextpnr timing remains the sign-off result because
