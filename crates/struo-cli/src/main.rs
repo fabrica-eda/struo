@@ -170,20 +170,23 @@ fn run_axi4_self_test(
             ..MappingOptions::default()
         },
     )?;
-    let mapped = match (draft_report, draft_placed_json) {
+    let (mapped, additional_candidates) = match (draft_report, draft_placed_json) {
         (Some(report), Some(placed)) => {
             let feedback = PhysicalFeedback::from_nextpnr_json(
                 &fs::read_to_string(report)?,
                 &fs::read_to_string(placed)?,
             )?;
-            let refined = mapped.apply_physical_feedback(&feedback);
+            let mut candidates = mapped.physical_feedback_candidates(&feedback).into_iter();
+            let refined = candidates.next().unwrap_or_else(|| mapped.clone());
+            let additional_candidates = candidates.collect::<Vec<_>>();
             println!(
-                "physical-feedback: {} equivalent physical rewires",
-                refined.retiming().equivalent_physical_rewires
+                "physical-feedback: {} candidates, {} equivalent physical rewires",
+                additional_candidates.len() + usize::from(refined != mapped),
+                refined.retiming().equivalent_physical_rewires,
             );
-            refined
+            (refined, additional_candidates)
         }
-        (None, None) => mapped,
+        (None, None) => (mapped, Vec::new()),
         (Some(_), None) | (None, Some(_)) => {
             return Err("draft report and placed JSON must be provided together".into());
         }
@@ -200,6 +203,17 @@ fn run_axi4_self_test(
     if let Some(path) = mapped_path {
         fs::write(path, mapped.to_nextpnr_json()?)?;
         println!("mapped JSON: {path}");
+        let path = Path::new(path);
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("design");
+        for (index, candidate) in additional_candidates.iter().enumerate() {
+            let candidate_path =
+                path.with_file_name(format!("{stem}.candidate-{}.json", index + 1));
+            fs::write(&candidate_path, candidate.to_nextpnr_json()?)?;
+            println!("physical candidate JSON: {}", candidate_path.display());
+        }
     }
     Ok(())
 }

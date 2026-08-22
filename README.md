@@ -140,15 +140,19 @@ goal, where a small routing repair is appropriate. If no such branch exists and
 the design is within 95 percent, the reported register-to-register critical
 path guides a whole-LUT boundary move at its sink. The move is checked by the
 retiming certificate machinery, including reset derivation, before it becomes
-an implementation candidate. Clock, reset, and enable nets are excluded from
+an implementation candidate. A bounded search also tries the opposite
+registered-input cut and one additional critical-cone move, emitting at most
+three proof-signed JSON candidates without another optimization switch. Clock,
+reset, and enable nets are excluded from
 generic data rewrites. LUT replication retains compatible draft BELs; retiming
 changes packing boundaries and therefore receives a fresh placement with the
 same fixed seed. `Ecp5Flow::draft_place_and_route_command` and
-`Ecp5Flow::refined_place_and_route_command` produce both configurations. The
-refined result is accepted only when every reported clock is no worse and at
-least one is strictly faster; `pack_physical_command` otherwise rolls back to
-the already-routed draft. Designs that already meet timing are not rewritten.
-This is feedback-directed physical synthesis rather than seed selection.
+`Ecp5Flow::physical_candidate_place_and_route_commands` produce the draft and
+same-seed candidate configurations. The best candidate is accepted only when
+every reported clock is no worse and at least one is strictly faster;
+`pack_physical_candidates_command` otherwise rolls back to the already-routed
+draft. Designs that already meet timing are not rewritten. This is
+feedback-directed physical synthesis rather than seed selection.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under
