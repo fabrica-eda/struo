@@ -831,6 +831,7 @@ mod tests {
                     &synthesized.netlist,
                     MappingOptions {
                         arithmetic: strategy,
+                        ..MappingOptions::default()
                     },
                 )
                 .unwrap();

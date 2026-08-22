@@ -111,7 +111,13 @@ fn run_carry_benchmark(directory: &str) -> Result<(), Box<dyn Error>> {
         ("carry", ArithmeticMapping::CarryChain),
         ("lut", ArithmeticMapping::Lut4),
     ] {
-        let mapped = map_to_ecp5_with_options(&synthesized.netlist, MappingOptions { arithmetic })?;
+        let mapped = map_to_ecp5_with_options(
+            &synthesized.netlist,
+            MappingOptions {
+                arithmetic,
+                ..MappingOptions::default()
+            },
+        )?;
         ecp5_simulator(&mapped)?.build_native()?;
         let lut_count = mapped
             .cells()
