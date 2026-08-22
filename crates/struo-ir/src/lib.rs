@@ -49,6 +49,8 @@ pub enum NodeKind {
     MemoryOutput(String),
     /// A bit produced by a retained word-level arithmetic cell.
     ArithmeticOutput(String),
+    /// The result of a retained word-level comparison cell.
+    ComparisonOutput(String),
 }
 
 impl NodeKind {
@@ -58,7 +60,8 @@ impl NodeKind {
             | Self::Constant(_)
             | Self::RegisterOutput(_)
             | Self::MemoryOutput(_)
-            | Self::ArithmeticOutput(_) => 0,
+            | Self::ArithmeticOutput(_)
+            | Self::ComparisonOutput(_) => 0,
             Self::Not | Self::Output(_) => 1,
             Self::And | Self::Or | Self::Xor => 2,
             Self::Mux => 3,
@@ -200,6 +203,75 @@ pub struct ArithmeticCell {
     lhs: Vec<NetId>,
     rhs: Vec<NetId>,
     outputs: Vec<NetId>,
+}
+
+/// A retained word-level comparison operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ComparisonOp {
+    /// Unsigned less-than.
+    LessThanUnsigned,
+    /// Unsigned less-than-or-equal.
+    LessOrEqualUnsigned,
+    /// Signed two's-complement less-than.
+    LessThanSigned,
+    /// Signed two's-complement less-than-or-equal.
+    LessOrEqualSigned,
+}
+
+impl ComparisonOp {
+    /// Returns whether the relation includes equal operands.
+    #[must_use]
+    pub const fn includes_equal(self) -> bool {
+        matches!(self, Self::LessOrEqualUnsigned | Self::LessOrEqualSigned)
+    }
+
+    /// Returns whether operands use two's-complement signed ordering.
+    #[must_use]
+    pub const fn is_signed(self) -> bool {
+        matches!(self, Self::LessThanSigned | Self::LessOrEqualSigned)
+    }
+}
+
+/// One combinational word-level comparison cell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComparisonCell {
+    name: String,
+    operation: ComparisonOp,
+    lhs: Vec<NetId>,
+    rhs: Vec<NetId>,
+    output: NetId,
+}
+
+impl ComparisonCell {
+    /// Returns the stable diagnostic name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the comparison operation.
+    #[must_use]
+    pub const fn operation(&self) -> ComparisonOp {
+        self.operation
+    }
+
+    /// Returns left operand bits least-significant first.
+    #[must_use]
+    pub fn lhs(&self) -> &[NetId] {
+        &self.lhs
+    }
+
+    /// Returns right operand bits least-significant first.
+    #[must_use]
+    pub fn rhs(&self) -> &[NetId] {
+        &self.rhs
+    }
+
+    /// Returns the one-bit comparison result.
+    #[must_use]
+    pub const fn output(&self) -> NetId {
+        self.output
+    }
 }
 
 impl ArithmeticCell {
@@ -441,6 +513,7 @@ pub struct Netlist {
     registers: Vec<RegisterCell>,
     memories: Vec<MemoryCell>,
     arithmetic: Vec<ArithmeticCell>,
+    comparisons: Vec<ComparisonCell>,
     next_net: u32,
     constants: [Option<NetId>; 2],
     logic_cache: HashMap<LogicKey, NetId>,
@@ -457,6 +530,7 @@ impl Netlist {
             registers: Vec::new(),
             memories: Vec::new(),
             arithmetic: Vec::new(),
+            comparisons: Vec::new(),
             next_net: 0,
             constants: [None, None],
             logic_cache: HashMap::new(),
@@ -503,6 +577,12 @@ impl Netlist {
     #[must_use]
     pub fn arithmetic(&self) -> &[ArithmeticCell] {
         &self.arithmetic
+    }
+
+    /// Returns retained word-level comparison cells in dependency order.
+    #[must_use]
+    pub fn comparisons(&self) -> &[ComparisonCell] {
+        &self.comparisons
     }
 
     /// Adds a primary input and returns its net.
@@ -603,6 +683,32 @@ impl Netlist {
             outputs: outputs.clone(),
         });
         Ok(outputs)
+    }
+
+    /// Adds a word-level comparison and returns its one-bit result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty or mismatched operands.
+    pub fn add_comparison(
+        &mut self,
+        operation: ComparisonOp,
+        lhs: &[NetId],
+        rhs: &[NetId],
+    ) -> Result<NetId, ValidationError> {
+        let name = format!("compare{}", self.comparisons.len());
+        if lhs.is_empty() || lhs.len() != rhs.len() {
+            return Err(ValidationError::ComparisonWidth(name));
+        }
+        let output = self.add_node(NodeKind::ComparisonOutput(name.clone()), Vec::new());
+        self.comparisons.push(ComparisonCell {
+            name,
+            operation,
+            lhs: lhs.to_vec(),
+            rhs: rhs.to_vec(),
+            output,
+        });
+        Ok(output)
     }
 
     /// Adds or reuses a two-input AND gate.
@@ -751,6 +857,7 @@ impl Netlist {
         let mut register_outputs = HashSet::new();
         let mut memory_outputs = HashSet::new();
         let mut arithmetic_outputs = HashSet::new();
+        let mut comparison_outputs = HashSet::new();
 
         for node in &self.nodes {
             let expected = node.kind.expected_input_count();
@@ -796,6 +903,12 @@ impl Netlist {
                     }
                     arithmetic_outputs.insert(node.output);
                 }
+                NodeKind::ComparisonOutput(name) => {
+                    if name.trim().is_empty() {
+                        return Err(ValidationError::EmptyComparisonName);
+                    }
+                    comparison_outputs.insert(node.output);
+                }
                 _ => {}
             }
         }
@@ -828,6 +941,7 @@ impl Netlist {
         self.validate_registers(&defined_nets, &register_outputs)?;
         self.validate_memories(&defined_nets, &memory_outputs)?;
         self.validate_arithmetic(&defined_nets, &arithmetic_outputs)?;
+        self.validate_comparisons(&defined_nets, &comparison_outputs)?;
 
         Ok(())
     }
@@ -969,6 +1083,43 @@ impl Netlist {
         Ok(())
     }
 
+    fn validate_comparisons(
+        &self,
+        defined_nets: &HashSet<NetId>,
+        comparison_outputs: &HashSet<NetId>,
+    ) -> Result<(), ValidationError> {
+        let mut connected_outputs = HashSet::new();
+        let mut names = HashSet::new();
+        for comparison in &self.comparisons {
+            if comparison.name.trim().is_empty() {
+                return Err(ValidationError::EmptyComparisonName);
+            }
+            if !names.insert(comparison.name.as_str()) {
+                return Err(ValidationError::DuplicateComparisonName(
+                    comparison.name.clone(),
+                ));
+            }
+            if comparison.lhs.is_empty() || comparison.lhs.len() != comparison.rhs.len() {
+                return Err(ValidationError::ComparisonWidth(comparison.name.clone()));
+            }
+            for input in comparison.lhs.iter().chain(&comparison.rhs) {
+                if !defined_nets.contains(input) {
+                    return Err(ValidationError::UndefinedNet(*input));
+                }
+            }
+            if !comparison_outputs.contains(&comparison.output) {
+                return Err(ValidationError::InvalidComparisonOutput(comparison.output));
+            }
+            if !connected_outputs.insert(comparison.output) {
+                return Err(ValidationError::MultipleDrivers(comparison.output));
+            }
+        }
+        if let Some(output) = comparison_outputs.difference(&connected_outputs).next() {
+            return Err(ValidationError::UnconnectedComparison(*output));
+        }
+        Ok(())
+    }
+
     fn add_cached(&mut self, key: LogicKey, kind: NodeKind, inputs: Vec<NetId>) -> NetId {
         if let Some(net) = self.logic_cache.get(&key) {
             return *net;
@@ -1026,6 +1177,8 @@ pub enum ValidationError {
     EmptyMemoryName,
     /// An arithmetic cell name is empty.
     EmptyArithmeticName,
+    /// A comparison cell name is empty.
+    EmptyComparisonName,
     /// More than one port has the same name.
     DuplicatePortName(String),
     /// More than one register has the same name.
@@ -1034,8 +1187,12 @@ pub enum ValidationError {
     DuplicateMemoryName(String),
     /// More than one arithmetic cell has the same name.
     DuplicateArithmeticName(String),
+    /// More than one comparison cell has the same name.
+    DuplicateComparisonName(String),
     /// An arithmetic cell has empty or mismatched operand/result widths.
     ArithmeticWidth(String),
+    /// A comparison cell has empty or mismatched operands.
+    ComparisonWidth(String),
     /// A memory has no words.
     ZeroMemoryDepth(String),
     /// A memory has invalid or mismatched address widths.
@@ -1058,6 +1215,10 @@ pub enum ValidationError {
     InvalidArithmeticOutput(NetId),
     /// A reserved arithmetic output has no arithmetic cell.
     UnconnectedArithmetic(NetId),
+    /// A comparison cell does not reference a reserved result output.
+    InvalidComparisonOutput(NetId),
+    /// A reserved comparison output has no comparison cell.
+    UnconnectedComparison(NetId),
     /// A grouped port references a node with the wrong direction.
     InvalidPortBit(NetId),
     /// A node has the wrong number of inputs.
@@ -1083,6 +1244,9 @@ impl Display for ValidationError {
             Self::EmptyArithmeticName => {
                 formatter.write_str("arithmetic cell name must not be empty")
             }
+            Self::EmptyComparisonName => {
+                formatter.write_str("comparison cell name must not be empty")
+            }
             Self::DuplicatePortName(name) => write!(formatter, "duplicate port name: {name}"),
             Self::DuplicateRegisterName(name) => {
                 write!(formatter, "duplicate register name: {name}")
@@ -1091,8 +1255,14 @@ impl Display for ValidationError {
             Self::DuplicateArithmeticName(name) => {
                 write!(formatter, "duplicate arithmetic cell name: {name}")
             }
+            Self::DuplicateComparisonName(name) => {
+                write!(formatter, "duplicate comparison cell name: {name}")
+            }
             Self::ArithmeticWidth(name) => {
                 write!(formatter, "arithmetic cell {name} has an invalid width")
+            }
+            Self::ComparisonWidth(name) => {
+                write!(formatter, "comparison cell {name} has an invalid width")
             }
             Self::ZeroMemoryDepth(name) => write!(formatter, "memory {name} has zero depth"),
             Self::MemoryAddressWidth(name) => {
@@ -1124,6 +1294,15 @@ impl Display for ValidationError {
                     "reserved arithmetic output {net} is not connected"
                 )
             }
+            Self::InvalidComparisonOutput(net) => {
+                write!(formatter, "comparison output {net} was not reserved")
+            }
+            Self::UnconnectedComparison(net) => {
+                write!(
+                    formatter,
+                    "reserved comparison output {net} is not connected"
+                )
+            }
             Self::InvalidPortBit(net) => {
                 write!(formatter, "net {net} has the wrong node kind for its port")
             }
@@ -1143,7 +1322,7 @@ impl Error for ValidationError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ArithmeticOp, ClockEdge, Netlist, NodeKind, RegisterCell};
+    use super::{ArithmeticOp, ClockEdge, ComparisonOp, Netlist, NodeKind, RegisterCell};
 
     #[test]
     fn valid_and_gate_netlist_passes_validation() {
@@ -1213,6 +1392,24 @@ mod tests {
         assert!(matches!(
             design.nodes()[result[0].index() as usize].kind(),
             NodeKind::ArithmeticOutput(_)
+        ));
+    }
+
+    #[test]
+    fn word_comparison_output_is_structurally_valid() {
+        let mut design = Netlist::new("compare");
+        let lhs = design.add_input("lhs");
+        let rhs = design.add_input("rhs");
+        let result = design
+            .add_comparison(ComparisonOp::LessThanUnsigned, &[lhs], &[rhs])
+            .unwrap();
+        design.add_output("result", result);
+
+        assert_eq!(design.validate(), Ok(()));
+        assert_eq!(design.comparisons()[0].output(), result);
+        assert!(matches!(
+            design.nodes()[result.index() as usize].kind(),
+            NodeKind::ComparisonOutput(_)
         ));
     }
 
