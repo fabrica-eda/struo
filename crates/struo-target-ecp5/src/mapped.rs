@@ -1,6 +1,6 @@
 //! ECP5 technology mapping and nextpnr serialization.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -182,54 +182,62 @@ impl Ecp5Netlist {
 /// Returns an error if the source netlist is invalid.
 pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
     netlist.validate()?;
-    let mut bits = vec![None; netlist.nodes().len()];
-    let mut cells = Vec::new();
+    let mut mapper = LutMapper::new(netlist);
 
-    for node in netlist.nodes() {
-        let mapped = match node.kind() {
-            NodeKind::Input(_) | NodeKind::RegisterOutput(_) | NodeKind::MemoryOutput(_) => {
-                wire_for(node.output())
-            }
-            NodeKind::Constant(value) => Bit::from(*value),
-            NodeKind::Output(_) => mapped_bit(&bits, node.inputs()[0]),
-            kind @ (NodeKind::And
-            | NodeKind::Or
-            | NodeKind::Xor
-            | NodeKind::Not
-            | NodeKind::Mux) => {
-                let output = wire_number(node.output());
-                let mut inputs = [Bit::Zero; 4];
-                for (target, source) in inputs.iter_mut().zip(node.inputs()) {
-                    *target = mapped_bit(&bits, *source);
-                }
-                cells.push(Ecp5Cell::Lut4 {
-                    name: format!("lut{}", node.output().index()),
-                    inputs,
-                    output,
-                    init: truth_table(kind),
-                });
-                Bit::Wire(output)
-            }
-        };
-        bits[node.output().index() as usize] = Some(mapped);
+    for port in netlist
+        .ports()
+        .iter()
+        .filter(|port| port.direction() == IrPortDirection::Output)
+    {
+        for output in port.bits() {
+            let node = node_for(netlist, *output);
+            let source = node.inputs()[0];
+            let output_bit = mapper.map_net(source);
+            mapper.bits[output.index() as usize] = Some(output_bit);
+        }
     }
 
     for register in netlist.registers() {
-        cells.push(Ecp5Cell::FlipFlop {
+        mapper.map_net(register.data());
+        mapper.map_net(register.clock());
+        if let Some(enable) = register.enable() {
+            mapper.map_net(enable.signal);
+        }
+        if let Some(reset) = register.reset() {
+            mapper.map_net(reset.signal);
+        }
+    }
+
+    for memory in netlist.memories() {
+        for net in memory
+            .read_address()
+            .iter()
+            .chain(memory.write_address())
+            .chain(memory.write_data())
+            .copied()
+            .chain([memory.clock(), memory.write_enable().signal])
+            .chain(memory.read_enable().map(|enable| enable.signal))
+        {
+            mapper.map_net(net);
+        }
+    }
+
+    for register in netlist.registers() {
+        mapper.cells.push(Ecp5Cell::FlipFlop {
             // nextpnr rejects a cell whose name is also a top-level IO name.
             // Keep primitive cells in a dedicated namespace even when an RTL
             // output is directly registered.
             name: format!("ff_{}", register.name()),
-            data: mapped_bit(&bits, register.data()),
+            data: mapped_bit(&mapper.bits, register.data()),
             output: wire_number(register.output()),
-            clock: mapped_bit(&bits, register.clock()),
+            clock: mapped_bit(&mapper.bits, register.clock()),
             edge: register.edge(),
             enable: register.enable().map(|enable| Control {
-                signal: mapped_bit(&bits, enable.signal),
+                signal: mapped_bit(&mapper.bits, enable.signal),
                 active: enable.active,
             }),
             reset: register.reset().map(|reset| Reset {
-                signal: mapped_bit(&bits, reset.signal),
+                signal: mapped_bit(&mapper.bits, reset.signal),
                 active: reset.active,
                 asynchronous: reset.asynchronous,
                 value: reset.value,
@@ -238,7 +246,7 @@ pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
     }
 
     for memory in netlist.memories() {
-        map_memory(memory, &bits, &mut cells)?;
+        map_memory(memory, &mapper.bits, &mut mapper.cells)?;
     }
 
     let ports = netlist
@@ -253,7 +261,7 @@ pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
             bits: port
                 .bits()
                 .iter()
-                .map(|net| mapped_bit(&bits, *net))
+                .map(|net| mapped_bit(&mapper.bits, *net))
                 .collect(),
         })
         .collect();
@@ -261,8 +269,223 @@ pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
     Ok(Ecp5Netlist {
         name: netlist.name().into(),
         ports,
-        cells,
+        cells: mapper.cells,
     })
+}
+
+const LUT_INPUTS: usize = 4;
+const CUT_LIMIT: usize = 64;
+
+#[derive(Clone, Debug)]
+struct LutPlan {
+    leaves: Vec<NetId>,
+    depth: usize,
+    area: usize,
+}
+
+struct LutMapper<'a> {
+    netlist: &'a Netlist,
+    bits: Vec<Option<Bit>>,
+    cells: Vec<Ecp5Cell>,
+    plans: Vec<Option<LutPlan>>,
+}
+
+impl<'a> LutMapper<'a> {
+    fn new(netlist: &'a Netlist) -> Self {
+        let mut bits = vec![None; netlist.nodes().len()];
+        let mut plans = vec![None; netlist.nodes().len()];
+
+        for node in netlist.nodes() {
+            let index = node.output().index() as usize;
+            match node.kind() {
+                NodeKind::Input(_) | NodeKind::RegisterOutput(_) | NodeKind::MemoryOutput(_) => {
+                    bits[index] = Some(wire_for(node.output()));
+                }
+                NodeKind::Constant(value) => bits[index] = Some(Bit::from(*value)),
+                NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not | NodeKind::Mux => {
+                    plans[index] = Some(best_lut_plan(netlist, &plans, node.output()));
+                }
+                NodeKind::Output(_) => {}
+            }
+        }
+
+        Self {
+            netlist,
+            bits,
+            cells: Vec::new(),
+            plans,
+        }
+    }
+
+    fn map_net(&mut self, net: NetId) -> Bit {
+        if let Some(bit) = self.bits[net.index() as usize] {
+            return bit;
+        }
+
+        let plan = self.plans[net.index() as usize]
+            .clone()
+            .expect("only Boolean logic requires a LUT plan");
+        let mut inputs = [Bit::Zero; LUT_INPUTS];
+        for (target, leaf) in inputs.iter_mut().zip(&plan.leaves) {
+            *target = self.map_net(*leaf);
+        }
+
+        let output = wire_number(net);
+        self.cells.push(Ecp5Cell::Lut4 {
+            name: format!("lut{}", net.index()),
+            inputs,
+            output,
+            init: cut_truth_table(self.netlist, net, &plan.leaves),
+        });
+        let bit = Bit::Wire(output);
+        self.bits[net.index() as usize] = Some(bit);
+        bit
+    }
+}
+
+fn best_lut_plan(netlist: &Netlist, plans: &[Option<LutPlan>], root: NetId) -> LutPlan {
+    enumerate_cuts(netlist, root)
+        .into_iter()
+        .map(|leaves| {
+            let area = 1 + leaves
+                .iter()
+                .filter_map(|leaf| plans[leaf.index() as usize].as_ref())
+                .map(|plan| plan.area)
+                .sum::<usize>();
+            let depth = 1 + leaves
+                .iter()
+                .filter_map(|leaf| plans[leaf.index() as usize].as_ref())
+                .map(|plan| plan.depth)
+                .max()
+                .unwrap_or(0);
+            LutPlan {
+                leaves,
+                depth,
+                area,
+            }
+        })
+        .min_by_key(|plan| {
+            (
+                plan.depth,
+                plan.area,
+                plan.leaves.len(),
+                plan.leaves.clone(),
+            )
+        })
+        .expect("a Boolean node always has a direct-input cut")
+}
+
+fn enumerate_cuts(netlist: &Netlist, root: NetId) -> Vec<Vec<NetId>> {
+    let mut first = node_for(netlist, root)
+        .inputs()
+        .iter()
+        .copied()
+        .filter(|net| !matches!(node_for(netlist, *net).kind(), NodeKind::Constant(_)))
+        .collect::<Vec<_>>();
+    first.sort_unstable();
+    first.dedup();
+
+    let mut seen = BTreeSet::from([first.clone()]);
+    let mut cuts = vec![first];
+    let mut cursor = 0;
+    while cursor < cuts.len() && cuts.len() < CUT_LIMIT {
+        let cut = cuts[cursor].clone();
+        cursor += 1;
+        for leaf in cut.iter().copied() {
+            if !is_boolean(node_for(netlist, leaf).kind()) {
+                continue;
+            }
+            let mut expanded = cut
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != leaf)
+                .chain(
+                    node_for(netlist, leaf)
+                        .inputs()
+                        .iter()
+                        .copied()
+                        .filter(|net| {
+                            !matches!(node_for(netlist, *net).kind(), NodeKind::Constant(_))
+                        }),
+                )
+                .collect::<Vec<_>>();
+            expanded.sort_unstable();
+            expanded.dedup();
+            if expanded.len() <= LUT_INPUTS && seen.insert(expanded.clone()) {
+                cuts.push(expanded);
+                if cuts.len() == CUT_LIMIT {
+                    break;
+                }
+            }
+        }
+    }
+    cuts
+}
+
+fn cut_truth_table(netlist: &Netlist, root: NetId, leaves: &[NetId]) -> u16 {
+    (0..16).fold(0, |table, assignment| {
+        let mut values = vec![None; netlist.nodes().len()];
+        let value = evaluate_cut(netlist, root, leaves, assignment, &mut values);
+        table | (u16::from(value) << assignment)
+    })
+}
+
+fn evaluate_cut(
+    netlist: &Netlist,
+    net: NetId,
+    leaves: &[NetId],
+    assignment: u16,
+    values: &mut [Option<bool>],
+) -> bool {
+    if let Some(index) = leaves.iter().position(|leaf| *leaf == net) {
+        return assignment & (1 << index) != 0;
+    }
+    if let Some(value) = values[net.index() as usize] {
+        return value;
+    }
+    let node = node_for(netlist, net);
+    let value = match node.kind() {
+        NodeKind::Constant(value) => *value,
+        NodeKind::And => {
+            evaluate_cut(netlist, node.inputs()[0], leaves, assignment, values)
+                & evaluate_cut(netlist, node.inputs()[1], leaves, assignment, values)
+        }
+        NodeKind::Or => {
+            evaluate_cut(netlist, node.inputs()[0], leaves, assignment, values)
+                | evaluate_cut(netlist, node.inputs()[1], leaves, assignment, values)
+        }
+        NodeKind::Xor => {
+            evaluate_cut(netlist, node.inputs()[0], leaves, assignment, values)
+                ^ evaluate_cut(netlist, node.inputs()[1], leaves, assignment, values)
+        }
+        NodeKind::Not => !evaluate_cut(netlist, node.inputs()[0], leaves, assignment, values),
+        NodeKind::Mux => {
+            if evaluate_cut(netlist, node.inputs()[0], leaves, assignment, values) {
+                evaluate_cut(netlist, node.inputs()[1], leaves, assignment, values)
+            } else {
+                evaluate_cut(netlist, node.inputs()[2], leaves, assignment, values)
+            }
+        }
+        NodeKind::Input(_)
+        | NodeKind::RegisterOutput(_)
+        | NodeKind::Output(_)
+        | NodeKind::MemoryOutput(_) => {
+            unreachable!("a cut must stop before a source or output node")
+        }
+    };
+    values[net.index() as usize] = Some(value);
+    value
+}
+
+fn is_boolean(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not | NodeKind::Mux
+    )
+}
+
+fn node_for(netlist: &Netlist, net: NetId) -> &struo_ir::Node {
+    &netlist.nodes()[net.index() as usize]
 }
 
 fn map_memory(
@@ -386,29 +609,6 @@ fn physical_address(bits: &[Option<Bit>], address: &[NetId], width: u8) -> [Bit;
         *target = mapped_bit(bits, *source);
     }
     physical
-}
-
-fn truth_table(kind: &NodeKind) -> u16 {
-    (0..16).fold(0, |table, index| {
-        let a = index & 1 != 0;
-        let b = index & 2 != 0;
-        let c = index & 4 != 0;
-        let value = match kind {
-            NodeKind::And => a & b,
-            NodeKind::Or => a | b,
-            NodeKind::Xor => a ^ b,
-            NodeKind::Not => !a,
-            NodeKind::Mux => {
-                if a {
-                    b
-                } else {
-                    c
-                }
-            }
-            _ => unreachable!("only Boolean logic nodes have truth tables"),
-        };
-        table | (u16::from(value) << index)
-    })
 }
 
 /// ECP5 technology-mapping failure.
@@ -848,7 +1048,7 @@ mod tests {
         ActiveLevel, ClockEdge, EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
     };
 
-    use super::{Ecp5Cell, map_to_ecp5};
+    use super::{Bit, Ecp5Cell, map_to_ecp5};
 
     #[test]
     fn maps_boolean_nodes_to_expected_lut_truth_tables() {
@@ -877,6 +1077,78 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(truth_tables, [0x8888, 0xeeee, 0x6666, 0x5555, 0xd8d8]);
+    }
+
+    #[test]
+    fn collapses_a_four_input_cone_into_one_lut() {
+        let mut source = Netlist::new("four_input");
+        let a = source.add_input("a");
+        let b = source.add_input("b");
+        let c = source.add_input("c");
+        let d = source.add_input("d");
+        let ab = source.add_and(a, b);
+        let cd = source.add_and(c, d);
+        let result = source.add_or(ab, cd);
+        source.add_output("y", result);
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        let luts = mapped
+            .cells()
+            .iter()
+            .filter_map(|cell| match cell {
+                Ecp5Cell::Lut4 { inputs, init, .. } => Some((*inputs, *init)),
+                Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            luts,
+            [(
+                [Bit::Wire(2), Bit::Wire(3), Bit::Wire(4), Bit::Wire(5)],
+                0xf888
+            )]
+        );
+    }
+
+    #[test]
+    fn maps_a_five_input_cone_to_two_luts() {
+        let mut source = Netlist::new("five_input");
+        let inputs = source.add_input_port("a", NonZeroU32::new(5).unwrap());
+        let lower = source.add_and(inputs[0], inputs[1]);
+        let upper = source.add_and(inputs[2], inputs[3]);
+        let four_input = source.add_or(lower, upper);
+        let result = source.add_xor(four_input, inputs[4]);
+        source.add_output("y", result);
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn omits_unreachable_boolean_nodes() {
+        let mut source = Netlist::new("dead_logic");
+        let a = source.add_input("a");
+        let b = source.add_input("b");
+        let live = source.add_and(a, b);
+        let _dead = source.add_or(a, b);
+        source.add_output("y", live);
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
