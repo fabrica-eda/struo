@@ -57,12 +57,16 @@ block memories. Other unsupported constructs fail explicitly.
 | nextpnr device | `--um5g-85k` |
 | Package | `CABGA381` |
 | Speed grade | `-8` |
-| Default clock | FTDI 12 MHz, pin A10, JP2 short required |
+| On-board reference clock | FTDI 12 MHz, pin A10, JP2 short required |
 
 The base pin constraints are in
 [`boards/lfe5um5g-85f-evn/base.lpf`](boards/lfe5um5g-85f-evn/base.lpf)
 and are based on the Project Trellis `ecp5_evn` example and the Lattice board
 manual.
+
+The 12 MHz value describes the no-PLL board smoke-test clock, not an ECP5
+performance target. QoR comparisons use an explicit implementation constraint;
+the carry-chain benchmark below uses 200 MHz.
 
 ## Mandatory verification
 
@@ -98,6 +102,7 @@ cargo fmt --all -- --check
 cargo run -- demo /tmp/struo-blinky.nextpnr.json
 cargo run -- axi4-demo /tmp/struo-axi4.nextpnr.json
 cargo run -- axi4-self-test /tmp/struo-axi4-self-test.nextpnr.json
+cargo run -- carry-benchmark /tmp/struo-carry-benchmark
 (cd examples/axi4-smartconnect && veryl fmt --check && veryl check)
 ```
 
@@ -106,12 +111,33 @@ addition and subtraction, signed and unsigned comparisons, variable logical
 and arithmetic shifts, muxes, concatenation, slicing, registers, enables, and
 synchronous or asynchronous constant resets. It performs constant folding and
 structural hashing, balances associative reductions, and uses parallel-prefix
-comparison networks. ECP5 technology mapping enumerates bounded four-input
-cuts, selects them by logic depth and area, omits unreachable Boolean logic,
+comparison networks. Addition and subtraction remain word-level cells until
+technology mapping. ECP5 maps operations wider than four bits to `CCU2C` carry
+chains by default; explicit carry-chain and LUT-ripple modes are also available
+for regression tests and A/B measurements. ECP5 technology mapping enumerates
+bounded four-input cuts, selects them by logic depth and area, omits unreachable Boolean logic,
 and maps the selected cover to `LUT4`; registers map to `TRELLIS_FF`.
 Synchronous 1R1W memories map directly to ECP5 `DP16KD`
 primitives, including width tiling across multiple blocks; inout ports are
 rejected explicitly.
+
+`carry-benchmark` emits two equivalent 32-bit registered counters as
+`carry.json` and `lut.json`. On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seed 1,
+and a 200 MHz timing target, the routed carry version used 38 `TRELLIS_COMB`
+sites and reached 472.14 MHz; the LUT-ripple baseline used 65 sites and reached
+60.22 MHz. These figures are a reproducible comparison point, not a guaranteed
+device specification; rerun place-and-route for the installed nextpnr/chipdb.
+
+```sh
+for implementation in carry lut; do
+  nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
+    --json "/tmp/struo-carry-benchmark/${implementation}.json" \
+    --lpf-allow-unconstrained \
+    --textcfg "/tmp/struo-carry-benchmark/${implementation}.config" \
+    --report "/tmp/struo-carry-benchmark/${implementation}-report.json" \
+    --freq 200 --timing-allow-fail --seed 1
+done
+```
 Module instances are flattened before synthesis; the implemented path consumes
 analyzer AIR directly and does not depend on generated Verilog.
 

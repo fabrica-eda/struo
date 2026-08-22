@@ -3,8 +3,9 @@
 mod mapped;
 
 pub use mapped::{
-    Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPort, MappingError,
-    PortDirection as MappedPortDirection, Reset, map_to_ecp5,
+    ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPort, MappingError,
+    MappingOptions, PortDirection as MappedPortDirection, Reset, map_to_ecp5,
+    map_to_ecp5_with_options,
 };
 
 use struo_sim::{ReleaseBlocked, VerificationPolicy, VerificationReport, VerificationStage};

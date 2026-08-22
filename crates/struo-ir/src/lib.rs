@@ -47,6 +47,8 @@ pub enum NodeKind {
     Output(String),
     /// A named output bit driven by a synchronous memory read port.
     MemoryOutput(String),
+    /// A bit produced by a retained word-level arithmetic cell.
+    ArithmeticOutput(String),
 }
 
 impl NodeKind {
@@ -55,7 +57,8 @@ impl NodeKind {
             Self::Input(_)
             | Self::Constant(_)
             | Self::RegisterOutput(_)
-            | Self::MemoryOutput(_) => 0,
+            | Self::MemoryOutput(_)
+            | Self::ArithmeticOutput(_) => 0,
             Self::Not | Self::Output(_) => 1,
             Self::And | Self::Or | Self::Xor => 2,
             Self::Mux => 3,
@@ -178,6 +181,57 @@ pub struct RegisterCell {
     edge: ClockEdge,
     enable: Option<EnableControl>,
     reset: Option<ResetControl>,
+}
+
+/// A retained word-level arithmetic operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ArithmeticOp {
+    /// Wrapping unsigned/signed addition (identical at the bit level).
+    Add,
+    /// Wrapping two's-complement subtraction.
+    Subtract,
+}
+
+/// One combinational word-level arithmetic cell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArithmeticCell {
+    name: String,
+    operation: ArithmeticOp,
+    lhs: Vec<NetId>,
+    rhs: Vec<NetId>,
+    outputs: Vec<NetId>,
+}
+
+impl ArithmeticCell {
+    /// Returns the stable diagnostic name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the arithmetic operation.
+    #[must_use]
+    pub const fn operation(&self) -> ArithmeticOp {
+        self.operation
+    }
+
+    /// Returns left operand bits least-significant first.
+    #[must_use]
+    pub fn lhs(&self) -> &[NetId] {
+        &self.lhs
+    }
+
+    /// Returns right operand bits least-significant first.
+    #[must_use]
+    pub fn rhs(&self) -> &[NetId] {
+        &self.rhs
+    }
+
+    /// Returns result bits least-significant first.
+    #[must_use]
+    pub fn outputs(&self) -> &[NetId] {
+        &self.outputs
+    }
 }
 
 /// One synchronous, simple-dual-port memory retained for block-RAM mapping.
@@ -377,6 +431,7 @@ pub struct Netlist {
     ports: Vec<Port>,
     registers: Vec<RegisterCell>,
     memories: Vec<MemoryCell>,
+    arithmetic: Vec<ArithmeticCell>,
     next_net: u32,
     constants: [Option<NetId>; 2],
     logic_cache: HashMap<LogicKey, NetId>,
@@ -392,6 +447,7 @@ impl Netlist {
             ports: Vec::new(),
             registers: Vec::new(),
             memories: Vec::new(),
+            arithmetic: Vec::new(),
             next_net: 0,
             constants: [None, None],
             logic_cache: HashMap::new(),
@@ -426,6 +482,12 @@ impl Netlist {
     #[must_use]
     pub fn memories(&self) -> &[MemoryCell] {
         &self.memories
+    }
+
+    /// Returns retained word-level arithmetic cells in dependency order.
+    #[must_use]
+    pub fn arithmetic(&self) -> &[ArithmeticCell] {
+        &self.arithmetic
     }
 
     /// Adds a primary input and returns its net.
@@ -488,6 +550,44 @@ impl Netlist {
     /// Connects previously reserved read outputs to a synchronous memory.
     pub fn add_memory(&mut self, memory: MemoryCell) {
         self.memories.push(memory);
+    }
+
+    /// Adds a wrapping word-level arithmetic operation.
+    ///
+    /// Operands and result bits are stored least-significant first and must
+    /// have the same non-zero width.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, mismatched, or unrepresentable widths.
+    pub fn add_arithmetic(
+        &mut self,
+        operation: ArithmeticOp,
+        lhs: &[NetId],
+        rhs: &[NetId],
+    ) -> Result<Vec<NetId>, ValidationError> {
+        let name = format!("arith{}", self.arithmetic.len());
+        if lhs.is_empty() || lhs.len() != rhs.len() {
+            return Err(ValidationError::ArithmeticWidth(name));
+        }
+        let width =
+            u32::try_from(lhs.len()).map_err(|_| ValidationError::ArithmeticWidth(name.clone()))?;
+        let outputs = (0..width)
+            .map(|bit| {
+                self.add_node(
+                    NodeKind::ArithmeticOutput(port_bit_name(&name, width, bit)),
+                    Vec::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.arithmetic.push(ArithmeticCell {
+            name,
+            operation,
+            lhs: lhs.to_vec(),
+            rhs: rhs.to_vec(),
+            outputs: outputs.clone(),
+        });
+        Ok(outputs)
     }
 
     /// Adds or reuses a two-input AND gate.
@@ -635,6 +735,7 @@ impl Netlist {
         let mut port_names = HashSet::new();
         let mut register_outputs = HashSet::new();
         let mut memory_outputs = HashSet::new();
+        let mut arithmetic_outputs = HashSet::new();
 
         for node in &self.nodes {
             let expected = node.kind.expected_input_count();
@@ -674,6 +775,12 @@ impl Netlist {
                     }
                     memory_outputs.insert(node.output);
                 }
+                NodeKind::ArithmeticOutput(name) => {
+                    if name.trim().is_empty() {
+                        return Err(ValidationError::EmptyArithmeticName);
+                    }
+                    arithmetic_outputs.insert(node.output);
+                }
                 _ => {}
             }
         }
@@ -705,6 +812,7 @@ impl Netlist {
 
         self.validate_registers(&defined_nets, &register_outputs)?;
         self.validate_memories(&defined_nets, &memory_outputs)?;
+        self.validate_arithmetic(&defined_nets, &arithmetic_outputs)?;
 
         Ok(())
     }
@@ -804,6 +912,48 @@ impl Netlist {
         Ok(())
     }
 
+    fn validate_arithmetic(
+        &self,
+        defined_nets: &HashSet<NetId>,
+        arithmetic_outputs: &HashSet<NetId>,
+    ) -> Result<(), ValidationError> {
+        let mut connected_outputs = HashSet::new();
+        let mut names = HashSet::new();
+        for arithmetic in &self.arithmetic {
+            if arithmetic.name.trim().is_empty() {
+                return Err(ValidationError::EmptyArithmeticName);
+            }
+            if !names.insert(arithmetic.name.as_str()) {
+                return Err(ValidationError::DuplicateArithmeticName(
+                    arithmetic.name.clone(),
+                ));
+            }
+            if arithmetic.lhs.is_empty()
+                || arithmetic.lhs.len() != arithmetic.rhs.len()
+                || arithmetic.lhs.len() != arithmetic.outputs.len()
+            {
+                return Err(ValidationError::ArithmeticWidth(arithmetic.name.clone()));
+            }
+            for input in arithmetic.lhs.iter().chain(&arithmetic.rhs) {
+                if !defined_nets.contains(input) {
+                    return Err(ValidationError::UndefinedNet(*input));
+                }
+            }
+            for output in &arithmetic.outputs {
+                if !arithmetic_outputs.contains(output) {
+                    return Err(ValidationError::InvalidArithmeticOutput(*output));
+                }
+                if !connected_outputs.insert(*output) {
+                    return Err(ValidationError::MultipleDrivers(*output));
+                }
+            }
+        }
+        if let Some(output) = arithmetic_outputs.difference(&connected_outputs).next() {
+            return Err(ValidationError::UnconnectedArithmetic(*output));
+        }
+        Ok(())
+    }
+
     fn add_cached(&mut self, key: LogicKey, kind: NodeKind, inputs: Vec<NetId>) -> NetId {
         if let Some(net) = self.logic_cache.get(&key) {
             return *net;
@@ -859,12 +1009,18 @@ pub enum ValidationError {
     EmptyRegisterName,
     /// A memory name is empty.
     EmptyMemoryName,
+    /// An arithmetic cell name is empty.
+    EmptyArithmeticName,
     /// More than one port has the same name.
     DuplicatePortName(String),
     /// More than one register has the same name.
     DuplicateRegisterName(String),
     /// More than one memory has the same name.
     DuplicateMemoryName(String),
+    /// More than one arithmetic cell has the same name.
+    DuplicateArithmeticName(String),
+    /// An arithmetic cell has empty or mismatched operand/result widths.
+    ArithmeticWidth(String),
     /// A memory has no words.
     ZeroMemoryDepth(String),
     /// A memory has invalid or mismatched address widths.
@@ -883,6 +1039,10 @@ pub enum ValidationError {
     InvalidMemoryOutput(NetId),
     /// A reserved memory read-data output has no memory cell.
     UnconnectedMemory(NetId),
+    /// An arithmetic cell does not reference a reserved result output.
+    InvalidArithmeticOutput(NetId),
+    /// A reserved arithmetic output has no arithmetic cell.
+    UnconnectedArithmetic(NetId),
     /// A grouped port references a node with the wrong direction.
     InvalidPortBit(NetId),
     /// A node has the wrong number of inputs.
@@ -905,11 +1065,20 @@ impl Display for ValidationError {
             Self::PortWidthOverflow => formatter.write_str("port width exceeds the IR limit"),
             Self::EmptyRegisterName => formatter.write_str("register name must not be empty"),
             Self::EmptyMemoryName => formatter.write_str("memory name must not be empty"),
+            Self::EmptyArithmeticName => {
+                formatter.write_str("arithmetic cell name must not be empty")
+            }
             Self::DuplicatePortName(name) => write!(formatter, "duplicate port name: {name}"),
             Self::DuplicateRegisterName(name) => {
                 write!(formatter, "duplicate register name: {name}")
             }
             Self::DuplicateMemoryName(name) => write!(formatter, "duplicate memory name: {name}"),
+            Self::DuplicateArithmeticName(name) => {
+                write!(formatter, "duplicate arithmetic cell name: {name}")
+            }
+            Self::ArithmeticWidth(name) => {
+                write!(formatter, "arithmetic cell {name} has an invalid width")
+            }
             Self::ZeroMemoryDepth(name) => write!(formatter, "memory {name} has zero depth"),
             Self::MemoryAddressWidth(name) => {
                 write!(formatter, "memory {name} has an invalid address width")
@@ -931,6 +1100,15 @@ impl Display for ValidationError {
             Self::UnconnectedMemory(net) => {
                 write!(formatter, "reserved memory output {net} is not connected")
             }
+            Self::InvalidArithmeticOutput(net) => {
+                write!(formatter, "arithmetic output {net} was not reserved")
+            }
+            Self::UnconnectedArithmetic(net) => {
+                write!(
+                    formatter,
+                    "reserved arithmetic output {net} is not connected"
+                )
+            }
             Self::InvalidPortBit(net) => {
                 write!(formatter, "net {net} has the wrong node kind for its port")
             }
@@ -950,7 +1128,7 @@ impl Error for ValidationError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ClockEdge, Netlist, NodeKind, RegisterCell};
+    use super::{ArithmeticOp, ClockEdge, Netlist, NodeKind, RegisterCell};
 
     #[test]
     fn valid_and_gate_netlist_passes_validation() {
@@ -1003,6 +1181,24 @@ mod tests {
 
         assert_eq!(design.validate(), Ok(()));
         assert_eq!(design.registers().len(), 1);
+    }
+
+    #[test]
+    fn word_arithmetic_outputs_are_structurally_valid() {
+        let mut design = Netlist::new("add");
+        let lhs = design.add_input("lhs");
+        let rhs = design.add_input("rhs");
+        let result = design
+            .add_arithmetic(ArithmeticOp::Add, &[lhs], &[rhs])
+            .unwrap();
+        design.add_output("result", result[0]);
+
+        assert_eq!(design.validate(), Ok(()));
+        assert_eq!(design.arithmetic()[0].outputs(), result);
+        assert!(matches!(
+            design.nodes()[result[0].index() as usize].kind(),
+            NodeKind::ArithmeticOutput(_)
+        ));
     }
 
     #[test]

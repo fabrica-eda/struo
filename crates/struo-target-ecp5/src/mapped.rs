@@ -7,8 +7,8 @@ use std::fmt::{self, Display, Formatter};
 use serde::Serialize;
 use serde::ser::Serializer;
 use struo_ir::{
-    ActiveLevel, ClockEdge, MemoryCell, NetId, Netlist, PortDirection as IrPortDirection,
-    ValidationError,
+    ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, MemoryCell, NetId, Netlist,
+    PortDirection as IrPortDirection, ValidationError,
 };
 
 mod lut;
@@ -81,6 +81,32 @@ pub struct Reset {
     pub value: bool,
 }
 
+/// How retained word-level arithmetic is implemented on ECP5.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArithmeticMapping {
+    /// Use CCU2C above four bits and LUTs for smaller operations.
+    Auto,
+    /// Always use the dedicated CCU2C carry chain.
+    CarryChain,
+    /// Implement a ripple carry using ordinary LUT4 cells.
+    Lut4,
+}
+
+/// Technology-mapping choices used for experiments and regression tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MappingOptions {
+    /// Arithmetic implementation strategy.
+    pub arithmetic: ArithmeticMapping,
+}
+
+impl Default for MappingOptions {
+    fn default() -> Self {
+        Self {
+            arithmetic: ArithmeticMapping::Auto,
+        }
+    }
+}
+
 /// A physical ECP5 primitive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ecp5Cell {
@@ -94,6 +120,23 @@ pub enum Ecp5Cell {
         output: u32,
         /// Complete LUT truth table.
         init: u16,
+    },
+    /// Two ECP5 LUT/carry slices connected through the dedicated carry path.
+    Ccu2c {
+        /// Stable cell name.
+        name: String,
+        /// A, B, C, and D inputs for each of the two slices.
+        inputs: [[Bit; 4]; 2],
+        /// Dedicated carry-chain input.
+        carry_in: Bit,
+        /// Sum output wires for the two slices.
+        sums: [u32; 2],
+        /// Dedicated carry-chain output wire.
+        carry_out: u32,
+        /// LUT truth tables for the two slices.
+        init: [u16; 2],
+        /// Whether each slice suppresses its incoming carry.
+        inject: [bool; 2],
     },
     /// ECP5 slice flip-flop.
     FlipFlop {
@@ -185,10 +228,35 @@ impl Ecp5Netlist {
 ///
 /// Returns an error if the source netlist is invalid.
 pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
+    map_to_ecp5_with_options(netlist, MappingOptions::default())
+}
+
+/// Maps a target-independent netlist with explicit arithmetic choices.
+///
+/// # Errors
+///
+/// Returns an error if the source netlist is invalid.
+pub fn map_to_ecp5_with_options(
+    netlist: &Netlist,
+    options: MappingOptions,
+) -> Result<Ecp5Netlist, MappingError> {
     netlist.validate()?;
     let cuts = CutDatabase::analyze(netlist);
     let cover = LutCover::select(netlist, &cuts);
     let mut emitter = LutEmitter::new(netlist, &cover);
+
+    for arithmetic in netlist.arithmetic() {
+        let use_carry = match options.arithmetic {
+            ArithmeticMapping::Auto => arithmetic.outputs().len() > 4,
+            ArithmeticMapping::CarryChain => true,
+            ArithmeticMapping::Lut4 => false,
+        };
+        if use_carry {
+            map_arithmetic_carry(arithmetic, &mut emitter);
+        } else {
+            map_arithmetic_luts(arithmetic, &mut emitter);
+        }
+    }
 
     for port in netlist
         .ports()
@@ -278,6 +346,87 @@ pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
         name: netlist.name().into(),
         ports,
         cells,
+    })
+}
+
+const CCU2C_ARITH_INIT: u16 = 0x96aa;
+
+fn map_arithmetic_carry(arithmetic: &ArithmeticCell, emitter: &mut LutEmitter<'_>) {
+    let subtract = arithmetic.operation() == ArithmeticOp::Subtract;
+    let mut carry = Bit::from(subtract);
+    for (pair, bit) in (0..arithmetic.outputs().len()).step_by(2).enumerate() {
+        let mut inputs = [[Bit::Zero; 4]; 2];
+        let mut sums = [0; 2];
+        for slice in 0..2 {
+            let index = bit + slice;
+            if index < arithmetic.outputs().len() {
+                inputs[slice] = [
+                    emitter.map_net(arithmetic.lhs()[index]),
+                    emitter.map_net(arithmetic.rhs()[index]),
+                    Bit::from(subtract),
+                    Bit::One,
+                ];
+                sums[slice] = wire_number(arithmetic.outputs()[index]);
+                emitter.alias_net(arithmetic.outputs()[index], Bit::Wire(sums[slice]));
+            } else {
+                inputs[slice] = [Bit::Zero, Bit::Zero, Bit::from(subtract), Bit::One];
+                sums[slice] = emitter.fresh_wire();
+            }
+        }
+        let carry_out = emitter.fresh_wire();
+        emitter.push_cell(Ecp5Cell::Ccu2c {
+            name: format!("ccu_{}_{pair}", arithmetic.name()),
+            inputs,
+            carry_in: carry,
+            sums,
+            carry_out,
+            init: [CCU2C_ARITH_INIT; 2],
+            inject: [false; 2],
+        });
+        carry = Bit::Wire(carry_out);
+    }
+}
+
+fn map_arithmetic_luts(arithmetic: &ArithmeticCell, emitter: &mut LutEmitter<'_>) {
+    let subtract = arithmetic.operation() == ArithmeticOp::Subtract;
+    let mut carry = Bit::from(subtract);
+    for bit in 0..arithmetic.outputs().len() {
+        let lhs = emitter.map_net(arithmetic.lhs()[bit]);
+        let rhs = emitter.map_net(arithmetic.rhs()[bit]);
+        let output = wire_number(arithmetic.outputs()[bit]);
+        emitter.push_cell(Ecp5Cell::Lut4 {
+            name: format!("lut_{}_sum_{bit}", arithmetic.name()),
+            inputs: [lhs, rhs, carry, Bit::Zero],
+            output,
+            init: arithmetic_truth_table(subtract, false),
+        });
+        emitter.alias_net(arithmetic.outputs()[bit], Bit::Wire(output));
+
+        if bit + 1 < arithmetic.outputs().len() {
+            let carry_out = emitter.fresh_wire();
+            emitter.push_cell(Ecp5Cell::Lut4 {
+                name: format!("lut_{}_carry_{bit}", arithmetic.name()),
+                inputs: [lhs, rhs, carry, Bit::Zero],
+                output: carry_out,
+                init: arithmetic_truth_table(subtract, true),
+            });
+            carry = Bit::Wire(carry_out);
+        }
+    }
+}
+
+fn arithmetic_truth_table(subtract: bool, carry_output: bool) -> u16 {
+    (0..16).fold(0, |table, assignment| {
+        let lhs = assignment & 1 != 0;
+        let rhs = assignment & 2 != 0;
+        let carry = assignment & 4 != 0;
+        let effective_rhs = rhs ^ subtract;
+        let value = if carry_output {
+            u8::from(lhs) + u8::from(effective_rhs) + u8::from(carry) >= 2
+        } else {
+            lhs ^ effective_rhs ^ carry
+        };
+        table | (u16::from(value) << assignment)
     })
 }
 
@@ -524,56 +673,7 @@ impl From<&Ecp5Netlist> for JsonDesign {
                 )
             })
             .collect();
-        let cells = netlist
-            .cells
-            .iter()
-            .map(|cell| match cell {
-                Ecp5Cell::Lut4 {
-                    name,
-                    inputs,
-                    output,
-                    init,
-                } => (name.clone(), json_lut(*inputs, *output, *init)),
-                Ecp5Cell::FlipFlop {
-                    name,
-                    data,
-                    output,
-                    clock,
-                    edge,
-                    enable,
-                    reset,
-                } => (
-                    name.clone(),
-                    json_flip_flop(*data, *output, *clock, *edge, *enable, *reset),
-                ),
-                Ecp5Cell::BlockRam {
-                    name,
-                    physical_width,
-                    write_address,
-                    write_data,
-                    write_enable,
-                    read_address,
-                    read_data,
-                    read_enable,
-                    clock,
-                    edge,
-                    ..
-                } => (
-                    name.clone(),
-                    json_block_ram(
-                        *physical_width,
-                        **write_address,
-                        write_data,
-                        *write_enable,
-                        **read_address,
-                        read_data,
-                        *read_enable,
-                        *clock,
-                        *edge,
-                    ),
-                ),
-            })
-            .collect();
+        let cells = netlist.cells.iter().map(json_cell).collect();
         Self {
             creator: "Struo",
             modules: [(
@@ -590,6 +690,67 @@ impl From<&Ecp5Netlist> for JsonDesign {
             .into_iter()
             .collect(),
         }
+    }
+}
+
+fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
+    match cell {
+        Ecp5Cell::Lut4 {
+            name,
+            inputs,
+            output,
+            init,
+        } => (name.clone(), json_lut(*inputs, *output, *init)),
+        Ecp5Cell::Ccu2c {
+            name,
+            inputs,
+            carry_in,
+            sums,
+            carry_out,
+            init,
+            inject,
+        } => (
+            name.clone(),
+            json_ccu2c(*inputs, *carry_in, *sums, *carry_out, *init, *inject),
+        ),
+        Ecp5Cell::FlipFlop {
+            name,
+            data,
+            output,
+            clock,
+            edge,
+            enable,
+            reset,
+        } => (
+            name.clone(),
+            json_flip_flop(*data, *output, *clock, *edge, *enable, *reset),
+        ),
+        Ecp5Cell::BlockRam {
+            name,
+            physical_width,
+            write_address,
+            write_data,
+            write_enable,
+            read_address,
+            read_data,
+            read_enable,
+            clock,
+            edge,
+            ..
+        } => (
+            name.clone(),
+            json_block_ram(
+                *physical_width,
+                **write_address,
+                write_data,
+                *write_enable,
+                **read_address,
+                read_data,
+                *read_enable,
+                *clock,
+                *edge,
+            ),
+        ),
     }
 }
 
@@ -616,6 +777,53 @@ fn json_lut(inputs: [Bit; 4], output: u32, init: u16) -> JsonCell {
         ]
         .into_iter()
         .collect(),
+        connections,
+    }
+}
+
+fn json_ccu2c(
+    inputs: [[Bit; 4]; 2],
+    carry_in: Bit,
+    sums: [u32; 2],
+    carry_out: u32,
+    init: [u16; 2],
+    inject: [bool; 2],
+) -> JsonCell {
+    let mut connections = BTreeMap::new();
+    let mut port_directions = BTreeMap::new();
+    connections.insert("CIN".into(), vec![carry_in]);
+    port_directions.insert("CIN".into(), "input");
+    for slice in 0..2 {
+        for (port, bit) in ["A", "B", "C", "D"].into_iter().zip(inputs[slice]) {
+            let name = format!("{port}{slice}");
+            connections.insert(name.clone(), vec![bit]);
+            port_directions.insert(name, "input");
+        }
+        let sum = format!("S{slice}");
+        connections.insert(sum.clone(), vec![Bit::Wire(sums[slice])]);
+        port_directions.insert(sum, "output");
+    }
+    connections.insert("COUT".into(), vec![Bit::Wire(carry_out)]);
+    port_directions.insert("COUT".into(), "output");
+    JsonCell {
+        hide_name: 0,
+        r#type: "CCU2C",
+        parameters: [
+            ("INIT0".into(), format!("{:016b}", init[0])),
+            ("INIT1".into(), format!("{:016b}", init[1])),
+            (
+                "INJECT1_0".into(),
+                if inject[0] { "YES" } else { "NO" }.into(),
+            ),
+            (
+                "INJECT1_1".into(),
+                if inject[1] { "YES" } else { "NO" }.into(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        attributes: BTreeMap::new(),
+        port_directions,
         connections,
     }
 }
@@ -842,10 +1050,78 @@ mod tests {
     use std::num::NonZeroU32;
 
     use struo_ir::{
-        ActiveLevel, ClockEdge, EnableControl, MemoryCell, Netlist, RegisterCell, ResetControl,
+        ActiveLevel, ArithmeticOp, ClockEdge, EnableControl, MemoryCell, Netlist, RegisterCell,
+        ResetControl,
     };
 
-    use super::{Bit, Ecp5Cell, map_to_ecp5};
+    use super::{
+        ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+    };
+
+    fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
+        let mut source = Netlist::new("arithmetic");
+        let width = NonZeroU32::new(width).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let result = source.add_arithmetic(operation, &lhs, &rhs).unwrap();
+        source.add_output_port("result", &result).unwrap();
+        source
+    }
+
+    #[test]
+    fn maps_wide_arithmetic_to_ccu2c() {
+        let mapped = map_to_ecp5(&arithmetic_netlist(8, ArithmeticOp::Add)).unwrap();
+        let carries = mapped
+            .cells()
+            .iter()
+            .filter(|cell| matches!(cell, Ecp5Cell::Ccu2c { .. }))
+            .count();
+        assert_eq!(carries, 4);
+        assert!(mapped.cells().iter().all(|cell| {
+            matches!(
+                cell,
+                Ecp5Cell::Ccu2c {
+                    init: [0x96aa, 0x96aa],
+                    inject: [false, false],
+                    ..
+                }
+            )
+        }));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let cells = json["modules"]["arithmetic"]["cells"].as_object().unwrap();
+        assert!(cells.values().all(|cell| cell["type"] == "CCU2C"));
+        assert!(cells.values().all(|cell| {
+            cell["parameters"]["INIT0"] == "1001011010101010"
+                && cell["parameters"]["INJECT1_0"] == "NO"
+        }));
+    }
+
+    #[test]
+    fn lut_arithmetic_option_provides_comparison_baseline() {
+        let mapped = map_to_ecp5_with_options(
+            &arithmetic_netlist(8, ArithmeticOp::Subtract),
+            MappingOptions {
+                arithmetic: ArithmeticMapping::Lut4,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+                .count(),
+            15
+        );
+        assert!(
+            !mapped
+                .cells()
+                .iter()
+                .any(|cell| matches!(cell, Ecp5Cell::Ccu2c { .. }))
+        );
+    }
 
     #[test]
     fn maps_boolean_nodes_to_expected_lut_truth_tables() {
@@ -870,7 +1146,9 @@ mod tests {
             .iter()
             .filter_map(|cell| match cell {
                 Ecp5Cell::Lut4 { init, .. } => Some(*init),
-                Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+                Ecp5Cell::Ccu2c { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => {
+                    None
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(truth_tables, [0x8888, 0xeeee, 0x6666, 0x5555, 0xd8d8]);
@@ -894,7 +1172,9 @@ mod tests {
             .iter()
             .filter_map(|cell| match cell {
                 Ecp5Cell::Lut4 { inputs, init, .. } => Some((*inputs, *init)),
-                Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+                Ecp5Cell::Ccu2c { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => {
+                    None
+                }
             })
             .collect::<Vec<_>>();
 
