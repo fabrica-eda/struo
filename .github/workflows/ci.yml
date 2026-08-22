@@ -89,7 +89,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            fpga-trellis nextpnr-ecp5
+            fpga-trellis jq nextpnr-ecp5
 
       - name: Generate technology-mapped AXI4 self-test
         run: |
@@ -97,28 +97,98 @@ jobs:
           cargo run --locked -- axi4-self-test \
             build/ci/axi4-smartconnect/design.json
 
-      - name: Place and route AXI4 self-test
+      - name: Place and route AXI4 self-test across seeds
         run: |
-          nextpnr-ecp5 \
-            --um5g-85k \
-            --package CABGA381 \
-            --speed 8 \
-            --json build/ci/axi4-smartconnect/design.json \
-            --lpf examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf \
-            --textcfg build/ci/axi4-smartconnect/design.config \
-            --report build/ci/axi4-smartconnect/nextpnr-report.json \
-            --freq 12
+          for seed in $(seq 1 10); do
+            nextpnr-ecp5 \
+              --um5g-85k \
+              --package CABGA381 \
+              --speed 8 \
+              --json build/ci/axi4-smartconnect/design.json \
+              --lpf examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf \
+              --textcfg "build/ci/axi4-smartconnect/seed-${seed}.config" \
+              --report "build/ci/axi4-smartconnect/seed-${seed}-report.json" \
+              --log "build/ci/axi4-smartconnect/seed-${seed}.log" \
+              --freq 250 \
+              --timing-allow-fail \
+              --seed "$seed"
+          done
+
+      - name: Summarize place-and-route results
+        run: |
+          results=build/ci/axi4-smartconnect/nextpnr-results.tsv
+          printf 'seed\tclock\tachieved_mhz\tconstraint_mhz\tstatus\n' > "$results"
+
+          for seed in $(seq 1 10); do
+            jq --raw-output --arg seed "$seed" '
+              .fmax | to_entries[] |
+              [
+                $seed,
+                .key,
+                (.value.achieved | tostring),
+                (.value.constraint | tostring),
+                (if .value.achieved >= .value.constraint then "pass" else "fail" end)
+              ] | @tsv
+            ' "build/ci/axi4-smartconnect/seed-${seed}-report.json" >> "$results"
+          done
+
+          {
+            printf '### nextpnr results by seed\n\n'
+            awk -F '\t' '
+              NR == 2 { minimum = maximum = $3 }
+              NR > 1 {
+                count++
+                total += $3
+                if ($3 < minimum) minimum = $3
+                if ($3 > maximum) maximum = $3
+                if ($5 == "pass") passes++
+              }
+              END {
+                printf "Runs: %d; timing passes: %d; Fmax min/mean/max: %.2f / %.2f / %.2f MHz\n\n", \
+                  count, passes, minimum, total / count, maximum
+              }
+            ' "$results"
+            printf '| Seed | Clock | Achieved (MHz) | Constraint (MHz) | Timing |\n'
+            printf '| ---: | :--- | ---: | ---: | :---: |\n'
+            tail -n +2 "$results" |
+              while IFS=$'\t' read -r seed clock achieved constraint status; do
+                printf '| %s | `%s` | %.2f | %.2f | %s |\n' \
+                  "$seed" "$clock" "$achieved" "$constraint" "$status"
+              done
+          } | tee --append "$GITHUB_STEP_SUMMARY"
+
+      - name: Require board-clock timing
+        run: |
+          awk -F '\t' '
+            NR > 1 && $3 < 12 {
+              printf "seed %s failed the 12 MHz board-clock requirement (%.2f MHz)\n", \
+                $1, $3 > "/dev/stderr"
+              failed = 1
+            }
+            END { exit failed }
+          ' build/ci/axi4-smartconnect/nextpnr-results.tsv
 
       - name: Pack and validate bitstream
         run: |
           ecppack \
             --svf build/ci/axi4-smartconnect/design.svf \
-            build/ci/axi4-smartconnect/design.config \
+            build/ci/axi4-smartconnect/seed-1.config \
             build/ci/axi4-smartconnect/design.bit
           test -s build/ci/axi4-smartconnect/design.bit
           ecpunpack \
             build/ci/axi4-smartconnect/design.bit \
             build/ci/axi4-smartconnect/unpacked.config
+
+      - name: Upload place-and-route results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nextpnr-results
+          path: |
+            build/ci/axi4-smartconnect/nextpnr-results.tsv
+            build/ci/axi4-smartconnect/seed-*-report.json
+            build/ci/axi4-smartconnect/seed-*.log
+          if-no-files-found: warn
 
   required:
     # Branch protection requires this stable check name.
