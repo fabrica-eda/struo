@@ -109,15 +109,17 @@ netlist. Clock enables are exposed as feedback muxes during the move and
 inferred again afterwards; unrelated clock/reset domains and their fan-in are
 fixed boundaries.
 
-ECP5 mapping also performs automatic, certificate-checked backward retiming on
-the final LUT4 network, where physical LUT depth and duplicated inputs are
-known. It moves a critical sink FF to the unique inputs of its driving LUT,
-copies clock-enable semantics, derives every new reset value, and rejects
-generated-clock/control uses. The greedy selection reduces maximum-depth
-register endpoints without increasing the overall LUT depth and caps cell and
-FF growth. This is part of normal mapping; callers do not choose an optimization
-mode. Unsupported proof cases fail construction instead of being accepted as
-equivalent.
+ECP5 mapping also performs automatic, certificate-checked retiming on the final
+LUT4 and CCU2C network, where physical depth, carry hops, and duplicated inputs
+are known. Backward moves split a critical sink FF across a LUT or carry slice;
+forward moves score a complete registered carry chain as one candidate so an
+unprofitable half-moved chain is never selected. Both directions preserve clock
+enables and derive every new reset value from the primitive truth table.
+Equivalent generated FFs are shared only up to fanout two, retaining useful
+physical replication for routing. The search reduces timing cutsets without
+increasing the overall mapped period and caps cell and FF growth. This is part
+of normal mapping; callers do not choose an optimization mode. Unsupported
+proof cases fail construction instead of being accepted as equivalent.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under
@@ -218,20 +220,21 @@ traffic, and local error completion through both the reference and post-map
 paths.
 
 On nextpnr 0.6, LFE5UM5G-85F speed grade 8, and seeds 1 through 10, the 300 MHz
-flow passes all ten seeds and reaches 301.75--323.21 MHz (306.90 MHz mean). The
-burst decoder registers only its 17-bit carry result and valid bit at the
-arithmetic boundary; its single-flight handshake keeps the address and protocol
-metadata stable until that result is consumed. This removes 68 RTL registers
-from the former full-metadata stage. The mapped self-test uses 1,193
-`TRELLIS_COMB` and 1,367 `TRELLIS_FF` sites, 85 fewer FFs than the previous
-1,452-FF implementation; automatic post-LUT retiming adds only two FFs to the
-1,365-register RTL netlist. The mapped timing model scores both CCU2C carry hops
-and ordinary LUT routing, including a post-map routing guard calibrated against
-the routed AXI paths. The qualified-payload pass removes 69 inferred clock
-enables and makes the eight QoS comparison preregisters unnecessary. The
-remaining result combines the mapper's 300 MHz required-time cover with
-registered write-completion, read-slot reservation, scoreboard, and arbitration
-boundaries in the RTL.
+flow passes all ten seeds and reaches 300.48--318.78 MHz (307.56 MHz mean). The
+burst decoder is natural three-cycle RTL: its registered operands feed the
+17-bit address addition and the output holding state directly, without a
+hand-written carry-result pipeline stage. Its single-flight handshake keeps the
+address and protocol metadata stable until the result is consumed. Removing
+that explicit boundary reduces the RTL from 1,365 to 1,293 registers. Automatic
+post-map retiming reconstructs a balanced physical boundary with 1,361
+`TRELLIS_FF` and 1,201 `TRELLIS_COMB` sites; the fanout cap prevents equivalent
+retimed state from becoming a routing hotspot. The mapped timing model scores
+both CCU2C carry hops and ordinary LUT routing, including a post-map routing
+guard calibrated against the routed AXI paths. The qualified-payload pass
+removes 69 inferred clock enables and makes the eight QoS comparison
+preregisters unnecessary. The remaining result combines the mapper's 300 MHz
+required-time cover with registered write-completion, read-slot reservation,
+scoreboard, and arbitration boundaries in the RTL.
 nextpnr uses timing budgets, a heap timing weight of 30,
 and timing-driven routing rip-up for every seed; no successful seed is selected
 after the fact. The CI timing gate repeats all ten fixed seeds and requires each

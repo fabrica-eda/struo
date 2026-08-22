@@ -386,10 +386,46 @@ fn automatically_retime_mapped_luts(
     let timing_driven = original_profile.data_period_ps > target_period_ps;
     let cell_limit = original_cells + original_cells.div_ceil(10);
     let register_limit = original_registers + original_registers.div_ceil(5);
-    let mut frontier = original.clone();
-    let mut plateau_budget = 2usize;
-    for _ in 0..64 {
+    let forward_candidate = forward_retime_registered_ccu_chains(original, timing_driven);
+    let forward_profile = mapped_lut_profile(&forward_candidate);
+    let forward_registers = mapped_register_count(&forward_candidate);
+    let use_forward = forward_candidate.cells.len() <= cell_limit
+        && forward_registers <= register_limit
+        && forward_profile.overall_period_ps <= original_profile.overall_period_ps
+        && retiming_score(
+            &forward_profile,
+            timing_driven,
+            forward_candidate.cells.len(),
+            forward_registers,
+        ) < retiming_score(
+            &original_profile,
+            timing_driven,
+            original.cells.len(),
+            mapped_register_count(original),
+        );
+    let mut frontier = if use_forward {
+        forward_candidate
+    } else {
+        original.clone()
+    };
+    let mut best_seen = frontier.clone();
+    let mut bridge_budget = 2usize;
+    for _ in 0..128 {
         let profile = mapped_lut_profile(&frontier);
+        let best_profile = mapped_lut_profile(&best_seen);
+        if retiming_score(
+            &profile,
+            timing_driven,
+            frontier.cells.len(),
+            mapped_register_count(&frontier),
+        ) < retiming_score(
+            &best_profile,
+            timing_driven,
+            best_seen.cells.len(),
+            mapped_register_count(&best_seen),
+        ) {
+            best_seen = frontier.clone();
+        }
         if (timing_driven && profile.data_period_ps <= target_period_ps)
             || (!timing_driven && profile.data_depth < original_depth)
         {
@@ -402,9 +438,10 @@ fn automatically_retime_mapped_luts(
             profile.critical_depth.clone()
         };
         for &register in &critical {
-            let Some(candidate) = backward_retime_lut(&frontier, register) else {
+            let Some(mut candidate) = backward_retime_primitive(&frontier, register) else {
                 continue;
             };
+            merge_equivalent_flip_flops(&mut candidate);
             let candidate_profile = mapped_lut_profile(&candidate);
             let candidate_registers = mapped_register_count(&candidate);
             if (!timing_driven && candidate_profile.overall_depth > original_profile.overall_depth)
@@ -436,13 +473,23 @@ fn automatically_retime_mapped_luts(
         }
         // Equal-delay endpoints form a timing cutset: moving any one endpoint
         // leaves the maximum unchanged, even though moving the whole cutset is
-        // profitable. Cell indices stay valid when transformed high-to-low.
-        let mut batch_registers = critical.clone();
-        batch_registers.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        // profitable. Stable names survive index shifts caused by pruning
+        // unobservable generated cells after every certified move.
+        let batch_registers = critical
+            .iter()
+            .map(|index| mapped_cell_name(&frontier.cells[*index]).to_owned())
+            .collect::<Vec<_>>();
         let mut batch = frontier.clone();
         let mut batch_moves = 0usize;
-        for register in batch_registers {
-            let Some(candidate) = backward_retime_lut(&batch, register) else {
+        for name in batch_registers {
+            let Some(register) = batch
+                .cells
+                .iter()
+                .position(|cell| mapped_cell_name(cell) == name)
+            else {
+                continue;
+            };
+            let Some(candidate) = backward_retime_primitive(&batch, register) else {
                 continue;
             };
             let candidate_profile = mapped_lut_profile(&candidate);
@@ -456,8 +503,67 @@ fn automatically_retime_mapped_luts(
                 batch_moves += 1;
             }
         }
-        let mut plateau_candidate = None;
+        let mut bridge_candidate = None;
+        if timing_driven && bridge_budget > 0 {
+            let ccu_period = profile
+                .timing_endpoints
+                .iter()
+                .filter_map(|(index, period)| {
+                    (*period > target_period_ps
+                        && register_data_is_driven_by_ccu(&frontier, *index))
+                    .then_some(*period)
+                })
+                .max();
+            if let Some(ccu_period) = ccu_period {
+                let endpoint_names = profile
+                    .timing_endpoints
+                    .iter()
+                    .filter(|(index, period)| {
+                        *period == ccu_period && register_data_is_driven_by_ccu(&frontier, *index)
+                    })
+                    .map(|(index, _)| mapped_cell_name(&frontier.cells[*index]).to_owned())
+                    .collect::<Vec<_>>();
+                let mut ccu_batch = frontier.clone();
+                let mut ccu_moves = 0usize;
+                for name in &endpoint_names {
+                    let Some(index) = ccu_batch
+                        .cells
+                        .iter()
+                        .position(|cell| mapped_cell_name(cell) == name)
+                    else {
+                        continue;
+                    };
+                    let Some(candidate) = backward_retime_ccu2c(&ccu_batch, index) else {
+                        continue;
+                    };
+                    let candidate_profile = mapped_lut_profile(&candidate);
+                    let candidate_registers = mapped_register_count(&candidate);
+                    if candidate_profile.overall_period_ps <= original_profile.overall_period_ps
+                        && candidate.cells.len() <= cell_limit
+                        && candidate_registers <= register_limit
+                    {
+                        ccu_batch = candidate;
+                        ccu_moves += 1;
+                    }
+                }
+                if ccu_moves == endpoint_names.len() && ccu_moves > 0 {
+                    merge_equivalent_flip_flops(&mut ccu_batch);
+                    let batch_profile = mapped_lut_profile(&ccu_batch);
+                    let batch_cells = ccu_batch.cells.len();
+                    let batch_registers = mapped_register_count(&ccu_batch);
+                    let score =
+                        retiming_score(&batch_profile, timing_driven, batch_cells, batch_registers);
+                    if bridge_candidate
+                        .as_ref()
+                        .is_none_or(|(_, bridge_score)| score < *bridge_score)
+                    {
+                        bridge_candidate = Some((ccu_batch, score));
+                    }
+                }
+            }
+        }
         if batch_moves > 0 {
+            merge_equivalent_flip_flops(&mut batch);
             let batch_profile = mapped_lut_profile(&batch);
             let batch_score = retiming_score(
                 &batch_profile,
@@ -477,25 +583,44 @@ fn automatically_retime_mapped_luts(
                     .is_none_or(|(_, best_score): &(Ecp5Netlist, _)| batch_score < *best_score)
             {
                 best = Some((batch, batch_score));
-            } else if timing_driven
+            } else if bridge_candidate.is_none()
+                && timing_driven
                 && profile.data_period_ps > target_period_ps
-                && batch_profile.data_period_ps == profile.data_period_ps
+                && batch_profile.data_period_ps
+                    <= profile
+                        .data_period_ps
+                        .saturating_add(2 * MAPPED_ROUTE_GUARD_PS)
                 && batch_moves == critical.len()
-                && plateau_budget > 0
+                && bridge_budget > 0
             {
-                plateau_candidate = Some((batch, batch_score));
+                bridge_candidate = Some((batch, batch_score));
             }
         }
-        let selected_plateau = best.is_none() && plateau_candidate.is_some();
-        let Some((candidate, _)) = best.or(plateau_candidate) else {
+        let selected_bridge = best.is_none() && bridge_candidate.is_some();
+        let Some((candidate, _)) = best.or(bridge_candidate) else {
             break;
         };
-        if selected_plateau {
-            plateau_budget -= 1;
+        if selected_bridge {
+            bridge_budget -= 1;
         }
         frontier = candidate;
     }
-    let selected_profile = mapped_lut_profile(&frontier);
+    let frontier_profile = mapped_lut_profile(&frontier);
+    let best_profile = mapped_lut_profile(&best_seen);
+    if retiming_score(
+        &frontier_profile,
+        timing_driven,
+        frontier.cells.len(),
+        mapped_register_count(&frontier),
+    ) < retiming_score(
+        &best_profile,
+        timing_driven,
+        best_seen.cells.len(),
+        mapped_register_count(&best_seen),
+    ) {
+        best_seen = frontier;
+    }
+    let selected_profile = mapped_lut_profile(&best_seen);
     let improved = if timing_driven {
         (
             selected_profile.data_period_ps,
@@ -513,7 +638,7 @@ fn automatically_retime_mapped_luts(
             original_profile.critical_depth.len(),
         )
     };
-    improved.then_some(frontier)
+    improved.then_some(best_seen)
 }
 
 fn retiming_score(
@@ -549,12 +674,23 @@ fn mapped_register_count(netlist: &Ecp5Netlist) -> usize {
         .count()
 }
 
+fn register_data_is_driven_by_ccu(netlist: &Ecp5Netlist, register_index: usize) -> bool {
+    let Some(Ecp5Cell::FlipFlop { data, .. }) = netlist.cells.get(register_index) else {
+        return false;
+    };
+    netlist
+        .cells
+        .iter()
+        .any(|cell| matches!(cell, Ecp5Cell::Ccu2c { .. }) && cell_output_bits(cell).contains(data))
+}
+
 struct MappedLutProfile {
     data_depth: usize,
     critical_depth: Vec<usize>,
     overall_depth: usize,
     data_period_ps: u32,
     critical_timing: Vec<usize>,
+    timing_endpoints: Vec<(usize, u32)>,
     overall_period_ps: u32,
 }
 
@@ -625,8 +761,8 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         .max()
         .unwrap_or(0);
     let critical_timing = timing_endpoints
-        .into_iter()
-        .filter_map(|(index, period)| (period == data_period_ps && period > 0).then_some(index))
+        .iter()
+        .filter_map(|(index, period)| (*period == data_period_ps && *period > 0).then_some(*index))
         .collect();
     let control_periods = netlist.cells.iter().filter_map(|cell| match cell {
         Ecp5Cell::FlipFlop { enable, .. } => {
@@ -667,6 +803,7 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         overall_depth,
         data_period_ps,
         critical_timing,
+        timing_endpoints,
         overall_period_ps,
     }
 }
@@ -904,6 +1041,11 @@ fn mapped_wire_fanouts(netlist: &Ecp5Netlist) -> HashMap<u32, usize> {
     fanouts
 }
 
+fn backward_retime_primitive(netlist: &Ecp5Netlist, register_index: usize) -> Option<Ecp5Netlist> {
+    backward_retime_lut(netlist, register_index)
+        .or_else(|| backward_retime_ccu2c(netlist, register_index))
+}
+
 #[allow(clippy::too_many_lines)]
 fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<Ecp5Netlist> {
     let Ecp5Cell::FlipFlop {
@@ -1021,6 +1163,906 @@ fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<E
     }
     prune_unobservable_retiming_cells(&mut candidate);
     Some(candidate)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CcuRetimeOutput {
+    Sum0,
+    Sum1,
+    Carry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CcuInputLocation {
+    Pin { slice: usize, pin: usize },
+    CarryIn,
+}
+
+#[derive(Clone, Copy)]
+enum CcuCarrySource {
+    External(Bit, CcuInputLocation),
+    Internal(usize),
+}
+
+#[derive(Clone, Copy)]
+enum CcuLogicValue {
+    Constant(bool),
+    Input(usize),
+}
+
+struct CcuBoundary {
+    vertex: usize,
+    bit: Bit,
+    location: CcuInputLocation,
+}
+
+fn forward_retime_registered_ccu_chains(netlist: &Ecp5Netlist, timing_driven: bool) -> Ecp5Netlist {
+    let mut selected = netlist.clone();
+    for _ in 0..netlist.cells.len() {
+        let profile = mapped_lut_profile(&selected);
+        let selected_score = retiming_score(
+            &profile,
+            timing_driven,
+            selected.cells.len(),
+            mapped_register_count(&selected),
+        );
+        let chains = ccu_chain_names(&selected);
+        let mut best = None;
+        for chain in chains {
+            let mut candidate = selected.clone();
+            let mut moved = 0usize;
+            for name in &chain {
+                let Some(index) = candidate
+                    .cells
+                    .iter()
+                    .position(|cell| mapped_cell_name(cell) == name)
+                else {
+                    break;
+                };
+                let Some(retimed) = forward_retime_ccu2c(&candidate, index) else {
+                    break;
+                };
+                candidate = retimed;
+                moved += 1;
+            }
+            if moved != chain.len() {
+                continue;
+            }
+            let candidate_profile = mapped_lut_profile(&candidate);
+            let score = retiming_score(
+                &candidate_profile,
+                timing_driven,
+                candidate.cells.len(),
+                mapped_register_count(&candidate),
+            );
+            if score < selected_score
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, best_score): &(Ecp5Netlist, _)| score < *best_score)
+            {
+                best = Some((candidate, score));
+            }
+        }
+        let Some((candidate, _)) = best else {
+            break;
+        };
+        selected = candidate;
+    }
+    selected
+}
+
+fn ccu_chain_names(netlist: &Ecp5Netlist) -> Vec<Vec<String>> {
+    let ccus = netlist
+        .cells
+        .iter()
+        .filter_map(|cell| match cell {
+            Ecp5Cell::Ccu2c {
+                name,
+                carry_in,
+                carry_out,
+                ..
+            } => Some((name.clone(), *carry_in, *carry_out)),
+            Ecp5Cell::Lut4 { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let carry_producers = ccus
+        .iter()
+        .map(|(name, _, carry_out)| (*carry_out, name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let successors = ccus
+        .iter()
+        .filter_map(|(name, carry_in, _)| match carry_in {
+            Bit::Wire(wire) => carry_producers
+                .get(wire)
+                .map(|producer| ((*producer).to_owned(), name.clone())),
+            Bit::Zero | Bit::One => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let roots = ccus
+        .iter()
+        .filter_map(|(name, carry_in, _)| {
+            let has_producer = match carry_in {
+                Bit::Wire(wire) => carry_producers.contains_key(wire),
+                Bit::Zero | Bit::One => false,
+            };
+            (!has_producer).then_some(name.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut chains = Vec::new();
+    let mut visited = HashSet::new();
+    for root in roots {
+        let mut chain = Vec::new();
+        let mut cursor = Some(root);
+        while let Some(name) = cursor {
+            if !visited.insert(name.clone()) {
+                break;
+            }
+            cursor = successors.get(&name).cloned();
+            chain.push(name);
+        }
+        if !chain.is_empty() {
+            chains.push(chain);
+        }
+    }
+    for (name, _, _) in ccus {
+        if visited.insert(name.clone()) {
+            chains.push(vec![name]);
+        }
+    }
+    chains
+}
+
+#[allow(clippy::too_many_lines)]
+fn forward_retime_ccu2c(netlist: &Ecp5Netlist, ccu_index: usize) -> Option<Ecp5Netlist> {
+    let Ecp5Cell::Ccu2c {
+        name: ccu_name,
+        inputs,
+        carry_in,
+        sums,
+        carry_out,
+        init,
+        inject,
+    } = netlist.cells.get(ccu_index)?
+    else {
+        return None;
+    };
+    let ccu_name = ccu_name.clone();
+    let (inputs, carry_in, sums, carry_out, init, inject) =
+        (*inputs, *carry_in, *sums, *carry_out, *init, *inject);
+
+    let mut physical_uses = inputs
+        .iter()
+        .flatten()
+        .copied()
+        .chain([carry_in])
+        .filter_map(|bit| match bit {
+            Bit::Wire(wire) => Some(wire),
+            Bit::Zero | Bit::One => None,
+        })
+        .fold(HashMap::<u32, usize>::new(), |mut uses, wire| {
+            *uses.entry(wire).or_insert(0) += 1;
+            uses
+        });
+    if inject[0]
+        && let Bit::Wire(wire) = carry_in
+        && let Some(uses) = physical_uses.get_mut(&wire)
+    {
+        *uses -= 1;
+        if *uses == 0 {
+            physical_uses.remove(&wire);
+        }
+    }
+    if physical_uses.is_empty() {
+        return None;
+    }
+
+    let mut input_data = HashMap::new();
+    let mut input_resets = HashMap::new();
+    let mut input_registers = HashSet::new();
+    let mut domain: Option<(Bit, ClockEdge, Option<Control>, Reset)> = None;
+    for (&wire, &local_uses) in &physical_uses {
+        if mapped_wire_fanout(netlist, wire) != local_uses {
+            return None;
+        }
+        let (register_index, data, clock, edge, enable, reset) =
+            netlist
+                .cells
+                .iter()
+                .enumerate()
+                .find_map(|(index, cell)| match cell {
+                    Ecp5Cell::FlipFlop {
+                        data,
+                        output,
+                        clock,
+                        edge,
+                        enable,
+                        reset: Some(reset),
+                        ..
+                    } if *output == wire => Some((index, *data, *clock, *edge, *enable, *reset)),
+                    Ecp5Cell::Lut4 { .. }
+                    | Ecp5Cell::Ccu2c { .. }
+                    | Ecp5Cell::FlipFlop { .. }
+                    | Ecp5Cell::BlockRam { .. } => None,
+                })?;
+        if let Some((domain_clock, domain_edge, domain_enable, domain_reset)) = domain {
+            if (clock, edge, enable) != (domain_clock, domain_edge, domain_enable)
+                || (reset.signal, reset.active, reset.asynchronous)
+                    != (
+                        domain_reset.signal,
+                        domain_reset.active,
+                        domain_reset.asynchronous,
+                    )
+            {
+                return None;
+            }
+        } else {
+            domain = Some((clock, edge, enable, reset));
+        }
+        input_data.insert(wire, data);
+        input_resets.insert(wire, reset.value);
+        input_registers.insert(register_index);
+    }
+    let (clock, clock_edge, enable, reset) = domain?;
+
+    let mut vertices = Vec::new();
+    let mut edges = Vec::new();
+    let mut boundaries = Vec::new();
+    let mut logic_vertices = Vec::new();
+    let sum0_vertex = append_ccu_logic_vertex(
+        &mut vertices,
+        &mut edges,
+        &mut boundaries,
+        inputs[0],
+        CcuCarrySource::External(carry_in, CcuInputLocation::CarryIn),
+        init[0],
+        inject[0],
+        false,
+        0,
+        &mut logic_vertices,
+        Some(&input_resets),
+    );
+    let carry0_vertex = append_ccu_logic_vertex(
+        &mut vertices,
+        &mut edges,
+        &mut boundaries,
+        inputs[0],
+        CcuCarrySource::External(carry_in, CcuInputLocation::CarryIn),
+        init[0],
+        inject[0],
+        true,
+        0,
+        &mut logic_vertices,
+        Some(&input_resets),
+    );
+    let slice1_carry = if inject[1] {
+        CcuCarrySource::External(Bit::Zero, CcuInputLocation::CarryIn)
+    } else {
+        CcuCarrySource::Internal(carry0_vertex)
+    };
+    let sum1_vertex = append_ccu_logic_vertex(
+        &mut vertices,
+        &mut edges,
+        &mut boundaries,
+        inputs[1],
+        slice1_carry,
+        init[1],
+        inject[1],
+        false,
+        1,
+        &mut logic_vertices,
+        Some(&input_resets),
+    );
+    let carry1_vertex = append_ccu_logic_vertex(
+        &mut vertices,
+        &mut edges,
+        &mut boundaries,
+        inputs[1],
+        slice1_carry,
+        init[1],
+        inject[1],
+        true,
+        1,
+        &mut logic_vertices,
+        Some(&input_resets),
+    );
+    let mut output_boundaries = Vec::new();
+    for (name, logic) in [
+        ("sum0", sum0_vertex),
+        ("sum1", sum1_vertex),
+        ("carry", carry1_vertex),
+    ] {
+        let boundary = vertices.len();
+        vertices.push(RetimingVertex::boundary(name, LogicFunction::new(1, 0b10)));
+        edges.push(RetimingEdge::new(logic, boundary, Vec::new()));
+        output_boundaries.push((logic, boundary));
+    }
+    let before = RetimingGraph::new(
+        RetimingDomain::new(
+            format!("{clock:?}"),
+            clock_edge,
+            format!("{:?}", reset.signal),
+            reset.active,
+            reset.asynchronous,
+        ),
+        vertices,
+        edges,
+    );
+    let mut labels = vec![0; before.vertices().len()];
+    for vertex in logic_vertices {
+        labels[vertex] = -1;
+    }
+    let certificate = RetimingCertificate::new(labels);
+    let after = derive_retimed_graph(&before, &certificate).ok()?;
+    verify_retiming_certificate(&before, &after, &certificate).ok()?;
+    let output_resets = output_boundaries
+        .iter()
+        .map(|&(logic, boundary)| {
+            after
+                .edges()
+                .iter()
+                .find(|edge| edge.source() == logic && edge.target() == boundary)?
+                .reset_values()
+                .first()
+                .copied()
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut candidate = netlist.clone();
+    let mut removed = input_registers.into_iter().collect::<Vec<_>>();
+    removed.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+    for index in removed {
+        candidate.cells.remove(index);
+    }
+    let retimed_ccu_index = candidate
+        .cells
+        .iter()
+        .position(|cell| mapped_cell_name(cell) == ccu_name)?;
+    let rewrite = |bit: Bit| match bit {
+        Bit::Wire(wire) => input_data.get(&wire).copied().unwrap_or(bit),
+        Bit::Zero | Bit::One => bit,
+    };
+    let retimed_inputs = inputs.map(|slice| slice.map(rewrite));
+    let retimed_carry_in = if inject[0] {
+        Bit::Zero
+    } else {
+        rewrite(carry_in)
+    };
+    let mut next_wire = maximum_mapped_wire(netlist)?.checked_add(1)?;
+    let internal_sums = [next_wire, next_wire.checked_add(1)?];
+    next_wire = next_wire.checked_add(2)?;
+    let internal_carry = next_wire;
+    candidate.cells[retimed_ccu_index] = Ecp5Cell::Ccu2c {
+        name: format!("retime_forward_{ccu_name}"),
+        inputs: retimed_inputs,
+        carry_in: retimed_carry_in,
+        sums: internal_sums,
+        carry_out: internal_carry,
+        init,
+        inject,
+    };
+    for (name, data, output, reset_value) in [
+        ("sum0", internal_sums[0], sums[0], output_resets[0]),
+        ("sum1", internal_sums[1], sums[1], output_resets[1]),
+        ("carry", internal_carry, carry_out, output_resets[2]),
+    ] {
+        if mapped_wire_fanout(netlist, output) == 0 {
+            continue;
+        }
+        candidate.cells.push(Ecp5Cell::FlipFlop {
+            name: format!("retime_forward_{ccu_name}_{name}"),
+            data: Bit::Wire(data),
+            output,
+            clock,
+            edge: clock_edge,
+            enable,
+            reset: Some(Reset {
+                value: reset_value,
+                ..reset
+            }),
+        });
+    }
+    Some(candidate)
+}
+
+#[allow(clippy::too_many_lines)]
+fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option<Ecp5Netlist> {
+    let Ecp5Cell::FlipFlop {
+        name: register_name,
+        data: Bit::Wire(data_wire),
+        output: register_output,
+        clock,
+        edge: clock_edge,
+        enable,
+        reset: Some(reset),
+    } = netlist.cells.get(register_index)?
+    else {
+        return None;
+    };
+    if mapped_wire_is_clock_or_reset(netlist, *register_output) {
+        return None;
+    }
+    let (ccu_index, ccu_name, inputs, carry_in, sums, carry_out, init, inject, output) = netlist
+        .cells
+        .iter()
+        .enumerate()
+        .find_map(|(index, cell)| match cell {
+            Ecp5Cell::Ccu2c {
+                name,
+                inputs,
+                carry_in,
+                sums,
+                carry_out,
+                init,
+                inject,
+            } => {
+                let output = if sums[0] == *data_wire {
+                    Some(CcuRetimeOutput::Sum0)
+                } else if sums[1] == *data_wire {
+                    Some(CcuRetimeOutput::Sum1)
+                } else if *carry_out == *data_wire {
+                    Some(CcuRetimeOutput::Carry)
+                } else {
+                    None
+                }?;
+                Some((
+                    index,
+                    name.clone(),
+                    *inputs,
+                    *carry_in,
+                    *sums,
+                    *carry_out,
+                    *init,
+                    *inject,
+                    output,
+                ))
+            }
+            Ecp5Cell::Lut4 { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+        })?;
+
+    let mut vertices = Vec::new();
+    let mut edges = Vec::new();
+    let mut boundaries = Vec::new();
+    let mut logic_vertices = Vec::new();
+    let desired_vertex = match output {
+        CcuRetimeOutput::Sum0 => append_ccu_logic_vertex(
+            &mut vertices,
+            &mut edges,
+            &mut boundaries,
+            inputs[0],
+            CcuCarrySource::External(carry_in, CcuInputLocation::CarryIn),
+            init[0],
+            inject[0],
+            false,
+            0,
+            &mut logic_vertices,
+            None,
+        ),
+        CcuRetimeOutput::Sum1 | CcuRetimeOutput::Carry => {
+            let slice1_carry = if inject[1] {
+                CcuCarrySource::External(Bit::Zero, CcuInputLocation::CarryIn)
+            } else {
+                let carry_vertex = append_ccu_logic_vertex(
+                    &mut vertices,
+                    &mut edges,
+                    &mut boundaries,
+                    inputs[0],
+                    CcuCarrySource::External(carry_in, CcuInputLocation::CarryIn),
+                    init[0],
+                    inject[0],
+                    true,
+                    0,
+                    &mut logic_vertices,
+                    None,
+                );
+                CcuCarrySource::Internal(carry_vertex)
+            };
+            append_ccu_logic_vertex(
+                &mut vertices,
+                &mut edges,
+                &mut boundaries,
+                inputs[1],
+                slice1_carry,
+                init[1],
+                inject[1],
+                output == CcuRetimeOutput::Carry,
+                1,
+                &mut logic_vertices,
+                None,
+            )
+        }
+    };
+    let q_vertex = vertices.len();
+    vertices.push(RetimingVertex::boundary("q", LogicFunction::new(1, 0b10)));
+    edges.push(RetimingEdge::new(
+        desired_vertex,
+        q_vertex,
+        vec![reset.value],
+    ));
+    let before = RetimingGraph::new(
+        RetimingDomain::new(
+            format!("{clock:?}"),
+            *clock_edge,
+            format!("{:?}", reset.signal),
+            reset.active,
+            reset.asynchronous,
+        ),
+        vertices,
+        edges,
+    );
+    let mut labels = vec![0; before.vertices().len()];
+    for vertex in logic_vertices {
+        labels[vertex] = 1;
+    }
+    let certificate = RetimingCertificate::new(labels);
+    let after = derive_retimed_graph(&before, &certificate).ok()?;
+    verify_retiming_certificate(&before, &after, &certificate).ok()?;
+
+    let mut next_wire = maximum_mapped_wire(netlist)?.checked_add(1)?;
+    let mut candidate = netlist.clone();
+    candidate.cells.remove(register_index);
+    let uses_slice1 = output != CcuRetimeOutput::Sum0;
+    let uses_slice0 = !uses_slice1 || !inject[1];
+    let mut retimed_inputs = [[Bit::Zero; 4]; 2];
+    if uses_slice0 {
+        retimed_inputs[0] = inputs[0];
+    }
+    if uses_slice1 {
+        retimed_inputs[1] = inputs[1];
+    }
+    let mut retimed_carry_in = if uses_slice0 && !inject[0] {
+        carry_in
+    } else {
+        Bit::Zero
+    };
+    for boundary in boundaries {
+        let Bit::Wire(input_wire) = boundary.bit else {
+            continue;
+        };
+        let reset_value = after
+            .edges()
+            .iter()
+            .find(|edge| edge.source() == boundary.vertex)?
+            .reset_values()
+            .first()
+            .copied()?;
+        let output_wire = next_wire;
+        next_wire = next_wire.checked_add(1)?;
+        let location_name = match boundary.location {
+            CcuInputLocation::Pin { slice, pin } => format!("s{slice}p{pin}"),
+            CcuInputLocation::CarryIn => "cin".into(),
+        };
+        candidate.cells.push(Ecp5Cell::FlipFlop {
+            name: format!("retime_{register_name}_{ccu_name}_{location_name}"),
+            data: Bit::Wire(input_wire),
+            output: output_wire,
+            clock: *clock,
+            edge: *clock_edge,
+            enable: *enable,
+            reset: Some(Reset {
+                value: reset_value,
+                ..*reset
+            }),
+        });
+        match boundary.location {
+            CcuInputLocation::Pin { slice, pin } => {
+                retimed_inputs[slice][pin] = Bit::Wire(output_wire);
+            }
+            CcuInputLocation::CarryIn => retimed_carry_in = Bit::Wire(output_wire),
+        }
+    }
+    let mut retimed_sums = [0; 2];
+    for (slice, sum) in retimed_sums.iter_mut().enumerate() {
+        *sum = if output == [CcuRetimeOutput::Sum0, CcuRetimeOutput::Sum1][slice] {
+            *register_output
+        } else {
+            let wire = next_wire;
+            next_wire = next_wire.checked_add(1)?;
+            wire
+        };
+    }
+    let retimed_carry_out = if output == CcuRetimeOutput::Carry {
+        *register_output
+    } else {
+        next_wire
+    };
+    let retimed_ccu = Ecp5Cell::Ccu2c {
+        name: format!("retime_{ccu_name}"),
+        inputs: retimed_inputs,
+        carry_in: retimed_carry_in,
+        sums: retimed_sums,
+        carry_out: retimed_carry_out,
+        init,
+        inject,
+    };
+    let original_outputs = [sums[0], sums[1], carry_out];
+    let replace_original = original_outputs
+        .iter()
+        .all(|wire| mapped_wire_fanout(netlist, *wire) == usize::from(*wire == *data_wire));
+    if replace_original {
+        let ccu_index = ccu_index - usize::from(register_index < ccu_index);
+        candidate.cells[ccu_index] = retimed_ccu;
+    } else {
+        candidate.cells.push(retimed_ccu);
+    }
+    prune_unobservable_retiming_cells(&mut candidate);
+    Some(candidate)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_ccu_logic_vertex(
+    vertices: &mut Vec<RetimingVertex>,
+    edges: &mut Vec<RetimingEdge>,
+    boundaries: &mut Vec<CcuBoundary>,
+    inputs: [Bit; 4],
+    carry: CcuCarrySource,
+    init: u16,
+    inject: bool,
+    carry_output: bool,
+    slice: usize,
+    logic_vertices: &mut Vec<usize>,
+    input_resets: Option<&HashMap<u32, bool>>,
+) -> usize {
+    let mut sources = Vec::new();
+    let mut logic_inputs = [CcuLogicValue::Constant(false); 4];
+    for (pin, input) in inputs.into_iter().enumerate() {
+        logic_inputs[pin] = append_ccu_external_input(
+            vertices,
+            boundaries,
+            &mut sources,
+            input,
+            CcuInputLocation::Pin { slice, pin },
+            input_resets,
+        );
+    }
+    let carry_input = if inject {
+        CcuLogicValue::Constant(false)
+    } else {
+        match carry {
+            CcuCarrySource::External(bit, location) => append_ccu_external_input(
+                vertices,
+                boundaries,
+                &mut sources,
+                bit,
+                location,
+                input_resets,
+            ),
+            CcuCarrySource::Internal(vertex) => {
+                let input = CcuLogicValue::Input(sources.len());
+                sources.push((vertex, Vec::new()));
+                input
+            }
+        }
+    };
+    let function = ccu_logic_function(logic_inputs, carry_input, init, carry_output, sources.len());
+    let vertex = vertices.len();
+    vertices.push(RetimingVertex::logic(
+        if carry_output { "carry" } else { "sum" },
+        function,
+    ));
+    logic_vertices.push(vertex);
+    for (source, reset_values) in sources {
+        edges.push(RetimingEdge::new(source, vertex, reset_values));
+    }
+    vertex
+}
+
+fn append_ccu_external_input(
+    vertices: &mut Vec<RetimingVertex>,
+    boundaries: &mut Vec<CcuBoundary>,
+    sources: &mut Vec<(usize, Vec<bool>)>,
+    bit: Bit,
+    location: CcuInputLocation,
+    input_resets: Option<&HashMap<u32, bool>>,
+) -> CcuLogicValue {
+    match bit {
+        Bit::Zero => CcuLogicValue::Constant(false),
+        Bit::One => CcuLogicValue::Constant(true),
+        Bit::Wire(wire) => {
+            let vertex = vertices.len();
+            vertices.push(RetimingVertex::boundary(
+                format!("wire{wire}"),
+                LogicFunction::new(0, 0),
+            ));
+            boundaries.push(CcuBoundary {
+                vertex,
+                bit,
+                location,
+            });
+            let input = CcuLogicValue::Input(sources.len());
+            let reset_values = input_resets
+                .and_then(|resets| resets.get(&wire))
+                .copied()
+                .map_or_else(Vec::new, |value| vec![value]);
+            sources.push((vertex, reset_values));
+            input
+        }
+    }
+}
+
+fn ccu_logic_function(
+    inputs: [CcuLogicValue; 4],
+    carry: CcuLogicValue,
+    init: u16,
+    carry_output: bool,
+    input_count: usize,
+) -> LogicFunction {
+    let mut truth_table = 0u64;
+    for assignment in 0..(1usize << input_count) {
+        let values = inputs.map(|input| ccu_logic_value(input, assignment));
+        let carry = ccu_logic_value(carry, assignment);
+        let lut4_index = values
+            .iter()
+            .enumerate()
+            .fold(0usize, |index, (pin, value)| {
+                index | (usize::from(*value) << pin)
+            });
+        let lut2_index = usize::from(values[0]) | (usize::from(values[1]) << 1);
+        let lut4 = init & (1u16 << lut4_index) != 0;
+        let lut2 = init & (1u16 << lut2_index) != 0;
+        let value = if carry_output {
+            if lut4 { lut2 } else { carry }
+        } else {
+            lut4 ^ carry
+        };
+        truth_table |= u64::from(value) << assignment;
+    }
+    LogicFunction::new(
+        u8::try_from(input_count).expect("CCU slice has at most five inputs"),
+        truth_table,
+    )
+}
+
+fn ccu_logic_value(value: CcuLogicValue, assignment: usize) -> bool {
+    match value {
+        CcuLogicValue::Constant(value) => value,
+        CcuLogicValue::Input(input) => assignment & (1usize << input) != 0,
+    }
+}
+
+fn merge_equivalent_flip_flops(netlist: &mut Ecp5Netlist) {
+    const MAX_SHARED_FANOUT: usize = 2;
+    loop {
+        let mut canonical = Vec::<(
+            Bit,
+            u32,
+            Bit,
+            ClockEdge,
+            Option<Control>,
+            Option<Reset>,
+            usize,
+        )>::new();
+        let mut duplicates = Vec::new();
+        for (index, cell) in netlist.cells.iter().enumerate() {
+            let Ecp5Cell::FlipFlop {
+                name,
+                data,
+                output,
+                clock,
+                edge,
+                enable,
+                reset,
+                ..
+            } = cell
+            else {
+                continue;
+            };
+            if !name.starts_with("retime_") {
+                continue;
+            }
+            let output_fanout = mapped_wire_fanout(netlist, *output);
+            if let Some((_, canonical_output, .., canonical_fanout)) = canonical.iter_mut().find(
+                |(
+                    candidate_data,
+                    _,
+                    candidate_clock,
+                    candidate_edge,
+                    candidate_enable,
+                    candidate_reset,
+                    candidate_fanout,
+                )| {
+                    (
+                        *candidate_data,
+                        *candidate_clock,
+                        *candidate_edge,
+                        *candidate_enable,
+                        *candidate_reset,
+                    ) == (*data, *clock, *edge, *enable, *reset)
+                        && *candidate_fanout + output_fanout <= MAX_SHARED_FANOUT
+                },
+            ) {
+                duplicates.push((index, *output, *canonical_output));
+                *canonical_fanout += output_fanout;
+            } else {
+                canonical.push((
+                    *data,
+                    *output,
+                    *clock,
+                    *edge,
+                    *enable,
+                    *reset,
+                    output_fanout,
+                ));
+            }
+        }
+        if duplicates.is_empty() {
+            break;
+        }
+        for &(_, duplicate, canonical) in &duplicates {
+            replace_mapped_wire_uses(netlist, duplicate, canonical);
+        }
+        duplicates.sort_unstable_by_key(|duplicate| std::cmp::Reverse(duplicate.0));
+        for (index, _, _) in duplicates {
+            netlist.cells.remove(index);
+        }
+    }
+}
+
+fn replace_mapped_wire_uses(netlist: &mut Ecp5Netlist, from: u32, to: u32) {
+    let replace = |bit: &mut Bit| {
+        if *bit == Bit::Wire(from) {
+            *bit = Bit::Wire(to);
+        }
+    };
+    for port in &mut netlist.ports {
+        for bit in &mut port.bits {
+            replace(bit);
+        }
+    }
+    for cell in &mut netlist.cells {
+        match cell {
+            Ecp5Cell::Lut4 { inputs, .. } => {
+                for bit in inputs {
+                    replace(bit);
+                }
+            }
+            Ecp5Cell::Ccu2c {
+                inputs, carry_in, ..
+            } => {
+                for bit in inputs.iter_mut().flatten() {
+                    replace(bit);
+                }
+                replace(carry_in);
+            }
+            Ecp5Cell::FlipFlop {
+                data,
+                clock,
+                enable,
+                reset,
+                ..
+            } => {
+                replace(data);
+                replace(clock);
+                if let Some(control) = enable {
+                    replace(&mut control.signal);
+                }
+                if let Some(control) = reset {
+                    replace(&mut control.signal);
+                }
+            }
+            Ecp5Cell::BlockRam {
+                write_address,
+                write_data,
+                write_enable,
+                read_address,
+                read_enable,
+                clock,
+                ..
+            } => {
+                for bit in write_address
+                    .iter_mut()
+                    .chain(write_data)
+                    .chain(read_address.iter_mut())
+                {
+                    replace(bit);
+                }
+                replace(&mut write_enable.signal);
+                if let Some(control) = read_enable {
+                    replace(&mut control.signal);
+                }
+                replace(clock);
+            }
+        }
+    }
 }
 
 fn prune_unobservable_retiming_cells(netlist: &mut Ecp5Netlist) {
@@ -2103,8 +3145,9 @@ mod tests {
     };
 
     use super::{
-        ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, backward_retime_lut, map_once,
-        map_to_ecp5, map_to_ecp5_with_options,
+        ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, backward_retime_ccu2c,
+        backward_retime_lut, ccu_chain_names, forward_retime_ccu2c, map_once, map_to_ecp5,
+        map_to_ecp5_with_options, mapped_wire_fanout, merge_equivalent_flip_flops,
     };
 
     fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
@@ -2245,6 +3288,202 @@ mod tests {
             outputs.len(),
             outputs.iter().copied().collect::<HashSet<_>>().len(),
             "retiming must not reuse the removed maximum Q wire"
+        );
+    }
+
+    #[test]
+    fn backward_ccu_retiming_splits_a_carry_chain_with_a_certificate() {
+        let mut source = Netlist::new("retimed_carry");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let lhs = source.add_input_port("lhs", NonZeroU32::new(8).unwrap());
+        let rhs = source.add_input_port("rhs", NonZeroU32::new(8).unwrap());
+        let sum = source
+            .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
+            .unwrap();
+        let output = source.add_register_output("result_q");
+        source.add_register(RegisterCell::new(
+            "result_q",
+            output,
+            sum[7],
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: false,
+            }),
+        ));
+        source.add_output("result", output);
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let register = mapped
+            .cells
+            .iter()
+            .position(
+                |cell| matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name == "ff_result_q"),
+            )
+            .unwrap();
+        let Ecp5Cell::FlipFlop {
+            output: register_output,
+            ..
+        } = mapped.cells[register]
+        else {
+            unreachable!()
+        };
+
+        let retimed = backward_retime_ccu2c(&mapped, register).unwrap();
+
+        assert!(!retimed.cells.iter().any(|cell| {
+            matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name == "ff_result_q")
+        }));
+        assert!(retimed.cells.iter().any(|cell| {
+            matches!(
+                cell,
+                Ecp5Cell::Ccu2c { name, sums, .. }
+                    if name.starts_with("retime_ccu_") && sums[1] == register_output
+            )
+        }));
+        assert!(
+            retimed
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name.starts_with("retime_ff_result_q_ccu_")))
+                .count()
+                >= 5
+        );
+        let outputs = retimed
+            .cells
+            .iter()
+            .flat_map(super::cell_output_bits)
+            .filter_map(|bit| match bit {
+                Bit::Wire(wire) => Some(wire),
+                Bit::Zero | Bit::One => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs.len(),
+            outputs.iter().copied().collect::<HashSet<_>>().len()
+        );
+    }
+
+    #[test]
+    fn forward_ccu_retiming_moves_operand_registers_across_the_whole_chain() {
+        let mut source = Netlist::new("forward_retimed_carry");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let lhs = source.add_input_port("lhs", NonZeroU32::new(8).unwrap());
+        let rhs = source.add_input_port("rhs", NonZeroU32::new(8).unwrap());
+        let reset_control = ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: false,
+        };
+        let registered = lhs
+            .iter()
+            .chain(&rhs)
+            .enumerate()
+            .map(|(index, input)| {
+                let name = format!("operand_q{index}");
+                let output = source.add_register_output(&name);
+                source.add_register(RegisterCell::new(
+                    name,
+                    output,
+                    *input,
+                    clock,
+                    ClockEdge::Rising,
+                    None,
+                    Some(reset_control),
+                ));
+                output
+            })
+            .collect::<Vec<_>>();
+        let sum = source
+            .add_arithmetic(ArithmeticOp::Add, &registered[..8], &registered[8..])
+            .unwrap();
+        source.add_output_port("sum", &sum).unwrap();
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+
+        let mut retimed = mapped.clone();
+        for name in &ccu_chain_names(&mapped)[0] {
+            let index = retimed
+                .cells
+                .iter()
+                .position(|cell| super::mapped_cell_name(cell) == name)
+                .unwrap();
+            retimed = forward_retime_ccu2c(&retimed, index).unwrap();
+        }
+
+        assert_eq!(
+            retimed
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::FlipFlop { .. }))
+                .count(),
+            8
+        );
+        assert!(retimed.cells.iter().all(|cell| {
+            !matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name.starts_with("ff_operand_q"))
+        }));
+        assert_eq!(
+            retimed
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::Ccu2c { name, .. } if name.starts_with("retime_forward_ccu_")))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn equivalent_retiming_registers_are_shared_without_high_fanout() {
+        let mut source = Netlist::new("shared_retiming_registers");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let data = source.add_input("data");
+        for index in 0..3 {
+            let name = format!("copy{index}");
+            let output = source.add_register_output(&name);
+            source.add_register(RegisterCell::new(
+                name.clone(),
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                None,
+                Some(ResetControl {
+                    signal: reset,
+                    active: ActiveLevel::High,
+                    asynchronous: true,
+                    value: false,
+                }),
+            ));
+            source.add_output(format!("output{index}"), output);
+        }
+        let (mut mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        for cell in &mut mapped.cells {
+            if let Ecp5Cell::FlipFlop { name, .. } = cell {
+                *name = format!("retime_{name}");
+            }
+        }
+
+        merge_equivalent_flip_flops(&mut mapped);
+
+        let outputs = mapped
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                Ecp5Cell::FlipFlop { output, .. } => Some(*output),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        assert!(
+            outputs
+                .iter()
+                .all(|output| mapped_wire_fanout(&mapped, *output) <= 2)
         );
     }
 
