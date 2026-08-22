@@ -16,8 +16,8 @@ use struo_rtl::{
 use struo_sim::VerificationPolicy;
 use struo_synth::synthesize;
 use struo_target_ecp5::{
-    ArithmeticMapping, ECP5_QOR_TARGET_MHZ, Ecp5Cell, Ecp5Flow, MappingOptions, map_to_ecp5,
-    map_to_ecp5_with_options,
+    ArithmeticMapping, ECP5_QOR_TARGET_MHZ, Ecp5Cell, Ecp5Flow, MappingOptions, PhysicalFeedback,
+    map_to_ecp5, map_to_ecp5_with_options,
 };
 
 const USAGE: &str = "\
@@ -28,7 +28,7 @@ Usage:
                        synthesize and simulate the ECP5 EVN blinky
   struo axi4-demo [MAPPED_JSON]
                        analyze, synthesize, and compile the 2x2 AXI4 crossbar
-  struo axi4-self-test [MAPPED_JSON] [TIMING_GOAL_MHZ]
+  struo axi4-self-test [MAPPED_JSON] [TIMING_GOAL_MHZ] [DRAFT_REPORT] [DRAFT_PLACED_JSON]
                        synthesize the closed-system AXI4 board wrapper
   struo carry-benchmark [DIRECTORY]
                        emit 32-bit CCU2C and LUT ripple comparison designs
@@ -49,9 +49,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     match env::args().nth(1).as_deref() {
         Some("demo") => run_demo(env::args().nth(2).as_deref()),
         Some("axi4-demo") => run_axi4_demo(env::args().nth(2).as_deref()),
-        Some("axi4-self-test") => {
-            run_axi4_self_test(env::args().nth(2).as_deref(), env::args().nth(3).as_deref())
-        }
+        Some("axi4-self-test") => run_axi4_self_test(
+            env::args().nth(2).as_deref(),
+            env::args().nth(3).as_deref(),
+            env::args().nth(4).as_deref(),
+            env::args().nth(5).as_deref(),
+        ),
         Some("carry-benchmark") => run_carry_benchmark(
             env::args()
                 .nth(2)
@@ -145,6 +148,8 @@ fn run_carry_benchmark(directory: &str) -> Result<(), Box<dyn Error>> {
 fn run_axi4_self_test(
     mapped_path: Option<&str>,
     timing_goal_mhz: Option<&str>,
+    draft_report: Option<&str>,
+    draft_placed_json: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let timing_goal_mhz = timing_goal_mhz
         .map(str::parse)
@@ -165,6 +170,24 @@ fn run_axi4_self_test(
             ..MappingOptions::default()
         },
     )?;
+    let mapped = match (draft_report, draft_placed_json) {
+        (Some(report), Some(placed)) => {
+            let feedback = PhysicalFeedback::from_nextpnr_json(
+                &fs::read_to_string(report)?,
+                &fs::read_to_string(placed)?,
+            )?;
+            let refined = mapped.apply_physical_feedback(&feedback);
+            println!(
+                "physical-feedback: {} equivalent physical rewires",
+                refined.retiming().equivalent_physical_rewires
+            );
+            refined
+        }
+        (None, None) => mapped,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("draft report and placed JSON must be provided together".into());
+        }
+    };
     print_retiming_decision(&mapped);
     println!(
         "Veryl AXI4 self-test at {timing_goal_mhz} MHz: {} Boolean nodes, {} registers, {} ECP5 cells",
@@ -305,7 +328,7 @@ fn print_retiming_decision(mapped: &struo_target_ecp5::Ecp5Netlist) {
         "kept original"
     };
     println!(
-        "retiming: {action}; LUT depth {} -> {}, critical register inputs {} -> {}, data period {} -> {} ps, overall period {} -> {} ps, registers {} -> {}, certified moves {}, register merges {}, logic replicas {}, dead cells {}, equivalence sign-off {}",
+        "retiming: {action}; LUT depth {} -> {}, critical register inputs {} -> {}, data period {} -> {} ps, overall period {} -> {} ps, registers {} -> {}, certified moves {}, register merges {}, logic replicas {}, physical rewires {}, dead cells {}, equivalence sign-off {}",
         decision.original_lut_depth,
         decision.selected_lut_depth,
         decision.original_critical_registers,
@@ -319,6 +342,7 @@ fn print_retiming_decision(mapped: &struo_target_ecp5::Ecp5Netlist) {
         decision.certified_primitive_moves,
         decision.equivalent_register_merges,
         decision.equivalent_logic_replications,
+        decision.equivalent_physical_rewires,
         decision.unobservable_cells_removed,
         if decision.equivalence_signed_off {
             "passed"

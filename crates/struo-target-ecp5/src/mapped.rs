@@ -15,6 +15,8 @@ use struo_ir::{
     Netlist, PortDirection as IrPortDirection, ValidationError,
 };
 
+use crate::physical::{PhysicalFeedback, PhysicalLocation};
+
 mod lut;
 
 use lut::{
@@ -31,6 +33,7 @@ const RETIMING_PERIOD_MARGIN_DENOMINATOR: u32 = 10;
 // 100 ps more than that model, while dedicated carry hops bypass this charge.
 const MAPPED_ROUTE_GUARD_PS: u32 = 100;
 const MAX_ENABLE_FANOUT_PER_REPLICA: usize = 16;
+const PHYSICAL_REWRITE_MIN_GOAL_PERCENT: u32 = 98;
 
 /// A constant or numbered wire in a mapped ECP5 design.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -262,6 +265,7 @@ pub struct Ecp5Netlist {
     cells: Vec<Ecp5Cell>,
     retiming: RetimingSelection,
     equivalence_proof: MappedEquivalenceProof,
+    placement_hints: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -269,6 +273,7 @@ struct MappedEquivalenceProof {
     certified_primitive_moves: usize,
     equivalent_register_merges: usize,
     equivalent_logic_replications: usize,
+    equivalent_physical_rewires: usize,
     unobservable_cells_removed: usize,
     valid: bool,
 }
@@ -304,6 +309,8 @@ pub struct RetimingSelection {
     pub equivalent_register_merges: usize,
     /// Combinational cells replicated without changing their truth tables.
     pub equivalent_logic_replications: usize,
+    /// Sinks reassigned between equivalent replicas using physical feedback.
+    pub equivalent_physical_rewires: usize,
     /// Unobservable cells removed after certified retiming moves.
     pub unobservable_cells_removed: usize,
     /// Whether the complete selected transformation chain passed sign-off.
@@ -343,6 +350,71 @@ impl Ecp5Netlist {
     /// Returns an error if JSON serialization fails.
     pub fn to_nextpnr_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(&JsonDesign::from(self))
+    }
+
+    /// Applies equivalent local rewrites using locations and routed timing
+    /// returned by a deterministic draft implementation.
+    #[must_use]
+    pub fn apply_physical_feedback(&self, feedback: &PhysicalFeedback) -> Self {
+        let mut refined = self.clone();
+        if !feedback.is_near_timing_closure(PHYSICAL_REWRITE_MIN_GOAL_PERCENT)
+            || !physical_feedback_matches_netlist(&refined, feedback)
+        {
+            return refined;
+        }
+        let (replicas, critical_rewires) =
+            replicate_physically_critical_luts(&mut refined, feedback);
+        let cluster_rewires = recluster_replicated_enable_sinks(&mut refined, feedback);
+        let rewires = critical_rewires + cluster_rewires;
+        if rewires == 0 {
+            return refined;
+        }
+        refined.placement_hints = refined
+            .cells
+            .iter()
+            .filter_map(|cell| {
+                let name = mapped_cell_name(cell);
+                let bel = feedback.bel(name)?;
+                physical_bel_is_compatible(cell, bel).then(|| (name.to_owned(), bel.to_owned()))
+            })
+            .collect();
+        refined.equivalence_proof.equivalent_logic_replications += replicas;
+        refined.equivalence_proof.equivalent_physical_rewires += rewires;
+        refined.retiming.equivalent_logic_replications += replicas;
+        refined.retiming.equivalent_physical_rewires += rewires;
+        refined.retiming.equivalence_signed_off =
+            verify_mapped_equivalence_proof(&refined, refined.retiming.applied || rewires > 0);
+        if refined.retiming.equivalence_signed_off {
+            refined
+        } else {
+            self.clone()
+        }
+    }
+}
+
+fn physical_feedback_matches_netlist(netlist: &Ecp5Netlist, feedback: &PhysicalFeedback) -> bool {
+    let mut expected = 0usize;
+    let mut missing = 0usize;
+    for cell in &netlist.cells {
+        if matches!(cell, Ecp5Cell::Ccu2c { .. }) {
+            continue;
+        }
+        expected += 1;
+        match feedback.bel(mapped_cell_name(cell)) {
+            Some(bel) if physical_bel_is_compatible(cell, bel) => {}
+            Some(_) => return false,
+            None => missing += 1,
+        }
+    }
+    expected > 0 && missing <= 2usize.max(expected / 100)
+}
+
+fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
+    match cell {
+        Ecp5Cell::Lut4 { .. } => bel.contains(".K"),
+        Ecp5Cell::FlipFlop { .. } => bel.contains(".FF"),
+        Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD"),
+        Ecp5Cell::Ccu2c { .. } => false,
     }
 }
 
@@ -403,6 +475,7 @@ pub fn map_to_ecp5_with_options(
         certified_primitive_moves: selected.equivalence_proof.certified_primitive_moves,
         equivalent_register_merges: selected.equivalence_proof.equivalent_register_merges,
         equivalent_logic_replications: selected.equivalence_proof.equivalent_logic_replications,
+        equivalent_physical_rewires: selected.equivalence_proof.equivalent_physical_rewires,
         unobservable_cells_removed: selected.equivalence_proof.unobservable_cells_removed,
         equivalence_signed_off,
     };
@@ -908,6 +981,314 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
         })
         .max()
         .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_lines)]
+fn recluster_replicated_enable_sinks(
+    netlist: &mut Ecp5Netlist,
+    feedback: &PhysicalFeedback,
+) -> usize {
+    let timed_enable_drivers = feedback
+        .net_timings()
+        .iter()
+        .filter(|timing| {
+            timing
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.port == "CE" && endpoint.delay_ps > endpoint.budget_ps)
+        })
+        .map(|timing| timing.driver.as_str())
+        .collect::<HashSet<_>>();
+    let mut groups = BTreeMap::<String, Vec<(String, u32, [Bit; 4], u16)>>::new();
+    for cell in &netlist.cells {
+        let Ecp5Cell::Lut4 {
+            name,
+            inputs,
+            output,
+            init,
+        } = cell
+        else {
+            continue;
+        };
+        let Some(replica) = name.strip_prefix("replicate_enable_") else {
+            continue;
+        };
+        let Some((origin, replica_index)) = replica.rsplit_once('_') else {
+            continue;
+        };
+        if replica_index.parse::<usize>().is_err() {
+            continue;
+        }
+        groups
+            .entry(origin.to_owned())
+            .or_default()
+            .push((name.clone(), *output, *inputs, *init));
+    }
+
+    let mut rewires = 0usize;
+    for (origin, replicas) in groups {
+        let Some(Ecp5Cell::Lut4 {
+            inputs: origin_inputs,
+            output: origin_output,
+            init: origin_init,
+            ..
+        }) = netlist
+            .cells
+            .iter()
+            .find(|cell| mapped_cell_name(cell) == origin)
+        else {
+            continue;
+        };
+        if replicas.len() != 1 {
+            continue;
+        }
+        let (replica_name, replica_output, replica_inputs, replica_init) = &replicas[0];
+        if replica_inputs != origin_inputs || replica_init != origin_init {
+            continue;
+        }
+        if !timed_enable_drivers.contains(origin.as_str())
+            && !timed_enable_drivers.contains(replica_name.as_str())
+        {
+            continue;
+        }
+        let outputs = [*origin_output, *replica_output];
+        let mut sinks = netlist
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                let Ecp5Cell::FlipFlop {
+                    name,
+                    enable: Some(enable),
+                    ..
+                } = cell
+                else {
+                    return None;
+                };
+                let Bit::Wire(wire) = enable.signal else {
+                    return None;
+                };
+                outputs.contains(&wire).then(|| {
+                    feedback
+                        .location(name)
+                        .map(|location| (index, name.clone(), wire, location))
+                })?
+            })
+            .collect::<Vec<_>>();
+        let total_sinks = netlist
+            .cells
+            .iter()
+            .filter(|cell| {
+                matches!(cell, Ecp5Cell::FlipFlop { enable: Some(enable), .. }
+                    if matches!(enable.signal, Bit::Wire(wire) if outputs.contains(&wire)))
+            })
+            .count();
+        if sinks.len() != total_sinks || sinks.len() < 2 {
+            continue;
+        }
+        let (min_x, max_x, min_y, max_y) = sinks.iter().fold(
+            (i32::MAX, i32::MIN, i32::MAX, i32::MIN),
+            |(min_x, max_x, min_y, max_y), (_, _, _, location)| {
+                (
+                    min_x.min(location.x),
+                    max_x.max(location.x),
+                    min_y.min(location.y),
+                    max_y.max(location.y),
+                )
+            },
+        );
+        let split_x = max_x - min_x >= max_y - min_y;
+        sinks.sort_by_key(|(_, name, _, location)| {
+            if split_x {
+                (location.x, location.y, name.clone())
+            } else {
+                (location.y, location.x, name.clone())
+            }
+        });
+        let split = sinks.len() / 2;
+        let (first, second) = sinks.split_at(split);
+        let assignments = match (feedback.location(&origin), feedback.location(replica_name)) {
+            (Some(origin_location), Some(replica_location))
+                if cluster_distance(first, origin_location)
+                    + cluster_distance(second, replica_location)
+                    > cluster_distance(first, replica_location)
+                        + cluster_distance(second, origin_location) =>
+            {
+                [outputs[1], outputs[0]]
+            }
+            _ => outputs,
+        };
+        for (&output, cluster) in assignments.iter().zip([first, second]) {
+            for &(index, _, previous, _) in cluster {
+                if previous == output {
+                    continue;
+                }
+                let Ecp5Cell::FlipFlop {
+                    enable: Some(enable),
+                    ..
+                } = &mut netlist.cells[index]
+                else {
+                    unreachable!("sink indices were collected from enabled flip-flops")
+                };
+                enable.signal = Bit::Wire(output);
+                rewires += 1;
+            }
+        }
+    }
+    rewires
+}
+
+fn replicate_physically_critical_luts(
+    netlist: &mut Ecp5Netlist,
+    feedback: &PhysicalFeedback,
+) -> (usize, usize) {
+    const MAX_PHYSICAL_REPLICAS: usize = 16;
+    const MAX_REPLICATED_NET_FANOUT: usize = 16;
+
+    let mut next_wire = maximum_mapped_wire(netlist)
+        .and_then(|wire| wire.checked_add(1))
+        .unwrap_or(1);
+    let mut replicas = 0usize;
+    let mut rewires = 0usize;
+    for timing in feedback.net_timings() {
+        if replicas >= MAX_PHYSICAL_REPLICAS {
+            break;
+        }
+        let violating_sinks = timing
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.delay_ps > endpoint.budget_ps
+                    && !matches!(endpoint.port.as_str(), "CLK" | "LSR" | "CE")
+            })
+            .map(|endpoint| endpoint.cell.as_str())
+            .collect::<HashSet<_>>();
+        let eligible_sinks = timing
+            .endpoints
+            .iter()
+            .filter(|endpoint| !matches!(endpoint.port.as_str(), "CLK" | "LSR" | "CE"))
+            .map(|endpoint| endpoint.cell.as_str())
+            .collect::<HashSet<_>>();
+        if violating_sinks.is_empty()
+            || violating_sinks.len() >= eligible_sinks.len()
+            || eligible_sinks.len() > MAX_REPLICATED_NET_FANOUT
+        {
+            continue;
+        }
+        let Some((inputs, output, init)) = netlist.cells.iter().find_map(|cell| match cell {
+            Ecp5Cell::Lut4 {
+                name,
+                inputs,
+                output,
+                init,
+            } if name == &timing.driver => Some((*inputs, *output, *init)),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let clone_output = next_wire;
+        let Some(allocated) = next_wire.checked_add(1) else {
+            break;
+        };
+        next_wire = allocated;
+        let mut clone_rewires = 0usize;
+        for cell in &mut netlist.cells {
+            if violating_sinks.contains(mapped_cell_name(cell)) {
+                clone_rewires += replace_wire_in_cell_inputs(cell, output, clone_output);
+            }
+        }
+        if clone_rewires == 0 || mapped_wire_fanout(netlist, output) == 0 {
+            for cell in &mut netlist.cells {
+                replace_wire_in_cell_inputs(cell, clone_output, output);
+            }
+            continue;
+        }
+        netlist.cells.push(Ecp5Cell::Lut4 {
+            name: format!("physical_replicate_{}_{replicas}", timing.driver),
+            inputs,
+            output: clone_output,
+            init,
+        });
+        replicas += 1;
+        rewires += clone_rewires;
+    }
+    (replicas, rewires)
+}
+
+fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize {
+    let mut replacements = 0usize;
+    let mut replace = |bit: &mut Bit| {
+        if *bit == Bit::Wire(from) {
+            *bit = Bit::Wire(to);
+            replacements += 1;
+        }
+    };
+    match cell {
+        Ecp5Cell::Lut4 { inputs, .. } => {
+            for input in inputs {
+                replace(input);
+            }
+        }
+        Ecp5Cell::Ccu2c {
+            inputs, carry_in, ..
+        } => {
+            for input in inputs.iter_mut().flatten() {
+                replace(input);
+            }
+            replace(carry_in);
+        }
+        Ecp5Cell::FlipFlop {
+            data,
+            clock,
+            enable,
+            reset,
+            ..
+        } => {
+            replace(data);
+            replace(clock);
+            if let Some(enable) = enable {
+                replace(&mut enable.signal);
+            }
+            if let Some(reset) = reset {
+                replace(&mut reset.signal);
+            }
+        }
+        Ecp5Cell::BlockRam {
+            write_address,
+            write_data,
+            write_enable,
+            read_address,
+            read_enable,
+            clock,
+            ..
+        } => {
+            for bit in write_address
+                .iter_mut()
+                .chain(write_data)
+                .chain(read_address.iter_mut())
+            {
+                replace(bit);
+            }
+            replace(&mut write_enable.signal);
+            if let Some(read_enable) = read_enable {
+                replace(&mut read_enable.signal);
+            }
+            replace(clock);
+        }
+    }
+    replacements
+}
+
+fn cluster_distance(
+    cluster: &[(usize, String, u32, PhysicalLocation)],
+    driver: PhysicalLocation,
+) -> i64 {
+    cluster
+        .iter()
+        .map(|(_, _, _, sink)| {
+            i64::from((sink.x - driver.x).abs()) + i64::from((sink.y - driver.y).abs())
+        })
+        .sum()
 }
 
 fn register_data_is_driven_by_ccu(netlist: &Ecp5Netlist, register_index: usize) -> bool {
@@ -2565,6 +2946,7 @@ fn map_once(
                 certified_primitive_moves: 0,
                 equivalent_register_merges: 0,
                 equivalent_logic_replications: 0,
+                equivalent_physical_rewires: 0,
                 unobservable_cells_removed: 0,
                 equivalence_signed_off: true,
             },
@@ -2572,6 +2954,7 @@ fn map_once(
                 valid: true,
                 ..MappedEquivalenceProof::default()
             },
+            placement_hints: BTreeMap::new(),
         },
         quality,
     ))
@@ -3014,7 +3397,19 @@ impl From<&Ecp5Netlist> for JsonDesign {
                 )
             })
             .collect();
-        let cells = netlist.cells.iter().map(json_cell).collect();
+        let mut cells = netlist
+            .cells
+            .iter()
+            .map(json_cell)
+            .collect::<BTreeMap<_, _>>();
+        for (name, bel) in &netlist.placement_hints {
+            let Some(cell) = cells.get_mut(name) else {
+                continue;
+            };
+            cell.attributes.insert("NEXTPNR_BEL".into(), bel.clone());
+            cell.attributes
+                .insert("BEL_STRENGTH".into(), format!("{:032b}", 1));
+        }
         Self {
             creator: "Struo",
             modules: [(
@@ -3402,6 +3797,7 @@ mod tests {
         map_to_ecp5_with_options, mapped_wire_fanout, merge_equivalent_flip_flops,
         replicate_high_fanout_enable_luts, verify_mapped_equivalence_proof,
     };
+    use crate::PhysicalFeedback;
 
     fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
         let mut source = Netlist::new("arithmetic");
@@ -3537,6 +3933,88 @@ mod tests {
             };
             mapped_wire_fanout(&replicated, wire) <= 5
         }));
+    }
+
+    #[test]
+    fn physical_feedback_replicates_only_the_violating_lut_branch() {
+        let mut source = Netlist::new("physical_feedback");
+        let clock = source.add_input("clock");
+        let lhs = source.add_input("lhs");
+        let rhs = source.add_input("rhs");
+        let data = source.add_and(lhs, rhs);
+        for index in 0..2 {
+            let name = format!("value{index}");
+            let output = source.add_register_output(&name);
+            source.add_register(RegisterCell::new(
+                name.clone(),
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                None,
+                None,
+            ));
+            source.add_output(format!("output{index}"), output);
+        }
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (driver, output) = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::Lut4 { name, output, .. }
+                    if mapped_wire_fanout(&mapped, *output) == 2 =>
+                {
+                    Some((name.clone(), *output))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let sinks = mapped
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                Ecp5Cell::FlipFlop {
+                    name,
+                    data: Bit::Wire(wire),
+                    ..
+                } if *wire == output => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let report = format!(
+            r#"{{"fmax":{{"clock":{{"achieved":319.0,"constraint":320.0}}}},"detailed_net_timings":[{{"driver":"{driver}","net":"critical","endpoints":[{{"cell":"{}","port":"DI","delay":4.0,"budget":3.0}},{{"cell":"{}","port":"DI","delay":2.0,"budget":3.0}}]}}]}}"#,
+            sinks[0], sinks[1]
+        );
+        let placed = format!(
+            r#"{{"modules":{{"physical_feedback":{{"cells":{{"{driver}":{{"attributes":{{"NEXTPNR_BEL":"X1/Y1/SLICEA.K0"}}}},"{}":{{"attributes":{{"NEXTPNR_BEL":"X8/Y8/SLICEA.FF0"}}}},"{}":{{"attributes":{{"NEXTPNR_BEL":"X2/Y2/SLICEA.FF1"}}}}}}}}}}}}"#,
+            sinks[0], sinks[1]
+        );
+        let feedback = PhysicalFeedback::from_nextpnr_json(&report, &placed).unwrap();
+
+        let refined = mapped.apply_physical_feedback(&feedback);
+
+        assert_eq!(refined.cells.len(), mapped.cells.len() + 1);
+        assert_eq!(refined.retiming.equivalent_physical_rewires, 1);
+        assert_eq!(
+            refined.retiming.equivalent_logic_replications,
+            mapped.retiming.equivalent_logic_replications + 1
+        );
+        assert!(refined.retiming.equivalence_signed_off);
+        let json = refined.to_nextpnr_json().unwrap();
+        assert!(json.contains("physical_replicate_"));
+        assert!(json.contains("NEXTPNR_BEL"));
+
+        let far_from_closure =
+            PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "300.0"), &placed)
+                .unwrap();
+        assert_eq!(mapped.apply_physical_feedback(&far_from_closure), mapped);
+
+        let incompatible = PhysicalFeedback::from_nextpnr_json(
+            &report,
+            &placed.replace("SLICEA.K0", "SLICEA.FF0"),
+        )
+        .unwrap();
+        assert_eq!(mapped.apply_physical_feedback(&incompatible), mapped);
     }
 
     #[test]
