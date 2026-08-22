@@ -177,16 +177,18 @@ completes to preserve AXI ordering. The simulation tests exercise reverse-order
 B/R completion, full-slot backpressure, QoS contention, legal WRAP traffic, and
 local error completion through both the reference and post-map paths.
 
-On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seed 1, and a 250 MHz constraint,
-the routed self-test reaches 263.50 MHz and passes timing; seeds 1 through 3 all
-pass, ranging from 263.44 to 269.11 MHz. Before the registered crossbar
-boundaries it reached 68.77 MHz under the same constraint. The timing
-tradeoff is additional address/control latency and higher utilization: the
-routed design uses 2,148 `TRELLIS_COMB` sites and 1,411 `TRELLIS_FF` sites,
-versus 1,705 and 477 respectively. Address decode admits one request at a time
-per address channel and initiator, while W and R data still stream at one beat
-per cycle; place and route should be repeated for a production top, floorplan,
-and seed.
+On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seeds 1 through 10, and a 250 MHz
+constraint, the routed self-test averages 269.11 MHz and passes timing in 9 of
+10 seeds, with a 243.66--290.44 MHz range. Register-enable inference converts
+1,090 self-hold muxes to dedicated FF clock enables and reduces the routed
+design from 2,148 to 1,133 `TRELLIS_COMB` sites while retaining 1,411
+`TRELLIS_FF` sites. Before enable inference, the same ten seeds averaged 268.81
+MHz, passed in 9 of 10 seeds, and ranged from 247.10 to 282.89 MHz. Before the
+registered crossbar boundaries it reached 68.77 MHz under the same constraint.
+The timing tradeoff is additional address/control latency. Address decode
+admits one request at a time per address channel and initiator, while W and R
+data still stream at one beat per cycle; place and route should be repeated for
+a production top, floorplan, and seed.
 
 `Axi4CrossbarSelfTest` instantiates the interface-based crossbar, an internal
 initiator, a target response model, and a result scoreboard. Its physical top
