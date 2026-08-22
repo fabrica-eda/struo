@@ -154,17 +154,19 @@ instead of being lowered to flip-flops silently.
 keeps the synthesizable crossbar in committed Veryl source. Its Rust harness
 invokes the Veryl analyzer and lowers AIR into Struo RTL. The
 two-initiator, two-target fabric uses a parameterized Veryl `Axi4Interface` and
-modports, forwards AXI4 burst metadata and IDs, buffers
-AW and W independently, streams W and R beats through backpressure, and uses
-QoS-first read/write arbitration with round-robin fairness for ties. A reusable
-parameterized decoder bank uses Veryl's parameter-bounded generate-for to
-elaborate one burst decoder per input directly in analyzer AIR; no template
-engine or generated HDL is involved. A parameterized QoS arbiter compares every
-request pair after elaboration and accepts a caller-provided tie-break order, so
-the same block supports round-robin policies beyond two inputs. Each decoder
-validates FIXED, INCR, and WRAP footprints, transfer width, FIXED and WRAP
-length rules, WRAP alignment, address overflow, target-window containment, and
-the AXI4 4 KiB rule. Invalid or unmapped bursts complete locally with `DECERR`.
+modports, forwards AXI4 burst metadata and IDs, buffers AW, W, and AR
+independently, streams W and R beats through backpressure, and uses QoS-first
+read/write arbitration with round-robin fairness for ties. Registered burst
+decode, arbitration, local read-error responses, and response-ID release break
+the former crossbar-wide combinational paths. A reusable parameterized decoder
+bank uses Veryl's parameter-bounded generate-for to elaborate one burst decoder
+per input directly in analyzer AIR; no template engine or generated HDL is
+involved. A parameterized QoS arbiter compares every request pair after
+elaboration and accepts a caller-provided tie-break order, so the same block
+supports round-robin policies beyond two inputs. Each decoder validates FIXED,
+INCR, and WRAP footprints, transfer width, FIXED and WRAP length rules, WRAP
+alignment, address overflow, target-window containment, and the AXI4 4 KiB
+rule. Invalid or unmapped bursts complete locally with `DECERR`.
 Tests
 take only the analyzed Veryl path through synthesis, ECP5 technology mapping,
 and Celox post-map simulation, with Celox's native Veryl frontend as the
@@ -174,6 +176,17 @@ to return out of order; a repeated ID is held until its earlier transaction
 completes to preserve AXI ordering. The simulation tests exercise reverse-order
 B/R completion, full-slot backpressure, QoS contention, legal WRAP traffic, and
 local error completion through both the reference and post-map paths.
+
+On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seed 1, and a 250 MHz constraint,
+the routed self-test reaches 263.50 MHz and passes timing; seeds 1 through 3 all
+pass, ranging from 263.44 to 269.11 MHz. Before the registered crossbar
+boundaries it reached 68.77 MHz under the same constraint. The timing
+tradeoff is additional address/control latency and higher utilization: the
+routed design uses 2,148 `TRELLIS_COMB` sites and 1,411 `TRELLIS_FF` sites,
+versus 1,705 and 477 respectively. Address decode admits one request at a time
+per address channel and initiator, while W and R data still stream at one beat
+per cycle; place and route should be repeated for a production top, floorplan,
+and seed.
 
 `Axi4CrossbarSelfTest` instantiates the interface-based crossbar, an internal
 initiator, a target response model, and a result scoreboard. Its physical top

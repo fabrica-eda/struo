@@ -206,6 +206,363 @@ module Axi4BurstDecoderBank::<PORTS: u32 = 2> (
     }
 }
 
+/// Four-cycle burst decoder with an output holding register.
+///
+/// Only one request is in flight per instance. This deliberately trades
+/// address-channel latency for a short, predictable ECP5 critical path while
+/// preserving the valid/ready contract when arbitration is backpressured.
+module Axi4BurstDecoderPipeline (
+    clk         : input  clock_posedge      ,
+    rst_n       : input  reset_async_low    ,
+    in_valid    : input  logic              ,
+    in_ready    : output logic              ,
+    addr        : input  logic          <16>,
+    len         : input  logic          <8> ,
+    size        : input  logic          <3> ,
+    burst       : input  logic          <2> ,
+    out_valid   : output logic              ,
+    out_ready   : input  logic              ,
+    target0     : output logic              ,
+    target1     : output logic              ,
+    decode_error: output logic              ,
+) {
+    var pre_valid            : logic    ;
+    var pre_addr             : logic<16>;
+    var pre_len              : logic<8> ;
+    var pre_burst            : logic<2> ;
+    var pre_size0            : logic    ;
+    var pre_size1            : logic    ;
+    var pre_size2            : logic    ;
+    var stage0_valid         : logic    ;
+    var stage0_addr          : logic<16>;
+    var stage0_burst         : logic<2> ;
+    var stage0_beat_mask     : logic<17>;
+    var stage0_burst_mask    : logic<17>;
+    var stage0_size_valid    : logic    ;
+    var stage0_fixed         : logic    ;
+    var stage0_increment     : logic    ;
+    var stage0_wrap          : logic    ;
+    var stage0_fixed_valid   : logic    ;
+    var stage0_wrap_lsb      : logic    ;
+    var stage0_wrap_order21  : logic    ;
+    var stage0_wrap_order32  : logic    ;
+    var stage0_wrap_aligned  : logic    ;
+    var stage1_valid         : logic    ;
+    var stage1_addr          : logic<16>;
+    var stage1_last_base     : logic<17>;
+    var stage1_last_mask     : logic<17>;
+    var stage1_protocol_valid: logic    ;
+    var stage2_valid         : logic    ;
+    var stage2_addr          : logic<16>;
+    var stage2_last_address  : logic<17>;
+    var stage2_protocol_valid: logic    ;
+    var input_beat_mask      : logic<17>;
+    var input_burst_mask     : logic<17>;
+    var input_size_valid     : logic    ;
+    var input_fixed_valid    : logic    ;
+    var input_wrap_aligned   : logic    ;
+    var stage0_aligned       : logic<17>;
+    var stage0_last_base     : logic<17>;
+    var stage0_last_mask     : logic<17>;
+    var stage1_last_address  : logic<17>;
+    var stage2_within_4k     : logic    ;
+
+    always_comb {
+        // For a 32-bit data bus, legal transfer sizes are one, two, or four
+        // bytes. Expanding len this way avoids a variable shifter and two
+        // cascaded adders in the first stage.
+        input_beat_mask     = 17'h00000;
+        input_beat_mask[0]  = pre_size1 || pre_size2;
+        input_beat_mask[1]  = pre_size2;
+        input_burst_mask    = 17'h00000;
+        input_burst_mask[0] = if pre_size0 ? pre_len[0] : 1'b1;
+        input_burst_mask[1] = if pre_size0 ? pre_len[1] : if pre_size1 ? pre_len[0] : 1'b1;
+        input_burst_mask[2] = if pre_size0 ? pre_len[2] : if pre_size1 ? pre_len[1] : pre_len[0];
+        input_burst_mask[3] = if pre_size0 ? pre_len[3] : if pre_size1 ? pre_len[2] : pre_len[1];
+        input_burst_mask[4] = if pre_size0 ? pre_len[4] : if pre_size1 ? pre_len[3] : pre_len[2];
+        input_burst_mask[5] = if pre_size0 ? pre_len[5] : if pre_size1 ? pre_len[4] : pre_len[3];
+        input_burst_mask[6] = if pre_size0 ? pre_len[6] : if pre_size1 ? pre_len[5] : pre_len[4];
+        input_burst_mask[7] = if pre_size0 ? pre_len[7] : if pre_size1 ? pre_len[6] : pre_len[5];
+        input_burst_mask[8] = if pre_size1 ? pre_len[7] : if pre_size2 ? pre_len[6] : 1'b0;
+        input_burst_mask[9] = if pre_size2 ? pre_len[7] : 1'b0;
+
+        input_size_valid   = pre_size0 || pre_size1 || pre_size2;
+        input_fixed_valid  = pre_len[7:4] == 4'b0000;
+        input_wrap_aligned = 1'b1;
+        if pre_size1 {
+            input_wrap_aligned = !pre_addr[0];
+        } else if pre_size2 {
+            input_wrap_aligned = pre_addr[1:0] == 2'b00;
+        } else if !pre_size0 {
+            input_wrap_aligned = 1'b0;
+        }
+
+        stage0_aligned = {1'b0, stage0_addr} & ~stage0_beat_mask;
+        case stage0_burst {
+            2'b00: {
+                stage0_last_base = stage0_aligned;
+                stage0_last_mask = stage0_beat_mask;
+            }
+            2'b01: {
+                stage0_last_base = stage0_aligned;
+                stage0_last_mask = stage0_burst_mask;
+            }
+            2'b10: {
+                stage0_last_base = {1'b0, stage0_addr} & ~stage0_burst_mask;
+                stage0_last_mask = stage0_burst_mask;
+            }
+            default: {
+                stage0_last_base = stage0_aligned;
+                stage0_last_mask = 17'b0;
+            }
+        }
+
+        stage1_last_address = stage1_last_base + stage1_last_mask;
+        stage2_within_4k    = !stage2_last_address[16] && (stage2_addr[15:12] == stage2_last_address[15:12]);
+        in_ready            = !pre_valid && !stage0_valid && !stage1_valid && !stage2_valid && !out_valid;
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            pre_valid = 1'b0;
+            pre_addr  = 16'b0;
+            pre_len   = 8'b0;
+            pre_burst = 2'b0;
+            pre_size0 = 1'b0;
+            pre_size1 = 1'b0;
+            pre_size2 = 1'b0;
+        } else {
+            if pre_valid {
+                pre_valid = 1'b0;
+            }
+            if in_valid && in_ready {
+                pre_valid = 1'b1;
+                pre_addr  = addr;
+                pre_len   = len;
+                pre_burst = burst;
+                pre_size0 = size == 3'd0;
+                pre_size1 = size == 3'd1;
+                pre_size2 = size == 3'd2;
+            }
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            stage0_valid        = 1'b0;
+            stage0_addr         = 16'b0;
+            stage0_burst        = 2'b0;
+            stage0_beat_mask    = 17'b0;
+            stage0_burst_mask   = 17'b0;
+            stage0_size_valid   = 1'b0;
+            stage0_fixed        = 1'b0;
+            stage0_increment    = 1'b0;
+            stage0_wrap         = 1'b0;
+            stage0_fixed_valid  = 1'b0;
+            stage0_wrap_lsb     = 1'b0;
+            stage0_wrap_order21 = 1'b0;
+            stage0_wrap_order32 = 1'b0;
+            stage0_wrap_aligned = 1'b0;
+        } else {
+            if stage0_valid {
+                stage0_valid = 1'b0;
+            }
+            if pre_valid {
+                stage0_valid        = 1'b1;
+                stage0_addr         = pre_addr;
+                stage0_burst        = pre_burst;
+                stage0_beat_mask    = input_beat_mask;
+                stage0_burst_mask   = input_burst_mask;
+                stage0_size_valid   = input_size_valid;
+                stage0_fixed        = pre_burst == 2'b00;
+                stage0_increment    = pre_burst == 2'b01;
+                stage0_wrap         = pre_burst == 2'b10;
+                stage0_fixed_valid  = input_fixed_valid;
+                stage0_wrap_lsb     = pre_len[0];
+                stage0_wrap_order21 = !pre_len[2] || pre_len[1];
+                stage0_wrap_order32 = !pre_len[3] || pre_len[2];
+                stage0_wrap_aligned = input_wrap_aligned;
+            }
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            stage1_valid          = 1'b0;
+            stage1_addr           = 16'b0;
+            stage1_last_base      = 17'b0;
+            stage1_last_mask      = 17'b0;
+            stage1_protocol_valid = 1'b0;
+        } else {
+            if stage1_valid {
+                stage1_valid = 1'b0;
+            }
+            if stage0_valid {
+                stage1_valid          = 1'b1;
+                stage1_addr           = stage0_addr;
+                stage1_last_base      = stage0_last_base;
+                stage1_last_mask      = stage0_last_mask;
+                stage1_protocol_valid = stage0_size_valid
+                    && ((stage0_fixed && stage0_fixed_valid) || stage0_increment
+                        || (stage0_wrap && stage0_fixed_valid && stage0_wrap_lsb && stage0_wrap_order21
+                            && stage0_wrap_order32 && stage0_wrap_aligned));
+            }
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            stage2_valid          = 1'b0;
+            stage2_addr           = 16'b0;
+            stage2_last_address   = 17'b0;
+            stage2_protocol_valid = 1'b0;
+        } else {
+            if stage2_valid {
+                stage2_valid = 1'b0;
+            }
+            if stage1_valid {
+                stage2_valid          = 1'b1;
+                stage2_addr           = stage1_addr;
+                stage2_last_address   = stage1_last_address;
+                stage2_protocol_valid = stage1_protocol_valid;
+            }
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            out_valid    = 1'b0;
+            target0      = 1'b0;
+            target1      = 1'b0;
+            decode_error = 1'b0;
+        } else {
+            if out_valid && out_ready {
+                out_valid = 1'b0;
+            }
+            if stage2_valid {
+                out_valid    = 1'b1;
+                target0      = stage2_protocol_valid && stage2_within_4k && (stage2_addr[15:14] == 2'b00)
+                    && (stage2_last_address[15:14] == 2'b00);
+                target1      = stage2_protocol_valid && stage2_within_4k && (stage2_addr[15:14] == 2'b10)
+                    && (stage2_last_address[15:14] == 2'b10);
+                decode_error = !(stage2_protocol_valid && stage2_within_4k
+                    && (((stage2_addr[15:14] == 2'b00) && (stage2_last_address[15:14] == 2'b00))
+                        || ((stage2_addr[15:14] == 2'b10) && (stage2_last_address[15:14] == 2'b10))));
+            }
+        }
+    }
+}
+
+/// Locally completes one rejected read burst with DECERR responses.
+module Axi4ReadDecodeErrorResponder (
+    clk           : input  clock_posedge     ,
+    rst_n         : input  reset_async_low   ,
+    start_valid   : input  logic             ,
+    start_ready   : output logic             ,
+    start_id      : input  logic          <4>,
+    start_len     : input  logic          <8>,
+    response_valid: output logic             ,
+    response_ready: input  logic             ,
+    response_id   : output logic          <4>,
+    response_last : output logic             ,
+) {
+    var issue    : logic   ;
+    var issue_id : logic<4>;
+    var issue_len: logic<8>;
+    var active   : logic   ;
+    var active_id: logic<4>;
+    var remaining: logic<8>;
+
+    always_comb {
+        start_ready    = !issue && !active;
+        response_valid = active;
+        response_id    = active_id;
+        response_last  = remaining == 8'h00;
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            issue     = 1'b0;
+            issue_id  = 4'b0;
+            issue_len = 8'b0;
+            active    = 1'b0;
+            active_id = 4'b0;
+            remaining = 8'b0;
+        } else {
+            if active {
+                if response_ready {
+                    if remaining == 8'h00 {
+                        active = 1'b0;
+                    } else {
+                        remaining = remaining - 8'h01;
+                    }
+                }
+            } else if issue {
+                issue     = 1'b0;
+                active    = 1'b1;
+                active_id = issue_id;
+                remaining = issue_len;
+            } else if start_valid && start_ready {
+                issue     = 1'b1;
+                issue_id  = start_id;
+                issue_len = start_len;
+            }
+        }
+    }
+}
+
+/// Pipelines response-ID matching before outstanding slots are released.
+module Axi4IdReleasePipeline (
+    clk          : input  clock_posedge     ,
+    rst_n        : input  reset_async_low   ,
+    release_valid: input  logic             ,
+    release_id   : input  logic          <4>,
+    slot0_valid  : input  logic             ,
+    slot0_id     : input  logic          <4>,
+    slot1_valid  : input  logic             ,
+    slot1_id     : input  logic          <4>,
+    match        : output logic          <2>,
+) {
+    var captured_valid      : logic   ;
+    var captured_id         : logic<4>;
+    var captured_slot0_valid: logic   ;
+    var captured_slot0_id   : logic<4>;
+    var captured_slot1_valid: logic   ;
+    var captured_slot1_id   : logic<4>;
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            captured_valid       = 1'b0;
+            captured_id          = 4'b0;
+            captured_slot0_valid = 1'b0;
+            captured_slot0_id    = 4'b0;
+            captured_slot1_valid = 1'b0;
+            captured_slot1_id    = 4'b0;
+        } else {
+            captured_valid = release_valid;
+            if release_valid {
+                captured_id          = release_id;
+                captured_slot0_valid = slot0_valid;
+                captured_slot0_id    = slot0_id;
+                captured_slot1_valid = slot1_valid;
+                captured_slot1_id    = slot1_id;
+            }
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            match = 2'b0;
+        } else {
+            match = 2'b0;
+            if captured_valid {
+                match[0] = captured_slot0_valid && (captured_slot0_id == captured_id);
+                match[1] = captured_slot1_valid && (captured_slot1_id == captured_id);
+            }
+        }
+    }
+}
+
 /// Selects the highest-QoS request from a statically sized input set.
 ///
 /// `tie_break[challenger * PORTS + candidate]` is asserted when the
@@ -229,6 +586,37 @@ module Axi4QosArbiter::<PORTS: u32 = 2> (
                         grant[candidate] = 1'b0;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Registers an arbitration decision before it updates crossbar ownership.
+module Axi4QosArbiterRegister (
+    clk      : input  clock_posedge     ,
+    rst_n    : input  reset_async_low   ,
+    request  : input  logic          <2>,
+    qos      : input  logic          <8>,
+    tie_break: input  logic          <4>,
+    grant    : output logic          <2>,
+) {
+    var next_grant: logic<2>;
+
+    inst arbiter: Axi4QosArbiter::<2> (
+        request  : request   ,
+        qos      : qos       ,
+        tie_break: tie_break ,
+        grant    : next_grant,
+    );
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            grant = 2'b00;
+        } else {
+            if grant != 2'b00 {
+                grant = 2'b00;
+            } else {
+                grant = next_grant;
             }
         }
     }
@@ -263,30 +651,36 @@ module Axi4Crossbar2x2 (
     m0   : modport Axi4Interface::<16, 32, 5>::initiator,
     m1   : modport Axi4Interface::<16, 32, 5>::initiator,
 ) {
-    var s0_aw_full       : logic    ;
-    var s0_aw_payload    : logic<49>;
-    var s0_w_full        : logic    ;
-    var s0_w_payload     : logic<37>;
-    var s0_w_busy        : logic    ;
-    var s0_w_error_active: logic    ;
-    var s0_w_error_valid : logic    ;
-    var s0_w_error_id    : logic<4> ;
-    var s0_w_slot0_valid : logic    ;
-    var s0_w_slot0_id    : logic<4> ;
-    var s0_w_slot1_valid : logic    ;
-    var s0_w_slot1_id    : logic<4> ;
-    var s1_aw_full       : logic    ;
-    var s1_aw_payload    : logic<49>;
-    var s1_w_full        : logic    ;
-    var s1_w_payload     : logic<37>;
-    var s1_w_busy        : logic    ;
-    var s1_w_error_active: logic    ;
-    var s1_w_error_valid : logic    ;
-    var s1_w_error_id    : logic<4> ;
-    var s1_w_slot0_valid : logic    ;
-    var s1_w_slot0_id    : logic<4> ;
-    var s1_w_slot1_valid : logic    ;
-    var s1_w_slot1_id    : logic<4> ;
+    var s0_aw_full        : logic    ;
+    var s0_aw_payload     : logic<49>;
+    var s0_aw_decode_valid: logic    ;
+    var s0_aw_decode_ready: logic    ;
+    var s0_w_full         : logic    ;
+    var s0_w_payload      : logic<37>;
+    var s0_w_busy         : logic    ;
+    var s0_w_error_active : logic    ;
+    var s0_w_error_valid  : logic    ;
+    var s0_w_error_id     : logic<4> ;
+    var s0_w_slot0_valid  : logic    ;
+    var s0_w_slot0_id     : logic<4> ;
+    var s0_w_slot1_valid  : logic    ;
+    var s0_w_slot1_id     : logic<4> ;
+    var s0_w_release_match: logic<2> ;
+    var s1_aw_full        : logic    ;
+    var s1_aw_payload     : logic<49>;
+    var s1_aw_decode_valid: logic    ;
+    var s1_aw_decode_ready: logic    ;
+    var s1_w_full         : logic    ;
+    var s1_w_payload      : logic<37>;
+    var s1_w_busy         : logic    ;
+    var s1_w_error_active : logic    ;
+    var s1_w_error_valid  : logic    ;
+    var s1_w_error_id     : logic<4> ;
+    var s1_w_slot0_valid  : logic    ;
+    var s1_w_slot0_id     : logic<4> ;
+    var s1_w_slot1_valid  : logic    ;
+    var s1_w_slot1_id     : logic<4> ;
+    var s1_w_release_match: logic<2> ;
 
     var wm0_active    : logic    ;
     var wm0_owner     : logic    ;
@@ -301,20 +695,32 @@ module Axi4Crossbar2x2 (
     var wm1_aw_payload: logic<49>;
     var wm1_rr        : logic    ;
 
-    var s0_r_error_valid    : logic   ;
-    var s0_r_error_id       : logic<4>;
-    var s0_r_error_remaining: logic<8>;
-    var s0_r_slot0_valid    : logic   ;
-    var s0_r_slot0_id       : logic<4>;
-    var s0_r_slot1_valid    : logic   ;
-    var s0_r_slot1_id       : logic<4>;
-    var s1_r_error_valid    : logic   ;
-    var s1_r_error_id       : logic<4>;
-    var s1_r_error_remaining: logic<8>;
-    var s1_r_slot0_valid    : logic   ;
-    var s1_r_slot0_id       : logic<4>;
-    var s1_r_slot1_valid    : logic   ;
-    var s1_r_slot1_id       : logic<4>;
+    var s0_r_error_valid  : logic    ;
+    var s0_r_error_ready  : logic    ;
+    var s0_r_error_id     : logic<4> ;
+    var s0_r_error_last   : logic    ;
+    var s0_r_slot0_valid  : logic    ;
+    var s0_r_slot0_id     : logic<4> ;
+    var s0_r_slot1_valid  : logic    ;
+    var s0_r_slot1_id     : logic<4> ;
+    var s0_r_release_match: logic<2> ;
+    var s0_ar_full        : logic    ;
+    var s0_ar_payload     : logic<49>;
+    var s0_ar_decode_valid: logic    ;
+    var s0_ar_decode_ready: logic    ;
+    var s1_r_error_valid  : logic    ;
+    var s1_r_error_ready  : logic    ;
+    var s1_r_error_id     : logic<4> ;
+    var s1_r_error_last   : logic    ;
+    var s1_r_slot0_valid  : logic    ;
+    var s1_r_slot0_id     : logic<4> ;
+    var s1_r_slot1_valid  : logic    ;
+    var s1_r_slot1_id     : logic<4> ;
+    var s1_r_release_match: logic<2> ;
+    var s1_ar_full        : logic    ;
+    var s1_ar_payload     : logic<49>;
+    var s1_ar_decode_valid: logic    ;
+    var s1_ar_decode_ready: logic    ;
 
     var rm0_active    : logic    ;
     var rm0_owner     : logic    ;
@@ -357,30 +763,28 @@ module Axi4Crossbar2x2 (
     var s1_b_from_m0   : logic;
     var s1_b_from_m1   : logic;
 
-    var rg00              : logic;
-    var rg01              : logic;
-    var rg10              : logic;
-    var rg11              : logic;
-    var rr00              : logic;
-    var rr01              : logic;
-    var rr10              : logic;
-    var rr11              : logic;
-    var r_accept0         : logic;
-    var r_accept1         : logic;
-    var r_error_accept0   : logic;
-    var r_error_accept1   : logic;
-    var r_error_handshake0: logic;
-    var r_error_handshake1: logic;
-    var rm0_ar_handshake  : logic;
-    var rm1_ar_handshake  : logic;
-    var s0_r_can_accept   : logic;
-    var s1_r_can_accept   : logic;
-    var s0_r_id_busy      : logic;
-    var s1_r_id_busy      : logic;
-    var s0_r_from_m0      : logic;
-    var s0_r_from_m1      : logic;
-    var s1_r_from_m0      : logic;
-    var s1_r_from_m1      : logic;
+    var rg00            : logic;
+    var rg01            : logic;
+    var rg10            : logic;
+    var rg11            : logic;
+    var rr00            : logic;
+    var rr01            : logic;
+    var rr10            : logic;
+    var rr11            : logic;
+    var r_accept0       : logic;
+    var r_accept1       : logic;
+    var r_error_accept0 : logic;
+    var r_error_accept1 : logic;
+    var rm0_ar_handshake: logic;
+    var rm1_ar_handshake: logic;
+    var s0_r_can_accept : logic;
+    var s1_r_can_accept : logic;
+    var s0_r_id_busy    : logic;
+    var s1_r_id_busy    : logic;
+    var s0_r_from_m0    : logic;
+    var s0_r_from_m1    : logic;
+    var s1_r_from_m0    : logic;
+    var s1_r_from_m1    : logic;
 
     var s0_aw_target0     : logic;
     var s0_aw_target1     : logic;
@@ -395,46 +799,164 @@ module Axi4Crossbar2x2 (
     var s1_ar_target1     : logic;
     var s1_ar_decode_error: logic;
 
-    inst aw_decoders: Axi4BurstDecoderBank::<2> (
-        addr        : {s1_aw_payload[44:29], s0_aw_payload[44:29]},
-        len         : {s1_aw_payload[28:21], s0_aw_payload[28:21]},
-        size        : {s1_aw_payload[20:18], s0_aw_payload[20:18]},
-        burst       : {s1_aw_payload[17:16], s0_aw_payload[17:16]},
-        target0     : {s1_aw_target0, s0_aw_target0},
-        target1     : {s1_aw_target1, s0_aw_target1},
-        decode_error: {s1_aw_decode_error, s0_aw_decode_error},
+    inst s0_aw_decoder: Axi4BurstDecoderPipeline (
+        clk         : clk                 ,
+        rst_n       : rst_n               ,
+        in_valid    : s0_aw_full          ,
+        in_ready    : s0_aw_decode_ready  ,
+        addr        : s0_aw_payload[44:29],
+        len         : s0_aw_payload[28:21],
+        size        : s0_aw_payload[20:18],
+        burst       : s0_aw_payload[17:16],
+        out_valid   : s0_aw_decode_valid  ,
+        out_ready   : w_dispatch0         ,
+        target0     : s0_aw_target0       ,
+        target1     : s0_aw_target1       ,
+        decode_error: s0_aw_decode_error  ,
     );
-    inst ar_decoders: Axi4BurstDecoderBank::<2> (
-        addr        : {s1.araddr, s0.araddr},
-        len         : {s1.arlen, s0.arlen},
-        size        : {s1.arsize, s0.arsize},
-        burst       : {s1.arburst, s0.arburst},
-        target0     : {s1_ar_target0, s0_ar_target0},
-        target1     : {s1_ar_target1, s0_ar_target1},
-        decode_error: {s1_ar_decode_error, s0_ar_decode_error},
+    inst s1_aw_decoder: Axi4BurstDecoderPipeline (
+        clk         : clk                 ,
+        rst_n       : rst_n               ,
+        in_valid    : s1_aw_full          ,
+        in_ready    : s1_aw_decode_ready  ,
+        addr        : s1_aw_payload[44:29],
+        len         : s1_aw_payload[28:21],
+        size        : s1_aw_payload[20:18],
+        burst       : s1_aw_payload[17:16],
+        out_valid   : s1_aw_decode_valid  ,
+        out_ready   : w_dispatch1         ,
+        target0     : s1_aw_target0       ,
+        target1     : s1_aw_target1       ,
+        decode_error: s1_aw_decode_error  ,
+    );
+    inst s0_ar_decoder: Axi4BurstDecoderPipeline (
+        clk         : clk                 ,
+        rst_n       : rst_n               ,
+        in_valid    : s0_ar_full          ,
+        in_ready    : s0_ar_decode_ready  ,
+        addr        : s0_ar_payload[44:29],
+        len         : s0_ar_payload[28:21],
+        size        : s0_ar_payload[20:18],
+        burst       : s0_ar_payload[17:16],
+        out_valid   : s0_ar_decode_valid  ,
+        out_ready   : r_accept0           ,
+        target0     : s0_ar_target0       ,
+        target1     : s0_ar_target1       ,
+        decode_error: s0_ar_decode_error  ,
+    );
+    inst s1_ar_decoder: Axi4BurstDecoderPipeline (
+        clk         : clk                 ,
+        rst_n       : rst_n               ,
+        in_valid    : s1_ar_full          ,
+        in_ready    : s1_ar_decode_ready  ,
+        addr        : s1_ar_payload[44:29],
+        len         : s1_ar_payload[28:21],
+        size        : s1_ar_payload[20:18],
+        burst       : s1_ar_payload[17:16],
+        out_valid   : s1_ar_decode_valid  ,
+        out_ready   : r_accept1           ,
+        target0     : s1_ar_target0       ,
+        target1     : s1_ar_target1       ,
+        decode_error: s1_ar_decode_error  ,
+    );
+    inst s0_r_error_responder: Axi4ReadDecodeErrorResponder (
+        clk           : clk                 ,
+        rst_n         : rst_n               ,
+        start_valid   : r_error_accept0     ,
+        start_ready   : s0_r_error_ready    ,
+        start_id      : s0_ar_payload[48:45],
+        start_len     : s0_ar_payload[28:21],
+        response_valid: s0_r_error_valid    ,
+        response_ready: s0.rready           ,
+        response_id   : s0_r_error_id       ,
+        response_last : s0_r_error_last     ,
+    );
+    inst s1_r_error_responder: Axi4ReadDecodeErrorResponder (
+        clk           : clk                 ,
+        rst_n         : rst_n               ,
+        start_valid   : r_error_accept1     ,
+        start_ready   : s1_r_error_ready    ,
+        start_id      : s1_ar_payload[48:45],
+        start_len     : s1_ar_payload[28:21],
+        response_valid: s1_r_error_valid    ,
+        response_ready: s1.rready           ,
+        response_id   : s1_r_error_id       ,
+        response_last : s1_r_error_last     ,
+    );
+    inst s0_w_releaser: Axi4IdReleasePipeline (
+        clk          : clk                   ,
+        rst_n        : rst_n                 ,
+        release_valid: s0.bvalid && s0.bready,
+        release_id   : s0.bid                ,
+        slot0_valid  : s0_w_slot0_valid      ,
+        slot0_id     : s0_w_slot0_id         ,
+        slot1_valid  : s0_w_slot1_valid      ,
+        slot1_id     : s0_w_slot1_id         ,
+        match        : s0_w_release_match    ,
+    );
+    inst s1_w_releaser: Axi4IdReleasePipeline (
+        clk          : clk                   ,
+        rst_n        : rst_n                 ,
+        release_valid: s1.bvalid && s1.bready,
+        release_id   : s1.bid                ,
+        slot0_valid  : s1_w_slot0_valid      ,
+        slot0_id     : s1_w_slot0_id         ,
+        slot1_valid  : s1_w_slot1_valid      ,
+        slot1_id     : s1_w_slot1_id         ,
+        match        : s1_w_release_match    ,
+    );
+    inst s0_r_releaser: Axi4IdReleasePipeline (
+        clk          : clk                               ,
+        rst_n        : rst_n                             ,
+        release_valid: s0.rvalid && s0.rready && s0.rlast,
+        release_id   : s0.rid                            ,
+        slot0_valid  : s0_r_slot0_valid                  ,
+        slot0_id     : s0_r_slot0_id                     ,
+        slot1_valid  : s0_r_slot1_valid                  ,
+        slot1_id     : s0_r_slot1_id                     ,
+        match        : s0_r_release_match                ,
+    );
+    inst s1_r_releaser: Axi4IdReleasePipeline (
+        clk          : clk                               ,
+        rst_n        : rst_n                             ,
+        release_valid: s1.rvalid && s1.rready && s1.rlast,
+        release_id   : s1.rid                            ,
+        slot0_valid  : s1_r_slot0_valid                  ,
+        slot0_id     : s1_r_slot0_id                     ,
+        slot1_valid  : s1_r_slot1_valid                  ,
+        slot1_id     : s1_r_slot1_id                     ,
+        match        : s1_r_release_match                ,
     );
 
-    inst wm0_arbiter: Axi4QosArbiter::<2> (
+    inst wm0_arbiter: Axi4QosArbiterRegister (
+        clk      : clk                                       ,
+        rst_n    : rst_n                                     ,
         request  : {!wm0_active && wr01, !wm0_active && wr00},
         qos      : {s1_aw_payload[7:4], s0_aw_payload[7:4]},
         tie_break: if wm0_rr ? 4'b0100 : 4'b0010,
         grant    : {wg01, wg00},
     );
-    inst wm1_arbiter: Axi4QosArbiter::<2> (
+    inst wm1_arbiter: Axi4QosArbiterRegister (
+        clk      : clk                                       ,
+        rst_n    : rst_n                                     ,
         request  : {!wm1_active && wr11, !wm1_active && wr10},
         qos      : {s1_aw_payload[7:4], s0_aw_payload[7:4]},
         tie_break: if wm1_rr ? 4'b0100 : 4'b0010,
         grant    : {wg11, wg10},
     );
-    inst rm0_arbiter: Axi4QosArbiter::<2> (
+    inst rm0_arbiter: Axi4QosArbiterRegister (
+        clk      : clk                                       ,
+        rst_n    : rst_n                                     ,
         request  : {!rm0_active && rr01, !rm0_active && rr00},
-        qos      : {s1.arqos, s0.arqos},
+        qos      : {s1_ar_payload[7:4], s0_ar_payload[7:4]},
         tie_break: if rm0_rr ? 4'b0100 : 4'b0010,
         grant    : {rg01, rg00},
     );
-    inst rm1_arbiter: Axi4QosArbiter::<2> (
+    inst rm1_arbiter: Axi4QosArbiterRegister (
+        clk      : clk                                       ,
+        rst_n    : rst_n                                     ,
         request  : {!rm1_active && rr11, !rm1_active && rr10},
-        qos      : {s1.arqos, s0.arqos},
+        qos      : {s1_ar_payload[7:4], s0_ar_payload[7:4]},
         tie_break: if rm1_rr ? 4'b0100 : 4'b0010,
         grant    : {rg11, rg10},
     );
@@ -452,14 +974,14 @@ module Axi4Crossbar2x2 (
 
         // A target owns a W stream only through the final W beat. B responses
         // are routed independently by the owner bit added to the downstream ID.
-        wr00           = s0_aw_full && s0_w_full && !s0_w_busy && s0_aw_target0;
-        wr01           = s1_aw_full && s1_w_full && !s1_w_busy && s1_aw_target0;
-        wr10           = s0_aw_full && s0_w_full && !s0_w_busy && s0_aw_target1;
-        wr11           = s1_aw_full && s1_w_full && !s1_w_busy && s1_aw_target1;
+        wr00           = s0_aw_full && s0_aw_decode_valid && s0_w_full && !s0_w_busy && s0_aw_target0;
+        wr01           = s1_aw_full && s1_aw_decode_valid && s1_w_full && !s1_w_busy && s1_aw_target0;
+        wr10           = s0_aw_full && s0_aw_decode_valid && s0_w_full && !s0_w_busy && s0_aw_target1;
+        wr11           = s1_aw_full && s1_aw_decode_valid && s1_w_full && !s1_w_busy && s1_aw_target1;
         w_error_grant0 = s0_aw_full && s0_w_full && !s0_w_busy && !s0_w_error_active && !s0_w_error_valid
-            && s0_aw_decode_error;
+            && s0_aw_decode_valid && s0_aw_decode_error;
         w_error_grant1 = s1_aw_full && s1_w_full && !s1_w_busy && !s1_w_error_active && !s1_w_error_valid
-            && s1_aw_decode_error;
+            && s1_aw_decode_valid && s1_aw_decode_error;
         w_dispatch0    = wg00 || wg10 || w_error_grant0;
         w_dispatch1    = wg01 || wg11 || w_error_grant1;
 
@@ -537,16 +1059,16 @@ module Axi4Crossbar2x2 (
             || (s1_r_slot1_valid && (s1_r_slot1_id == s1.arid));
         s0_r_can_accept = (!s0_r_slot0_valid || !s0_r_slot1_valid) && !s0_r_id_busy;
         s1_r_can_accept = (!s1_r_slot0_valid || !s1_r_slot1_valid) && !s1_r_id_busy;
-        rr00            = s0.arvalid && s0_r_can_accept && s0_ar_target0;
-        rr01            = s1.arvalid && s1_r_can_accept && s1_ar_target0;
-        rr10            = s0.arvalid && s0_r_can_accept && s0_ar_target1;
-        rr11            = s1.arvalid && s1_r_can_accept && s1_ar_target1;
-        r_error_accept0 = s0.arvalid && s0_r_can_accept && !s0_r_error_valid && s0_ar_decode_error;
-        r_error_accept1 = s1.arvalid && s1_r_can_accept && !s1_r_error_valid && s1_ar_decode_error;
+        s0.arready      = !s0_ar_full && s0_r_can_accept;
+        s1.arready      = !s1_ar_full && s1_r_can_accept;
+        rr00            = s0_ar_full && s0_ar_decode_valid && s0_ar_target0;
+        rr01            = s1_ar_full && s1_ar_decode_valid && s1_ar_target0;
+        rr10            = s0_ar_full && s0_ar_decode_valid && s0_ar_target1;
+        rr11            = s1_ar_full && s1_ar_decode_valid && s1_ar_target1;
+        r_error_accept0 = s0_ar_full && s0_ar_decode_valid && s0_r_error_ready && s0_ar_decode_error;
+        r_error_accept1 = s1_ar_full && s1_ar_decode_valid && s1_r_error_ready && s1_ar_decode_error;
         r_accept0       = rg00 || rg10 || r_error_accept0;
         r_accept1       = rg01 || rg11 || r_error_accept1;
-        s0.arready      = r_accept0;
-        s1.arready      = r_accept1;
 
         m0.arid          = {rm0_owner, rm0_ar_payload[48:45]};
         m0.araddr        = rm0_ar_payload[44:29];
@@ -574,104 +1096,80 @@ module Axi4Crossbar2x2 (
         m1.arvalid       = rm1_active;
         rm1_ar_handshake = m1.arvalid && m1.arready;
 
-        s0_r_from_m0       = m0.rvalid && !m0.rid[4];
-        s0_r_from_m1       = m1.rvalid && !m1.rid[4];
-        s1_r_from_m0       = m0.rvalid && m0.rid[4];
-        s1_r_from_m1       = m1.rvalid && m1.rid[4];
-        s0.rvalid          = s0_r_error_valid || s0_r_from_m0 || s0_r_from_m1;
-        s0.rid             = if s0_r_error_valid ? s0_r_error_id : if s0_r_from_m0 ? m0.rid[3:0] : m1.rid[3:0];
-        s0.rdata           = if s0_r_error_valid ? 32'h00000000 : if s0_r_from_m0 ? m0.rdata : m1.rdata;
-        s0.rresp           = if s0_r_error_valid ? 2'b11 : if s0_r_from_m0 ? m0.rresp : m1.rresp;
-        s0.rlast           = if s0_r_error_valid ?
-            (s0_r_error_remaining == 8'h00)
-        : if s0_r_from_m0 ?
-            m0.rlast
-        :
-            m1.rlast
-        ;
-        s1.rvalid          = s1_r_error_valid || s1_r_from_m0 || s1_r_from_m1;
-        s1.rid             = if s1_r_error_valid ? s1_r_error_id : if s1_r_from_m0 ? m0.rid[3:0] : m1.rid[3:0];
-        s1.rdata           = if s1_r_error_valid ? 32'h00000000 : if s1_r_from_m0 ? m0.rdata : m1.rdata;
-        s1.rresp           = if s1_r_error_valid ? 2'b11 : if s1_r_from_m0 ? m0.rresp : m1.rresp;
-        s1.rlast           = if s1_r_error_valid ?
-            (s1_r_error_remaining == 8'h00)
-        : if s1_r_from_m0 ?
-            m0.rlast
-        :
-            m1.rlast
-        ;
-        m0.rready          = m0.rvalid
+        s0_r_from_m0 = m0.rvalid && !m0.rid[4];
+        s0_r_from_m1 = m1.rvalid && !m1.rid[4];
+        s1_r_from_m0 = m0.rvalid && m0.rid[4];
+        s1_r_from_m1 = m1.rvalid && m1.rid[4];
+        s0.rvalid    = s0_r_error_valid || s0_r_from_m0 || s0_r_from_m1;
+        s0.rid       = if s0_r_error_valid ? s0_r_error_id : if s0_r_from_m0 ? m0.rid[3:0] : m1.rid[3:0];
+        s0.rdata     = if s0_r_error_valid ? 32'h00000000 : if s0_r_from_m0 ? m0.rdata : m1.rdata;
+        s0.rresp     = if s0_r_error_valid ? 2'b11 : if s0_r_from_m0 ? m0.rresp : m1.rresp;
+        s0.rlast     = if s0_r_error_valid ? s0_r_error_last : if s0_r_from_m0 ? m0.rlast : m1.rlast;
+        s1.rvalid    = s1_r_error_valid || s1_r_from_m0 || s1_r_from_m1;
+        s1.rid       = if s1_r_error_valid ? s1_r_error_id : if s1_r_from_m0 ? m0.rid[3:0] : m1.rid[3:0];
+        s1.rdata     = if s1_r_error_valid ? 32'h00000000 : if s1_r_from_m0 ? m0.rdata : m1.rdata;
+        s1.rresp     = if s1_r_error_valid ? 2'b11 : if s1_r_from_m0 ? m0.rresp : m1.rresp;
+        s1.rlast     = if s1_r_error_valid ? s1_r_error_last : if s1_r_from_m0 ? m0.rlast : m1.rlast;
+        m0.rready    = m0.rvalid
             && (if m0.rid[4] ? (!s1_r_error_valid && s1.rready) : (!s0_r_error_valid && s0.rready));
-        m1.rready          = m1.rvalid
+        m1.rready    = m1.rvalid
             && (if m1.rid[4] ?
                 (!s1_r_error_valid && !s1_r_from_m0 && s1.rready)
             :
                 (!s0_r_error_valid && !s0_r_from_m0 && s0.rready)
             );
-        r_error_handshake0 = s0_r_error_valid && s0.rready;
-        r_error_handshake1 = s1_r_error_valid && s1.rready;
     }
 
     always_ff (clk, rst_n) {
         if_reset {
-            s0_aw_full           = 1'b0;
-            s0_aw_payload        = 49'b0;
-            s0_w_full            = 1'b0;
-            s0_w_payload         = 37'b0;
-            s0_w_busy            = 1'b0;
-            s0_w_error_active    = 1'b0;
-            s0_w_error_valid     = 1'b0;
-            s0_w_error_id        = 4'b0;
-            s0_w_slot0_valid     = 1'b0;
-            s0_w_slot0_id        = 4'b0;
-            s0_w_slot1_valid     = 1'b0;
-            s0_w_slot1_id        = 4'b0;
-            s1_aw_full           = 1'b0;
-            s1_aw_payload        = 49'b0;
-            s1_w_full            = 1'b0;
-            s1_w_payload         = 37'b0;
-            s1_w_busy            = 1'b0;
-            s1_w_error_active    = 1'b0;
-            s1_w_error_valid     = 1'b0;
-            s1_w_error_id        = 4'b0;
-            s1_w_slot0_valid     = 1'b0;
-            s1_w_slot0_id        = 4'b0;
-            s1_w_slot1_valid     = 1'b0;
-            s1_w_slot1_id        = 4'b0;
-            wm0_active           = 1'b0;
-            wm0_owner            = 1'b0;
-            wm0_aw_sent          = 1'b0;
-            wm0_w_done           = 1'b0;
-            wm0_aw_payload       = 49'b0;
-            wm0_rr               = 1'b0;
-            wm1_active           = 1'b0;
-            wm1_owner            = 1'b0;
-            wm1_aw_sent          = 1'b0;
-            wm1_w_done           = 1'b0;
-            wm1_aw_payload       = 49'b0;
-            wm1_rr               = 1'b0;
-            s0_r_error_valid     = 1'b0;
-            s0_r_error_id        = 4'b0;
-            s0_r_error_remaining = 8'b0;
-            s0_r_slot0_valid     = 1'b0;
-            s0_r_slot0_id        = 4'b0;
-            s0_r_slot1_valid     = 1'b0;
-            s0_r_slot1_id        = 4'b0;
-            s1_r_error_valid     = 1'b0;
-            s1_r_error_id        = 4'b0;
-            s1_r_error_remaining = 8'b0;
-            s1_r_slot0_valid     = 1'b0;
-            s1_r_slot0_id        = 4'b0;
-            s1_r_slot1_valid     = 1'b0;
-            s1_r_slot1_id        = 4'b0;
-            rm0_active           = 1'b0;
-            rm0_owner            = 1'b0;
-            rm0_ar_payload       = 49'b0;
-            rm0_rr               = 1'b0;
-            rm1_active           = 1'b0;
-            rm1_owner            = 1'b0;
-            rm1_ar_payload       = 49'b0;
-            rm1_rr               = 1'b0;
+            s0_aw_full        = 1'b0;
+            s0_aw_payload     = 49'b0;
+            s0_w_full         = 1'b0;
+            s0_w_payload      = 37'b0;
+            s0_w_busy         = 1'b0;
+            s0_w_error_active = 1'b0;
+            s0_w_error_valid  = 1'b0;
+            s0_w_error_id     = 4'b0;
+            s0_w_slot0_valid  = 1'b0;
+            s0_w_slot0_id     = 4'b0;
+            s0_w_slot1_valid  = 1'b0;
+            s0_w_slot1_id     = 4'b0;
+            s1_aw_full        = 1'b0;
+            s1_aw_payload     = 49'b0;
+            s1_w_full         = 1'b0;
+            s1_w_payload      = 37'b0;
+            s1_w_busy         = 1'b0;
+            s1_w_error_active = 1'b0;
+            s1_w_error_valid  = 1'b0;
+            s1_w_error_id     = 4'b0;
+            s1_w_slot0_valid  = 1'b0;
+            s1_w_slot0_id     = 4'b0;
+            s1_w_slot1_valid  = 1'b0;
+            s1_w_slot1_id     = 4'b0;
+            wm0_active        = 1'b0;
+            wm0_owner         = 1'b0;
+            wm0_aw_sent       = 1'b0;
+            wm0_w_done        = 1'b0;
+            wm0_aw_payload    = 49'b0;
+            wm0_rr            = 1'b0;
+            wm1_active        = 1'b0;
+            wm1_owner         = 1'b0;
+            wm1_aw_sent       = 1'b0;
+            wm1_w_done        = 1'b0;
+            wm1_aw_payload    = 49'b0;
+            wm1_rr            = 1'b0;
+            s0_r_slot0_valid  = 1'b0;
+            s0_r_slot0_id     = 4'b0;
+            s0_r_slot1_valid  = 1'b0;
+            s0_r_slot1_id     = 4'b0;
+            s0_ar_full        = 1'b0;
+            s0_ar_payload     = 49'b0;
+            s1_r_slot0_valid  = 1'b0;
+            s1_r_slot0_id     = 4'b0;
+            s1_r_slot1_valid  = 1'b0;
+            s1_r_slot1_id     = 4'b0;
+            s1_ar_full        = 1'b0;
+            s1_ar_payload     = 49'b0;
         } else {
             if s0.awvalid && s0.awready {
                 s0_aw_full    = 1'b1;
@@ -724,23 +1222,23 @@ module Axi4Crossbar2x2 (
                 s1_aw_full = 1'b0;
                 s1_w_busy  = 1'b1;
             }
+            if s0_w_release_match[0] {
+                s0_w_slot0_valid = 1'b0;
+            }
+            if s0_w_release_match[1] {
+                s0_w_slot1_valid = 1'b0;
+            }
             if s0.bvalid && s0.bready {
                 s0_w_error_valid = 1'b0;
-                if s0_w_slot0_valid && (s0_w_slot0_id == s0.bid) {
-                    s0_w_slot0_valid = 1'b0;
-                }
-                if s0_w_slot1_valid && (s0_w_slot1_id == s0.bid) {
-                    s0_w_slot1_valid = 1'b0;
-                }
+            }
+            if s1_w_release_match[0] {
+                s1_w_slot0_valid = 1'b0;
+            }
+            if s1_w_release_match[1] {
+                s1_w_slot1_valid = 1'b0;
             }
             if s1.bvalid && s1.bready {
                 s1_w_error_valid = 1'b0;
-                if s1_w_slot0_valid && (s1_w_slot0_id == s1.bid) {
-                    s1_w_slot0_valid = 1'b0;
-                }
-                if s1_w_slot1_valid && (s1_w_slot1_id == s1.bid) {
-                    s1_w_slot1_valid = 1'b0;
-                }
             }
             if w_error_grant0 {
                 s0_w_error_active = 1'b1;
@@ -806,7 +1304,12 @@ module Axi4Crossbar2x2 (
                 }
             }
 
-            if r_accept0 {
+            if s0.arvalid && s0.arready {
+                s0_ar_full    = 1'b1;
+                s0_ar_payload = {
+                    s0.arid, s0.araddr, s0.arlen, s0.arsize, s0.arburst, s0.arlock, s0.arcache, s0.arprot, s0.arqos,
+                    s0.arregion
+                };
                 if !s0_r_slot0_valid {
                     s0_r_slot0_valid = 1'b1;
                     s0_r_slot0_id    = s0.arid;
@@ -815,7 +1318,12 @@ module Axi4Crossbar2x2 (
                     s0_r_slot1_id    = s0.arid;
                 }
             }
-            if r_accept1 {
+            if s1.arvalid && s1.arready {
+                s1_ar_full    = 1'b1;
+                s1_ar_payload = {
+                    s1.arid, s1.araddr, s1.arlen, s1.arsize, s1.arburst, s1.arlock, s1.arcache, s1.arprot, s1.arqos,
+                    s1.arregion
+                };
                 if !s1_r_slot0_valid {
                     s1_r_slot0_valid = 1'b1;
                     s1_r_slot0_id    = s1.arid;
@@ -824,55 +1332,42 @@ module Axi4Crossbar2x2 (
                     s1_r_slot1_id    = s1.arid;
                 }
             }
-            if s0.rvalid && s0.rready && s0.rlast {
-                if s0_r_slot0_valid && (s0_r_slot0_id == s0.rid) {
-                    s0_r_slot0_valid = 1'b0;
-                }
-                if s0_r_slot1_valid && (s0_r_slot1_id == s0.rid) {
-                    s0_r_slot1_valid = 1'b0;
-                }
+            if r_accept0 {
+                s0_ar_full = 1'b0;
             }
-            if s1.rvalid && s1.rready && s1.rlast {
-                if s1_r_slot0_valid && (s1_r_slot0_id == s1.rid) {
-                    s1_r_slot0_valid = 1'b0;
-                }
-                if s1_r_slot1_valid && (s1_r_slot1_id == s1.rid) {
-                    s1_r_slot1_valid = 1'b0;
-                }
+            if r_accept1 {
+                s1_ar_full = 1'b0;
             }
-            if r_error_accept0 {
-                s0_r_error_valid     = 1'b1;
-                s0_r_error_id        = s0.arid;
-                s0_r_error_remaining = s0.arlen;
+            if s0_r_release_match[0] {
+                s0_r_slot0_valid = 1'b0;
             }
-            if r_error_handshake0 {
-                if s0_r_error_remaining == 8'h00 {
-                    s0_r_error_valid = 1'b0;
-                } else {
-                    s0_r_error_remaining = s0_r_error_remaining - 8'h01;
-                }
+            if s0_r_release_match[1] {
+                s0_r_slot1_valid = 1'b0;
             }
-            if r_error_accept1 {
-                s1_r_error_valid     = 1'b1;
-                s1_r_error_id        = s1.arid;
-                s1_r_error_remaining = s1.arlen;
+            if s1_r_release_match[0] {
+                s1_r_slot0_valid = 1'b0;
             }
-            if r_error_handshake1 {
-                if s1_r_error_remaining == 8'h00 {
-                    s1_r_error_valid = 1'b0;
-                } else {
-                    s1_r_error_remaining = s1_r_error_remaining - 8'h01;
-                }
+            if s1_r_release_match[1] {
+                s1_r_slot1_valid = 1'b0;
             }
+        }
+    }
 
+    always_ff (clk, rst_n) {
+        if_reset {
+            rm0_active     = 1'b0;
+            rm0_owner      = 1'b0;
+            rm0_ar_payload = 49'b0;
+            rm0_rr         = 1'b0;
+            rm1_active     = 1'b0;
+            rm1_owner      = 1'b0;
+            rm1_ar_payload = 49'b0;
+            rm1_rr         = 1'b0;
+        } else {
             if rg00 || rg01 {
                 rm0_active     = 1'b1;
                 rm0_owner      = rg01;
-                rm0_ar_payload = if rg01 ?
-                    {s1.arid, s1.araddr, s1.arlen, s1.arsize, s1.arburst, s1.arlock, s1.arcache, s1.arprot, s1.arqos, s1.arregion}
-                :
-                    {s0.arid, s0.araddr, s0.arlen, s0.arsize, s0.arburst, s0.arlock, s0.arcache, s0.arprot, s0.arqos, s0.arregion}
-                ;
+                rm0_ar_payload = if rg01 ? s1_ar_payload : s0_ar_payload;
             }
             if rm0_ar_handshake {
                 rm0_active = 1'b0;
@@ -881,11 +1376,7 @@ module Axi4Crossbar2x2 (
             if rg10 || rg11 {
                 rm1_active     = 1'b1;
                 rm1_owner      = rg11;
-                rm1_ar_payload = if rg11 ?
-                    {s1.arid, s1.araddr, s1.arlen, s1.arsize, s1.arburst, s1.arlock, s1.arcache, s1.arprot, s1.arqos, s1.arregion}
-                :
-                    {s0.arid, s0.araddr, s0.arlen, s0.arsize, s0.arburst, s0.arlock, s0.arcache, s0.arprot, s0.arqos, s0.arregion}
-                ;
+                rm1_ar_payload = if rg11 ? s1_ar_payload : s0_ar_payload;
             }
             if rm1_ar_handshake {
                 rm1_active = 1'b0;
