@@ -6,8 +6,8 @@ use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU32;
 
 use struo_ir::{
-    ActiveLevel, ClockEdge as IrClockEdge, EnableControl, MemoryCell, NetId, Netlist, RegisterCell,
-    ResetControl, ValidationError,
+    ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, EnableControl, MemoryCell, NetId, Netlist,
+    RegisterCell, ResetControl, ValidationError,
 };
 use struo_rtl::{
     BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, Polarity, PortDirection, ResetMode,
@@ -34,9 +34,9 @@ pub struct SynthesisResult {
 
 /// Synthesizes the selected top module into a bit-level logic netlist.
 ///
-/// Construction performs constant folding and structural hashing. Arithmetic
-/// is bit-blasted into Boolean logic. Synchronous simple-dual-port memories are
-/// retained as memory cells for target-specific block-RAM mapping. Hierarchy
+/// Construction performs constant folding and structural hashing. Word-level
+/// addition and subtraction are retained for target-specific carry mapping.
+/// Synchronous simple-dual-port memories are retained for block-RAM mapping. Hierarchy
 /// and inout ports are rejected until their semantics have dedicated passes.
 ///
 /// # Errors
@@ -61,9 +61,10 @@ pub fn synthesize(design: &Design) -> Result<SynthesisResult, SynthesisError> {
     let reports = vec![PassReport {
         pass: "lower-rtl",
         message: format!(
-            "lowered {} expressions to {} Boolean nodes, {} registers, and {} memories",
+            "lowered {} expressions to {} nodes, {} arithmetic cells, {} registers, and {} memories",
             module.expressions().len(),
             lowering.netlist.nodes().len(),
+            lowering.netlist.arithmetic().len(),
             lowering.netlist.registers().len(),
             lowering.netlist.memories().len()
         ),
@@ -431,14 +432,14 @@ impl<'a> Lowering<'a> {
             BinaryOp::And => self.bitwise(lhs, rhs, Netlist::add_and),
             BinaryOp::Or => self.bitwise(lhs, rhs, Netlist::add_or),
             BinaryOp::Xor => self.bitwise(lhs, rhs, Netlist::add_xor),
-            BinaryOp::Add => self.add_words(lhs, rhs, false),
-            BinaryOp::Sub => {
-                let inverted = rhs
-                    .iter()
-                    .map(|&net| self.netlist.add_not(net))
-                    .collect::<Vec<_>>();
-                self.add_words(lhs, &inverted, true)
-            }
+            BinaryOp::Add => self
+                .netlist
+                .add_arithmetic(ArithmeticOp::Add, lhs, rhs)
+                .expect("validated RTL arithmetic has equal, non-zero widths"),
+            BinaryOp::Sub => self
+                .netlist
+                .add_arithmetic(ArithmeticOp::Subtract, lhs, rhs)
+                .expect("validated RTL arithmetic has equal, non-zero widths"),
             BinaryOp::Equal => vec![self.equal_words(lhs, rhs)],
             BinaryOp::NotEqual => {
                 let equal = self.equal_words(lhs, rhs);
@@ -608,19 +609,6 @@ impl<'a> Lowering<'a> {
             .zip(rhs)
             .map(|(&lhs, &rhs)| operation(&mut self.netlist, lhs, rhs))
             .collect()
-    }
-
-    fn add_words(&mut self, lhs: &[NetId], rhs: &[NetId], carry_in: bool) -> Vec<NetId> {
-        let mut carry = self.netlist.add_constant(carry_in);
-        let mut result = Vec::with_capacity(lhs.len());
-        for (&lhs, &rhs) in lhs.iter().zip(rhs) {
-            let propagate = self.netlist.add_xor(lhs, rhs);
-            result.push(self.netlist.add_xor(propagate, carry));
-            let generate = self.netlist.add_and(lhs, rhs);
-            let carry_propagate = self.netlist.add_and(propagate, carry);
-            carry = self.netlist.add_or(generate, carry_propagate);
-        }
-        result
     }
 
     fn reduce_or(&mut self, bits: &[NetId]) -> NetId {
@@ -812,7 +800,7 @@ impl From<ValidationError> for SynthesisError {
 mod tests {
     use std::collections::HashMap;
 
-    use struo_ir::{Netlist, NodeKind};
+    use struo_ir::{ArithmeticOp, Netlist, NodeKind};
     use struo_rtl::{
         BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, Memory, Module, Polarity, Port,
         PortDirection, Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
@@ -828,8 +816,8 @@ mod tests {
         }
     }
 
-    fn adder_design(width: u32) -> Design {
-        let mut module = Module::new("Adder");
+    fn arithmetic_design(width: u32, operation: BinaryOp) -> Design {
+        let mut module = Module::new("Arithmetic");
         let lhs = module.add_port(Port {
             name: "lhs".into(),
             direction: PortDirection::Input,
@@ -847,9 +835,9 @@ mod tests {
         });
         let lhs = module.read(lhs).unwrap();
         let rhs = module.read(rhs).unwrap();
-        let sum = module.binary(BinaryOp::Add, lhs, rhs).unwrap();
+        let sum = module.binary(operation, lhs, rhs).unwrap();
         module.assign(module.whole(output).unwrap(), sum).unwrap();
-        let mut design = Design::new("Adder");
+        let mut design = Design::new("Arithmetic");
         design.add_module(module);
         design
     }
@@ -923,14 +911,12 @@ mod tests {
 
     #[test]
     fn lowers_wrapping_adder() {
-        let synthesized = synthesize(&adder_design(4)).unwrap();
+        let synthesized = synthesize(&arithmetic_design(4, BinaryOp::Add)).unwrap();
         assert_eq!(synthesized.netlist.registers().len(), 0);
-        assert!(
-            synthesized
-                .netlist
-                .nodes()
-                .iter()
-                .any(|node| matches!(node.kind(), NodeKind::Xor))
+        assert_eq!(synthesized.netlist.arithmetic().len(), 1);
+        assert_eq!(
+            synthesized.netlist.arithmetic()[0].operation(),
+            ArithmeticOp::Add
         );
         assert_eq!(
             synthesized
@@ -949,6 +935,26 @@ mod tests {
                     .collect();
                 let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
                 assert_eq!(output_word(&outputs, "sum", 4), (lhs + rhs) & 0xf);
+            }
+        }
+    }
+
+    #[test]
+    fn retains_wrapping_subtraction() {
+        let synthesized = synthesize(&arithmetic_design(4, BinaryOp::Sub)).unwrap();
+        assert_eq!(synthesized.netlist.arithmetic().len(), 1);
+        assert_eq!(
+            synthesized.netlist.arithmetic()[0].operation(),
+            ArithmeticOp::Subtract
+        );
+        for lhs in 0u64..16 {
+            for rhs in 0u64..16 {
+                let inputs = input_word("lhs", 4, lhs)
+                    .into_iter()
+                    .chain(input_word("rhs", 4, rhs))
+                    .collect();
+                let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+                assert_eq!(output_word(&outputs, "sum", 4), lhs.wrapping_sub(rhs) & 0xf);
             }
         }
     }
@@ -1294,6 +1300,39 @@ mod tests {
                 NodeKind::RegisterOutput(_) | NodeKind::MemoryOutput(_) => {
                     panic!("combinational test contains state")
                 }
+                NodeKind::ArithmeticOutput(_) => {
+                    let (cell, bit) = netlist
+                        .arithmetic()
+                        .iter()
+                        .find_map(|cell| {
+                            cell.outputs()
+                                .iter()
+                                .position(|output| *output == node.output())
+                                .map(|bit| (cell, bit))
+                        })
+                        .expect("arithmetic output belongs to a cell");
+                    let width = cell.outputs().len();
+                    let lhs = cell
+                        .lhs()
+                        .iter()
+                        .enumerate()
+                        .fold(0u128, |word, (bit, net)| {
+                            word | (u128::from(values[net.index() as usize]) << bit)
+                        });
+                    let rhs = cell
+                        .rhs()
+                        .iter()
+                        .enumerate()
+                        .fold(0u128, |word, (bit, net)| {
+                            word | (u128::from(values[net.index() as usize]) << bit)
+                        });
+                    let mask = u128::MAX >> (u128::BITS as usize - width);
+                    let result = match cell.operation() {
+                        ArithmeticOp::Add => lhs.wrapping_add(rhs),
+                        ArithmeticOp::Subtract => lhs.wrapping_sub(rhs),
+                    } & mask;
+                    result & (1 << bit) != 0
+                }
                 NodeKind::Output(name) => {
                     let value = values[node.inputs()[0].index() as usize];
                     outputs.insert(name.clone(), value);
@@ -1314,6 +1353,18 @@ mod tests {
                 | NodeKind::Constant(_)
                 | NodeKind::RegisterOutput(_)
                 | NodeKind::MemoryOutput(_) => 0,
+                NodeKind::ArithmeticOutput(_) => {
+                    netlist
+                        .arithmetic()
+                        .iter()
+                        .find(|cell| cell.outputs().contains(&node.output()))
+                        .into_iter()
+                        .flat_map(|cell| cell.lhs().iter().chain(cell.rhs()))
+                        .map(|input| depths[input.index() as usize])
+                        .max()
+                        .unwrap_or(0)
+                        + 1
+                }
                 NodeKind::Output(_) => depths[node.inputs()[0].index() as usize],
                 NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not | NodeKind::Mux => {
                     node.inputs()

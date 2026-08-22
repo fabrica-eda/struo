@@ -78,6 +78,7 @@ pub(super) struct LutEmitter<'a> {
     cover: &'a LutCover,
     bits: Vec<Option<Bit>>,
     cells: Vec<Ecp5Cell>,
+    next_wire: u32,
 }
 
 impl<'a> LutEmitter<'a> {
@@ -95,7 +96,8 @@ impl<'a> LutEmitter<'a> {
                 | NodeKind::Xor
                 | NodeKind::Not
                 | NodeKind::Mux
-                | NodeKind::Output(_) => {}
+                | NodeKind::Output(_)
+                | NodeKind::ArithmeticOutput(_) => {}
             }
         }
         Self {
@@ -103,6 +105,10 @@ impl<'a> LutEmitter<'a> {
             cover,
             bits,
             cells: Vec::new(),
+            next_wire: u32::try_from(netlist.nodes().len())
+                .expect("netlist exceeds the Yosys JSON range")
+                .checked_add(2)
+                .expect("netlist exceeds the Yosys JSON range"),
         }
     }
 
@@ -135,6 +141,19 @@ impl<'a> LutEmitter<'a> {
 
     pub(super) fn alias_net(&mut self, net: NetId, bit: Bit) {
         self.bits[net.index() as usize] = Some(bit);
+    }
+
+    pub(super) fn fresh_wire(&mut self) -> u32 {
+        let wire = self.next_wire;
+        self.next_wire = self
+            .next_wire
+            .checked_add(1)
+            .expect("mapped netlist exceeds the Yosys JSON range");
+        wire
+    }
+
+    pub(super) fn push_cell(&mut self, cell: Ecp5Cell) {
+        self.cells.push(cell);
     }
 
     pub(super) fn finish(self) -> (Vec<Option<Bit>>, Vec<Ecp5Cell>) {
@@ -269,7 +288,8 @@ fn evaluate_cut(
         NodeKind::Input(_)
         | NodeKind::RegisterOutput(_)
         | NodeKind::Output(_)
-        | NodeKind::MemoryOutput(_) => {
+        | NodeKind::MemoryOutput(_)
+        | NodeKind::ArithmeticOutput(_) => {
             unreachable!("a cut must stop before a source or output node")
         }
     };

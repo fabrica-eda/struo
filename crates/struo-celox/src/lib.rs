@@ -118,6 +118,23 @@ fn reserve_cell_output(
         Ecp5Cell::FlipFlop { name, output, .. } => {
             Some((*output, format!("__struo_ff_{name}_{output}")))
         }
+        Ecp5Cell::Ccu2c {
+            name,
+            sums,
+            carry_out,
+            ..
+        } => {
+            for (label, wire) in [("sum0", sums[0]), ("sum1", sums[1]), ("carry", *carry_out)] {
+                reserve_scalar(
+                    builder,
+                    wires,
+                    wire,
+                    format!("__struo_ccu_{name}_{label}_{wire}"),
+                    bit_type,
+                )?;
+            }
+            None
+        }
         Ecp5Cell::BlockRam {
             name, read_data, ..
         } => {
@@ -140,18 +157,28 @@ fn reserve_cell_output(
         }
     };
     if let Some((wire, name)) = scalar {
-        let signal = builder.internal(name, bit_type)?;
-        insert_wire(
-            wires,
-            Bit::Wire(wire),
-            WireRef {
-                signal,
-                lsb: 0,
-                signal_width: 1,
-            },
-        )?;
+        reserve_scalar(builder, wires, wire, name, bit_type)?;
     }
     Ok(())
+}
+
+fn reserve_scalar(
+    builder: &mut ModuleBuilder,
+    wires: &mut BTreeMap<u32, WireRef>,
+    wire: u32,
+    name: String,
+    bit_type: ValueType,
+) -> Result<(), CeloxAdapterError> {
+    let signal = builder.internal(name, bit_type)?;
+    insert_wire(
+        wires,
+        Bit::Wire(wire),
+        WireRef {
+            signal,
+            lsb: 0,
+            signal_width: 1,
+        },
+    )
 }
 
 fn emit_cell(
@@ -176,6 +203,17 @@ fn emit_cell(
             builder.assign(target, value)?;
             Ok(())
         }
+        Ecp5Cell::Ccu2c {
+            inputs,
+            carry_in,
+            sums,
+            carry_out,
+            init,
+            inject,
+            ..
+        } => emit_ccu2c(
+            builder, wires, constants, *inputs, *carry_in, *sums, *carry_out, *init, *inject,
+        ),
         Ecp5Cell::FlipFlop {
             data,
             output,
@@ -218,6 +256,46 @@ fn emit_cell(
             *edge,
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ccu2c(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    inputs: [[Bit; 4]; 2],
+    carry_in: Bit,
+    sums: [u32; 2],
+    carry_out: u32,
+    init: [u16; 2],
+    inject: [bool; 2],
+) -> Result<(), CeloxAdapterError> {
+    let one_bit = ValueType::bits(1)?;
+    let mut carry = bit_expression(builder, wires, constants, carry_in)?;
+    for slice in 0..2 {
+        let expressions = inputs[slice]
+            .iter()
+            .map(|bit| bit_expression(builder, wires, constants, *bit))
+            .collect::<Result<Vec<_>, _>>()?;
+        let lut4 = lut_expression(builder, &expressions, init[slice], 0, 0, constants)?;
+        let lut2_inputs = [
+            expressions[0],
+            expressions[1],
+            constants.zero_expression,
+            constants.zero_expression,
+        ];
+        let lut2 = lut_expression(builder, &lut2_inputs, init[slice], 0, 0, constants)?;
+        let gated_carry = if inject[slice] {
+            constants.zero_expression
+        } else {
+            carry
+        };
+        let sum = builder.binary(CeloxBinaryOp::Xor, lut4, gated_carry, one_bit)?;
+        builder.assign(builder.whole(wire_ref(wires, sums[slice])?.signal)?, sum)?;
+        carry = builder.mux(lut4, gated_carry, lut2)?;
+    }
+    builder.assign(builder.whole(wire_ref(wires, carry_out)?.signal)?, carry)?;
+    Ok(())
 }
 
 fn emit_outputs(
@@ -600,13 +678,17 @@ impl From<BuildError> for CeloxAdapterError {
 mod tests {
     use std::num::NonZeroU32;
 
-    use struo_ir::{ActiveLevel, ClockEdge, EnableControl, Netlist, RegisterCell, ResetControl};
+    use struo_ir::{
+        ActiveLevel, ArithmeticOp, ClockEdge, EnableControl, Netlist, RegisterCell, ResetControl,
+    };
     use struo_rtl::{
         BinaryOp, BitWidth, ClockEdge as RtlClockEdge, Constant, Design, Enable, Memory, Module,
         Polarity, Port, PortDirection, StateDomain, ValueType,
     };
     use struo_synth::synthesize;
-    use struo_target_ecp5::map_to_ecp5;
+    use struo_target_ecp5::{
+        ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+    };
 
     use super::{ecp5_frontend_artifact, ecp5_simulator};
 
@@ -615,6 +697,67 @@ mod tests {
             width: BitWidth::new(width).unwrap(),
             signed: false,
             state: StateDomain::TwoState,
+        }
+    }
+
+    #[test]
+    fn synthesized_carry_and_lut_arithmetic_are_exhaustively_equivalent() {
+        for (rtl_operation, operation) in [
+            (BinaryOp::Add, ArithmeticOp::Add),
+            (BinaryOp::Sub, ArithmeticOp::Subtract),
+        ] {
+            let mut module = Module::new("arithmetic");
+            let lhs = module.add_port(Port {
+                name: "lhs".into(),
+                direction: PortDirection::Input,
+                r#type: bits(5),
+            });
+            let rhs = module.add_port(Port {
+                name: "rhs".into(),
+                direction: PortDirection::Input,
+                r#type: bits(5),
+            });
+            let result = module.add_port(Port {
+                name: "result".into(),
+                direction: PortDirection::Output,
+                r#type: bits(5),
+            });
+            let lhs = module.read(lhs).unwrap();
+            let rhs = module.read(rhs).unwrap();
+            let value = module.binary(rtl_operation, lhs, rhs).unwrap();
+            module.assign(module.whole(result).unwrap(), value).unwrap();
+            let mut design = Design::new("arithmetic");
+            design.add_module(module);
+            let synthesized = synthesize(&design).unwrap();
+
+            for strategy in [ArithmeticMapping::CarryChain, ArithmeticMapping::Lut4] {
+                let mapped = map_to_ecp5_with_options(
+                    &synthesized.netlist,
+                    MappingOptions {
+                        arithmetic: strategy,
+                    },
+                )
+                .unwrap();
+                let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+                let lhs = simulator.signal("lhs");
+                let rhs = simulator.signal("rhs");
+                let result = simulator.signal("result");
+                for lhs_value in 0u8..32 {
+                    for rhs_value in 0u8..32 {
+                        simulator
+                            .modify(|io| {
+                                io.set(lhs, lhs_value);
+                                io.set(rhs, rhs_value);
+                            })
+                            .unwrap();
+                        let expected = match operation {
+                            ArithmeticOp::Add => lhs_value.wrapping_add(rhs_value),
+                            ArithmeticOp::Subtract => lhs_value.wrapping_sub(rhs_value),
+                        } & 0x1f;
+                        assert_eq!(simulator.get(result), expected.into());
+                    }
+                }
+            }
         }
     }
 
