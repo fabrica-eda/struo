@@ -260,6 +260,15 @@ pub struct Ecp5Netlist {
     ports: Vec<MappedPort>,
     cells: Vec<Ecp5Cell>,
     retiming: RetimingSelection,
+    equivalence_proof: MappedEquivalenceProof,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MappedEquivalenceProof {
+    certified_primitive_moves: usize,
+    equivalent_register_merges: usize,
+    unobservable_cells_removed: usize,
+    valid: bool,
 }
 
 /// Result of the automatic, technology-scored retiming search.
@@ -279,10 +288,22 @@ pub struct RetimingSelection {
     pub original_period_ps: u32,
     /// Estimated register-to-register period selected for mapping.
     pub selected_period_ps: u32,
+    /// Estimated worst data, control, or output period before retiming.
+    pub original_overall_period_ps: u32,
+    /// Estimated worst data, control, or output period after retiming.
+    pub selected_overall_period_ps: u32,
     /// Mapped flip-flops before candidate selection.
     pub original_registers: usize,
     /// Mapped flip-flops after candidate selection.
     pub selected_registers: usize,
+    /// Primitive retiming certificates composed into the selected result.
+    pub certified_primitive_moves: usize,
+    /// Structurally equivalent generated registers merged in the selected result.
+    pub equivalent_register_merges: usize,
+    /// Unobservable cells removed after certified retiming moves.
+    pub unobservable_cells_removed: usize,
+    /// Whether the complete selected transformation chain passed sign-off.
+    pub equivalence_signed_off: bool,
 }
 
 impl Ecp5Netlist {
@@ -354,12 +375,15 @@ pub fn map_to_ecp5_with_options(
         original_cells,
         original_registers,
         target_period_ps,
-    ) {
+    )
+    .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
+    {
         selected = retimed;
         selected_registers = mapped_register_count(&selected);
         applied = true;
     }
     let mapped_selected_profile = mapped_lut_profile(&selected);
+    let equivalence_signed_off = verify_mapped_equivalence_proof(&selected, applied);
     selected.retiming = RetimingSelection {
         applied,
         original_lut_depth: mapped_original_profile.data_depth,
@@ -368,8 +392,14 @@ pub fn map_to_ecp5_with_options(
         selected_critical_registers: mapped_selected_profile.critical_depth.len(),
         original_period_ps: mapped_original_profile.data_period_ps,
         selected_period_ps: mapped_selected_profile.data_period_ps,
+        original_overall_period_ps: mapped_original_profile.overall_period_ps,
+        selected_overall_period_ps: mapped_selected_profile.overall_period_ps,
         original_registers,
         selected_registers,
+        certified_primitive_moves: selected.equivalence_proof.certified_primitive_moves,
+        equivalent_register_merges: selected.equivalence_proof.equivalent_register_merges,
+        unobservable_cells_removed: selected.equivalence_proof.unobservable_cells_removed,
+        equivalence_signed_off,
     };
     Ok(selected)
 }
@@ -383,7 +413,7 @@ fn automatically_retime_mapped_luts(
 ) -> Option<Ecp5Netlist> {
     let original_profile = mapped_lut_profile(original);
     let original_depth = original_profile.data_depth;
-    let timing_driven = original_profile.data_period_ps > target_period_ps;
+    let timing_driven = original_profile.overall_period_ps > target_period_ps;
     let cell_limit = original_cells + original_cells.div_ceil(10);
     let register_limit = original_registers + original_registers.div_ceil(5);
     let forward_candidate = forward_retime_registered_ccu_chains(original, timing_driven);
@@ -426,7 +456,7 @@ fn automatically_retime_mapped_luts(
         ) {
             best_seen = frontier.clone();
         }
-        if (timing_driven && profile.data_period_ps <= target_period_ps)
+        if (timing_driven && profile.overall_period_ps <= target_period_ps)
             || (!timing_driven && profile.data_depth < original_depth)
         {
             return Some(frontier);
@@ -623,9 +653,11 @@ fn automatically_retime_mapped_luts(
     let selected_profile = mapped_lut_profile(&best_seen);
     let improved = if timing_driven {
         (
+            selected_profile.overall_period_ps,
             selected_profile.data_period_ps,
             selected_profile.critical_timing.len(),
         ) < (
+            original_profile.overall_period_ps,
             original_profile.data_period_ps,
             original_profile.critical_timing.len(),
         )
@@ -646,9 +678,10 @@ fn retiming_score(
     timing_driven: bool,
     cells: usize,
     registers: usize,
-) -> (u64, u64, usize, usize, usize) {
+) -> (u64, u64, u64, usize, usize, usize) {
     if timing_driven {
         (
+            u64::from(profile.overall_period_ps),
             u64::from(profile.data_period_ps),
             u64::try_from(profile.critical_timing.len()).unwrap_or(u64::MAX),
             profile.data_depth,
@@ -659,6 +692,7 @@ fn retiming_score(
         (
             u64::try_from(profile.data_depth).unwrap_or(u64::MAX),
             u64::try_from(profile.critical_depth.len()).unwrap_or(u64::MAX),
+            u64::from(profile.overall_period_ps),
             usize::try_from(profile.data_period_ps).unwrap_or(usize::MAX),
             cells,
             registers,
@@ -672,6 +706,49 @@ fn mapped_register_count(netlist: &Ecp5Netlist) -> usize {
         .iter()
         .filter(|cell| matches!(cell, Ecp5Cell::FlipFlop { .. }))
         .count()
+}
+
+fn verify_mapped_equivalence_proof(netlist: &Ecp5Netlist, applied: bool) -> bool {
+    if !netlist.equivalence_proof.valid
+        || (applied && netlist.equivalence_proof.certified_primitive_moves == 0)
+    {
+        return false;
+    }
+    let primary_inputs = netlist
+        .ports
+        .iter()
+        .filter(|port| port.direction == PortDirection::Input)
+        .flat_map(|port| &port.bits)
+        .filter_map(|bit| match bit {
+            Bit::Wire(wire) => Some(*wire),
+            Bit::Zero | Bit::One => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut driven = primary_inputs.clone();
+    for bit in netlist.cells.iter().flat_map(cell_output_bits) {
+        let Bit::Wire(wire) = bit else {
+            continue;
+        };
+        if !driven.insert(wire) {
+            return false;
+        }
+    }
+    netlist
+        .cells
+        .iter()
+        .flat_map(cell_input_bits)
+        .chain(
+            netlist
+                .ports
+                .iter()
+                .filter(|port| port.direction == PortDirection::Output)
+                .flat_map(|port| &port.bits)
+                .copied(),
+        )
+        .all(|bit| match bit {
+            Bit::Wire(wire) => driven.contains(&wire),
+            Bit::Zero | Bit::One => true,
+        })
 }
 
 fn register_data_is_driven_by_ccu(netlist: &Ecp5Netlist, register_index: usize) -> bool {
@@ -1125,6 +1202,7 @@ fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<E
     // and create two drivers when the retimed LUT takes over that same Q.
     let mut next_wire = maximum_mapped_wire(netlist)?.checked_add(1)?;
     let mut candidate = netlist.clone();
+    candidate.equivalence_proof.certified_primitive_moves += 1;
     candidate.cells.remove(register_index);
     let mut replacements = HashMap::new();
     for (input, reset_edge) in input_wires.iter().zip(after.edges()) {
@@ -1508,6 +1586,7 @@ fn forward_retime_ccu2c(netlist: &Ecp5Netlist, ccu_index: usize) -> Option<Ecp5N
         .collect::<Option<Vec<_>>>()?;
 
     let mut candidate = netlist.clone();
+    candidate.equivalence_proof.certified_primitive_moves += 1;
     let mut removed = input_registers.into_iter().collect::<Vec<_>>();
     removed.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
     for index in removed {
@@ -1699,6 +1778,7 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
 
     let mut next_wire = maximum_mapped_wire(netlist)?.checked_add(1)?;
     let mut candidate = netlist.clone();
+    candidate.equivalence_proof.certified_primitive_moves += 1;
     candidate.cells.remove(register_index);
     let uses_slice1 = output != CcuRetimeOutput::Sum0;
     let uses_slice0 = !uses_slice1 || !inject[1];
@@ -1987,6 +2067,7 @@ fn merge_equivalent_flip_flops(netlist: &mut Ecp5Netlist) {
         if duplicates.is_empty() {
             break;
         }
+        netlist.equivalence_proof.equivalent_register_merges += duplicates.len();
         for &(_, duplicate, canonical) in &duplicates {
             replace_mapped_wire_uses(netlist, duplicate, canonical);
         }
@@ -2075,6 +2156,7 @@ fn prune_unobservable_retiming_cells(netlist: &mut Ecp5Netlist) {
                     .into_iter()
                     .any(|bit| matches!(bit, Bit::Wire(wire) if fanouts.contains_key(&wire)))
         });
+        netlist.equivalence_proof.unobservable_cells_removed += previous_len - netlist.cells.len();
         if netlist.cells.len() == previous_len {
             break;
         }
@@ -2317,8 +2399,18 @@ fn map_once(
                 selected_critical_registers: 0,
                 original_period_ps: quality.period_ps,
                 selected_period_ps: quality.period_ps,
+                original_overall_period_ps: quality.period_ps,
+                selected_overall_period_ps: quality.period_ps,
                 original_registers: netlist.registers().len(),
                 selected_registers: netlist.registers().len(),
+                certified_primitive_moves: 0,
+                equivalent_register_merges: 0,
+                unobservable_cells_removed: 0,
+                equivalence_signed_off: true,
+            },
+            equivalence_proof: MappedEquivalenceProof {
+                valid: true,
+                ..MappedEquivalenceProof::default()
             },
         },
         quality,
@@ -3148,6 +3240,7 @@ mod tests {
         ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, backward_retime_ccu2c,
         backward_retime_lut, ccu_chain_names, forward_retime_ccu2c, map_once, map_to_ecp5,
         map_to_ecp5_with_options, mapped_wire_fanout, merge_equivalent_flip_flops,
+        verify_mapped_equivalence_proof,
     };
 
     fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
@@ -3210,11 +3303,25 @@ mod tests {
         let mapped = map_to_ecp5(&source).unwrap();
 
         assert!(mapped.retiming().applied, "{:?}", mapped.retiming());
+        assert!(mapped.retiming().equivalence_signed_off);
+        assert!(mapped.retiming().certified_primitive_moves > 0);
         assert!(
             mapped.retiming().selected_lut_depth < mapped.retiming().original_lut_depth,
             "{:?}",
             mapped.retiming()
         );
+    }
+
+    #[test]
+    fn mapped_equivalence_signoff_rejects_an_invalid_final_netlist() {
+        let source = arithmetic_netlist(8, ArithmeticOp::Add);
+        let (mut mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        assert!(verify_mapped_equivalence_proof(&mapped, false));
+
+        let duplicate = mapped.cells[0].clone();
+        mapped.cells.push(duplicate);
+
+        assert!(!verify_mapped_equivalence_proof(&mapped, false));
     }
 
     #[test]
