@@ -16,7 +16,8 @@ use struo_rtl::{
 use struo_sim::VerificationPolicy;
 use struo_synth::synthesize;
 use struo_target_ecp5::{
-    ArithmeticMapping, Ecp5Cell, Ecp5Flow, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+    ArithmeticMapping, ECP5_QOR_TARGET_MHZ, Ecp5Cell, Ecp5Flow, MappingOptions, map_to_ecp5,
+    map_to_ecp5_with_options,
 };
 
 const USAGE: &str = "\
@@ -64,6 +65,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_carry_benchmark(directory: &str) -> Result<(), Box<dyn Error>> {
+    println!("ECP5 QoR timing target: {ECP5_QOR_TARGET_MHZ} MHz");
     let width = BitWidth::new(32)?;
     let bit = ValueType {
         width: BitWidth::new(1)?,

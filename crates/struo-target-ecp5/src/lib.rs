@@ -40,6 +40,12 @@ pub const LFE5UM5G_85F_EVN: BoardProfile = BoardProfile {
     clock_setup: "short JP2 to connect the FTDI 12 MHz clock to FPGA pin A10",
 };
 
+/// Default implementation-quality target for ECP5 speed-grade 8 designs.
+///
+/// This constrains place-and-route quality independently of the 12 MHz
+/// reference clock used by the no-PLL evaluation-board smoke test.
+pub const ECP5_QOR_TARGET_MHZ: u32 = 250;
+
 /// A subprocess invocation represented without a shell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolCommand {
@@ -88,6 +94,8 @@ pub struct Ecp5Flow {
     pub top: String,
     /// Physical board target.
     pub board: BoardProfile,
+    /// Frequency used to drive timing optimization and sign-off.
+    pub timing_goal_mhz: u32,
     /// Files produced during the flow.
     pub artifacts: FlowArtifacts,
 }
@@ -99,6 +107,7 @@ impl Ecp5Flow {
         Self {
             top: top.into(),
             board: LFE5UM5G_85F_EVN,
+            timing_goal_mhz: ECP5_QOR_TARGET_MHZ,
             artifacts: FlowArtifacts::under(artifact_root),
         }
     }
@@ -121,7 +130,7 @@ impl Ecp5Flow {
                 "--textcfg".into(),
                 self.artifacts.routed_config.clone(),
                 "--freq".into(),
-                "12".into(),
+                self.timing_goal_mhz.to_string(),
             ],
             evidence: Some(VerificationStage::PlaceAndRoute),
         }
@@ -157,7 +166,7 @@ impl Ecp5Flow {
 mod tests {
     use struo_sim::{VerificationPolicy, VerificationReport};
 
-    use super::{Ecp5Flow, LFE5UM5G_85F_EVN};
+    use super::{ECP5_QOR_TARGET_MHZ, Ecp5Flow, LFE5UM5G_85F_EVN};
 
     #[test]
     fn board_profile_selects_the_exact_fpga() {
@@ -178,6 +187,13 @@ mod tests {
                 .any(|args| args == ["--package", "CABGA381"])
         );
         assert!(command.args.windows(2).any(|args| args == ["--speed", "8"]));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|args| args == ["--freq", "250"])
+        );
+        assert_eq!(ECP5_QOR_TARGET_MHZ, 250);
     }
 
     #[test]

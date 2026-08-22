@@ -65,8 +65,8 @@ and are based on the Project Trellis `ecp5_evn` example and the Lattice board
 manual.
 
 The 12 MHz value describes the no-PLL board smoke-test clock, not an ECP5
-performance target. QoR comparisons use an explicit implementation constraint;
-the carry-chain benchmark below uses 200 MHz.
+performance target. Struo targets 250 MHz for ECP5 implementation QoR; designs
+that use this frequency in hardware still require an explicit PLL clock path.
 
 ## Mandatory verification
 
@@ -123,7 +123,7 @@ rejected explicitly.
 
 `carry-benchmark` emits two equivalent 32-bit registered counters as
 `carry.json` and `lut.json`. On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seed 1,
-and a 200 MHz timing target, the routed carry version used 38 `TRELLIS_COMB`
+and a 250 MHz timing target, the routed carry version used 38 `TRELLIS_COMB`
 sites and reached 472.14 MHz; the LUT-ripple baseline used 65 sites and reached
 60.22 MHz. These figures are a reproducible comparison point, not a guaranteed
 device specification; rerun place-and-route for the installed nextpnr/chipdb.
@@ -135,7 +135,7 @@ for implementation in carry lut; do
     --lpf-allow-unconstrained \
     --textcfg "/tmp/struo-carry-benchmark/${implementation}.config" \
     --report "/tmp/struo-carry-benchmark/${implementation}-report.json" \
-    --freq 200 --timing-allow-fail --seed 1
+    --freq 250 --timing-allow-fail --seed 1
 done
 ```
 Module instances are flattened before synthesis; the implemented path consumes
