@@ -33,6 +33,7 @@ pub fn ecp5_frontend_artifact(
     let mut builder = ModuleBuilder::new(netlist.name())?;
     let mut wires = BTreeMap::new();
     let mut outputs = Vec::new();
+    let flip_flop_banks = collect_flip_flop_banks(netlist.cells());
 
     for port in netlist.ports() {
         let port_type = ValueType::bits(port.bits.len())?;
@@ -61,6 +62,7 @@ pub fn ecp5_frontend_artifact(
     for cell in netlist.cells() {
         reserve_cell_output(&mut builder, &mut wires, cell, bit_type)?;
     }
+    reserve_flip_flop_banks(&mut builder, &mut wires, &flip_flop_banks)?;
 
     let constant_zero_signal = builder.internal("__struo_constant_zero", bit_type)?;
     let constant_one_signal = builder.internal("__struo_constant_one", bit_type)?;
@@ -78,6 +80,9 @@ pub fn ecp5_frontend_artifact(
 
     for cell in netlist.cells() {
         emit_cell(&mut builder, &wires, constants, cell)?;
+    }
+    for bank in &flip_flop_banks {
+        emit_flip_flop_bank(&mut builder, &wires, constants, bank)?;
     }
 
     emit_outputs(&mut builder, &wires, constants, outputs)?;
@@ -115,9 +120,7 @@ fn reserve_cell_output(
         Ecp5Cell::Lut4 { name, output, .. } => {
             Some((*output, format!("__struo_lut_{name}_{output}")))
         }
-        Ecp5Cell::FlipFlop { name, output, .. } => {
-            Some((*output, format!("__struo_ff_{name}_{output}")))
-        }
+        Ecp5Cell::FlipFlop { .. } => None,
         Ecp5Cell::Ccu2c {
             name,
             sums,
@@ -214,17 +217,7 @@ fn emit_cell(
         } => emit_ccu2c(
             builder, wires, constants, *inputs, *carry_in, *sums, *carry_out, *init, *inject,
         ),
-        Ecp5Cell::FlipFlop {
-            data,
-            output,
-            clock,
-            edge,
-            enable,
-            reset,
-            ..
-        } => emit_flip_flop(
-            builder, wires, constants, *data, *output, *clock, *edge, *enable, *reset,
-        ),
+        Ecp5Cell::FlipFlop { .. } => Ok(()),
         Ecp5Cell::BlockRam {
             name,
             depth,
@@ -334,6 +327,98 @@ struct WireRef {
     signal_width: usize,
 }
 
+struct FlipFlopBank {
+    data: Vec<Bit>,
+    outputs: Vec<u32>,
+    enables: Vec<Option<Control>>,
+    resets: Vec<Option<Reset>>,
+    clock: Bit,
+    edge: ClockEdge,
+    async_reset: Option<Reset>,
+}
+
+// A physical ECP5 netlist contains scalar TRELLIS_FF cells. Celox SDK
+// registers sharing an event are separate processes, so a Q-to-D pipeline can
+// otherwise observe a newly committed upstream Q on the same edge. Packing FFs
+// sharing a clock and asynchronous-reset domain into one vector register gives
+// every bit one atomic sample/commit boundary. Per-bit enables and synchronous
+// resets are folded into the vector next-state expression.
+fn collect_flip_flop_banks(cells: &[Ecp5Cell]) -> Vec<FlipFlopBank> {
+    let mut banks: Vec<FlipFlopBank> = Vec::new();
+    for cell in cells {
+        let Ecp5Cell::FlipFlop {
+            data,
+            output,
+            clock,
+            edge,
+            enable,
+            reset,
+            ..
+        } = cell
+        else {
+            continue;
+        };
+        let async_reset = reset.filter(|reset| reset.asynchronous);
+        if let Some(bank) = banks.iter_mut().find(|bank| {
+            bank.clock == *clock
+                && bank.edge == *edge
+                && same_reset_control(bank.async_reset, async_reset)
+        }) {
+            bank.data.push(*data);
+            bank.outputs.push(*output);
+            bank.enables.push(*enable);
+            bank.resets.push(*reset);
+        } else {
+            banks.push(FlipFlopBank {
+                data: vec![*data],
+                outputs: vec![*output],
+                enables: vec![*enable],
+                resets: vec![*reset],
+                clock: *clock,
+                edge: *edge,
+                async_reset,
+            });
+        }
+    }
+    banks
+}
+
+fn same_reset_control(lhs: Option<Reset>, rhs: Option<Reset>) -> bool {
+    match (lhs, rhs) {
+        (None, None) => true,
+        (Some(lhs), Some(rhs)) => {
+            lhs.signal == rhs.signal
+                && lhs.active == rhs.active
+                && lhs.asynchronous == rhs.asynchronous
+        }
+        _ => false,
+    }
+}
+
+fn reserve_flip_flop_banks(
+    builder: &mut ModuleBuilder,
+    wires: &mut BTreeMap<u32, WireRef>,
+    banks: &[FlipFlopBank],
+) -> Result<(), CeloxAdapterError> {
+    for (index, bank) in banks.iter().enumerate() {
+        let width = bank.outputs.len();
+        let signal =
+            builder.internal(format!("__struo_ff_bank_{index}"), ValueType::bits(width)?)?;
+        for (lsb, output) in bank.outputs.iter().enumerate() {
+            insert_wire(
+                wires,
+                Bit::Wire(*output),
+                WireRef {
+                    signal,
+                    lsb,
+                    signal_width: width,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn insert_wire(
     wires: &mut BTreeMap<u32, WireRef>,
     bit: Bit,
@@ -427,44 +512,27 @@ fn lut_expression(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_flip_flop(
+fn emit_flip_flop_bank(
     builder: &mut ModuleBuilder,
     wires: &BTreeMap<u32, WireRef>,
     constants: Constants,
-    data: Bit,
-    output: u32,
-    clock: Bit,
-    edge: ClockEdge,
-    enable: Option<Control>,
-    reset: Option<Reset>,
+    bank: &FlipFlopBank,
 ) -> Result<(), CeloxAdapterError> {
-    let target_signal = wire_ref(wires, output)?.signal;
+    let target_signal = wire_ref(wires, bank.outputs[0])?.signal;
     let target = builder.whole(target_signal)?;
-    let mut next = bit_expression(builder, wires, constants, data)?;
-    let mut sdk_enable = match enable {
-        Some(enable) => Some(builder.enable(
-            bit_signal(wires, constants, enable.signal)?,
-            active_level(enable.active),
-        )?),
-        None => None,
-    };
-    let async_reset = match reset {
-        Some(reset) if reset.asynchronous => Some(builder.async_reset(
-            bit_signal(wires, constants, reset.signal)?,
-            active_level(reset.active),
-            if reset.value {
-                constants.one_expression
-            } else {
-                constants.zero_expression
-            },
-        )?),
-        Some(reset) => {
-            if let Some(enable) = enable {
-                let current = builder.read(target_signal)?;
-                let condition = asserted_expression(builder, wires, constants, enable)?;
-                next = builder.mux(condition, next, current)?;
-            }
+    let mut next_bits = Vec::with_capacity(bank.data.len());
+    for (index, data) in bank.data.iter().enumerate() {
+        let mut next = bit_expression(builder, wires, constants, *data)?;
+        if let Some(enable) = bank.enables[index] {
+            let reference = wire_ref(wires, bank.outputs[index])?;
+            let current =
+                builder.read_slice(builder.slice(reference.signal, reference.lsb, 1)?)?;
+            let condition = asserted_expression(builder, wires, constants, enable)?;
+            next = builder.mux(condition, next, current)?;
+        }
+        if let Some(reset) = bank.resets[index]
+            && !reset.asynchronous
+        {
             let condition = asserted_expression(
                 builder,
                 wires,
@@ -474,30 +542,58 @@ fn emit_flip_flop(
                     active: reset.active,
                 },
             )?;
-            next = builder.mux(
-                condition,
-                if reset.value {
+            let value = if reset.value {
+                constants.one_expression
+            } else {
+                constants.zero_expression
+            };
+            next = builder.mux(condition, value, next)?;
+        }
+        next_bits.push(next);
+    }
+    next_bits.reverse();
+    let next = match next_bits.as_slice() {
+        [next] => *next,
+        _ => builder.concat(next_bits)?,
+    };
+    let reset_value = if bank.async_reset.is_some() {
+        let parts = bank
+            .resets
+            .iter()
+            .rev()
+            .map(|reset| {
+                if reset.is_some_and(|reset| reset.value) {
                     constants.one_expression
                 } else {
                     constants.zero_expression
-                },
-                next,
-            )?;
-            sdk_enable = None;
-            None
-        }
-        None => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(match parts.as_slice() {
+            [value] => *value,
+            _ => builder.concat(parts)?,
+        })
+    } else {
+        None
+    };
+    let async_reset = match (bank.async_reset, reset_value) {
+        (Some(reset), Some(value)) if reset.asynchronous => Some(builder.async_reset(
+            bit_signal(wires, constants, reset.signal)?,
+            active_level(reset.active),
+            value,
+        )?),
+        _ => None,
     };
     builder.register(
         target,
         next,
-        bit_signal(wires, constants, clock)?,
-        match edge {
+        bit_signal(wires, constants, bank.clock)?,
+        match bank.edge {
             ClockEdge::Rising => Edge::Posedge,
             ClockEdge::Falling => Edge::Negedge,
         },
         async_reset,
-        sdk_enable,
+        None,
     )?;
     Ok(())
 }
@@ -1000,6 +1096,76 @@ mod tests {
         assert_eq!(artifact.registers().len(), 1);
         assert!(register.async_reset().is_some());
         assert!(register.enable().is_none());
+    }
+
+    #[test]
+    fn simulates_flip_flop_banks_without_same_edge_feedthrough() {
+        let mut source = Netlist::new("pipeline");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset_n");
+        let input = source.add_input("input");
+        let stage0 = source.add_register_output("stage0");
+        let stage1 = source.add_register_output("stage1");
+        let stage2 = source.add_register_output("stage2");
+        for (name, output, data, reset_value) in [
+            ("stage0", stage0, input, false),
+            ("stage1", stage1, stage0, false),
+            ("stage2", stage2, stage1, true),
+        ] {
+            source.add_register(RegisterCell::new(
+                name,
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                None,
+                Some(ResetControl {
+                    signal: reset,
+                    active: ActiveLevel::Low,
+                    asynchronous: true,
+                    value: reset_value,
+                }),
+            ));
+        }
+        source.add_output("stage0", stage0);
+        source.add_output("stage1", stage1);
+        source.add_output("stage2", stage2);
+        let mapped = map_to_ecp5(&source).unwrap();
+        let artifact = ecp5_frontend_artifact(&mapped).unwrap();
+        assert_eq!(artifact.registers().len(), 1);
+
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let clock = simulator.event("clock");
+        let reset = simulator.signal("reset_n");
+        let input = simulator.signal("input");
+        let stage0 = simulator.signal("stage0");
+        let stage1 = simulator.signal("stage1");
+        let stage2 = simulator.signal("stage2");
+        simulator.modify(|io| io.set(reset, 0u8)).unwrap();
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(stage0), 0u8.into());
+        assert_eq!(simulator.get(stage1), 0u8.into());
+        assert_eq!(simulator.get(stage2), 1u8.into());
+        simulator
+            .modify(|io| {
+                io.set(reset, 1u8);
+                io.set(input, 1u8);
+            })
+            .unwrap();
+
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(stage0), 1u8.into());
+        assert_eq!(simulator.get(stage1), 0u8.into());
+        assert_eq!(simulator.get(stage2), 0u8.into());
+        simulator.modify(|io| io.set(input, 0u8)).unwrap();
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(stage0), 0u8.into());
+        assert_eq!(simulator.get(stage1), 1u8.into());
+        assert_eq!(simulator.get(stage2), 0u8.into());
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(stage0), 0u8.into());
+        assert_eq!(simulator.get(stage1), 0u8.into());
+        assert_eq!(simulator.get(stage2), 1u8.into());
     }
 
     #[test]
