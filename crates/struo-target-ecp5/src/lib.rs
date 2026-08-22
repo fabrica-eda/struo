@@ -1,12 +1,14 @@
 //! Lattice ECP5 target descriptions and reproducible tool recipes.
 
 mod mapped;
+mod physical;
 
 pub use mapped::{
     ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPort, MappingError,
     MappingOptions, PortDirection as MappedPortDirection, Reset, RetimingSelection, map_to_ecp5,
     map_to_ecp5_with_options,
 };
+pub use physical::{PhysicalFeedback, PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint};
 
 use struo_sim::{ReleaseBlocked, VerificationPolicy, VerificationReport, VerificationStage};
 
@@ -62,6 +64,14 @@ pub struct ToolCommand {
 pub struct FlowArtifacts {
     /// Serialized mapped netlist consumed by nextpnr.
     pub mapped_json: String,
+    /// Post-draft netlist annotated with exact physical placements.
+    pub draft_placed_json: String,
+    /// Detailed routed timing observations from the draft implementation.
+    pub draft_report: String,
+    /// Throwaway routed configuration used to obtain physical feedback.
+    pub draft_config: String,
+    /// Equivalent mapped netlist refined using draft physical feedback.
+    pub refined_json: String,
     /// nextpnr textual configuration.
     pub routed_config: String,
     /// Packed FPGA bitstream.
@@ -79,6 +89,10 @@ impl FlowArtifacts {
         let root = root.trim_end_matches('/');
         Self {
             mapped_json: format!("{root}/design.json"),
+            draft_placed_json: format!("{root}/design.draft.json"),
+            draft_report: format!("{root}/design.draft-report.json"),
+            draft_config: format!("{root}/design.draft.config"),
+            refined_json: format!("{root}/design.refined.json"),
             routed_config: format!("{root}/design.config"),
             bitstream: format!("{root}/design.bit"),
             svf: format!("{root}/design.svf"),
@@ -112,9 +126,41 @@ impl Ecp5Flow {
         }
     }
 
+    /// Deterministic routed draft used only to return physical observations to
+    /// synthesis. Timing failure is allowed because this is not sign-off.
+    #[must_use]
+    pub fn draft_place_and_route_command(&self) -> ToolCommand {
+        let mut command = self
+            .place_and_route_command_for(&self.artifacts.mapped_json, &self.artifacts.draft_config);
+        command.args.extend([
+            "--write".into(),
+            self.artifacts.draft_placed_json.clone(),
+            "--report".into(),
+            self.artifacts.draft_report.clone(),
+            "--detailed-timing-report".into(),
+            "--timing-allow-fail".into(),
+        ]);
+        command.evidence = None;
+        command
+    }
+
     /// nextpnr command for the exact UM5G-85K CABGA381 device.
     #[must_use]
     pub fn place_and_route_command(&self) -> ToolCommand {
+        self.place_and_route_command_for(&self.artifacts.mapped_json, &self.artifacts.routed_config)
+    }
+
+    /// Final implementation command for a netlist refined from the matching
+    /// deterministic draft run.
+    #[must_use]
+    pub fn refined_place_and_route_command(&self) -> ToolCommand {
+        self.place_and_route_command_for(
+            &self.artifacts.refined_json,
+            &self.artifacts.routed_config,
+        )
+    }
+
+    fn place_and_route_command_for(&self, json: &str, config: &str) -> ToolCommand {
         ToolCommand {
             program: "nextpnr-ecp5",
             args: vec![
@@ -124,17 +170,19 @@ impl Ecp5Flow {
                 "--speed".into(),
                 self.board.speed_grade.to_string(),
                 "--json".into(),
-                self.artifacts.mapped_json.clone(),
+                json.into(),
                 "--lpf".into(),
                 self.artifacts.constraints.clone(),
                 "--textcfg".into(),
-                self.artifacts.routed_config.clone(),
+                config.into(),
                 "--freq".into(),
                 self.timing_goal_mhz.to_string(),
                 "--placer-budgets".into(),
                 "--placer-heap-timingweight".into(),
                 "30".into(),
                 "--tmg-ripup".into(),
+                "--seed".into(),
+                "1".into(),
             ],
             evidence: Some(VerificationStage::PlaceAndRoute),
         }
@@ -199,6 +247,7 @@ mod tests {
         );
         assert!(command.args.iter().any(|arg| arg == "--placer-budgets"));
         assert!(command.args.iter().any(|arg| arg == "--tmg-ripup"));
+        assert!(command.args.windows(2).any(|args| args == ["--seed", "1"]));
         assert!(
             command
                 .args
@@ -206,6 +255,40 @@ mod tests {
                 .any(|args| args == ["--placer-heap-timingweight", "30"])
         );
         assert_eq!(ECP5_QOR_TARGET_MHZ, 300);
+    }
+
+    #[test]
+    fn physical_feedback_flow_uses_a_detailed_deterministic_draft() {
+        let flow = Ecp5Flow::evaluation_board("Top", "build/Top");
+        let draft = flow.draft_place_and_route_command();
+        let final_run = flow.refined_place_and_route_command();
+
+        assert!(
+            draft
+                .args
+                .iter()
+                .any(|arg| arg == "--detailed-timing-report")
+        );
+        assert!(draft.args.iter().any(|arg| arg == "--timing-allow-fail"));
+        assert!(
+            draft
+                .args
+                .windows(2)
+                .any(|args| { args == ["--write", "build/Top/design.draft.json"] })
+        );
+        assert!(
+            draft
+                .args
+                .windows(2)
+                .any(|args| { args == ["--report", "build/Top/design.draft-report.json"] })
+        );
+        assert!(
+            final_run
+                .args
+                .windows(2)
+                .any(|args| { args == ["--json", "build/Top/design.refined.json"] })
+        );
+        assert_eq!(draft.evidence, None);
     }
 
     #[test]
