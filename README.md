@@ -106,8 +106,10 @@ addition and subtraction, signed and unsigned comparisons, variable logical
 and arithmetic shifts, muxes, concatenation, slicing, registers, enables, and
 synchronous or asynchronous constant resets. It performs constant folding and
 structural hashing, balances associative reductions, and uses parallel-prefix
-comparison networks before mapping Boolean nodes to `LUT4` and registers to
-`TRELLIS_FF`. Synchronous 1R1W memories map directly to ECP5 `DP16KD`
+comparison networks. ECP5 technology mapping enumerates bounded four-input
+cuts, selects them by logic depth and area, omits unreachable Boolean logic,
+and maps the selected cover to `LUT4`; registers map to `TRELLIS_FF`.
+Synchronous 1R1W memories map directly to ECP5 `DP16KD`
 primitives, including width tiling across multiple blocks; inout ports are
 rejected explicitly.
 Module instances are flattened before synthesis; the implemented path consumes
