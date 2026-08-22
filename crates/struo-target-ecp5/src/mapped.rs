@@ -7,8 +7,8 @@ use std::fmt::{self, Display, Formatter};
 use serde::Serialize;
 use serde::ser::Serializer;
 use struo_ir::{
-    ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, MemoryCell, NetId, Netlist,
-    PortDirection as IrPortDirection, ValidationError,
+    ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, ComparisonCell, MemoryCell, NetId,
+    Netlist, PortDirection as IrPortDirection, ValidationError,
 };
 
 mod lut;
@@ -245,18 +245,7 @@ pub fn map_to_ecp5_with_options(
     let cover = LutCover::select(netlist, &cuts);
     let mut emitter = LutEmitter::new(netlist, &cover);
 
-    for arithmetic in netlist.arithmetic() {
-        let use_carry = match options.arithmetic {
-            ArithmeticMapping::Auto => arithmetic.outputs().len() > 4,
-            ArithmeticMapping::CarryChain => true,
-            ArithmeticMapping::Lut4 => false,
-        };
-        if use_carry {
-            map_arithmetic_carry(arithmetic, &mut emitter);
-        } else {
-            map_arithmetic_luts(arithmetic, &mut emitter);
-        }
-    }
+    map_retained_cells(netlist, options, &mut emitter);
 
     for port in netlist
         .ports()
@@ -351,6 +340,48 @@ pub fn map_to_ecp5_with_options(
 
 const CCU2C_ARITH_INIT: u16 = 0x96aa;
 
+#[derive(Clone, Copy)]
+enum RetainedCell<'a> {
+    Arithmetic(&'a ArithmeticCell),
+    Comparison(&'a ComparisonCell),
+}
+
+fn map_retained_cells(netlist: &Netlist, options: MappingOptions, emitter: &mut LutEmitter<'_>) {
+    let mut retained = netlist
+        .arithmetic()
+        .iter()
+        .map(RetainedCell::Arithmetic)
+        .chain(netlist.comparisons().iter().map(RetainedCell::Comparison))
+        .collect::<Vec<_>>();
+    retained.sort_by_key(|cell| cell.output_index());
+    for cell in retained {
+        match cell {
+            RetainedCell::Arithmetic(arithmetic) => {
+                let use_carry = match options.arithmetic {
+                    ArithmeticMapping::Auto => arithmetic.outputs().len() > 4,
+                    ArithmeticMapping::CarryChain => true,
+                    ArithmeticMapping::Lut4 => false,
+                };
+                if use_carry {
+                    map_arithmetic_carry(arithmetic, emitter);
+                } else {
+                    map_arithmetic_luts(arithmetic, emitter);
+                }
+            }
+            RetainedCell::Comparison(comparison) => map_comparison_carry(comparison, emitter),
+        }
+    }
+}
+
+impl RetainedCell<'_> {
+    fn output_index(self) -> u32 {
+        match self {
+            Self::Arithmetic(cell) => cell.outputs()[0].index(),
+            Self::Comparison(cell) => cell.output().index(),
+        }
+    }
+}
+
 fn map_arithmetic_carry(arithmetic: &ArithmeticCell, emitter: &mut LutEmitter<'_>) {
     let subtract = arithmetic.operation() == ArithmeticOp::Subtract;
     let mut carry = Bit::from(subtract);
@@ -385,6 +416,77 @@ fn map_arithmetic_carry(arithmetic: &ArithmeticCell, emitter: &mut LutEmitter<'_
         });
         carry = Bit::Wire(carry_out);
     }
+}
+
+fn map_comparison_carry(comparison: &ComparisonCell, emitter: &mut LutEmitter<'_>) {
+    let mut carry = Bit::from(comparison.operation().includes_equal());
+    let pairs = comparison.lhs().len().div_ceil(2);
+    for (pair, bit) in (0..comparison.lhs().len()).step_by(2).enumerate() {
+        let mut inputs = [[Bit::Zero; 4]; 2];
+        let mut sums = [0; 2];
+        for slice in 0..2 {
+            let index = bit + slice;
+            inputs[slice] = if index < comparison.lhs().len() {
+                [
+                    emitter.map_net(comparison.rhs()[index]),
+                    emitter.map_net(comparison.lhs()[index]),
+                    Bit::One,
+                    Bit::One,
+                ]
+            } else {
+                // The unused high slice of an odd-width comparison computes
+                // 0 + !0 + carry, propagating carry without changing it.
+                [Bit::Zero, Bit::Zero, Bit::One, Bit::One]
+            };
+            sums[slice] = emitter.fresh_wire();
+        }
+        let last = pair + 1 == pairs;
+        let carry_out = if last && !comparison.operation().is_signed() {
+            wire_number(comparison.output())
+        } else {
+            emitter.fresh_wire()
+        };
+        emitter.push_cell(Ecp5Cell::Ccu2c {
+            name: format!("ccu_{}_{pair}", comparison.name()),
+            inputs,
+            carry_in: carry,
+            sums,
+            carry_out,
+            init: [CCU2C_ARITH_INIT; 2],
+            inject: [false; 2],
+        });
+        carry = Bit::Wire(carry_out);
+    }
+
+    if comparison.operation().is_signed() {
+        let output = wire_number(comparison.output());
+        let most_significant = comparison.lhs().len() - 1;
+        let lhs_sign = emitter.map_net(comparison.lhs()[most_significant]);
+        let rhs_sign = emitter.map_net(comparison.rhs()[most_significant]);
+        emitter.push_cell(Ecp5Cell::Lut4 {
+            name: format!("lut_{}_signed", comparison.name()),
+            inputs: [lhs_sign, rhs_sign, carry, Bit::Zero],
+            output,
+            init: signed_comparison_truth_table(),
+        });
+        emitter.alias_net(comparison.output(), Bit::Wire(output));
+    } else {
+        emitter.alias_net(comparison.output(), carry);
+    }
+}
+
+fn signed_comparison_truth_table() -> u16 {
+    (0..16).fold(0, |table, assignment| {
+        let lhs_sign = assignment & 1 != 0;
+        let rhs_sign = assignment & 2 != 0;
+        let unsigned_relation = assignment & 4 != 0;
+        let value = if lhs_sign == rhs_sign {
+            unsigned_relation
+        } else {
+            lhs_sign
+        };
+        table | (u16::from(value) << assignment)
+    })
 }
 
 fn map_arithmetic_luts(arithmetic: &ArithmeticCell, emitter: &mut LutEmitter<'_>) {
@@ -1050,8 +1152,8 @@ mod tests {
     use std::num::NonZeroU32;
 
     use struo_ir::{
-        ActiveLevel, ArithmeticOp, ClockEdge, EnableControl, MemoryCell, Netlist, RegisterCell,
-        ResetControl,
+        ActiveLevel, ArithmeticOp, ClockEdge, ComparisonOp, EnableControl, MemoryCell, Netlist,
+        RegisterCell, ResetControl,
     };
 
     use super::{
@@ -1096,6 +1198,33 @@ mod tests {
             cell["parameters"]["INIT0"] == "1001011010101010"
                 && cell["parameters"]["INJECT1_0"] == "NO"
         }));
+    }
+
+    #[test]
+    fn maps_mixed_retained_cells_in_dependency_order() {
+        let mut source = Netlist::new("mixed_words");
+        let width = NonZeroU32::new(5).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let sum = source
+            .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
+            .unwrap();
+        let less = source
+            .add_comparison(ComparisonOp::LessThanUnsigned, &sum, &rhs)
+            .unwrap();
+        let incremented = source
+            .add_arithmetic(ArithmeticOp::Add, &[less], &[lhs[0]])
+            .unwrap();
+        source.add_output("result", incremented[0]);
+
+        let mapped = map_to_ecp5(&source).unwrap();
+
+        assert!(
+            mapped
+                .cells()
+                .iter()
+                .any(|cell| matches!(cell, Ecp5Cell::Ccu2c { .. }))
+        );
     }
 
     #[test]

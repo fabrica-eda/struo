@@ -858,6 +858,112 @@ mod tests {
     }
 
     #[test]
+    fn synthesized_carry_comparisons_are_exhaustively_equivalent() {
+        for width in [1u32, 2, 5] {
+            let operations = [
+                ("ltu", BinaryOp::LessThanUnsigned),
+                ("leu", BinaryOp::LessOrEqualUnsigned),
+                ("gtu", BinaryOp::GreaterThanUnsigned),
+                ("geu", BinaryOp::GreaterOrEqualUnsigned),
+                ("lts", BinaryOp::LessThanSigned),
+                ("les", BinaryOp::LessOrEqualSigned),
+                ("gts", BinaryOp::GreaterThanSigned),
+                ("ges", BinaryOp::GreaterOrEqualSigned),
+            ];
+            let mut module = Module::new("comparisons");
+            let lhs_signal = module.add_port(Port {
+                name: "lhs".into(),
+                direction: PortDirection::Input,
+                r#type: bits(width),
+            });
+            let rhs_signal = module.add_port(Port {
+                name: "rhs".into(),
+                direction: PortDirection::Input,
+                r#type: bits(width),
+            });
+            let outputs = operations
+                .iter()
+                .map(|(name, _)| {
+                    module.add_port(Port {
+                        name: (*name).into(),
+                        direction: PortDirection::Output,
+                        r#type: bits(1),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let lhs = module.read(lhs_signal).unwrap();
+            let rhs = module.read(rhs_signal).unwrap();
+            for ((_, operation), output) in operations.into_iter().zip(outputs) {
+                let value = module.binary(operation, lhs, rhs).unwrap();
+                module.assign(module.whole(output).unwrap(), value).unwrap();
+            }
+            let mut design = Design::new("comparisons");
+            design.add_module(module);
+
+            let synthesized = synthesize(&design).unwrap();
+            assert_eq!(synthesized.netlist.comparisons().len(), 8);
+            let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+            assert_eq!(
+                mapped
+                    .cells()
+                    .iter()
+                    .filter(|cell| matches!(cell, struo_target_ecp5::Ecp5Cell::Ccu2c { .. }))
+                    .count(),
+                8 * width.div_ceil(2) as usize
+            );
+            let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+            let lhs = simulator.signal("lhs");
+            let rhs = simulator.signal("rhs");
+            let ltu = simulator.signal("ltu");
+            let leu = simulator.signal("leu");
+            let gtu = simulator.signal("gtu");
+            let geu = simulator.signal("geu");
+            let lts = simulator.signal("lts");
+            let les = simulator.signal("les");
+            let gts = simulator.signal("gts");
+            let ges = simulator.signal("ges");
+
+            let limit = 1u8 << width;
+            let sign = 1u8 << (width - 1);
+            let modulus = 1i16 << width;
+            for lhs_value in 0u8..limit {
+                for rhs_value in 0u8..limit {
+                    simulator
+                        .modify(|io| {
+                            io.set(lhs, lhs_value);
+                            io.set(rhs, rhs_value);
+                        })
+                        .unwrap();
+                    let lhs_signed = if lhs_value & sign == 0 {
+                        i16::from(lhs_value)
+                    } else {
+                        i16::from(lhs_value) - modulus
+                    };
+                    let rhs_signed = if rhs_value & sign == 0 {
+                        i16::from(rhs_value)
+                    } else {
+                        i16::from(rhs_value) - modulus
+                    };
+                    assert_eq!(simulator.get(ltu), u8::from(lhs_value < rhs_value).into());
+                    assert_eq!(simulator.get(leu), u8::from(lhs_value <= rhs_value).into());
+                    assert_eq!(simulator.get(gtu), u8::from(lhs_value > rhs_value).into());
+                    assert_eq!(simulator.get(geu), u8::from(lhs_value >= rhs_value).into());
+                    assert_eq!(simulator.get(lts), u8::from(lhs_signed < rhs_signed).into());
+                    assert_eq!(
+                        simulator.get(les),
+                        u8::from(lhs_signed <= rhs_signed).into()
+                    );
+                    assert_eq!(simulator.get(gts), u8::from(lhs_signed > rhs_signed).into());
+                    assert_eq!(
+                        simulator.get(ges),
+                        u8::from(lhs_signed >= rhs_signed).into()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn emits_lut_logic_as_a_valid_celox_artifact() {
         let mut source = Netlist::new("logic");
         let lhs = source.add_input("lhs");

@@ -6,8 +6,8 @@ use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU32;
 
 use struo_ir::{
-    ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, EnableControl, MemoryCell, NetId, Netlist,
-    NodeKind, RegisterCell, ResetControl, ValidationError,
+    ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, ComparisonOp, EnableControl, MemoryCell,
+    NetId, Netlist, NodeKind, RegisterCell, ResetControl, ValidationError,
 };
 use struo_rtl::{
     BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, Polarity, PortDirection, ResetMode,
@@ -35,7 +35,7 @@ pub struct SynthesisResult {
 /// Synthesizes the selected top module into a bit-level logic netlist.
 ///
 /// Construction performs constant folding and structural hashing. Word-level
-/// addition and subtraction are retained for target-specific carry mapping.
+/// addition, subtraction, and ordering comparisons are retained for target-specific carry mapping.
 /// Synchronous simple-dual-port memories are retained for block-RAM mapping. Hierarchy
 /// and inout ports are rejected until their semantics have dedicated passes.
 ///
@@ -60,10 +60,11 @@ pub fn synthesize(design: &Design) -> Result<SynthesisResult, SynthesisError> {
     let mut reports = vec![PassReport {
         pass: "lower-rtl",
         message: format!(
-            "lowered {} expressions to {} nodes, {} arithmetic cells, {} registers, and {} memories",
+            "lowered {} expressions to {} nodes, {} arithmetic cells, {} comparison cells, {} registers, and {} memories",
             module.expressions().len(),
             netlist.nodes().len(),
             netlist.arithmetic().len(),
+            netlist.comparisons().len(),
             netlist.registers().len(),
             netlist.memories().len()
         ),
@@ -442,29 +443,19 @@ impl<'a> Lowering<'a> {
                 let equal = self.equal_words(lhs, rhs);
                 vec![self.netlist.add_not(equal)]
             }
-            BinaryOp::LessThanUnsigned => vec![self.less_unsigned(lhs, rhs)],
-            BinaryOp::LessThanSigned => vec![self.less_signed(lhs, rhs)],
+            BinaryOp::LessThanUnsigned => self.compare(ComparisonOp::LessThanUnsigned, lhs, rhs),
+            BinaryOp::LessThanSigned => self.compare(ComparisonOp::LessThanSigned, lhs, rhs),
             BinaryOp::LessOrEqualUnsigned => {
-                let less = self.less_unsigned(lhs, rhs);
-                let equal = self.equal_words(lhs, rhs);
-                vec![self.netlist.add_or(less, equal)]
+                self.compare(ComparisonOp::LessOrEqualUnsigned, lhs, rhs)
             }
-            BinaryOp::LessOrEqualSigned => {
-                let less = self.less_signed(lhs, rhs);
-                let equal = self.equal_words(lhs, rhs);
-                vec![self.netlist.add_or(less, equal)]
-            }
-            BinaryOp::GreaterThanUnsigned => vec![self.less_unsigned(rhs, lhs)],
-            BinaryOp::GreaterThanSigned => vec![self.less_signed(rhs, lhs)],
+            BinaryOp::LessOrEqualSigned => self.compare(ComparisonOp::LessOrEqualSigned, lhs, rhs),
+            BinaryOp::GreaterThanUnsigned => self.compare(ComparisonOp::LessThanUnsigned, rhs, lhs),
+            BinaryOp::GreaterThanSigned => self.compare(ComparisonOp::LessThanSigned, rhs, lhs),
             BinaryOp::GreaterOrEqualUnsigned => {
-                let less = self.less_unsigned(rhs, lhs);
-                let equal = self.equal_words(lhs, rhs);
-                vec![self.netlist.add_or(less, equal)]
+                self.compare(ComparisonOp::LessOrEqualUnsigned, rhs, lhs)
             }
             BinaryOp::GreaterOrEqualSigned => {
-                let less = self.less_signed(rhs, lhs);
-                let equal = self.equal_words(lhs, rhs);
-                vec![self.netlist.add_or(less, equal)]
+                self.compare(ComparisonOp::LessOrEqualSigned, rhs, lhs)
             }
             BinaryOp::ShiftLeft => self.shift_left(lhs, rhs),
             BinaryOp::ShiftRightLogical => self.shift_right(lhs, rhs, false),
@@ -484,38 +475,12 @@ impl<'a> Lowering<'a> {
         self.reduce_tree(&same, true, Netlist::add_and)
     }
 
-    fn less_unsigned(&mut self, lhs: &[NetId], rhs: &[NetId]) -> NetId {
-        let mut segments = lhs
-            .iter()
-            .zip(rhs)
-            .rev()
-            .map(|(&lhs, &rhs)| {
-                let lhs_zero = self.netlist.add_not(lhs);
-                let less = self.netlist.add_and(lhs_zero, rhs);
-                let different = self.netlist.add_xor(lhs, rhs);
-                let equal = self.netlist.add_not(different);
-                (equal, less)
-            })
-            .collect::<Vec<_>>();
-
-        while segments.len() > 1 {
-            let mut next = Vec::with_capacity(segments.len().div_ceil(2));
-            for pair in segments.chunks(2) {
-                if let [higher, lower] = pair {
-                    let equal = self.netlist.add_and(higher.0, lower.0);
-                    let lower_less = self.netlist.add_and(higher.0, lower.1);
-                    let less = self.netlist.add_or(higher.1, lower_less);
-                    next.push((equal, less));
-                } else {
-                    next.push(pair[0]);
-                }
-            }
-            segments = next;
-        }
-
-        segments
-            .first()
-            .map_or_else(|| self.netlist.add_constant(false), |segment| segment.1)
+    fn compare(&mut self, operation: ComparisonOp, lhs: &[NetId], rhs: &[NetId]) -> Vec<NetId> {
+        vec![
+            self.netlist
+                .add_comparison(operation, lhs, rhs)
+                .expect("validated RTL comparisons have equal, non-zero widths"),
+        ]
     }
 
     fn reduce_tree(
@@ -540,14 +505,6 @@ impl<'a> Lowering<'a> {
             level = next;
         }
         level[0]
-    }
-
-    fn less_signed(&mut self, lhs: &[NetId], rhs: &[NetId]) -> NetId {
-        let unsigned_less = self.less_unsigned(lhs, rhs);
-        let lhs_sign = lhs[lhs.len() - 1];
-        let rhs_sign = rhs[rhs.len() - 1];
-        let signs_differ = self.netlist.add_xor(lhs_sign, rhs_sign);
-        self.netlist.add_mux(signs_differ, lhs_sign, unsigned_less)
     }
 
     fn shift_left(&mut self, input: &[NetId], amount: &[NetId]) -> Vec<NetId> {
@@ -858,7 +815,7 @@ impl From<ValidationError> for SynthesisError {
 mod tests {
     use std::collections::HashMap;
 
-    use struo_ir::{ActiveLevel, ArithmeticOp, Netlist, NodeKind};
+    use struo_ir::{ActiveLevel, ArithmeticOp, ComparisonOp, NetId, Netlist, NodeKind};
     use struo_rtl::{
         BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, Memory, Module, Polarity, Port,
         PortDirection, Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
@@ -1525,6 +1482,31 @@ mod tests {
                     } & mask;
                     result & (1 << bit) != 0
                 }
+                NodeKind::ComparisonOutput(_) => {
+                    let cell = netlist
+                        .comparisons()
+                        .iter()
+                        .find(|cell| cell.output() == node.output())
+                        .expect("comparison output belongs to a cell");
+                    let word = |nets: &[NetId]| {
+                        nets.iter().enumerate().fold(0u128, |word, (bit, net)| {
+                            word | (u128::from(values[net.index() as usize]) << bit)
+                        })
+                    };
+                    let mut lhs = word(cell.lhs());
+                    let mut rhs = word(cell.rhs());
+                    if cell.operation().is_signed() {
+                        let sign = 1 << (cell.lhs().len() - 1);
+                        lhs ^= sign;
+                        rhs ^= sign;
+                    }
+                    match cell.operation() {
+                        ComparisonOp::LessThanUnsigned | ComparisonOp::LessThanSigned => lhs < rhs,
+                        ComparisonOp::LessOrEqualUnsigned | ComparisonOp::LessOrEqualSigned => {
+                            lhs <= rhs
+                        }
+                    }
+                }
                 NodeKind::Output(name) => {
                     let value = values[node.inputs()[0].index() as usize];
                     outputs.insert(name.clone(), value);
@@ -1550,6 +1532,18 @@ mod tests {
                         .arithmetic()
                         .iter()
                         .find(|cell| cell.outputs().contains(&node.output()))
+                        .into_iter()
+                        .flat_map(|cell| cell.lhs().iter().chain(cell.rhs()))
+                        .map(|input| depths[input.index() as usize])
+                        .max()
+                        .unwrap_or(0)
+                        + 1
+                }
+                NodeKind::ComparisonOutput(_) => {
+                    netlist
+                        .comparisons()
+                        .iter()
+                        .find(|cell| cell.output() == node.output())
                         .into_iter()
                         .flat_map(|cell| cell.lhs().iter().chain(cell.rhs()))
                         .map(|input| depths[input.index() as usize])

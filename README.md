@@ -185,10 +185,14 @@ design from 2,148 to 1,133 `TRELLIS_COMB` sites while retaining 1,411
 `TRELLIS_FF` sites. Before enable inference, the same ten seeds averaged 268.81
 MHz, passed in 9 of 10 seeds, and ranged from 247.10 to 282.89 MHz. Before the
 registered crossbar boundaries it reached 68.77 MHz under the same constraint.
-The timing tradeoff is additional address/control latency. Address decode
-admits one request at a time per address channel and initiator, while W and R
-data still stream at one beat per cycle; place and route should be repeated for
-a production top, floorplan, and seed.
+Retaining eight ordering comparisons through synthesis and mapping them to
+`CCU2C` raises the ten-seed average to 273.34 MHz, passes all ten seeds, and
+ranges from 256.15 to 300.75 MHz. This delay-first mapping increases
+`TRELLIS_COMB` use from 1,133 to 1,181 sites. The timing tradeoff is additional
+address/control latency. Address decode admits one request at a time per
+address channel and initiator, while W and R data still stream at one beat per
+cycle; place and route should be repeated for a production top, floorplan, and
+seed.
 
 `Axi4CrossbarSelfTest` instantiates the interface-based crossbar, an internal
 initiator, a target response model, and a result scoreboard. Its physical top

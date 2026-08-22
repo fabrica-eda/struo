@@ -97,7 +97,8 @@ impl<'a> LutEmitter<'a> {
                 | NodeKind::Not
                 | NodeKind::Mux
                 | NodeKind::Output(_)
-                | NodeKind::ArithmeticOutput(_) => {}
+                | NodeKind::ArithmeticOutput(_)
+                | NodeKind::ComparisonOutput(_) => {}
             }
         }
         Self {
@@ -289,7 +290,8 @@ fn evaluate_cut(
         | NodeKind::RegisterOutput(_)
         | NodeKind::Output(_)
         | NodeKind::MemoryOutput(_)
-        | NodeKind::ArithmeticOutput(_) => {
+        | NodeKind::ArithmeticOutput(_)
+        | NodeKind::ComparisonOutput(_) => {
             unreachable!("a cut must stop before a source or output node")
         }
     };
