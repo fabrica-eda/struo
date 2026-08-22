@@ -5,7 +5,6 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::Mutex;
 
 use struo_rtl::{BitWidth, Design, Module, Port, PortDirection, RtlError, StateDomain, ValueType};
 use veryl_analyzer::ir::{Component, Declaration, Ir, VarKind};
@@ -16,8 +15,6 @@ use veryl_parser::{Parser, resource_table};
 mod lower;
 
 pub use lower::lower_analyzed_ir;
-
-static ANALYZER_LOCK: Mutex<()> = Mutex::new(());
 
 /// Analyzes one self-contained Veryl source and lowers its selected top.
 ///
@@ -30,9 +27,9 @@ static ANALYZER_LOCK: Mutex<()> = Mutex::new(());
 /// Returns an error for parser or analyzer diagnostics, metadata setup, or
 /// semantic lowering failures.
 pub fn analyze_and_lower(source: &str, project: &str, top: &str) -> Result<Design, ImportError> {
-    let _guard = ANALYZER_LOCK
-        .lock()
-        .map_err(|_| ImportError::AnalysisFailed("analyzer lock was poisoned".into()))?;
+    // Veryl's resource, symbol, and attribute tables are thread-local. Reset
+    // this worker's analyzer state without serializing independent analyses on
+    // other threads.
     veryl_analyzer::symbol_table::clear();
     veryl_analyzer::attribute_table::clear();
     let metadata = Metadata::create_default(project)
