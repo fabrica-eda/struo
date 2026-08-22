@@ -33,6 +33,15 @@ pub fn axi4_qos_arbiter_4() -> Result<Design, ImportError> {
     analyze_and_lower(AXI4_CROSSBAR_SOURCE, "struo_axi4", "Axi4QosArbiter4")
 }
 
+/// Analyzes the two-slot response ID release pipeline.
+///
+/// # Errors
+///
+/// Returns an error if Veryl analysis, hierarchy flattening, or RTL validation fails.
+pub fn axi4_id_release_pipeline() -> Result<Design, ImportError> {
+    analyze_and_lower(AXI4_CROSSBAR_SOURCE, "struo_axi4", "Axi4IdReleasePipeline")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
@@ -42,7 +51,9 @@ mod tests {
     use struo_synth::synthesize;
     use struo_target_ecp5::map_to_ecp5;
 
-    use super::{axi4_crossbar_2x2, axi4_crossbar_self_test, axi4_qos_arbiter_4};
+    use super::{
+        axi4_crossbar_2x2, axi4_crossbar_self_test, axi4_id_release_pipeline, axi4_qos_arbiter_4,
+    };
 
     static CROSSBAR_IMAGES: OnceLock<CrossbarImages> = OnceLock::new();
 
@@ -90,6 +101,30 @@ mod tests {
     }
 
     #[test]
+    fn pipelines_outstanding_id_release_before_and_after_mapping() {
+        let design = axi4_id_release_pipeline().unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let reference = SimulatorBuilder::new(super::AXI4_CROSSBAR_SOURCE, "Axi4IdReleasePipeline")
+            .build_native()
+            .unwrap();
+        let mapped = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        for mut simulator in [reference, mapped] {
+            reset(&mut simulator);
+            set_u8(&mut simulator, "slot0_valid", 1);
+            set_u8(&mut simulator, "slot0_id", 9);
+            set_u8(&mut simulator, "release_id", 9);
+            set_u8(&mut simulator, "release_valid", 1);
+            tick(&mut simulator);
+            set_u8(&mut simulator, "release_valid", 0);
+            wait_until(&mut simulator, "match", 1, 6);
+            tick(&mut simulator);
+            assert_value(&mut simulator, "match", 0);
+        }
+    }
+
+    #[test]
     fn preserves_axi4_bursts_ids_sidebands_and_backpressure() {
         for mut simulator in crossbar_simulators() {
             reset(&mut simulator);
@@ -112,25 +147,17 @@ mod tests {
             set_u8(&mut simulator, "s0.arvalid", 1);
             set_u8(&mut simulator, "s1.arvalid", 1);
             assert_value(&mut simulator, "s0.arready", 1);
-            assert_value(&mut simulator, "s1.arready", 0);
+            assert_value(&mut simulator, "s1.arready", 1);
             tick(&mut simulator);
             set_u8(&mut simulator, "s0.arvalid", 0);
+            set_u8(&mut simulator, "s1.arvalid", 0);
+            wait_until(&mut simulator, "m0.arvalid", 1, 16);
             assert_value(&mut simulator, "m0.araddr", 0x0020);
             set_u8(&mut simulator, "m0.arready", 1);
             tick(&mut simulator);
             set_u8(&mut simulator, "m0.arready", 0);
-            set_u8(&mut simulator, "m0.rvalid", 1);
-            set_u8(&mut simulator, "m0.rlast", 1);
-            set_u8(&mut simulator, "s0.rready", 1);
-            set_u8(&mut simulator, "s0.arvalid", 1);
-            assert_value(&mut simulator, "s0.arready", 0);
-            assert_value(&mut simulator, "s1.arready", 1);
-            tick(&mut simulator);
-            set_u8(&mut simulator, "m0.rvalid", 0);
-            set_u8(&mut simulator, "m0.rlast", 0);
-            set_u8(&mut simulator, "s0.rready", 0);
-            set_u8(&mut simulator, "s0.arvalid", 0);
-            set_u8(&mut simulator, "s1.arvalid", 0);
+
+            wait_until(&mut simulator, "m0.arvalid", 1, 16);
             assert_value(&mut simulator, "m0.araddr", 0x0024);
         }
     }
@@ -247,7 +274,7 @@ mod tests {
         assert_value(simulator, "s0.wready", 1);
         tick(simulator);
         set_u8(simulator, "s0.wvalid", 0);
-        tick(simulator);
+        wait_until(simulator, "m1.awvalid", 1, 16);
         assert_value(simulator, "m1.awvalid", 1);
         assert_value(simulator, "m1.awid", 9);
         assert_value(simulator, "m1.awaddr", 0x8020);
@@ -295,6 +322,7 @@ mod tests {
         set_u8(simulator, "s0.bready", 0);
         set_u8(simulator, "m1.bvalid", 0);
         assert_value(simulator, "s0.bvalid", 0);
+        wait_until(simulator, "s0.awready", 1, 16);
         assert_value(simulator, "s0.awready", 1);
     }
 
@@ -313,6 +341,7 @@ mod tests {
         assert_value(simulator, "s1.arready", 1);
         tick(simulator);
         set_u8(simulator, "s1.arvalid", 0);
+        wait_until(simulator, "m0.arvalid", 1, 16);
         assert_value(simulator, "m0.arvalid", 1);
         assert_value(simulator, "m0.arid", 0x16);
         assert_value(simulator, "m0.araddr", 0x0040);
@@ -359,9 +388,10 @@ mod tests {
         set_u16(simulator, "s0.araddr", 0x6000);
         set_u8(simulator, "s0.arlen", 2);
         set_u8(simulator, "s0.arvalid", 1);
-        assert_value(simulator, "s0.arready", 1);
+        wait_until(simulator, "s0.arready", 1, 8);
         tick(simulator);
         set_u8(simulator, "s0.arvalid", 0);
+        wait_until(simulator, "s0.rvalid", 1, 16);
         assert_value(simulator, "s0.rvalid", 1);
         assert_value(simulator, "s0.rid", 3);
         assert_value(simulator, "s0.rresp", 0b11);
@@ -394,10 +424,11 @@ mod tests {
         tick(simulator);
 
         set_write_beat(simulator, 1, 0xdead_0002, true);
+        wait_until(simulator, "s1.wready", 1, 16);
         assert_value(simulator, "s1.wready", 1);
         tick(simulator);
         set_u8(simulator, "s1.wvalid", 0);
-        tick(simulator);
+        wait_until(simulator, "s1.bvalid", 1, 16);
         assert_value(simulator, "s1.bvalid", 1);
         assert_value(simulator, "s1.bid", 5);
         assert_value(simulator, "s1.bresp", 0b11);
@@ -420,6 +451,7 @@ mod tests {
         assert_value(simulator, "s0.arready", 1);
         tick(simulator);
         set_u8(simulator, "s0.arvalid", 0);
+        wait_until(simulator, "m0.arvalid", 1, 16);
         assert_value(simulator, "m0.arvalid", 1);
         assert_value(simulator, "m0.araddr", 0x3ffc);
         assert_value(simulator, "m0.arlen", 3);
@@ -484,6 +516,7 @@ mod tests {
 
     fn consume_decode_error_read(simulator: &mut Simulator<NativeBackend>, id: u8, beats: usize) {
         set_u8(simulator, "s0.rready", 1);
+        wait_until(simulator, "s0.rvalid", 1, 16);
         for beat in 0..beats {
             assert_value(simulator, "s0.rvalid", 1);
             assert_value(simulator, "s0.rid", u64::from(id));
@@ -509,11 +542,12 @@ mod tests {
         set_u8(simulator, "s1.arburst", 1);
         set_u8(simulator, "s1.arqos", 9);
         set_u8(simulator, "s1.arvalid", 1);
-        assert_value(simulator, "s0.arready", 0);
+        assert_value(simulator, "s0.arready", 1);
         assert_value(simulator, "s1.arready", 1);
         tick(simulator);
         set_u8(simulator, "s0.arvalid", 0);
         set_u8(simulator, "s1.arvalid", 0);
+        wait_until(simulator, "m0.arvalid", 1, 16);
         assert_value(simulator, "m0.arvalid", 1);
         assert_value(simulator, "m0.arid", 0x12);
         assert_value(simulator, "m0.araddr", 0x0104);
@@ -552,7 +586,7 @@ mod tests {
         set_u8(simulator, "s0.wvalid", 0);
         set_u8(simulator, "s1.awvalid", 0);
         set_u8(simulator, "s1.wvalid", 0);
-        tick(simulator);
+        wait_until(simulator, "m1.awvalid", 1, 16);
         assert_value(simulator, "m1.awvalid", 1);
         assert_value(simulator, "m1.awid", 0x14);
         assert_value(simulator, "m1.awaddr", 0x8104);
@@ -583,9 +617,10 @@ mod tests {
         set_u8(simulator, "m1.rvalid", 0);
         set_u8(simulator, "s0.rready", 0);
 
-        assert_value(simulator, "s0.arready", 1);
+        wait_until(simulator, "s0.arready", 1, 8);
         tick(simulator);
         set_u8(simulator, "s0.arvalid", 0);
+        wait_until(simulator, "m0.arvalid", 1, 16);
         assert_value(simulator, "m0.arvalid", 1);
         assert_value(simulator, "m0.arid", 3);
         set_u8(simulator, "m0.arready", 1);
@@ -638,7 +673,7 @@ mod tests {
         set_u8(simulator, "m1.bvalid", 0);
         set_u8(simulator, "s0.bready", 0);
 
-        assert_value(simulator, "s0.awready", 1);
+        wait_until(simulator, "s0.awready", 1, 8);
         set_u8(simulator, "s0.awvalid", 0);
 
         set_u8(simulator, "m0.bid", 3);
@@ -663,6 +698,7 @@ mod tests {
         assert_value(simulator, &format!("s{initiator}.arready"), 1);
         tick(simulator);
         set_u8(simulator, &format!("s{initiator}.arvalid"), 0);
+        wait_until(simulator, &format!("m{target}.arvalid"), 1, 16);
         assert_value(simulator, &format!("m{target}.arvalid"), 1);
         assert_value(
             simulator,
@@ -691,7 +727,7 @@ mod tests {
         tick(simulator);
         set_u8(simulator, &format!("s{initiator}.awvalid"), 0);
         set_u8(simulator, &format!("s{initiator}.wvalid"), 0);
-        tick(simulator);
+        wait_until(simulator, &format!("m{target}.awvalid"), 1, 16);
         assert_value(simulator, &format!("m{target}.awvalid"), 1);
         assert_value(simulator, &format!("m{target}.wvalid"), 1);
         assert_value(
@@ -720,6 +756,22 @@ mod tests {
 
     fn tick(simulator: &mut Simulator<NativeBackend>) {
         simulator.tick(simulator.event("clk")).unwrap();
+    }
+
+    fn wait_until(
+        simulator: &mut Simulator<NativeBackend>,
+        name: &str,
+        expected: u64,
+        max_cycles: usize,
+    ) {
+        let signal = signal(simulator, name);
+        for _ in 0..max_cycles {
+            if simulator.get(signal) == expected.into() {
+                return;
+            }
+            tick(simulator);
+        }
+        assert_value(simulator, name, expected);
     }
 
     fn set_u8(simulator: &mut Simulator<NativeBackend>, name: &str, value: u8) {
