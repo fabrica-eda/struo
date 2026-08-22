@@ -1,16 +1,19 @@
 //! ECP5 technology mapping and nextpnr serialization.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use serde::Serialize;
 use serde::ser::Serializer;
+use struo_formal::{
+    LogicFunction, RetimingCertificate, RetimingDomain, RetimingEdge, RetimingGraph,
+    RetimingVertex, derive_retimed_graph, verify_retiming_certificate,
+};
 use struo_ir::{
     ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, ComparisonCell, MemoryCell, NetId,
     Netlist, PortDirection as IrPortDirection, ValidationError,
 };
-use struo_synth::{InferRegisterEnables, Pass, TimingDrivenRetiming};
 
 mod lut;
 
@@ -250,15 +253,23 @@ pub struct Ecp5Netlist {
 /// Result of the automatic, technology-scored retiming search.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetimingSelection {
-    /// Whether a certified retimed candidate beat the original mapped timing estimate.
+    /// Whether automatic mapped-LUT retiming selected a certified candidate.
     pub applied: bool,
+    /// Maximum LUT4 levels into a register before retiming.
+    pub original_lut_depth: usize,
+    /// Maximum LUT4 levels into a register in the selected mapping.
+    pub selected_lut_depth: usize,
+    /// Register data inputs at the original maximum LUT4 depth.
+    pub original_critical_registers: usize,
+    /// Register data inputs remaining at the maximum depth after retiming.
+    pub selected_critical_registers: usize,
     /// Estimated register-to-register period before retiming.
     pub original_period_ps: u32,
     /// Estimated register-to-register period selected for mapping.
     pub selected_period_ps: u32,
-    /// Registers in the target-independent netlist before candidate selection.
+    /// Mapped flip-flops before candidate selection.
     pub original_registers: usize,
-    /// Registers in the selected target-independent netlist.
+    /// Mapped flip-flops after candidate selection.
     pub selected_registers: usize,
 }
 
@@ -316,55 +327,498 @@ pub fn map_to_ecp5_with_options(
     netlist: &Netlist,
     options: MappingOptions,
 ) -> Result<Ecp5Netlist, MappingError> {
-    let (mut selected, mut selected_quality) = map_once(netlist, options)?;
-    let original_quality = selected_quality;
+    let (mut selected, original_quality) = map_once(netlist, options)?;
     let original_cells = selected.cells.len();
     let original_registers = netlist.registers().len();
     let mut selected_registers = original_registers;
-    let mut seen = Vec::new();
-    for target_depth in [4, 8, 12] {
-        let mut candidate = netlist.clone();
-        if TimingDrivenRetiming::new(target_depth)
-            .run(&mut candidate)
-            .is_err()
-        {
-            continue;
-        }
-        if candidate == *netlist {
-            continue;
-        }
-        if InferRegisterEnables.run(&mut candidate).is_err() {
-            continue;
-        }
-        if seen.iter().any(|prior| prior == &candidate) {
-            continue;
-        }
-        seen.push(candidate.clone());
-        let Ok((mapped, quality)) = map_once(&candidate, options) else {
-            continue;
-        };
-        let area_limit = original_cells + original_cells.div_ceil(10);
-        let register_limit = original_registers + original_registers.div_ceil(5);
-        if quality.period_ps.saturating_add(100) <= selected_quality.period_ps
-            && mapped.cells.len() <= area_limit
-            && candidate.registers().len() <= register_limit
-        {
-            selected = mapped;
-            selected_quality = quality;
-            selected_registers = candidate.registers().len();
-        }
+    let mut applied = false;
+    let mapped_original_profile = mapped_lut_profile(&selected);
+    if let Some(retimed) =
+        automatically_retime_mapped_luts(&selected, original_cells, original_registers)
+    {
+        selected = retimed;
+        selected_registers = mapped_register_count(&selected);
+        applied = true;
     }
+    let mapped_selected_profile = mapped_lut_profile(&selected);
     selected.retiming = RetimingSelection {
-        applied: selected_quality != original_quality,
+        applied,
+        original_lut_depth: mapped_original_profile.data_depth,
+        selected_lut_depth: mapped_selected_profile.data_depth,
+        original_critical_registers: mapped_original_profile.critical_data.len(),
+        selected_critical_registers: mapped_selected_profile.critical_data.len(),
         original_period_ps: original_quality.period_ps,
-        selected_period_ps: selected_quality.period_ps,
+        selected_period_ps: original_quality.period_ps,
         original_registers,
         selected_registers,
     };
     Ok(selected)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+fn automatically_retime_mapped_luts(
+    original: &Ecp5Netlist,
+    original_cells: usize,
+    original_registers: usize,
+) -> Option<Ecp5Netlist> {
+    let original_profile = mapped_lut_profile(original);
+    let original_depth = original_profile.data_depth;
+    let cell_limit = original_cells + original_cells.div_ceil(10);
+    let register_limit = original_registers + original_registers.div_ceil(5);
+    let mut frontier = original.clone();
+    for _ in 0..64 {
+        let profile = mapped_lut_profile(&frontier);
+        if profile.data_depth < original_depth {
+            return Some(frontier);
+        }
+        let mut best = None;
+        for &register in &profile.critical_data {
+            let Some(candidate) = backward_retime_lut(&frontier, register) else {
+                continue;
+            };
+            let candidate_profile = mapped_lut_profile(&candidate);
+            let candidate_registers = mapped_register_count(&candidate);
+            if candidate_profile.overall_depth > original_profile.overall_depth
+                || candidate.cells.len() > cell_limit
+                || candidate_registers > register_limit
+            {
+                continue;
+            }
+            let score = (
+                candidate_profile.data_depth,
+                candidate_profile.critical_data.len(),
+                candidate_profile.overall_depth,
+                candidate.cells.len(),
+                candidate_registers,
+            );
+            let frontier_score = (
+                profile.data_depth,
+                profile.critical_data.len(),
+                profile.overall_depth,
+                frontier.cells.len(),
+                mapped_register_count(&frontier),
+            );
+            if score < frontier_score
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, best_score): &(Ecp5Netlist, _)| score < *best_score)
+            {
+                best = Some((candidate, score));
+            }
+        }
+        let Some((candidate, _)) = best else {
+            break;
+        };
+        frontier = candidate;
+    }
+    let selected_profile = mapped_lut_profile(&frontier);
+    ((
+        selected_profile.data_depth,
+        selected_profile.critical_data.len(),
+    ) < (
+        original_profile.data_depth,
+        original_profile.critical_data.len(),
+    ))
+        .then_some(frontier)
+}
+
+fn mapped_register_count(netlist: &Ecp5Netlist) -> usize {
+    netlist
+        .cells
+        .iter()
+        .filter(|cell| matches!(cell, Ecp5Cell::FlipFlop { .. }))
+        .count()
+}
+
+struct MappedLutProfile {
+    data_depth: usize,
+    critical_data: Vec<usize>,
+    overall_depth: usize,
+}
+
+fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
+    let depths = mapped_lut_depths(netlist);
+    let data_endpoints = netlist
+        .cells
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cell)| match cell {
+            Ecp5Cell::FlipFlop { data, .. } => Some((index, bit_lut_depth(*data, &depths))),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let data_depth = data_endpoints
+        .iter()
+        .map(|(_, depth)| *depth)
+        .max()
+        .unwrap_or(0);
+    let control_depths = netlist.cells.iter().filter_map(|cell| match cell {
+        Ecp5Cell::FlipFlop { enable, .. } => {
+            enable.map(|control| bit_lut_depth(control.signal, &depths))
+        }
+        Ecp5Cell::BlockRam {
+            write_enable,
+            read_enable,
+            ..
+        } => Some(
+            read_enable
+                .map_or(0, |control| bit_lut_depth(control.signal, &depths))
+                .max(bit_lut_depth(write_enable.signal, &depths)),
+        ),
+        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => None,
+    });
+    let output_depths = netlist
+        .ports
+        .iter()
+        .filter(|port| port.direction == PortDirection::Output)
+        .flat_map(|port| &port.bits)
+        .map(|bit| bit_lut_depth(*bit, &depths));
+    let overall_depth = [data_depth]
+        .into_iter()
+        .chain(control_depths)
+        .chain(output_depths)
+        .max()
+        .unwrap_or(0);
+    let critical_data = data_endpoints
+        .into_iter()
+        .filter_map(|(index, depth)| (depth == data_depth && depth > 0).then_some(index))
+        .collect();
+    MappedLutProfile {
+        data_depth,
+        critical_data,
+        overall_depth,
+    }
+}
+
+fn mapped_lut_depths(netlist: &Ecp5Netlist) -> HashMap<u32, usize> {
+    let mut depths = HashMap::<u32, usize>::new();
+    for port in &netlist.ports {
+        if port.direction == PortDirection::Input {
+            for bit in &port.bits {
+                if let Bit::Wire(wire) = bit {
+                    depths.entry(*wire).or_insert(0);
+                }
+            }
+        }
+    }
+    for cell in &netlist.cells {
+        match cell {
+            Ecp5Cell::FlipFlop { output, .. } => {
+                depths.insert(*output, 0);
+            }
+            Ecp5Cell::BlockRam { read_data, .. } => {
+                for output in read_data {
+                    depths.insert(*output, 0);
+                }
+            }
+            Ecp5Cell::Ccu2c {
+                sums, carry_out, ..
+            } => {
+                for output in sums.iter().chain([carry_out]) {
+                    depths.entry(*output).or_insert(0);
+                }
+            }
+            Ecp5Cell::Lut4 { .. } => {}
+        }
+    }
+    // Retimed cells need not remain in producer-before-consumer order. Iterate
+    // to a fixed point so the score is independent of JSON cell ordering.
+    for _ in 0..netlist.cells.len() {
+        let mut progress = false;
+        for cell in &netlist.cells {
+            let Ecp5Cell::Lut4 { inputs, output, .. } = cell else {
+                continue;
+            };
+            let input_depths = inputs
+                .iter()
+                .map(|input| match input {
+                    Bit::Wire(wire) => depths.get(wire).copied(),
+                    Bit::Zero | Bit::One => Some(0),
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(input_depths) = input_depths {
+                let depth = 1 + input_depths.into_iter().max().unwrap_or(0);
+                if depths.insert(*output, depth) != Some(depth) {
+                    progress = true;
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    depths
+}
+
+fn bit_lut_depth(bit: Bit, depths: &HashMap<u32, usize>) -> usize {
+    match bit {
+        Bit::Wire(wire) => depths.get(&wire).copied().unwrap_or(0),
+        Bit::Zero | Bit::One => 0,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<Ecp5Netlist> {
+    let Ecp5Cell::FlipFlop {
+        name: register_name,
+        data: Bit::Wire(data_wire),
+        output: register_output,
+        clock,
+        edge: clock_edge,
+        enable,
+        reset: Some(reset),
+    } = netlist.cells.get(register_index)?
+    else {
+        return None;
+    };
+    if mapped_wire_is_control(netlist, *register_output) {
+        return None;
+    }
+    let (lut_index, lut_name, lut_inputs, lut_init) =
+        netlist
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| match cell {
+                Ecp5Cell::Lut4 {
+                    name,
+                    inputs,
+                    output,
+                    init,
+                } if output == data_wire => Some((index, name.clone(), *inputs, *init)),
+                _ => None,
+            })?;
+    let mut input_wires = lut_inputs
+        .iter()
+        .filter_map(|input| match input {
+            Bit::Wire(wire) => Some(*wire),
+            Bit::Zero | Bit::One => None,
+        })
+        .collect::<Vec<_>>();
+    input_wires.sort_unstable();
+    input_wires.dedup();
+    if input_wires.is_empty() || input_wires.len() > 4 {
+        return None;
+    }
+    let function = reduced_lut_function(lut_inputs, lut_init, &input_wires);
+    let input_count = input_wires.len();
+    let mut vertices = input_wires
+        .iter()
+        .map(|wire| RetimingVertex::boundary(format!("wire{wire}"), LogicFunction::new(0, 0)))
+        .collect::<Vec<_>>();
+    vertices.push(RetimingVertex::logic("lut", function));
+    vertices.push(RetimingVertex::boundary("q", LogicFunction::new(1, 0b10)));
+    let lut_vertex = input_count;
+    let q_vertex = input_count + 1;
+    let mut edges = (0..input_count)
+        .map(|input| RetimingEdge::new(input, lut_vertex, Vec::new()))
+        .collect::<Vec<_>>();
+    edges.push(RetimingEdge::new(lut_vertex, q_vertex, vec![reset.value]));
+    let before = RetimingGraph::new(
+        RetimingDomain::new(
+            format!("{clock:?}"),
+            *clock_edge,
+            format!("{:?}", reset.signal),
+            reset.active,
+            reset.asynchronous,
+        ),
+        vertices,
+        edges,
+    );
+    let mut labels = vec![0; input_count + 2];
+    labels[lut_vertex] = 1;
+    let certificate = RetimingCertificate::new(labels);
+    let after = derive_retimed_graph(&before, &certificate).ok()?;
+    verify_retiming_certificate(&before, &after, &certificate).ok()?;
+
+    let mut candidate = netlist.clone();
+    candidate.cells.remove(register_index);
+    let mut next_wire = maximum_mapped_wire(&candidate)?.checked_add(1)?;
+    let mut replacements = HashMap::new();
+    for (input, reset_edge) in input_wires.iter().zip(after.edges()) {
+        let output = next_wire;
+        next_wire = next_wire.checked_add(1)?;
+        replacements.insert(*input, output);
+        candidate.cells.push(Ecp5Cell::FlipFlop {
+            name: format!("retime_{register_name}_{input}"),
+            data: Bit::Wire(*input),
+            output,
+            clock: *clock,
+            edge: *clock_edge,
+            enable: *enable,
+            reset: Some(Reset {
+                value: reset_edge.reset_values()[0],
+                ..*reset
+            }),
+        });
+    }
+    let new_inputs = lut_inputs.map(|input| match input {
+        Bit::Wire(wire) => Bit::Wire(replacements[&wire]),
+        constant => constant,
+    });
+    let fanout = mapped_wire_fanout(netlist, *data_wire);
+    let retimed_lut = Ecp5Cell::Lut4 {
+        name: format!("retime_{lut_name}"),
+        inputs: new_inputs,
+        output: *register_output,
+        init: lut_init,
+    };
+    if fanout == 1 {
+        let lut_index = lut_index - usize::from(register_index < lut_index);
+        candidate.cells[lut_index] = retimed_lut;
+    } else {
+        candidate.cells.push(retimed_lut);
+    }
+    Some(candidate)
+}
+
+fn mapped_wire_is_control(netlist: &Ecp5Netlist, wire: u32) -> bool {
+    netlist.cells.iter().any(|cell| match cell {
+        Ecp5Cell::FlipFlop {
+            clock,
+            enable,
+            reset,
+            ..
+        } => {
+            *clock == Bit::Wire(wire)
+                || enable.is_some_and(|control| control.signal == Bit::Wire(wire))
+                || reset.is_some_and(|control| control.signal == Bit::Wire(wire))
+        }
+        Ecp5Cell::BlockRam {
+            write_enable,
+            read_enable,
+            clock,
+            ..
+        } => {
+            *clock == Bit::Wire(wire)
+                || write_enable.signal == Bit::Wire(wire)
+                || read_enable.is_some_and(|control| control.signal == Bit::Wire(wire))
+        }
+        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => false,
+    })
+}
+
+fn reduced_lut_function(inputs: [Bit; 4], init: u16, variables: &[u32]) -> LogicFunction {
+    let mut truth_table = 0u64;
+    for assignment in 0..(1usize << variables.len()) {
+        let lut_index = inputs
+            .iter()
+            .enumerate()
+            .fold(0usize, |index, (pin, input)| {
+                let value = match input {
+                    Bit::Zero => false,
+                    Bit::One => true,
+                    Bit::Wire(wire) => {
+                        let variable = variables
+                            .iter()
+                            .position(|candidate| candidate == wire)
+                            .expect("wire was collected as a variable");
+                        assignment & (1usize << variable) != 0
+                    }
+                };
+                index | (usize::from(value) << pin)
+            });
+        if init & (1u16 << lut_index) != 0 {
+            truth_table |= 1u64 << assignment;
+        }
+    }
+    LogicFunction::new(
+        u8::try_from(variables.len()).expect("LUT has at most four variables"),
+        truth_table,
+    )
+}
+
+fn mapped_wire_fanout(netlist: &Ecp5Netlist, wire: u32) -> usize {
+    netlist
+        .cells
+        .iter()
+        .map(|cell| {
+            cell_input_bits(cell)
+                .into_iter()
+                .filter(|bit| *bit == Bit::Wire(wire))
+                .count()
+        })
+        .sum::<usize>()
+        + netlist
+            .ports
+            .iter()
+            .flat_map(|port| &port.bits)
+            .filter(|bit| **bit == Bit::Wire(wire))
+            .count()
+}
+
+fn maximum_mapped_wire(netlist: &Ecp5Netlist) -> Option<u32> {
+    netlist
+        .ports
+        .iter()
+        .flat_map(|port| &port.bits)
+        .copied()
+        .chain(netlist.cells.iter().flat_map(cell_output_bits))
+        .filter_map(|bit| match bit {
+            Bit::Wire(wire) => Some(wire),
+            Bit::Zero | Bit::One => None,
+        })
+        .max()
+}
+
+fn cell_input_bits(cell: &Ecp5Cell) -> Vec<Bit> {
+    match cell {
+        Ecp5Cell::Lut4 { inputs, .. } => inputs.to_vec(),
+        Ecp5Cell::Ccu2c {
+            inputs, carry_in, ..
+        } => inputs
+            .iter()
+            .flatten()
+            .copied()
+            .chain([*carry_in])
+            .collect(),
+        Ecp5Cell::FlipFlop {
+            data,
+            clock,
+            enable,
+            reset,
+            ..
+        } => [*data, *clock]
+            .into_iter()
+            .chain(enable.map(|control| control.signal))
+            .chain(reset.map(|control| control.signal))
+            .collect(),
+        Ecp5Cell::BlockRam {
+            write_address,
+            write_data,
+            write_enable,
+            read_address,
+            read_enable,
+            clock,
+            ..
+        } => write_address
+            .iter()
+            .chain(write_data)
+            .chain(read_address.iter())
+            .copied()
+            .chain([write_enable.signal, *clock])
+            .chain(read_enable.map(|control| control.signal))
+            .collect(),
+    }
+}
+
+fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
+    match cell {
+        Ecp5Cell::Lut4 { output, .. } | Ecp5Cell::FlipFlop { output, .. } => {
+            vec![Bit::Wire(*output)]
+        }
+        Ecp5Cell::Ccu2c {
+            sums, carry_out, ..
+        } => sums
+            .iter()
+            .copied()
+            .chain([*carry_out])
+            .map(Bit::Wire)
+            .collect(),
+        Ecp5Cell::BlockRam { read_data, .. } => read_data.iter().copied().map(Bit::Wire).collect(),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct MappingQuality {
     period_ps: u32,
 }
@@ -377,9 +831,8 @@ fn map_once(
     let demand = MappingDemand::collect(netlist);
     let cuts = CutDatabase::analyze(netlist);
     let cover = LutCover::select(netlist, &cuts, &demand.roots, options);
-    let quality = MappingQuality {
-        period_ps: cover.estimated_register_period_ps(netlist),
-    };
+    let (period_ps, _) = cover.estimated_register_period_ps(netlist);
+    let quality = MappingQuality { period_ps };
     let mut emitter = LutEmitter::new(netlist, &cover);
 
     map_retained_cells(netlist, options, &mut emitter);
@@ -454,6 +907,10 @@ fn map_once(
             cells,
             retiming: RetimingSelection {
                 applied: false,
+                original_lut_depth: 0,
+                selected_lut_depth: 0,
+                original_critical_registers: 0,
+                selected_critical_registers: 0,
                 original_period_ps: quality.period_ps,
                 selected_period_ps: quality.period_ps,
                 original_registers: netlist.registers().len(),
@@ -1283,7 +1740,8 @@ mod tests {
     };
 
     use super::{
-        ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+        ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, backward_retime_lut, map_once,
+        map_to_ecp5, map_to_ecp5_with_options,
     };
 
     fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
@@ -1346,7 +1804,60 @@ mod tests {
         let mapped = map_to_ecp5(&source).unwrap();
 
         assert!(mapped.retiming().applied, "{:?}", mapped.retiming());
-        assert!(mapped.retiming().selected_period_ps < mapped.retiming().original_period_ps);
+        assert!(
+            mapped.retiming().selected_lut_depth < mapped.retiming().original_lut_depth,
+            "{:?}",
+            mapped.retiming()
+        );
+    }
+
+    #[test]
+    fn backward_lut_retiming_derives_nonzero_input_reset() {
+        let mut source = Netlist::new("retimed_not");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let input = source.add_input("input");
+        let inverted = source.add_not(input);
+        let output = source.add_register_output("result_q");
+        source.add_register(RegisterCell::new(
+            "result_q",
+            output,
+            inverted,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: false,
+            }),
+        ));
+        source.add_output("result", output);
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let register = mapped
+            .cells
+            .iter()
+            .position(
+                |cell| matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name == "ff_result_q"),
+            )
+            .unwrap();
+
+        let retimed = backward_retime_lut(&mapped, register).unwrap();
+
+        assert!(retimed.cells.iter().any(|cell| {
+            matches!(
+                cell,
+                Ecp5Cell::FlipFlop {
+                    name,
+                    reset: Some(super::Reset { value: true, .. }),
+                    ..
+                } if name.starts_with("retime_ff_result_q_")
+            )
+        }));
+        assert!(!retimed.cells.iter().any(|cell| {
+            matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name == "ff_result_q")
+        }));
     }
 
     #[test]

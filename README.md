@@ -100,18 +100,24 @@ only after their reachable base cases are proved; invalid hints are discarded.
 Non-equivalence returns a named input trace through the first mismatching
 output cycle. The initial transition-system path requires one clock domain,
 known reset-derived state, and no retained memory. A separate linear-time
-certificate checker validates boundary-preserving, reset-to-zero retiming over
-zero-preserving truth-table vertices. `struo-synth::TimingDrivenRetiming`
-builds that register-weighted graph, searches forward and backward placements,
-checks the selected labels, and rebuilds the netlist. Clock enables are exposed
-as feedback muxes during the move and inferred again afterwards; unrelated
-clock/reset domains and their fan-in are fixed boundaries. ECP5 mapping runs
-the original placement and several certified candidates through the LUT4 cut
-and required-time model automatically. It selects retiming only for a strict
-estimated-period improvement with bounded cell/register growth, so callers do
-not choose an optimization mode and an unhelpful retiming falls back to the
-original netlist. Unsupported proof cases remain inconclusive or fail
-construction instead of being accepted as equivalent.
+certificate checker validates boundary-preserving retiming over truth-table
+vertices. It derives reset values in both directions: forward moves evaluate
+the crossed function, while backward moves solve a reset preimage.
+`struo-synth::TimingDrivenRetiming` builds that register-weighted graph, searches
+forward and backward placements, checks the selected labels, and rebuilds the
+netlist. Clock enables are exposed as feedback muxes during the move and
+inferred again afterwards; unrelated clock/reset domains and their fan-in are
+fixed boundaries.
+
+ECP5 mapping also performs automatic, certificate-checked backward retiming on
+the final LUT4 network, where physical LUT depth and duplicated inputs are
+known. It moves a critical sink FF to the unique inputs of its driving LUT,
+copies clock-enable semantics, derives every new reset value, and rejects
+generated-clock/control uses. The greedy selection reduces maximum-depth
+register endpoints without increasing the overall LUT depth and caps cell and
+FF growth. This is part of normal mapping; callers do not choose an optimization
+mode. Unsupported proof cases fail construction instead of being accepted as
+equivalent.
 
 The direct backend requires nextpnr-ecp5 and Project Trellis (`ecppack`) after
 synthesis. The existing Veryl/Yosys bitstream smoke test remains under
@@ -212,12 +218,16 @@ traffic, and local error completion through both the reference and post-map
 paths.
 
 On nextpnr 0.6, LFE5UM5G-85F speed grade 8, and seeds 1 through 10, the 300 MHz
-flow passes all ten seeds and reaches 303.03--316.66 MHz (307.62 MHz mean). The
-mapped self-test uses 1,193 `TRELLIS_COMB` and 1,433 `TRELLIS_FF` sites. The
-qualified-payload pass removes 69 of 1,109 inferred clock enables and makes the
-eight QoS comparison preregisters unnecessary. The remaining result combines
-the mapper's 300 MHz required-time cover with registered write-completion,
-read-slot reservation, scoreboard, and arbitration boundaries in the RTL.
+flow passes all ten seeds and reaches 302.94--319.59 MHz (309.80 MHz mean). The
+post-LUT retimer reduces four-LUT register endpoints from 15 to 6 and moves the
+former address-decoder critical path off the routed worst path, at a cost of 19
+FFs. The mapped self-test uses 1,193 `TRELLIS_COMB` and 1,452 `TRELLIS_FF` sites.
+Without post-LUT retiming the same seeds reached 303.03--316.66 MHz (307.62 MHz
+mean) with 1,433 FFs. The qualified-payload pass removes 69 of 1,109 inferred
+clock enables and makes the eight QoS comparison preregisters unnecessary. The
+remaining result combines the mapper's 300 MHz required-time cover with
+registered write-completion, read-slot reservation, scoreboard, and arbitration
+boundaries in the RTL.
 nextpnr uses timing budgets, a heap timing weight of 30,
 and timing-driven routing rip-up for every seed; no successful seed is selected
 after the fact. The CI timing gate repeats all ten fixed seeds and requires each

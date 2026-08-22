@@ -143,8 +143,8 @@ impl LutCover {
         self.plans[net.index() as usize].as_ref()
     }
 
-    pub(super) fn estimated_register_period_ps(&self, netlist: &Netlist) -> u32 {
-        netlist
+    pub(super) fn estimated_register_period_ps(&self, netlist: &Netlist) -> (u32, Vec<NetId>) {
+        let endpoints = netlist
             .registers()
             .iter()
             .flat_map(|register| {
@@ -154,12 +154,26 @@ impl LutCover {
             })
             .map(|net| {
                 let index = net.index() as usize;
-                self.arrivals[index]
-                    .saturating_add(wire_delay_ps(self.fanouts[index]))
-                    .saturating_add(FLIP_FLOP_SETUP_PS)
+                (
+                    net,
+                    self.arrivals[index]
+                        .saturating_add(wire_delay_ps(self.fanouts[index]))
+                        .saturating_add(FLIP_FLOP_SETUP_PS),
+                )
             })
+            .collect::<Vec<_>>();
+        let maximum = endpoints
+            .iter()
+            .map(|(_, period)| *period)
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let mut critical = endpoints
+            .into_iter()
+            .filter_map(|(net, period)| (period == maximum).then_some(net))
+            .collect::<Vec<_>>();
+        critical.sort_unstable();
+        critical.dedup();
+        (maximum, critical)
     }
 }
 

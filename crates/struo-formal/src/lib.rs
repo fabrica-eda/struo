@@ -18,6 +18,6 @@ pub use equivalence::{
 };
 pub use retiming::{
     LogicFunction, RetimingCertificate, RetimingDomain, RetimingEdge, RetimingError, RetimingGraph,
-    RetimingVertex, verify_retiming_certificate,
+    RetimingVertex, derive_retimed_graph, verify_retiming_certificate,
 };
 pub use transition::{StateBit, StateDomain, TransitionError, TransitionSystem};

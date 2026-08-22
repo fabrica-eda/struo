@@ -305,7 +305,11 @@ fn print_retiming_decision(mapped: &struo_target_ecp5::Ecp5Netlist) {
         "kept original"
     };
     println!(
-        "retiming: {action}; estimated period {} -> {} ps, registers {} -> {}",
+        "retiming: {action}; LUT depth {} -> {}, critical register inputs {} -> {}, estimated period {} -> {} ps, registers {} -> {}",
+        decision.original_lut_depth,
+        decision.selected_lut_depth,
+        decision.original_critical_registers,
+        decision.selected_critical_registers,
         decision.original_period_ps,
         decision.selected_period_ps,
         decision.original_registers,

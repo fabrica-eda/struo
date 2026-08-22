@@ -42,6 +42,21 @@ impl LogicFunction {
     pub const fn preserves_zero(self) -> bool {
         self.truth_table & 1 == 0
     }
+
+    /// Evaluates the truth table with input zero as the least-significant index bit.
+    #[must_use]
+    pub fn evaluate(self, inputs: &[bool]) -> Option<bool> {
+        if inputs.len() != usize::from(self.input_count) {
+            return None;
+        }
+        let index = inputs
+            .iter()
+            .enumerate()
+            .fold(0usize, |index, (bit, value)| {
+                index | (usize::from(*value) << bit)
+            });
+        Some((self.truth_table >> index) & 1 != 0)
+    }
 }
 
 /// One combinational vertex in a classical retiming graph.
@@ -141,7 +156,7 @@ pub struct RetimingDomain {
 }
 
 impl RetimingDomain {
-    /// Creates a reset-to-zero retiming domain.
+    /// Creates a retiming domain. Individual edge registers carry their reset values.
     #[must_use]
     pub fn new(
         clock: impl Into<String>,
@@ -252,12 +267,64 @@ impl RetimingCertificate {
     }
 }
 
-/// Checks that `after` is exactly the zero-reset, boundary-preserving retiming
-/// described by `certificate`.
+/// Derives the exact edge weights and reset values implied by a certificate.
 ///
-/// The initial implementation intentionally accepts only reset-to-zero edges
-/// and zero-preserving functions crossed by retiming. This makes reset-state
-/// correspondence independently checkable without sequential search.
+/// Forward moves may cross any truth-table function: the new reset value is
+/// the function evaluated at the removed input-register reset values. Backward
+/// moves choose a deterministic truth-table preimage for the removed output
+/// register reset value.
+///
+/// # Errors
+///
+/// Returns an error when labels are malformed or cannot be realized as legal
+/// unit retiming moves.
+pub fn derive_retimed_graph(
+    before: &RetimingGraph,
+    certificate: &RetimingCertificate,
+) -> Result<RetimingGraph, RetimingError> {
+    validate_graph(before)?;
+    if certificate.labels.len() != before.vertices.len() {
+        return Err(RetimingError::LabelCount {
+            expected: before.vertices.len(),
+            actual: certificate.labels.len(),
+        });
+    }
+    for (index, (vertex, label)) in before.vertices.iter().zip(&certificate.labels).enumerate() {
+        if vertex.boundary && *label != 0 {
+            return Err(RetimingError::MovedBoundary(index));
+        }
+    }
+    let has_forward = certificate.labels.iter().any(|label| *label < 0);
+    let has_backward = certificate.labels.iter().any(|label| *label > 0);
+    if has_forward && has_backward {
+        return Err(RetimingError::MixedDirections);
+    }
+    let reset_values = if has_forward {
+        forward_reset_values(before, &certificate.labels)?
+    } else if has_backward {
+        backward_reset_values(before, &certificate.labels)?
+    } else {
+        before
+            .edges
+            .iter()
+            .map(|edge| edge.reset_values.clone())
+            .collect()
+    };
+    let edges = before
+        .edges
+        .iter()
+        .zip(reset_values)
+        .map(|(edge, reset_values)| RetimingEdge::new(edge.source, edge.target, reset_values))
+        .collect();
+    Ok(RetimingGraph::new(
+        before.domain.clone(),
+        before.vertices.clone(),
+        edges,
+    ))
+}
+
+/// Checks that `after` is exactly the boundary-preserving retiming described by
+/// `certificate`, including the reset values implied by crossed logic.
 ///
 /// # Errors
 ///
@@ -301,19 +368,11 @@ pub fn verify_retiming_certificate(
         if before_vertex.boundary && label != 0 {
             return Err(RetimingError::MovedBoundary(index));
         }
-        if label != 0 && !before_vertex.function.preserves_zero() {
-            return Err(RetimingError::NonZeroPreservingVertex(index));
-        }
     }
 
     for (index, (before_edge, after_edge)) in before.edges.iter().zip(&after.edges).enumerate() {
         if (before_edge.source, before_edge.target) != (after_edge.source, after_edge.target) {
             return Err(RetimingError::ChangedEdge(index));
-        }
-        if before_edge.reset_values.iter().any(|value| *value)
-            || after_edge.reset_values.iter().any(|value| *value)
-        {
-            return Err(RetimingError::NonZeroReset(index));
         }
         let delta = i64::from(certificate.labels[before_edge.target])
             - i64::from(certificate.labels[before_edge.source]);
@@ -337,7 +396,136 @@ pub fn verify_retiming_certificate(
             });
         }
     }
+    let expected = derive_retimed_graph(before, certificate)?;
+    for (edge, (expected, actual)) in expected.edges.iter().zip(&after.edges).enumerate() {
+        if expected.reset_values != actual.reset_values {
+            return Err(RetimingError::WrongResetValues { edge });
+        }
+    }
     Ok(())
+}
+
+fn forward_reset_values(
+    graph: &RetimingGraph,
+    target_labels: &[i32],
+) -> Result<Vec<Vec<bool>>, RetimingError> {
+    let mut values = graph
+        .edges
+        .iter()
+        .map(|edge| edge.reset_values.clone())
+        .collect::<Vec<_>>();
+    let mut labels = vec![0i32; graph.vertices.len()];
+    while labels != target_labels {
+        let mut progress = false;
+        for vertex in 0..graph.vertices.len() {
+            if labels[vertex] <= target_labels[vertex] || graph.vertices[vertex].boundary {
+                continue;
+            }
+            let incoming = graph
+                .edges
+                .iter()
+                .enumerate()
+                .filter_map(|(edge, connection)| (connection.target == vertex).then_some(edge))
+                .collect::<Vec<_>>();
+            if incoming.iter().any(|edge| values[*edge].is_empty()) {
+                continue;
+            }
+            let reset_inputs = incoming
+                .iter()
+                .map(|edge| *values[*edge].last().expect("incoming weights were checked"))
+                .collect::<Vec<_>>();
+            let output = graph.vertices[vertex]
+                .function
+                .evaluate(&reset_inputs)
+                .ok_or(RetimingError::FunctionArity {
+                    vertex,
+                    expected: usize::from(graph.vertices[vertex].function.input_count),
+                    actual: reset_inputs.len(),
+                })?;
+            for edge in &incoming {
+                values[*edge].pop();
+            }
+            for (edge, connection) in graph.edges.iter().enumerate() {
+                if connection.source == vertex {
+                    values[edge].insert(0, output);
+                }
+            }
+            labels[vertex] -= 1;
+            progress = true;
+        }
+        if !progress {
+            return Err(RetimingError::UnrealizableLabels);
+        }
+    }
+    Ok(values)
+}
+
+fn backward_reset_values(
+    graph: &RetimingGraph,
+    target_labels: &[i32],
+) -> Result<Vec<Vec<bool>>, RetimingError> {
+    let mut values = graph
+        .edges
+        .iter()
+        .map(|edge| edge.reset_values.clone())
+        .collect::<Vec<_>>();
+    let mut labels = vec![0i32; graph.vertices.len()];
+    while labels != target_labels {
+        let mut progress = false;
+        for vertex in 0..graph.vertices.len() {
+            if labels[vertex] >= target_labels[vertex] || graph.vertices[vertex].boundary {
+                continue;
+            }
+            let outgoing = graph
+                .edges
+                .iter()
+                .enumerate()
+                .filter_map(|(edge, connection)| (connection.source == vertex).then_some(edge))
+                .collect::<Vec<_>>();
+            if outgoing.is_empty() || outgoing.iter().any(|edge| values[*edge].is_empty()) {
+                continue;
+            }
+            let output_reset = values[outgoing[0]][0];
+            if outgoing.iter().any(|edge| values[*edge][0] != output_reset) {
+                return Err(RetimingError::ConflictingOutputResets(vertex));
+            }
+            let function = graph.vertices[vertex].function;
+            let input_count = usize::from(function.input_count);
+            let input_resets = (0..(1usize << input_count))
+                .map(|assignment| {
+                    (0..input_count)
+                        .map(|bit| assignment & (1usize << bit) != 0)
+                        .collect::<Vec<_>>()
+                })
+                .find(|inputs| function.evaluate(inputs) == Some(output_reset))
+                .ok_or(RetimingError::MissingResetPreimage(vertex))?;
+            for edge in &outgoing {
+                values[*edge].remove(0);
+            }
+            let incoming = graph
+                .edges
+                .iter()
+                .enumerate()
+                .filter_map(|(edge, connection)| (connection.target == vertex).then_some(edge))
+                .collect::<Vec<_>>();
+            if incoming.len() != input_resets.len() {
+                return Err(RetimingError::FunctionArity {
+                    vertex,
+                    expected: input_count,
+                    actual: incoming.len(),
+                });
+            }
+            for (edge, reset) in incoming.iter().zip(input_resets) {
+                values[*edge].push(reset);
+            }
+            labels[vertex] += 1;
+            progress = true;
+        }
+        if !progress {
+            return Err(RetimingError::UnrealizableLabels);
+        }
+    }
+    Ok(values)
 }
 
 fn validate_graph(graph: &RetimingGraph) -> Result<(), RetimingError> {
@@ -402,10 +590,19 @@ pub enum RetimingError {
     InvalidEndpoint(usize),
     /// Retiming attempted to cross a primary boundary.
     MovedBoundary(usize),
-    /// Retiming crossed a function that does not map zero to zero.
-    NonZeroPreservingVertex(usize),
-    /// A register edge uses an unsupported reset-to-one value.
-    NonZeroReset(usize),
+    /// Forward and backward moves were mixed in one compact certificate.
+    MixedDirections,
+    /// Fanout registers removed by one backward move disagree on reset value.
+    ConflictingOutputResets(usize),
+    /// The function has no input assignment matching the output reset value.
+    MissingResetPreimage(usize),
+    /// The requested labels cannot be reached through legal unit moves.
+    UnrealizableLabels,
+    /// A retimed edge has reset values inconsistent with function propagation.
+    WrongResetValues {
+        /// Offending edge index.
+        edge: usize,
+    },
     /// A retimed edge would contain a negative number of registers.
     NegativeWeight {
         /// Offending edge index.
@@ -459,14 +656,22 @@ impl Display for RetimingError {
             Self::MovedBoundary(vertex) => {
                 write!(formatter, "boundary vertex {vertex} has a non-zero label")
             }
-            Self::NonZeroPreservingVertex(vertex) => {
-                write!(
-                    formatter,
-                    "retimed vertex {vertex} does not preserve reset zero"
-                )
+            Self::MixedDirections => {
+                formatter.write_str("certificate mixes forward and backward retiming")
             }
-            Self::NonZeroReset(edge) => {
-                write!(formatter, "edge {edge} contains a reset-to-one register")
+            Self::ConflictingOutputResets(vertex) => write!(
+                formatter,
+                "vertex {vertex} has conflicting output-register reset values"
+            ),
+            Self::MissingResetPreimage(vertex) => write!(
+                formatter,
+                "vertex {vertex} has no reset preimage for backward retiming"
+            ),
+            Self::UnrealizableLabels => {
+                formatter.write_str("retiming labels cannot be realized by legal unit moves")
+            }
+            Self::WrongResetValues { edge } => {
+                write!(formatter, "edge {edge} has incorrect retimed reset values")
             }
             Self::NegativeWeight { edge } => {
                 write!(formatter, "retiming makes edge {edge} weight negative")
@@ -552,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_illegal_weight_and_reset_transformations() {
+    fn propagates_reset_values_through_non_zero_preserving_logic() {
         let vertices = vec![
             RetimingVertex::boundary("a", LogicFunction::new(0, 0)),
             RetimingVertex::logic("not", LogicFunction::new(1, 0b01)),
@@ -571,13 +776,65 @@ mod tests {
             vertices,
             vec![
                 RetimingEdge::new(0, 1, vec![]),
-                RetimingEdge::new(1, 2, vec![false]),
+                RetimingEdge::new(1, 2, vec![true]),
             ],
         );
 
         assert_eq!(
             verify_retiming_certificate(&before, &after, &RetimingCertificate::new(vec![0, -1, 0]),),
-            Err(RetimingError::NonZeroPreservingVertex(1))
+            Ok(())
+        );
+
+        let wrong = RetimingGraph::new(
+            domain(),
+            before.vertices().to_vec(),
+            vec![
+                RetimingEdge::new(0, 1, vec![]),
+                RetimingEdge::new(1, 2, vec![false]),
+            ],
+        );
+        assert_eq!(
+            verify_retiming_certificate(&before, &wrong, &RetimingCertificate::new(vec![0, -1, 0]),),
+            Err(RetimingError::WrongResetValues { edge: 1 })
+        );
+    }
+
+    #[test]
+    fn derives_backward_reset_preimage_through_non_zero_preserving_logic() {
+        let vertices = vec![
+            RetimingVertex::boundary("a", LogicFunction::new(0, 0)),
+            RetimingVertex::logic("not", LogicFunction::new(1, 0b01)),
+            RetimingVertex::boundary("y", LogicFunction::new(1, 0b10)),
+        ];
+        let before = RetimingGraph::new(
+            domain(),
+            vertices,
+            vec![
+                RetimingEdge::new(0, 1, vec![]),
+                RetimingEdge::new(1, 2, vec![false]),
+            ],
+        );
+        let certificate = RetimingCertificate::new(vec![0, 1, 0]);
+        let after = super::derive_retimed_graph(&before, &certificate).unwrap();
+
+        assert_eq!(after.edges()[0].reset_values(), &[true]);
+        assert!(after.edges()[1].reset_values().is_empty());
+        assert_eq!(
+            verify_retiming_certificate(&before, &after, &certificate),
+            Ok(())
+        );
+
+        let wrong = RetimingGraph::new(
+            domain(),
+            before.vertices().to_vec(),
+            vec![
+                RetimingEdge::new(0, 1, vec![false]),
+                RetimingEdge::new(1, 2, vec![]),
+            ],
+        );
+        assert_eq!(
+            verify_retiming_certificate(&before, &wrong, &certificate),
+            Err(RetimingError::WrongResetValues { edge: 0 })
         );
     }
 
