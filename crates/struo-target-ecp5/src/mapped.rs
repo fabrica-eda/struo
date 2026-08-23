@@ -167,19 +167,23 @@ struct MappingDemand {
 }
 
 impl MappingDemand {
-    fn collect(netlist: &Netlist) -> Self {
+    fn collect(netlist: &Netlist, constant_registers: &HashMap<NetId, bool>) -> Self {
         let output_roots = netlist
             .ports()
             .iter()
             .filter(|port| port.direction() == IrPortDirection::Output)
             .flat_map(struo_ir::Port::bits)
             .map(|output| node_for(netlist, *output).inputs()[0]);
-        let register_roots = netlist.registers().iter().flat_map(|register| {
-            [register.data(), register.clock()]
-                .into_iter()
-                .chain(register.enable().map(|enable| enable.signal))
-                .chain(register.reset().map(|reset| reset.signal))
-        });
+        let register_roots = netlist
+            .registers()
+            .iter()
+            .filter(|register| !constant_registers.contains_key(&register.output()))
+            .flat_map(|register| {
+                [register.data(), register.clock()]
+                    .into_iter()
+                    .chain(register.enable().map(|enable| enable.signal))
+                    .chain(register.reset().map(|reset| reset.signal))
+            });
         let memory_roots = netlist.memories().iter().flat_map(|memory| {
             memory
                 .read_address()
@@ -3348,17 +3352,55 @@ struct MappingQuality {
     period_ps: u32,
 }
 
+/// Constant flip-flop outputs must be folded before any consumer logic is
+/// materialized so every sink resolves to the literal bit.
+fn fold_constant_registers(
+    netlist: &Netlist,
+    constant_registers: &HashMap<NetId, bool>,
+    emitter: &mut LutEmitter<'_>,
+) {
+    for register in netlist.registers() {
+        if let Some(value) = constant_registers.get(&register.output()) {
+            emitter.alias_net(register.output(), Bit::from(*value));
+        }
+    }
+}
+
+fn constant_register_values(netlist: &Netlist) -> HashMap<NetId, bool> {
+    netlist
+        .registers()
+        .iter()
+        .filter_map(|register| {
+            let value = netlist.constant_value(register.data())?;
+            if register.reset().is_none_or(|reset| reset.value == value) {
+                Some((register.output(), value))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn map_once(
     netlist: &Netlist,
     options: MappingOptions,
 ) -> Result<(Ecp5Netlist, MappingQuality), MappingError> {
     netlist.validate()?;
-    let demand = MappingDemand::collect(netlist);
+    // ECP5 loads every flip-flop through GSR at configuration and REGSET
+    // selects the loaded value, so a flip-flop whose data is a constant and
+    // whose reset (when present) asserts the same constant never leaves its
+    // configured state: it is indistinguishable from a constant driver. A
+    // reset asserting a different value still forces the flip-flop to leave
+    // that state after the first clock edge, so it must stay a flip-flop.
+    let constant_registers = constant_register_values(netlist);
+    let demand = MappingDemand::collect(netlist, &constant_registers);
     let cuts = CutDatabase::analyze(netlist);
     let cover = LutCover::select(netlist, &cuts, &demand.roots, options);
     let (period_ps, _) = cover.estimated_register_period_ps(netlist);
     let quality = MappingQuality { period_ps };
     let mut emitter = LutEmitter::new(netlist, &cover);
+
+    fold_constant_registers(netlist, &constant_registers, &mut emitter);
 
     map_retained_cells(netlist, options, &mut emitter);
 
@@ -3382,6 +3424,9 @@ fn map_once(
     let (bits, mut cells) = emitter.finish();
 
     for register in netlist.registers() {
+        if constant_registers.contains_key(&register.output()) {
+            continue;
+        }
         cells.push(Ecp5Cell::FlipFlop {
             // nextpnr rejects a cell whose name is also a top-level IO name.
             // Keep primitive cells in a dedicated namespace even when an RTL
@@ -4398,6 +4443,99 @@ mod tests {
             "{:?}",
             mapped.retiming()
         );
+    }
+
+    #[test]
+    fn folds_constant_flip_flops_that_gsr_initialization_makes_constant() {
+        let mut source = Netlist::new("constant_ff");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let zero = source.add_constant(false);
+        let one = source.add_constant(true);
+
+        // No reset: GSR loads the configured value, so the flip-flop output
+        // equals its constant data from configuration onward.
+        let unreset_zero_q = source.add_register_output("unreset_zero_q");
+        source.add_register(RegisterCell::new(
+            "unreset_zero_q",
+            unreset_zero_q,
+            zero,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("unreset_zero", unreset_zero_q);
+        let unreset_one_q = source.add_register_output("unreset_one_q");
+        source.add_register(RegisterCell::new(
+            "unreset_one_q",
+            unreset_one_q,
+            one,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("unreset_one", unreset_one_q);
+
+        // Reset asserting the same constant also stays constant forever.
+        let matched_reset_q = source.add_register_output("matched_reset_q");
+        source.add_register(RegisterCell::new(
+            "matched_reset_q",
+            matched_reset_q,
+            zero,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: false,
+            }),
+        ));
+        source.add_output("matched_reset", matched_reset_q);
+
+        // A reset asserting the opposite value forces the output away from
+        // the constant after the first clock edge, so it must stay a flip-flop.
+        let mismatched_reset_q = source.add_register_output("mismatched_reset_q");
+        source.add_register(RegisterCell::new(
+            "mismatched_reset_q",
+            mismatched_reset_q,
+            zero,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: true,
+            }),
+        ));
+        source.add_output("mismatched_reset", mismatched_reset_q);
+
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let flip_flops = mapped
+            .cells
+            .iter()
+            .filter(|cell| matches!(cell, Ecp5Cell::FlipFlop { .. }))
+            .count();
+        assert_eq!(flip_flops, 1, "only the mismatched-reset register remains");
+
+        let bits = |name: &str| {
+            mapped
+                .ports
+                .iter()
+                .find(|port| port.name == name)
+                .unwrap_or_else(|| panic!("port `{name}` missing"))
+                .bits
+                .clone()
+        };
+        assert_eq!(bits("unreset_zero"), vec![Bit::Zero]);
+        assert_eq!(bits("unreset_one"), vec![Bit::One]);
+        assert_eq!(bits("matched_reset"), vec![Bit::Zero]);
+        assert!(matches!(bits("mismatched_reset")[0], Bit::Wire(_)));
     }
 
     #[test]

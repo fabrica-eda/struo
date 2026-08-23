@@ -57,16 +57,16 @@ nextpnr-ecp5 0.6-3build5, Yosys 0.33, seeds 1-3, goal 300 MHz:
 |---|---|---|---|---|
 | counter32 | struo | 38 | 32 | 472.14 (472.14..472.14) |
 | counter32 | baseline | 38 | 32 | 472.14 (472.14..472.14) |
-| shift32 | struo | 157 | 64 | 602.99 (575.71..630.12) |
+| shift32 | struo | 157 | 60 | 617.75 (603.14..630.91) |
 | shift32 | baseline | 204 | 56 | 604.77 (578.03..657.89) |
 | maxtree16 | struo | 110 | 48 | 346.69 (319.49..360.88) |
 | maxtree16 | baseline | 110 | 48 | 357.35 (352.73..364.83) |
 | blinky | struo | 46 | 25 | 518.13 (518.13..518.13) |
 | blinky | baseline | 54 | 24 | 373.34 (360.88..388.50) |
-| axi4-crossbar | struo | 1205 | 1361 | 307.53 (305.62..311.24) |
+| axi4-crossbar | struo | 1197 | 1217 | 305.38 (304.60..306.09) |
 
-Geometric-mean Struo/baseline ratios: COMB sites 0.900, FF 1.045,
-period (1/Fmax) 0.929.
+Geometric-mean Struo/baseline ratios: COMB sites 0.900, FF 1.028,
+period (1/Fmax) 0.923.
 
 Observations:
 
@@ -75,3 +75,6 @@ Observations:
 - Struo wins area on shift-heavy logic (fanout-weighted cut selection) and
   period on the registered feedback designs; Yosys currently optimizes away
   redundant shifter pipeline bits more aggressively on shift32 (fewer FFs).
+- Constant-input flip-flop folding at mapping time (GSR/REGSET
+  initialization semantics) removed 4 constant shifter bits on shift32 and
+  144 constant registers on the axi4-crossbar.
