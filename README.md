@@ -164,10 +164,11 @@ synthesis. The existing Veryl/Yosys bitstream smoke test remains under
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-cargo run -- demo /tmp/struo-blinky.nextpnr.json
-cargo run -- axi4-demo /tmp/struo-axi4.nextpnr.json
-cargo run -- axi4-self-test /tmp/struo-axi4-self-test.nextpnr.json
-cargo run -- carry-benchmark /tmp/struo-carry-benchmark
+cargo run -p struo-cli --example demo -- /tmp/struo-blinky.nextpnr.json
+cargo run -p struo-cli --example axi4-demo -- /tmp/struo-axi4.nextpnr.json
+cargo run -p struo-cli --example axi4-self-test -- /tmp/struo-axi4-self-test.nextpnr.json
+cargo run -p struo-cli --example carry-benchmark -- /tmp/struo-carry-benchmark
+struo bench/designs/counter32/counter32.veryl --top counter32 --output /tmp/struo-counter32.nextpnr.json
 python3 bench/scripts/qor.py
 (cd examples/axi4-smartconnect && veryl fmt --check && veryl check)
 ```
@@ -305,7 +306,7 @@ The complete open-source hardware smoke flow is:
 
 ```sh
 mkdir -p build/axi4-self-test
-cargo run -- axi4-self-test build/axi4-self-test/design.json
+cargo run -p struo-cli --example axi4-self-test -- build/axi4-self-test/design.json
 nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
   --json build/axi4-self-test/design.json \
   --lpf examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf \
