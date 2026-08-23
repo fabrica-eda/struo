@@ -111,7 +111,7 @@ jobs:
               --log "build/ci/axi4-smartconnect/seed-${seed}.log" \
               --freq 300 \
               --placer-budgets \
-              --placer-heap-timingweight 30 \
+              --placer-heap-timingweight 40 \
               --tmg-ripup \
               --timing-allow-fail \
               --seed "$seed"
