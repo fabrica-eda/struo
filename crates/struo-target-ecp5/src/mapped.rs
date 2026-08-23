@@ -757,6 +757,7 @@ pub fn map_to_ecp5_with_options(
         selected_registers = mapped_register_count(&selected);
         applied = true;
     }
+    split_branched_carry_outs(&mut selected);
     let mapped_selected_profile = mapped_lut_profile(&selected);
     let equivalence_signed_off = verify_mapped_equivalence_proof(&selected, applied);
     selected.retiming = RetimingSelection {
@@ -793,8 +794,9 @@ fn automatically_retime_mapped_luts(
     let timing_driven = original_profile.overall_period_ps > target_period_ps;
     let cell_limit = original_cells + original_cells.div_ceil(10);
     let register_limit = original_registers + original_registers.div_ceil(5);
-    let control_candidate =
+    let mut control_candidate =
         replicate_high_fanout_enable_luts(original, MAX_ENABLE_FANOUT_PER_REPLICA);
+    split_branched_carry_outs(&mut control_candidate);
     let control_profile = mapped_lut_profile(&control_candidate);
     let control_registers = mapped_register_count(&control_candidate);
     let original_enable_fanout =
@@ -820,7 +822,8 @@ fn automatically_retime_mapped_luts(
     } else {
         original
     };
-    let forward_candidate = forward_retime_registered_ccu_chains(seed, timing_driven);
+    let mut forward_candidate = forward_retime_registered_ccu_chains(seed, timing_driven);
+    split_branched_carry_outs(&mut forward_candidate);
     let forward_profile = mapped_lut_profile(&forward_candidate);
     let forward_registers = mapped_register_count(&forward_candidate);
     let use_forward = forward_candidate.cells.len() <= cell_limit
@@ -901,6 +904,7 @@ fn automatically_retime_mapped_luts(
                 && best
                     .as_ref()
                     .is_none_or(|(_, best_score): &(Ecp5Netlist, _)| score < *best_score)
+                && carry_outs_are_point_to_point(&candidate)
             {
                 best = Some((candidate, score));
             }
@@ -926,12 +930,15 @@ fn automatically_retime_mapped_luts(
             let Some(candidate) = backward_retime_primitive(&batch, register) else {
                 continue;
             };
+            let mut candidate = candidate;
+            split_branched_carry_outs(&mut candidate);
             let candidate_profile = mapped_lut_profile(&candidate);
             let candidate_registers = mapped_register_count(&candidate);
             if (timing_driven || candidate_profile.overall_depth <= original_profile.overall_depth)
                 && candidate_profile.overall_period_ps <= original_profile.overall_period_ps
                 && candidate.cells.len() <= cell_limit
                 && candidate_registers <= register_limit
+                && carry_outs_are_point_to_point(&candidate)
             {
                 batch = candidate;
                 batch_moves += 1;
@@ -970,6 +977,8 @@ fn automatically_retime_mapped_luts(
                     let Some(candidate) = backward_retime_ccu2c(&ccu_batch, index) else {
                         continue;
                     };
+                    let mut candidate = candidate;
+                    split_branched_carry_outs(&mut candidate);
                     let candidate_profile = mapped_lut_profile(&candidate);
                     let candidate_registers = mapped_register_count(&candidate);
                     if candidate_profile.overall_period_ps <= original_profile.overall_period_ps
@@ -3352,6 +3361,57 @@ struct MappingQuality {
     period_ps: u32,
 }
 
+/// ECP5 carry routing is a dedicated chain: one CCU2C carry-out may feed only
+/// one downstream carry-in. Chained certified retiming moves can leave a
+/// carry-out driving several slices, which nextpnr cannot pack; candidates
+/// must keep every chain link point-to-point.
+fn carry_outs_are_point_to_point(netlist: &Ecp5Netlist) -> bool {
+    let mut consumers: HashMap<u32, usize> = HashMap::new();
+    for cell in &netlist.cells {
+        let visit = |bit: &Bit, consumers: &mut HashMap<u32, usize>| {
+            if let Bit::Wire(wire) = *bit {
+                *consumers.entry(wire).or_insert(0) += 1;
+            }
+        };
+        match cell {
+            Ecp5Cell::Lut4 { inputs, .. } => {
+                for input in inputs {
+                    visit(input, &mut consumers);
+                }
+            }
+            Ecp5Cell::Ccu2c {
+                inputs, carry_in, ..
+            } => {
+                for input in inputs.iter().flatten() {
+                    visit(input, &mut consumers);
+                }
+                visit(carry_in, &mut consumers);
+            }
+            Ecp5Cell::FlipFlop {
+                data,
+                clock,
+                enable,
+                reset,
+                ..
+            } => {
+                visit(data, &mut consumers);
+                visit(clock, &mut consumers);
+                if let Some(control) = enable {
+                    visit(&control.signal, &mut consumers);
+                }
+                if let Some(control) = reset {
+                    visit(&control.signal, &mut consumers);
+                }
+            }
+            Ecp5Cell::BlockRam { .. } => {}
+        }
+    }
+    netlist.cells.iter().all(|cell| match cell {
+        Ecp5Cell::Ccu2c { carry_out, .. } => consumers.get(carry_out).copied().unwrap_or(0) <= 1,
+        _ => true,
+    })
+}
+
 /// Constant flip-flop outputs must be folded before any consumer logic is
 /// materialized so every sink resolves to the literal bit.
 fn fold_constant_registers(
@@ -3379,6 +3439,118 @@ fn constant_register_values(netlist: &Netlist) -> HashMap<NetId, bool> {
             }
         })
         .collect()
+}
+
+/// ECP5 carry routing is a dedicated chain: one CCU2C carry-out may feed only
+/// one downstream carry-in. Chained certified retiming moves can leave a
+/// carry-out driving several slices; each extra branch receives a
+/// truth-table-identical slice replica so every chain link stays
+/// point-to-point and nextpnr can pack the chains.
+fn split_branched_carry_outs(netlist: &mut Ecp5Netlist) -> usize {
+    let mut next_wire = maximum_mapped_wire(netlist)
+        .and_then(|wire| wire.checked_add(1))
+        .unwrap_or(1);
+    let mut replicas = 0usize;
+    let mut index = 0usize;
+    while index < netlist.cells.len() {
+        index += 1;
+        let Some((inputs, carry_in, _sums, carry_out, init, inject)) =
+            (match &netlist.cells[index - 1] {
+                Ecp5Cell::Ccu2c {
+                    name: _,
+                    inputs,
+                    carry_in,
+                    sums,
+                    carry_out,
+                    init,
+                    inject,
+                } => Some((*inputs, *carry_in, *sums, *carry_out, *init, *inject)),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let carry_wire = carry_out;
+        let consumers = netlist
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(consumer_index, cell)| {
+                *consumer_index != index - 1 && cell_consumes_wire(cell, carry_wire)
+            })
+            .map(|(consumer_index, _)| consumer_index)
+            .collect::<Vec<_>>();
+        for consumer_index in consumers.into_iter().skip(1) {
+            let Some(clone_output) = next_wire.checked_add(0) else {
+                break;
+            };
+            let Some(allocated) = next_wire.checked_add(3) else {
+                break;
+            };
+            // One carry-out plus two sum outputs.
+            let clone_sums = [next_wire + 1, next_wire + 2];
+            next_wire = allocated;
+            let name = match &netlist.cells[index - 1] {
+                Ecp5Cell::Ccu2c { name, .. } => name.clone(),
+                _ => unreachable!("matched Ccu2c above"),
+            };
+            replace_wire_in_cell_inputs(
+                &mut netlist.cells[consumer_index],
+                carry_wire,
+                clone_output,
+            );
+            netlist.cells.push(Ecp5Cell::Ccu2c {
+                name: unique_cell_name(&format!("{name}_carry{replicas}"), &netlist.cells, None),
+                inputs,
+                carry_in,
+                sums: clone_sums,
+                carry_out: clone_output,
+                init,
+                inject,
+            });
+            replicas += 1;
+        }
+    }
+    if replicas > 0 {
+        netlist.equivalence_proof.equivalent_logic_replications += replicas;
+    }
+    replicas
+}
+
+fn cell_consumes_wire(cell: &Ecp5Cell, wire: u32) -> bool {
+    let mut consumes = false;
+    let mut visit = |bit: &Bit| {
+        if *bit == Bit::Wire(wire) {
+            consumes = true;
+        }
+    };
+    match cell {
+        Ecp5Cell::Lut4 { inputs, .. } => inputs.iter().for_each(&mut visit),
+        Ecp5Cell::Ccu2c {
+            inputs, carry_in, ..
+        } => {
+            inputs.iter().flatten().for_each(&mut visit);
+            visit(carry_in);
+        }
+        Ecp5Cell::FlipFlop {
+            data,
+            clock,
+            enable,
+            reset,
+            ..
+        } => {
+            visit(data);
+            visit(clock);
+            if let Some(control) = enable {
+                visit(&control.signal);
+            }
+            if let Some(control) = reset {
+                visit(&control.signal);
+            }
+        }
+        Ecp5Cell::BlockRam { .. } => {}
+    }
+    consumes
 }
 
 fn map_once(
