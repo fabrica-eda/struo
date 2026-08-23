@@ -378,9 +378,21 @@ impl Ecp5Netlist {
     ///
     /// # Errors
     ///
-    /// Returns an error if JSON serialization fails.
-    pub fn to_nextpnr_json(&self) -> Result<String, serde_json::Error> {
+    /// Returns an error if two cells share a name or JSON serialization fails.
+    pub fn to_nextpnr_json(&self) -> Result<String, NextpnrJsonError> {
+        let mut seen = HashSet::new();
+        if let Some(duplicate) = self
+            .cells
+            .iter()
+            .map(mapped_cell_name)
+            .find(|name| !seen.insert((*name).to_owned()))
+        {
+            return Err(NextpnrJsonError::DuplicateCellName {
+                name: duplicate.to_owned(),
+            });
+        }
         serde_json::to_string_pretty(&JsonDesign::from(self))
+            .map_err(NextpnrJsonError::Serialization)
     }
 
     /// Applies equivalent local rewrites using locations and routed timing
@@ -2050,15 +2062,27 @@ fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<E
         constant => constant,
     });
     let fanout = mapped_wire_fanout(netlist, *data_wire);
+    // The retimed LUT takes over the register output. When the original LUT
+    // keeps other sinks it stays in the netlist, and either branch can collide
+    // with a replica name created by an earlier move. Keep every pushed or
+    // renamed cell unique among all cells except the one being replaced.
+    let replacement_index = if fanout == 1 {
+        Some(lut_index - usize::from(register_index < lut_index))
+    } else {
+        None
+    };
     let retimed_lut = Ecp5Cell::Lut4 {
-        name: format!("retime_{lut_name}"),
+        name: unique_cell_name(
+            &format!("retime_{lut_name}"),
+            &candidate.cells,
+            replacement_index,
+        ),
         inputs: new_inputs,
         output: *register_output,
         init: lut_init,
     };
-    if fanout == 1 {
-        let lut_index = lut_index - usize::from(register_index < lut_index);
-        candidate.cells[lut_index] = retimed_lut;
+    if let Some(replacement_index) = replacement_index {
+        candidate.cells[replacement_index] = retimed_lut;
     } else {
         candidate.cells.push(retimed_lut);
     }
@@ -2815,8 +2839,25 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
     } else {
         next_wire
     };
+    let original_outputs = [sums[0], sums[1], carry_out];
+    let replace_original = original_outputs
+        .iter()
+        .all(|wire| mapped_wire_fanout(netlist, *wire) == usize::from(*wire == *data_wire));
+    // The retimed CCU2C takes over the register output. When the original CCU
+    // keeps other sinks it stays in the netlist, and either branch can collide
+    // with a replica name created by an earlier move. Keep every pushed or
+    // renamed cell unique among all cells except the one being replaced.
+    let replacement_index = if replace_original {
+        Some(ccu_index - usize::from(register_index < ccu_index))
+    } else {
+        None
+    };
     let retimed_ccu = Ecp5Cell::Ccu2c {
-        name: format!("retime_{ccu_name}"),
+        name: unique_cell_name(
+            &format!("retime_{ccu_name}"),
+            &candidate.cells,
+            replacement_index,
+        ),
         inputs: retimed_inputs,
         carry_in: retimed_carry_in,
         sums: retimed_sums,
@@ -2824,13 +2865,8 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
         init,
         inject,
     };
-    let original_outputs = [sums[0], sums[1], carry_out];
-    let replace_original = original_outputs
-        .iter()
-        .all(|wire| mapped_wire_fanout(netlist, *wire) == usize::from(*wire == *data_wire));
-    if replace_original {
-        let ccu_index = ccu_index - usize::from(register_index < ccu_index);
-        candidate.cells[ccu_index] = retimed_ccu;
+    if let Some(replacement_index) = replacement_index {
+        candidate.cells[replacement_index] = retimed_ccu;
     } else {
         candidate.cells.push(retimed_ccu);
     }
@@ -3141,6 +3177,20 @@ fn mapped_cell_name(cell: &Ecp5Cell) -> &str {
         | Ecp5Cell::FlipFlop { name, .. }
         | Ecp5Cell::BlockRam { name, .. } => name,
     }
+}
+
+fn unique_cell_name(base: &str, cells: &[Ecp5Cell], skip: Option<usize>) -> String {
+    let mut name = base.to_owned();
+    let mut suffix = 2usize;
+    while cells
+        .iter()
+        .enumerate()
+        .any(|(index, cell)| index != skip.unwrap_or(usize::MAX) && mapped_cell_name(cell) == name)
+    {
+        name = format!("{base}_{suffix}");
+        suffix += 1;
+    }
+    name
 }
 
 fn mapped_wire_is_clock_or_reset(netlist: &Ecp5Netlist, wire: u32) -> bool {
@@ -3777,6 +3827,38 @@ impl From<ValidationError> for MappingError {
     }
 }
 
+/// nextpnr Yosys-JSON serialization failure.
+#[derive(Debug)]
+pub enum NextpnrJsonError {
+    /// Two mapped cells share a name, so the JSON cell map would drop one.
+    DuplicateCellName {
+        /// Duplicated cell name.
+        name: String,
+    },
+    /// JSON serialization failed.
+    Serialization(serde_json::Error),
+}
+
+impl Display for NextpnrJsonError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateCellName { name } => {
+                write!(formatter, "duplicate mapped cell name `{name}`")
+            }
+            Self::Serialization(error) => write!(formatter, "JSON serialization failed: {error}"),
+        }
+    }
+}
+
+impl Error for NextpnrJsonError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::DuplicateCellName { .. } => None,
+            Self::Serialization(error) => Some(error),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct JsonDesign {
     creator: &'static str,
@@ -4241,10 +4323,10 @@ mod tests {
     };
 
     use super::{
-        ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, backward_retime_ccu2c,
-        backward_retime_lut, ccu_chain_names, forward_retime_ccu2c, forward_retime_lut, map_once,
-        map_to_ecp5, map_to_ecp5_with_options, mapped_cell_name, mapped_wire_fanout,
-        merge_equivalent_flip_flops, replicate_high_fanout_enable_luts,
+        ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, MappingOptions, NextpnrJsonError,
+        backward_retime_ccu2c, backward_retime_lut, ccu_chain_names, forward_retime_ccu2c,
+        forward_retime_lut, map_once, map_to_ecp5, map_to_ecp5_with_options, mapped_cell_name,
+        mapped_wire_fanout, merge_equivalent_flip_flops, replicate_high_fanout_enable_luts,
         verify_mapped_equivalence_proof,
     };
     use crate::PhysicalFeedback;
@@ -4800,6 +4882,96 @@ mod tests {
             outputs.iter().copied().collect::<HashSet<_>>().len(),
             "retiming must not reuse the removed maximum Q wire"
         );
+    }
+
+    #[test]
+    fn backward_lut_retimings_keep_cell_names_unique_across_replicas() {
+        let mut source = Netlist::new("shared_lut_retime");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let lhs = source.add_input("lhs");
+        let rhs = source.add_input("rhs");
+        let and = source.add_and(lhs, rhs);
+        let reset_control = ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: false,
+        };
+        for name in ["a_q", "b_q"] {
+            let output = source.add_register_output(name);
+            source.add_register(RegisterCell::new(
+                name,
+                output,
+                and,
+                clock,
+                ClockEdge::Rising,
+                None,
+                Some(reset_control),
+            ));
+            source.add_output(name, output);
+        }
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let register = |netlist: &Ecp5Netlist, name: &str| {
+            netlist
+                .cells
+                .iter()
+                .position(|cell| matches!(cell, Ecp5Cell::FlipFlop { name: cell_name, .. } if cell_name == name))
+                .unwrap()
+        };
+        let first = backward_retime_lut(&mapped, register(&mapped, "ff_a_q")).unwrap();
+        let second = backward_retime_lut(&first, register(&first, "ff_b_q")).unwrap();
+
+        let names = second
+            .cells
+            .iter()
+            .map(mapped_cell_name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names.len(),
+            second.cells.len(),
+            "every retimed cell must keep a unique name"
+        );
+        let json = second.to_nextpnr_json().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["modules"][second.name()]
+                ["cells"]
+                .as_object()
+                .unwrap()
+                .len(),
+            second.cells.len(),
+            "serialization must preserve every cell"
+        );
+    }
+
+    #[test]
+    fn nextpnr_json_rejects_duplicate_cell_names() {
+        let mut source = Netlist::new("duplicated_cell");
+        let clock = source.add_input("clock");
+        let input = source.add_input("input");
+        let output_net = source.add_register_output("result_q");
+        source.add_register(RegisterCell::new(
+            "result_q",
+            output_net,
+            input,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("result", output_net);
+        let (mut mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let mut duplicate = mapped.cells[0].clone();
+        if let Ecp5Cell::FlipFlop { name, output, .. } = &mut duplicate {
+            *name = mapped_cell_name(&mapped.cells[0]).to_owned();
+            *output = output.checked_add(1).unwrap();
+        }
+        mapped.cells.push(duplicate);
+
+        assert!(matches!(
+            mapped.to_nextpnr_json(),
+            Err(NextpnrJsonError::DuplicateCellName { .. })
+        ));
     }
 
     #[test]

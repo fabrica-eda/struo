@@ -253,7 +253,7 @@ traffic, and local error completion through both the reference and post-map
 paths.
 
 On nextpnr 0.6, LFE5UM5G-85F speed grade 8, and seeds 1 through 10, the 300 MHz
-flow passes all ten seeds and reaches 302.30--319.80 MHz (307.36 MHz mean). The
+flow passes all ten seeds and reaches 302.48--315.36 MHz (308.45 MHz mean). The
 burst decoder is natural three-cycle RTL: its registered operands feed the
 17-bit address addition and the output holding state directly, without a
 hand-written carry-result pipeline stage. Its single-flight handshake keeps the
@@ -271,7 +271,7 @@ removes 69 inferred clock enables and makes the eight QoS comparison
 preregisters unnecessary. The remaining result combines the mapper's 300 MHz
 required-time cover with registered write-completion, read-slot reservation,
 scoreboard, and arbitration boundaries in the RTL.
-nextpnr uses timing budgets, a heap timing weight of 30,
+nextpnr uses timing budgets, a heap timing weight of 40,
 and timing-driven routing rip-up for every seed; no successful seed is selected
 after the fact. The CI timing gate repeats all ten fixed seeds and requires each
 one to reach 300 MHz. nextpnr timing remains the sign-off result because
@@ -305,7 +305,7 @@ nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
   --lpf examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf \
   --textcfg build/axi4-self-test/design.config \
   --report build/axi4-self-test/nextpnr-report.json \
-  --freq 300 --placer-budgets --placer-heap-timingweight 30 --tmg-ripup
+  --freq 300 --placer-budgets --placer-heap-timingweight 40 --tmg-ripup
 ecppack --svf build/axi4-self-test/design.svf \
   build/axi4-self-test/design.config build/axi4-self-test/design.bit
 ```
