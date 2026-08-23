@@ -791,6 +791,14 @@ fn automatically_retime_mapped_luts(
 ) -> Option<Ecp5Netlist> {
     let original_profile = mapped_lut_profile(original);
     let original_depth = original_profile.data_depth;
+    let baseline_burden = routing_burden(original);
+    let adjusted_overall = |profile: &MappedLutProfile, cells_now: &Ecp5Netlist| {
+        congestion_adjusted_overall(
+            profile.overall_period_ps,
+            routing_burden(cells_now),
+            baseline_burden,
+        )
+    };
     let timing_driven = original_profile.overall_period_ps > target_period_ps;
     let cell_limit = original_cells + original_cells.div_ceil(10);
     let register_limit = original_registers + original_registers.div_ceil(5);
@@ -805,17 +813,20 @@ fn automatically_retime_mapped_luts(
         maximum_replicable_enable_fanout(&control_candidate, MAX_ENABLE_FANOUT_PER_REPLICA);
     let use_control = control_candidate.cells.len() <= cell_limit
         && control_registers <= register_limit
-        && control_profile.overall_period_ps <= original_profile.overall_period_ps
+        && adjusted_overall(&control_profile, &control_candidate)
+            <= original_profile.overall_period_ps
         && (retiming_score(
             &control_profile,
             timing_driven,
             control_candidate.cells.len(),
             control_registers,
+            adjusted_overall(&control_profile, &control_candidate),
         ) < retiming_score(
             &original_profile,
             timing_driven,
             original.cells.len(),
             mapped_register_count(original),
+            original_profile.overall_period_ps,
         ) || control_enable_fanout < original_enable_fanout);
     let seed = if use_control {
         &control_candidate
@@ -828,17 +839,20 @@ fn automatically_retime_mapped_luts(
     let forward_registers = mapped_register_count(&forward_candidate);
     let use_forward = forward_candidate.cells.len() <= cell_limit
         && forward_registers <= register_limit
-        && forward_profile.overall_period_ps <= original_profile.overall_period_ps
+        && adjusted_overall(&forward_profile, &forward_candidate)
+            <= original_profile.overall_period_ps
         && retiming_score(
             &forward_profile,
             timing_driven,
             forward_candidate.cells.len(),
             forward_registers,
+            adjusted_overall(&forward_profile, &forward_candidate),
         ) < retiming_score(
             &original_profile,
             timing_driven,
             original.cells.len(),
             mapped_register_count(original),
+            original_profile.overall_period_ps,
         );
     let mut frontier = if use_forward {
         forward_candidate
@@ -855,15 +869,17 @@ fn automatically_retime_mapped_luts(
             timing_driven,
             frontier.cells.len(),
             mapped_register_count(&frontier),
+            adjusted_overall(&profile, &frontier),
         ) < retiming_score(
             &best_profile,
             timing_driven,
             best_seen.cells.len(),
             mapped_register_count(&best_seen),
+            adjusted_overall(&best_profile, &best_seen),
         ) {
             best_seen = frontier.clone();
         }
-        if (timing_driven && profile.overall_period_ps <= target_period_ps)
+        if (timing_driven && adjusted_overall(&profile, &frontier) <= target_period_ps)
             || (!timing_driven && profile.data_depth < original_depth)
         {
             return Some(frontier);
@@ -881,8 +897,9 @@ fn automatically_retime_mapped_luts(
             merge_equivalent_flip_flops(&mut candidate);
             let candidate_profile = mapped_lut_profile(&candidate);
             let candidate_registers = mapped_register_count(&candidate);
+            let candidate_overall = adjusted_overall(&candidate_profile, &candidate);
             if (!timing_driven && candidate_profile.overall_depth > original_profile.overall_depth)
-                || candidate_profile.overall_period_ps > original_profile.overall_period_ps
+                || candidate_overall > original_profile.overall_period_ps
                 || candidate.cells.len() > cell_limit
                 || candidate_registers > register_limit
             {
@@ -893,12 +910,14 @@ fn automatically_retime_mapped_luts(
                 timing_driven,
                 candidate.cells.len(),
                 candidate_registers,
+                candidate_overall,
             );
             let frontier_score = retiming_score(
                 &profile,
                 timing_driven,
                 frontier.cells.len(),
                 mapped_register_count(&frontier),
+                adjusted_overall(&profile, &frontier),
             );
             if score < frontier_score
                 && best
@@ -981,7 +1000,8 @@ fn automatically_retime_mapped_luts(
                     split_branched_carry_outs(&mut candidate);
                     let candidate_profile = mapped_lut_profile(&candidate);
                     let candidate_registers = mapped_register_count(&candidate);
-                    if candidate_profile.overall_period_ps <= original_profile.overall_period_ps
+                    if adjusted_overall(&candidate_profile, &candidate)
+                        <= original_profile.overall_period_ps
                         && candidate.cells.len() <= cell_limit
                         && candidate_registers <= register_limit
                     {
@@ -994,8 +1014,13 @@ fn automatically_retime_mapped_luts(
                     let batch_profile = mapped_lut_profile(&ccu_batch);
                     let batch_cells = ccu_batch.cells.len();
                     let batch_registers = mapped_register_count(&ccu_batch);
-                    let score =
-                        retiming_score(&batch_profile, timing_driven, batch_cells, batch_registers);
+                    let score = retiming_score(
+                        &batch_profile,
+                        timing_driven,
+                        batch_cells,
+                        batch_registers,
+                        adjusted_overall(&batch_profile, &ccu_batch),
+                    );
                     if bridge_candidate
                         .as_ref()
                         .is_none_or(|(_, bridge_score)| score < *bridge_score)
@@ -1013,12 +1038,14 @@ fn automatically_retime_mapped_luts(
                 timing_driven,
                 batch.cells.len(),
                 mapped_register_count(&batch),
+                adjusted_overall(&batch_profile, &batch),
             );
             let frontier_score = retiming_score(
                 &profile,
                 timing_driven,
                 frontier.cells.len(),
                 mapped_register_count(&frontier),
+                adjusted_overall(&profile, &frontier),
             );
             if batch_score < frontier_score
                 && best
@@ -1055,11 +1082,13 @@ fn automatically_retime_mapped_luts(
         timing_driven,
         frontier.cells.len(),
         mapped_register_count(&frontier),
+        adjusted_overall(&frontier_profile, &frontier),
     ) < retiming_score(
         &best_profile,
         timing_driven,
         best_seen.cells.len(),
         mapped_register_count(&best_seen),
+        adjusted_overall(&best_profile, &best_seen),
     ) {
         best_seen = frontier;
     }
@@ -1099,15 +1128,34 @@ fn automatically_retime_mapped_luts(
     improved.then_some(best_seen)
 }
 
+/// Retiming moves add primitives, and added primitives lengthen real routes
+/// everywhere even though flat per-hop estimates cannot see it. Charge each
+/// percent of routing-burden growth beyond a small allowance against the
+/// claimed period so aggressive trajectories pay for their own congestion.
+const CONGESTION_ALLOWANCE_PERCENT: u64 = 2;
+const CONGESTION_PENALTY_PS_PER_PERCENT: u64 = 250;
+
+fn congestion_adjusted_overall(overall_period_ps: u32, burden: u64, baseline_burden: u64) -> u32 {
+    let growth_ppm =
+        (burden.saturating_sub(baseline_burden)).saturating_mul(1_000_000) / baseline_burden.max(1);
+    let allowance_ppm = CONGESTION_ALLOWANCE_PERCENT * 10_000;
+    let excess_ppm = growth_ppm.saturating_sub(allowance_ppm);
+    overall_period_ps.saturating_add(
+        u32::try_from(excess_ppm.saturating_mul(CONGESTION_PENALTY_PS_PER_PERCENT) / 10_000)
+            .unwrap_or(u32::MAX),
+    )
+}
+
 fn retiming_score(
     profile: &MappedLutProfile,
     timing_driven: bool,
     cells: usize,
     registers: usize,
+    overall_period_ps: u32,
 ) -> (u64, u64, u64, usize, usize, usize) {
     if timing_driven {
         (
-            u64::from(profile.overall_period_ps),
+            u64::from(overall_period_ps),
             u64::from(profile.data_period_ps),
             u64::try_from(profile.critical_timing.len()).unwrap_or(u64::MAX),
             profile.data_depth,
@@ -1118,7 +1166,7 @@ fn retiming_score(
         (
             u64::try_from(profile.data_depth).unwrap_or(u64::MAX),
             u64::try_from(profile.critical_depth.len()).unwrap_or(u64::MAX),
-            u64::from(profile.overall_period_ps),
+            u64::from(overall_period_ps),
             usize::try_from(profile.data_period_ps).unwrap_or(usize::MAX),
             cells,
             registers,
@@ -1943,6 +1991,21 @@ fn mapped_output_period(bit: Bit, arrivals: &WireMap<u32>, fanouts: &WireMap<usi
     mapped_routed_arrival(bit, arrivals, fanouts).unwrap_or(0)
 }
 
+/// Structural wiring burden: the sum of per-net fanout-weighted route
+/// estimates over every driver in the netlist. Growth of this value tracks
+/// the placement pressure that added primitives create, which flat per-hop
+/// delays cannot see.
+fn routing_burden(netlist: &Ecp5Netlist) -> u64 {
+    let fanouts = mapped_wire_fanouts(netlist);
+    fanouts
+        .iter()
+        .map(|(&wire, &fanout)| {
+            let _ = wire;
+            u64::from(wire_delay_ps(fanout.max(1))) * u64::try_from(fanout).unwrap_or(1)
+        })
+        .sum()
+}
+
 fn mapped_wire_fanouts(netlist: &Ecp5Netlist) -> WireMap<usize> {
     let mut fanouts = WireMap::default();
     fanouts.reserve(netlist.cells.len());
@@ -2282,6 +2345,14 @@ struct CcuBoundary {
 }
 
 fn forward_retime_registered_ccu_chains(netlist: &Ecp5Netlist, timing_driven: bool) -> Ecp5Netlist {
+    let baseline_burden = routing_burden(netlist);
+    let adjusted_overall = |profile: &MappedLutProfile, cells_now: &Ecp5Netlist| {
+        congestion_adjusted_overall(
+            profile.overall_period_ps,
+            routing_burden(cells_now),
+            baseline_burden,
+        )
+    };
     let mut selected = netlist.clone();
     for _ in 0..netlist.cells.len() {
         let profile = mapped_lut_profile(&selected);
@@ -2290,6 +2361,7 @@ fn forward_retime_registered_ccu_chains(netlist: &Ecp5Netlist, timing_driven: bo
             timing_driven,
             selected.cells.len(),
             mapped_register_count(&selected),
+            adjusted_overall(&profile, &selected),
         );
         let chains = ccu_chain_names(&selected);
         let mut best = None;
@@ -2319,6 +2391,7 @@ fn forward_retime_registered_ccu_chains(netlist: &Ecp5Netlist, timing_driven: bo
                 timing_driven,
                 candidate.cells.len(),
                 mapped_register_count(&candidate),
+                adjusted_overall(&candidate_profile, &candidate),
             );
             if score < selected_score
                 && best
