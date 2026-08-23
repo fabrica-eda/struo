@@ -220,6 +220,19 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
+      - name: Install Veryl
+        env:
+          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.20.3/veryl-x86_64-linux.zip
+          VERYL_SHA256: 8e4f36919dcb676afa037867dd80e98172e2d19487825423f1fdedd1e87e9ab7
+        run: |
+          curl --fail --location --silent --show-error \
+            "$VERYL_URL" --output "$RUNNER_TEMP/veryl.zip"
+          echo "$VERYL_SHA256  $RUNNER_TEMP/veryl.zip" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/veryl-bin"
+          unzip -q "$RUNNER_TEMP/veryl.zip" veryl -d "$RUNNER_TEMP/veryl-bin"
+          chmod 0755 "$RUNNER_TEMP/veryl-bin/veryl"
+          echo "$RUNNER_TEMP/veryl-bin" >> "$GITHUB_PATH"
+
       - name: Install ECP5 tools and Yosys
         run: |
           sudo apt-get update
