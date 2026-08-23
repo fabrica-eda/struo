@@ -94,7 +94,7 @@ jobs:
       - name: Generate technology-mapped AXI4 self-test
         run: |
           mkdir -p build/ci/axi4-smartconnect
-          cargo run --locked -- axi4-self-test \
+          cargo run --locked -p struo-cli --example axi4-self-test -- \
             build/ci/axi4-smartconnect/design.json
 
       - name: Place and route AXI4 self-test across seeds

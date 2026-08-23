@@ -12,6 +12,7 @@ name = "struo"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
 struo-celox = { path = "../struo-celox" }
 struo-example-axi4-smartconnect = { path = "../../examples/axi4-smartconnect" }
 struo-frontend-veryl = { path = "../struo-frontend-veryl" }
@@ -19,6 +20,8 @@ struo-rtl = { path = "../struo-rtl" }
 struo-sim = { path = "../struo-sim" }
 struo-synth = { path = "../struo-synth" }
 struo-target-ecp5 = { path = "../struo-target-ecp5" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [lints]
 workspace = true
