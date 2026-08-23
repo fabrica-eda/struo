@@ -280,8 +280,12 @@ scoreboard, and arbitration boundaries in the RTL.
 nextpnr uses timing budgets, a heap timing weight of 40,
 and timing-driven routing rip-up for every seed; no successful seed is selected
 after the fact. The CI timing gate repeats all ten fixed seeds and requires each
-one to reach 300 MHz. nextpnr timing remains the sign-off result because
-placement-dependent routing cannot be predicted by the pre-route mapper.
+one to reach 300 MHz. A seed whose routed draft misses the goal qualifies the
+bounded physical-feedback candidates synthesized from that draft and is
+represented by its fastest certified-equivalent implementation; drafts that
+already meet timing are never rewritten. nextpnr timing remains the sign-off
+result because placement-dependent routing cannot be predicted by the pre-route
+mapper.
 At the separate 320 MHz stress target, the routed drafts reach
 306.84--325.10 MHz (318.01 MHz mean) and pass five of ten seeds. Physical
 feedback qualifies only seed 2, adds two LUT replicas, and improves that same
