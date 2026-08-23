@@ -1,0 +1,25 @@
+/// Two-stage variable barrel shifter with a clock enable.
+module shift32 (
+    clk:  input  clock,
+    run:  input  logic,
+    amt:  input  logic<5>,
+    din:  input  logic<32>,
+    dout: output logic<32>,
+) {
+    var pipe0: logic<32>;
+    var pipe1: logic<32>;
+
+    always_ff (clk) {
+        if run {
+            pipe0 = din << amt;
+        }
+    }
+
+    always_ff (clk) {
+        pipe1 = pipe0 >> 4;
+    }
+
+    always_comb {
+        dout = pipe1;
+    }
+}

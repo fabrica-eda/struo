@@ -5,3 +5,6 @@
 *.log
 .idea/
 .vscode/
+bench/**/.build/
+bench/**/build/
+bench/designs/*/Veryl.lock

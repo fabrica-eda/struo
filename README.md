@@ -168,8 +168,14 @@ cargo run -- demo /tmp/struo-blinky.nextpnr.json
 cargo run -- axi4-demo /tmp/struo-axi4.nextpnr.json
 cargo run -- axi4-self-test /tmp/struo-axi4-self-test.nextpnr.json
 cargo run -- carry-benchmark /tmp/struo-carry-benchmark
+python3 bench/scripts/qor.py
 (cd examples/axi4-smartconnect && veryl fmt --check && veryl check)
 ```
+
+`bench/scripts/qor.py` runs the QoR benchmark suite comparing Struo against
+a pinned Yosys `synth_ecp5` baseline on shared Veryl sources with identical
+nextpnr seeds and timing goals; methodology and current results are in
+[`bench/README.md`](bench/README.md).
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
 addition and subtraction, signed and unsigned comparisons, variable logical
