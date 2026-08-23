@@ -387,7 +387,8 @@ impl<'a> ModuleLowerer<'a> {
                 Declaration::Comb(comb) => {
                     let initial = self.read_env()?;
                     let mut env = initial.clone();
-                    let changed = self.lower_statements(&comb.statements, &mut env, false)?;
+                    let changed =
+                        self.lower_statements(&comb.statements, &initial, &mut env, false)?;
                     for key in changed {
                         if !driven_comb.insert(key.clone()) || driven_ff.contains(&key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
@@ -726,7 +727,7 @@ impl<'a> ModuleLowerer<'a> {
                 next = next_env;
                 changed.extend(branch_changed);
             } else {
-                changed.extend(self.lower_statement(statement, &mut next, true)?);
+                changed.extend(self.lower_statement(statement, &initial, &mut next, true)?);
             }
         }
 
@@ -788,20 +789,28 @@ impl<'a> ModuleLowerer<'a> {
     ) -> Result<(Env, Env, BTreeSet<SignalKey>), ImportError> {
         let mut reset = initial.clone();
         let mut next = initial.clone();
-        let mut changed = self.lower_statements(&branch.true_side, &mut reset, true)?;
-        changed.extend(self.lower_statements(&branch.false_side, &mut next, true)?);
+        let mut changed = self.lower_statements(&branch.true_side, initial, &mut reset, true)?;
+        changed.extend(self.lower_statements(&branch.false_side, initial, &mut next, true)?);
         Ok((reset, next, changed))
     }
 
     fn lower_statements(
         &mut self,
         statements: &[Statement],
-        env: &mut Env,
+        reads: &Env,
+        writes: &mut Env,
         sequential: bool,
     ) -> Result<BTreeSet<SignalKey>, ImportError> {
         let mut changed = BTreeSet::new();
         for statement in statements {
-            changed.extend(self.lower_statement(statement, env, sequential)?);
+            if sequential {
+                changed.extend(self.lower_statement(statement, reads, writes, true)?);
+            } else {
+                // Combinational blocks follow blocking semantics: each
+                // statement observes every earlier write in the block.
+                let snapshot = writes.clone();
+                changed.extend(self.lower_statement(statement, &snapshot, writes, false)?);
+            }
         }
         Ok(changed)
     }
@@ -809,7 +818,8 @@ impl<'a> ModuleLowerer<'a> {
     fn lower_statement(
         &mut self,
         statement: &Statement,
-        env: &mut Env,
+        reads: &Env,
+        writes: &mut Env,
         sequential: bool,
     ) -> Result<BTreeSet<SignalKey>, ImportError> {
         match statement {
@@ -821,20 +831,24 @@ impl<'a> ModuleLowerer<'a> {
                 }
                 let destination = &assign.dst[0];
                 let key = self.destination_key(destination)?;
-                let value = self.lower_expression(&assign.expr, env)?;
-                self.assign_env(destination, value, env)?;
+                // Reads observe the pre-edge register value, but a partial
+                // write composes over the value already scheduled for this
+                // edge (later writes win per bit).
+                let value = self.lower_expression(&assign.expr, reads)?;
+                self.assign_env(destination, value, writes)?;
                 Ok(BTreeSet::from([key]))
             }
             Statement::If(branch) => {
-                let condition = self.lower_expression(&branch.cond, env)?;
+                let condition = self.lower_expression(&branch.cond, reads)?;
                 let condition = self.boolean(condition)?;
-                let base = env.clone();
+                let base = writes.clone();
                 let mut true_env = base.clone();
                 let mut false_env = base;
                 let mut changed =
-                    self.lower_statements(&branch.true_side, &mut true_env, sequential)?;
+                    self.lower_statements(&branch.true_side, reads, &mut true_env, sequential)?;
                 changed.extend(self.lower_statements(
                     &branch.false_side,
+                    reads,
                     &mut false_env,
                     sequential,
                 )?);
@@ -845,7 +859,7 @@ impl<'a> ModuleLowerer<'a> {
                     let then_value = self.resize(then_value, width, self.is_signed(key))?;
                     let else_value = self.resize(else_value, width, self.is_signed(key))?;
                     let value = self.rtl.mux(condition.id, then_value.id, else_value.id)?;
-                    env.insert(
+                    writes.insert(
                         key.clone(),
                         LoweredExpr {
                             id: value,
@@ -860,7 +874,9 @@ impl<'a> ModuleLowerer<'a> {
                 "nested if_reset statements".into(),
             )),
             Statement::Null => Ok(BTreeSet::new()),
-            Statement::Case(case_statement) => self.lower_case(case_statement, env, sequential),
+            Statement::Case(case_statement) => {
+                self.lower_case(case_statement, reads, writes, sequential)
+            }
             Statement::For(_) => Err(ImportError::UnsupportedBehavior(
                 "runtime and unrolled for statements are not lowered yet".into(),
             )),
@@ -885,17 +901,19 @@ impl<'a> ModuleLowerer<'a> {
     fn lower_case(
         &mut self,
         statement: &CaseStatement,
-        env: &mut Env,
+        reads: &Env,
+        writes: &mut Env,
         sequential: bool,
     ) -> Result<BTreeSet<SignalKey>, ImportError> {
-        let target = self.lower_expression(&statement.case_target, env)?;
-        let base = env.clone();
+        let target = self.lower_expression(&statement.case_target, reads)?;
+        let base = writes.clone();
         let mut else_env = base.clone();
-        let mut changed = self.lower_statements(&statement.default, &mut else_env, sequential)?;
+        let mut changed =
+            self.lower_statements(&statement.default, reads, &mut else_env, sequential)?;
 
         for arm in statement.arms.iter().rev() {
             let mut then_env = base.clone();
-            let arm_changed = self.lower_statements(&arm.body, &mut then_env, sequential)?;
+            let arm_changed = self.lower_statements(&arm.body, reads, &mut then_env, sequential)?;
             let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
             let mut merged_changed = changed.clone();
             merged_changed.extend(arm_changed);
@@ -919,7 +937,7 @@ impl<'a> ModuleLowerer<'a> {
             changed = merged_changed;
         }
 
-        *env = else_env;
+        *writes = else_env;
         Ok(changed)
     }
 
@@ -1897,6 +1915,43 @@ module UnpackedArrayInstanceTop (
 }
 ";
 
+    const NBA_SOURCE: &str = r"
+module NbaTop (
+    clk    : input  clock_posedge  ,
+    rst_n  : input  reset_async_low,
+    din    : input  logic<8>       ,
+    use_alt: input  logic          ,
+    alt    : input  logic<2>       ,
+    stage2 : output logic<8>       ,
+    flags  : output logic<2>       ,
+) {
+    var stage1 : logic<8>;
+    var echoed : logic<8>;
+    var flags_q: logic<2>;
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            stage1 = 8'h00;
+            echoed = 8'h00;
+            flags_q = 2'b00;
+        } else {
+            stage1 = din;
+            echoed = stage1 + 8'h01;
+            flags_q = 2'b01;
+            if use_alt {
+                flags_q[1] = alt[0];
+                flags_q[0] = alt[1];
+            }
+        }
+    }
+
+    always_comb {
+        stage2 = echoed;
+        flags  = flags_q;
+    }
+}
+";
+
     #[test]
     fn lowers_analyzed_comb_and_ff_through_ecp5_and_celox() {
         let design = analyze_and_lower(SOURCE, "air_lowering", "Top").unwrap();
@@ -1957,6 +2012,39 @@ module UnpackedArrayInstanceTop (
             set(&mut simulator, "select", select);
             assert_value(&mut simulator, "decoded", expected);
         }
+    }
+
+    #[test]
+    fn sequential_reads_observe_previous_register_values() {
+        let design = analyze_and_lower(NBA_SOURCE, "nba_lowering", "NbaTop").unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        // Read-after-write in one always_ff must observe the pre-edge
+        // register value: `echoed` captures `stage1 + 1` from the *previous*
+        // cycle, not the value assigned earlier in the same block.
+        reset(&mut simulator);
+        set(&mut simulator, "din", 100);
+        tick(&mut simulator);
+        assert_value(&mut simulator, "stage2", 1);
+        tick(&mut simulator);
+        assert_value(&mut simulator, "stage2", 101);
+
+        // A default assignment followed by partial overrides composes over
+        // the scheduled value, never over stale pre-edge bits.
+        set(&mut simulator, "use_alt", 0);
+        tick(&mut simulator);
+        assert_value(&mut simulator, "flags", 0b01);
+        set(&mut simulator, "use_alt", 1);
+        set(&mut simulator, "alt", 0b10);
+        tick(&mut simulator);
+        // flags = {alt[0], alt[1]} = {0, 1}; a stale-bit composition would
+        // keep the default 0b01 bit pattern instead.
+        assert_value(&mut simulator, "flags", 0b01);
+        set(&mut simulator, "alt", 0b11);
+        tick(&mut simulator);
+        assert_value(&mut simulator, "flags", 0b11);
     }
 
     #[test]

@@ -168,8 +168,14 @@ cargo run -- demo /tmp/struo-blinky.nextpnr.json
 cargo run -- axi4-demo /tmp/struo-axi4.nextpnr.json
 cargo run -- axi4-self-test /tmp/struo-axi4-self-test.nextpnr.json
 cargo run -- carry-benchmark /tmp/struo-carry-benchmark
+python3 bench/scripts/qor.py
 (cd examples/axi4-smartconnect && veryl fmt --check && veryl check)
 ```
+
+`bench/scripts/qor.py` runs the QoR benchmark suite comparing Struo against
+a pinned Yosys `synth_ecp5` baseline on shared Veryl sources with identical
+nextpnr seeds and timing goals; methodology and current results are in
+[`bench/README.md`](bench/README.md).
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
 addition and subtraction, signed and unsigned comparisons, variable logical
@@ -274,8 +280,12 @@ scoreboard, and arbitration boundaries in the RTL.
 nextpnr uses timing budgets, a heap timing weight of 40,
 and timing-driven routing rip-up for every seed; no successful seed is selected
 after the fact. The CI timing gate repeats all ten fixed seeds and requires each
-one to reach 300 MHz. nextpnr timing remains the sign-off result because
-placement-dependent routing cannot be predicted by the pre-route mapper.
+one to reach 300 MHz. A seed whose routed draft misses the goal qualifies the
+bounded physical-feedback candidates synthesized from that draft and is
+represented by its fastest certified-equivalent implementation; drafts that
+already meet timing are never rewritten. nextpnr timing remains the sign-off
+result because placement-dependent routing cannot be predicted by the pre-route
+mapper.
 At the separate 320 MHz stress target, the routed drafts reach
 306.84--325.10 MHz (318.01 MHz mean) and pass five of ten seeds. Physical
 feedback qualifies only seed 2, adds two LUT replicas, and improves that same

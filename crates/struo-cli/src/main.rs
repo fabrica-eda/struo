@@ -9,6 +9,7 @@ use std::path::Path;
 
 use struo_celox::ecp5_simulator;
 use struo_example_axi4_smartconnect::{axi4_crossbar_2x2, axi4_crossbar_self_test};
+use struo_frontend_veryl::analyze_and_lower;
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Module, Polarity, Port, PortDirection,
     Register, Reset, ResetMode, StateDomain, ValueType,
@@ -31,7 +32,9 @@ Usage:
   struo axi4-self-test [MAPPED_JSON] [TIMING_GOAL_MHZ] [DRAFT_REPORT] [DRAFT_PLACED_JSON]
                        synthesize the closed-system AXI4 board wrapper
   struo carry-benchmark [DIRECTORY]
-                       emit 32-bit CCU2C and LUT ripple comparison designs
+                        emit 32-bit CCU2C and LUT ripple comparison designs
+  struo qor <VERYL_FILE> <TOP> [NEXTPNR_JSON] [TIMING_GOAL_MHZ]
+                        synthesize an arbitrary self-contained Veryl source
   struo help    show this help
 ";
 
@@ -60,6 +63,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .nth(2)
                 .as_deref()
                 .unwrap_or("build/carry-benchmark"),
+        ),
+        Some("qor") => run_qor(
+            env::args().nth(2).as_deref(),
+            env::args().nth(3).as_deref(),
+            env::args().nth(4).as_deref(),
+            env::args().nth(5).as_deref(),
         ),
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
@@ -141,6 +150,67 @@ fn run_carry_benchmark(directory: &str) -> Result<(), Box<dyn Error>> {
             mapped.cells().len(),
             path.display()
         );
+    }
+    Ok(())
+}
+
+fn run_qor(
+    veryl_path: Option<&str>,
+    top: Option<&str>,
+    mapped_path: Option<&str>,
+    timing_goal_mhz: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(veryl_path) = veryl_path else {
+        return Err("qor requires a Veryl source path".into());
+    };
+    let Some(top) = top else {
+        return Err("qor requires a top module name".into());
+    };
+    let timing_goal_mhz = timing_goal_mhz
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(ECP5_QOR_TARGET_MHZ);
+    if timing_goal_mhz == 0 {
+        return Err("timing goal must be greater than zero".into());
+    }
+    let source = fs::read_to_string(veryl_path)?;
+    let project = Path::new(veryl_path)
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .map_or_else(|| "bench".to_owned(), str::to_owned);
+    let design = analyze_and_lower(&source, &project, top)?;
+    run_qor_design(&design, top, timing_goal_mhz, mapped_path)
+}
+
+fn run_qor_design(
+    design: &struo_rtl::Design,
+    label: &str,
+    timing_goal_mhz: u32,
+    mapped_path: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let synthesized = synthesize(design)?;
+    for report in &synthesized.reports {
+        println!("{}: {}", report.pass, report.message);
+    }
+    let mapped = map_to_ecp5_with_options(
+        &synthesized.netlist,
+        MappingOptions {
+            timing_goal_mhz,
+            ..MappingOptions::default()
+        },
+    )?;
+    print_retiming_decision(&mapped);
+    println!(
+        "{label}: {} Boolean nodes, {} registers, {} ECP5 cells, goal {timing_goal_mhz} MHz",
+        synthesized.netlist.nodes().len(),
+        synthesized.netlist.registers().len(),
+        mapped.cells().len()
+    );
+    ecp5_simulator(&mapped)?.build_native()?;
+    if let Some(path) = mapped_path {
+        fs::write(path, mapped.to_nextpnr_json()?)?;
+        println!("nextpnr JSON: {path}");
     }
     Ok(())
 }

@@ -1,0 +1,15 @@
+/// 32-bit free-running counter matching the carry-benchmark register shape.
+module counter32 (
+    clk: input  clock,
+    count: output logic<32>,
+) {
+    var counter: logic<32>;
+
+    always_ff (clk) {
+        counter = counter + 1;
+    }
+
+    always_comb {
+        count = counter;
+    }
+}

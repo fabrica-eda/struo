@@ -1,0 +1,26 @@
+/// Pipelined max-of-four accumulator with comparator-tree feedback.
+module maxtree16 (
+    clk:  input  clock,
+    a:    input  logic<16>,
+    b:    input  logic<16>,
+    c:    input  logic<16>,
+    d:    input  logic<16>,
+    peak: output logic<16>,
+) {
+    var r01 : logic<16>;
+    var r23 : logic<16>;
+    var best: logic<16>;
+
+    always_ff (clk) {
+        r01 = if a >: b ? a : b;
+        r23 = if c >: d ? c : d;
+    }
+
+    always_ff (clk) {
+        best = if r01 >: r23 ? r01 : r23;
+    }
+
+    always_comb {
+        peak = best;
+    }
+}
