@@ -3063,6 +3063,7 @@ version = "0.1.0"
 dependencies = [
  "struo-celox",
  "struo-example-axi4-smartconnect",
+ "struo-frontend-veryl",
  "struo-rtl",
  "struo-sim",
  "struo-synth",
