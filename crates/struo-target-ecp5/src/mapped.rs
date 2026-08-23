@@ -4554,9 +4554,10 @@ mod tests {
 
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, MappingOptions, NextpnrJsonError,
-        backward_retime_ccu2c, backward_retime_lut, ccu_chain_names, forward_retime_ccu2c,
-        forward_retime_lut, map_once, map_to_ecp5, map_to_ecp5_with_options, mapped_cell_name,
-        mapped_wire_fanout, merge_equivalent_flip_flops, replicate_high_fanout_enable_luts,
+        backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names,
+        forward_retime_ccu2c, forward_retime_lut, map_once, map_to_ecp5, map_to_ecp5_with_options,
+        mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
+        replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
     use crate::PhysicalFeedback;
@@ -4721,6 +4722,169 @@ mod tests {
         assert_eq!(bits("unreset_one"), vec![Bit::One]);
         assert_eq!(bits("matched_reset"), vec![Bit::Zero]);
         assert!(matches!(bits("mismatched_reset")[0], Bit::Wire(_)));
+    }
+
+    #[test]
+    fn splits_branched_carry_outs_until_chains_are_point_to_point() {
+        let (base, _) = map_once(
+            &arithmetic_netlist(8, ArithmeticOp::Add),
+            MappingOptions::default(),
+        )
+        .unwrap();
+        let mut netlist = base;
+        netlist.cells.clear();
+        netlist.ports.clear();
+        netlist.equivalence_proof.equivalent_logic_replications = 0;
+
+        // Chain a -> b -> c where b's carry-out branches into c and d.
+        let constant = Bit::Zero;
+        netlist.cells.push(Ecp5Cell::Ccu2c {
+            name: "a".into(),
+            inputs: [[constant; 4]; 2],
+            carry_in: constant,
+            sums: [110, 111],
+            carry_out: 120,
+            init: [0xaaaa, 0xaaaa],
+            inject: [false, false],
+        });
+        netlist.cells.push(Ecp5Cell::Ccu2c {
+            name: "b".into(),
+            inputs: [[constant; 4]; 2],
+            carry_in: Bit::Wire(120),
+            sums: [112, 113],
+            carry_out: 121,
+            init: [0xaaaa, 0xaaaa],
+            inject: [false, false],
+        });
+        netlist.cells.push(Ecp5Cell::Ccu2c {
+            name: "c".into(),
+            inputs: [[constant; 4]; 2],
+            carry_in: Bit::Wire(121),
+            sums: [114, 115],
+            carry_out: 122,
+            init: [0xaaaa, 0xaaaa],
+            inject: [false, false],
+        });
+        netlist.cells.push(Ecp5Cell::Ccu2c {
+            name: "d".into(),
+            inputs: [[constant; 4]; 2],
+            carry_in: Bit::Wire(121),
+            sums: [116, 117],
+            carry_out: 123,
+            init: [0xaaaa, 0xaaaa],
+            inject: [false, false],
+        });
+
+        assert!(!carry_outs_are_point_to_point(&netlist));
+
+        let replicas = split_branched_carry_outs(&mut netlist);
+
+        // The branch at b is repaired by cloning b for d, which branches a;
+        // the cascade terminates once a is cloned for the replica of b.
+        assert_eq!(replicas, 2);
+        assert!(carry_outs_are_point_to_point(&netlist));
+        assert_eq!(
+            netlist.equivalence_proof.equivalent_logic_replications,
+            replicas
+        );
+
+        // Two independent point-to-point chains now cover the six slices:
+        // the originals feed c, and one full replica chain feeds d.
+        let slices = netlist
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                Ecp5Cell::Ccu2c {
+                    name,
+                    carry_in,
+                    carry_out,
+                    init,
+                    ..
+                } => Some((name.clone(), *carry_in, *carry_out, *init)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(slices.len(), 6);
+
+        let consumers_of = |wire: u32| {
+            slices
+                .iter()
+                .filter(|(_, carry_in, ..)| *carry_in == Bit::Wire(wire))
+                .map(|(name, ..)| name.clone())
+                .collect::<Vec<_>>()
+        };
+        let cout = |name: &str| {
+            slices
+                .iter()
+                .find(|(candidate, ..)| candidate == name)
+                .map(|&(_, _, carry_out, _)| carry_out)
+                .unwrap_or_else(|| panic!("slice {name} missing"))
+        };
+        let init_of = |name: &str| {
+            slices
+                .iter()
+                .find(|(candidate, ..)| candidate == name)
+                .map(|&(.., init)| init)
+                .unwrap_or_else(|| panic!("slice {name} missing"))
+        };
+
+        assert_eq!(consumers_of(cout("a")), vec!["b".to_owned()]);
+        assert_eq!(consumers_of(cout("b")), vec!["c".to_owned()]);
+
+        let producer_of = |wire: u32| {
+            slices
+                .iter()
+                .find(|&(_, _, carry_out, _)| *carry_out == wire)
+                .unwrap_or_else(|| panic!("no producer drives wire {wire}"))
+        };
+
+        let slice_by_name = |name: &str| slices.iter().find(|(candidate, ..)| candidate == name);
+
+        // d must be fed by a replica of b whose own carry-in is fed by a
+        // replica of a rooted at an external constant, never by the original
+        // a or b (which would re-create the branch one level up).
+        let d_cin = slice_by_name("d").map(|&(_, cin, ..)| cin).unwrap();
+        let Bit::Wire(feeder_wire) = d_cin else {
+            panic!("d lost its carry connection");
+        };
+        let (feeder_name, _, _, _) = producer_of(feeder_wire);
+        assert_ne!(feeder_name, "b");
+        assert_eq!(init_of(feeder_name), init_of("b"));
+
+        let feeder_cin = slice_by_name(feeder_name).map(|&(_, cin, ..)| cin).unwrap();
+        let Bit::Wire(root_wire) = feeder_cin else {
+            panic!("expected the replica chain to continue to a root");
+        };
+        let (root_name, root_cin, _, _) = producer_of(root_wire);
+        assert_ne!(root_name, "a");
+        assert_eq!(init_of(&root_name), init_of("a"));
+        assert_eq!(*root_cin, Bit::Zero);
+
+        assert_eq!(split_branched_carry_outs(&mut netlist), 0);
+        assert!(carry_outs_are_point_to_point(&netlist));
+    }
+
+    #[test]
+    fn treats_dead_end_carry_outs_as_point_to_point() {
+        let (base, _) = map_once(
+            &arithmetic_netlist(8, ArithmeticOp::Add),
+            MappingOptions::default(),
+        )
+        .unwrap();
+        let mut netlist = base;
+        netlist.cells.clear();
+        netlist.ports.clear();
+        netlist.cells.push(Ecp5Cell::Ccu2c {
+            name: "lone".into(),
+            inputs: [[Bit::Zero; 4]; 2],
+            carry_in: Bit::Zero,
+            sums: [210, 211],
+            carry_out: 220,
+            init: [0xaaaa, 0xaaaa],
+            inject: [false, false],
+        });
+        assert!(carry_outs_are_point_to_point(&netlist));
+        assert_eq!(split_branched_carry_outs(&mut netlist), 0);
     }
 
     #[test]
