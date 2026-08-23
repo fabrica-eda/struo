@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::hash::{BuildHasherDefault, Hasher};
 
 use serde::Serialize;
 use serde::ser::Serializer;
@@ -36,6 +37,34 @@ const MAX_ENABLE_FANOUT_PER_REPLICA: usize = 16;
 const PHYSICAL_REWRITE_MIN_GOAL_PERCENT: u32 = 98;
 const PHYSICAL_RETIME_MIN_GOAL_PERCENT: u32 = 95;
 const PHYSICAL_RETIME_MODEL_BRIDGE_PS: u32 = 400;
+
+// These maps only contain trusted internal u32 wire IDs. Avoid the randomized
+// string-oriented hashing cost in the timing model's repeated fixed-point scans.
+struct WireHasher(u64);
+
+impl Default for WireHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for WireHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+type WireMap<T> = HashMap<u32, T, BuildHasherDefault<WireHasher>>;
 
 /// A constant or numbered wire in a mapped ECP5 design.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1679,8 +1708,9 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
     }
 }
 
-fn mapped_lut_depths(netlist: &Ecp5Netlist) -> HashMap<u32, usize> {
-    let mut depths = HashMap::<u32, usize>::new();
+fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
+    let mut depths = WireMap::default();
+    depths.reserve(netlist.cells.len());
     for port in &netlist.ports {
         if port.direction == PortDirection::Input {
             for bit in &port.bits {
@@ -1739,14 +1769,14 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> HashMap<u32, usize> {
     depths
 }
 
-fn bit_lut_depth(bit: Bit, depths: &HashMap<u32, usize>) -> usize {
+fn bit_lut_depth(bit: Bit, depths: &WireMap<usize>) -> usize {
     match bit {
         Bit::Wire(wire) => depths.get(&wire).copied().unwrap_or(0),
         Bit::Zero | Bit::One => 0,
     }
 }
 
-fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> HashMap<u32, u32> {
+fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
     let fanouts = mapped_wire_fanouts(netlist);
     let carry_outputs = netlist
         .cells
@@ -1756,7 +1786,8 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> HashMap<u32, u32> {
             _ => None,
         })
         .collect::<HashSet<_>>();
-    let mut arrivals = HashMap::<u32, u32>::new();
+    let mut arrivals = WireMap::default();
+    arrivals.reserve(netlist.cells.len());
     for port in &netlist.ports {
         if port.direction == PortDirection::Input {
             for bit in &port.bits {
@@ -1846,8 +1877,8 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> HashMap<u32, u32> {
 
 fn mapped_ccu_inputs(
     inputs: [Bit; 4],
-    arrivals: &HashMap<u32, u32>,
-    fanouts: &HashMap<u32, usize>,
+    arrivals: &WireMap<u32>,
+    fanouts: &WireMap<usize>,
 ) -> Option<u32> {
     inputs
         .into_iter()
@@ -1864,8 +1895,8 @@ fn mapped_ccu_inputs(
 
 fn mapped_routed_arrival(
     bit: Bit,
-    arrivals: &HashMap<u32, u32>,
-    fanouts: &HashMap<u32, usize>,
+    arrivals: &WireMap<u32>,
+    fanouts: &WireMap<usize>,
 ) -> Option<u32> {
     match bit {
         Bit::Zero | Bit::One => Some(0),
@@ -1877,36 +1908,34 @@ fn mapped_routed_arrival(
     }
 }
 
-fn mapped_setup_period(
-    bit: Bit,
-    arrivals: &HashMap<u32, u32>,
-    fanouts: &HashMap<u32, usize>,
-) -> u32 {
+fn mapped_setup_period(bit: Bit, arrivals: &WireMap<u32>, fanouts: &WireMap<usize>) -> u32 {
     mapped_routed_arrival(bit, arrivals, fanouts)
         .unwrap_or(0)
         .saturating_add(FLIP_FLOP_SETUP_PS)
 }
 
-fn mapped_output_period(
-    bit: Bit,
-    arrivals: &HashMap<u32, u32>,
-    fanouts: &HashMap<u32, usize>,
-) -> u32 {
+fn mapped_output_period(bit: Bit, arrivals: &WireMap<u32>, fanouts: &WireMap<usize>) -> u32 {
     mapped_routed_arrival(bit, arrivals, fanouts).unwrap_or(0)
 }
 
-fn mapped_wire_fanouts(netlist: &Ecp5Netlist) -> HashMap<u32, usize> {
-    let mut fanouts = HashMap::new();
-    for bit in netlist.cells.iter().flat_map(cell_input_bits).chain(
-        netlist
-            .ports
-            .iter()
-            .filter(|port| port.direction == PortDirection::Output)
-            .flat_map(|port| &port.bits)
-            .copied(),
-    ) {
+fn mapped_wire_fanouts(netlist: &Ecp5Netlist) -> WireMap<usize> {
+    let mut fanouts = WireMap::default();
+    fanouts.reserve(netlist.cells.len());
+    for cell in &netlist.cells {
+        for_each_cell_input_bit(cell, |bit| {
+            if let Bit::Wire(wire) = bit {
+                *fanouts.entry(wire).or_insert(0) += 1;
+            }
+        });
+    }
+    for bit in netlist
+        .ports
+        .iter()
+        .filter(|port| port.direction == PortDirection::Output)
+        .flat_map(|port| &port.bits)
+    {
         if let Bit::Wire(wire) = bit {
-            *fanouts.entry(wire).or_insert(0) += 1;
+            *fanouts.entry(*wire).or_insert(0) += 1;
         }
     }
     fanouts
@@ -2943,6 +2972,7 @@ fn ccu_logic_value(value: CcuLogicValue, assignment: usize) -> bool {
 fn merge_equivalent_flip_flops(netlist: &mut Ecp5Netlist) {
     const MAX_SHARED_FANOUT: usize = 2;
     loop {
+        let fanouts = mapped_wire_fanouts(netlist);
         let mut canonical = Vec::<(
             Bit,
             u32,
@@ -2970,7 +3000,7 @@ fn merge_equivalent_flip_flops(netlist: &mut Ecp5Netlist) {
             if !name.starts_with("retime_") {
                 continue;
             }
-            let output_fanout = mapped_wire_fanout(netlist, *output);
+            let output_fanout = fanouts.get(output).copied().unwrap_or(0);
             if let Some((_, canonical_output, .., canonical_fanout)) = canonical.iter_mut().find(
                 |(
                     candidate_data,
@@ -3155,16 +3185,13 @@ fn reduced_lut_function(inputs: [Bit; 4], init: u16, variables: &[u32]) -> Logic
 }
 
 fn mapped_wire_fanout(netlist: &Ecp5Netlist, wire: u32) -> usize {
-    netlist
-        .cells
-        .iter()
-        .map(|cell| {
-            cell_input_bits(cell)
-                .into_iter()
-                .filter(|bit| *bit == Bit::Wire(wire))
-                .count()
-        })
-        .sum::<usize>()
+    let mut fanout = 0usize;
+    for cell in &netlist.cells {
+        for_each_cell_input_bit(cell, |bit| {
+            fanout += usize::from(bit == Bit::Wire(wire));
+        });
+    }
+    fanout
         + netlist
             .ports
             .iter()
@@ -3188,27 +3215,42 @@ fn maximum_mapped_wire(netlist: &Ecp5Netlist) -> Option<u32> {
 }
 
 fn cell_input_bits(cell: &Ecp5Cell) -> Vec<Bit> {
+    let mut bits = Vec::new();
+    for_each_cell_input_bit(cell, |bit| bits.push(bit));
+    bits
+}
+
+fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
     match cell {
-        Ecp5Cell::Lut4 { inputs, .. } => inputs.to_vec(),
+        Ecp5Cell::Lut4 { inputs, .. } => {
+            for bit in inputs {
+                visit(*bit);
+            }
+        }
         Ecp5Cell::Ccu2c {
             inputs, carry_in, ..
-        } => inputs
-            .iter()
-            .flatten()
-            .copied()
-            .chain([*carry_in])
-            .collect(),
+        } => {
+            for bit in inputs.iter().flatten() {
+                visit(*bit);
+            }
+            visit(*carry_in);
+        }
         Ecp5Cell::FlipFlop {
             data,
             clock,
             enable,
             reset,
             ..
-        } => [*data, *clock]
-            .into_iter()
-            .chain(enable.map(|control| control.signal))
-            .chain(reset.map(|control| control.signal))
-            .collect(),
+        } => {
+            visit(*data);
+            visit(*clock);
+            if let Some(control) = enable {
+                visit(control.signal);
+            }
+            if let Some(control) = reset {
+                visit(control.signal);
+            }
+        }
         Ecp5Cell::BlockRam {
             write_address,
             write_data,
@@ -3217,14 +3259,20 @@ fn cell_input_bits(cell: &Ecp5Cell) -> Vec<Bit> {
             read_enable,
             clock,
             ..
-        } => write_address
-            .iter()
-            .chain(write_data)
-            .chain(read_address.iter())
-            .copied()
-            .chain([write_enable.signal, *clock])
-            .chain(read_enable.map(|control| control.signal))
-            .collect(),
+        } => {
+            for bit in write_address
+                .iter()
+                .chain(write_data)
+                .chain(read_address.iter())
+            {
+                visit(*bit);
+            }
+            visit(write_enable.signal);
+            visit(*clock);
+            if let Some(control) = read_enable {
+                visit(control.signal);
+            }
+        }
     }
 }
 
