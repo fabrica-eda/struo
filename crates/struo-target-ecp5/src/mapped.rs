@@ -3447,6 +3447,19 @@ fn constant_register_values(netlist: &Netlist) -> HashMap<NetId, bool> {
 /// truth-table-identical slice replica so every chain link stays
 /// point-to-point and nextpnr can pack the chains.
 fn split_branched_carry_outs(netlist: &mut Ecp5Netlist) -> usize {
+    // Repairing a branch moves it one slice upstream (the replica shares the
+    // parent's carry-in), so passes must repeat until the cascade reaches a
+    // chain root whose carry-in is external.
+    let mut total = 0usize;
+    while {
+        let replicas = split_branched_carry_outs_once(netlist);
+        total += replicas;
+        replicas > 0
+    } {}
+    total
+}
+
+fn split_branched_carry_outs_once(netlist: &mut Ecp5Netlist) -> usize {
     let mut next_wire = maximum_mapped_wire(netlist)
         .and_then(|wire| wire.checked_add(1))
         .unwrap_or(1);
