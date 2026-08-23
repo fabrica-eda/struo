@@ -63,7 +63,7 @@ nextpnr-ecp5 0.6-3build5, Yosys 0.33, seeds 1-3, goal 300 MHz:
 | maxtree16 | baseline | 110 | 48 | 357.35 (352.73..364.83) |
 | blinky | struo | 46 | 25 | 518.13 (518.13..518.13) |
 | blinky | baseline | 54 | 24 | 373.34 (360.88..388.50) |
-| axi4-crossbar | struo | 1197 | 1217 | 305.38 (304.60..306.09) |
+| axi4-crossbar | struo | 1197 | 1189 | 306.78 (302.66..313.77) |
 
 Geometric-mean Struo/baseline ratios: COMB sites 0.900, FF 1.028,
 period (1/Fmax) 0.923.
@@ -78,3 +78,23 @@ Observations:
 - Constant-input flip-flop folding at mapping time (GSR/REGSET
   initialization semantics) removed 4 constant shifter bits on shift32 and
   144 constant registers on the axi4-crossbar.
+- The retiming score prices routing-burden growth (fanout-weighted route
+  estimate summed over all nets) at 250 ps per percent beyond a 2% allowance.
+  This rejects trajectories whose model-period gains are smaller than the
+  placement pressure they create: a 310 MHz-goal run that previously routed
+  at 248--289 MHz now lands on the default trajectory.
+- Moving the burst decoder's 17-bit last-address addition from stage one into
+  stage zero was evaluated and rejected: routed results collapsed to
+  239--256 MHz across all ten seeds because the mux-heavy stage-zero boundary
+  has no slack for the adder, and congestion pricing correctly refuses the
+  retiming moves that would have hidden it.
+- The retiming score prices routing-burden growth (fanout-weighted route
+  estimate summed over all nets) at 250 ps per percent beyond a 2% allowance.
+  This rejects trajectories whose model-period gains are smaller than the
+  placement pressure they create; a 310 MHz-goal run that previously routed
+  at 248--289 MHz now lands on the default trajectory.
+- Moving the burst decoder's 17-bit last-address addition from stage one into
+  stage zero was evaluated and rejected: routed results collapsed to
+  239--256 MHz across all ten seeds because the mux-heavy stage-zero boundary
+  has no slack for the adder, and congestion pricing correctly refuses the
+  retiming moves that would have hidden it.
