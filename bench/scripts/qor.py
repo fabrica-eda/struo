@@ -154,6 +154,19 @@ def run_baseline_yosys(design: Design, workdir: Path, out_json: Path) -> str:
         raise RuntimeError(f"veryl build did not emit {sv_path}")
     project = veryl_project_name(design.source_dir)
     top_module = f"{project}_{design.top}"
+    if shutil.which("yosys") is not None:
+        sh(
+            [
+                "yosys",
+                "-p",
+                f"read_verilog -sv {sv_path}; "
+                f"hierarchy -check -top {top_module}; "
+                f"synth_ecp5 -top {top_module} -json {out_json}",
+            ],
+            stdout=subprocess.DEVNULL,
+        )
+        return top_module
+
     mounted = "/work"
     container_sv = f"{mounted}/{sv_path.relative_to(REPO_ROOT)}"
     container_out = f"{mounted}/{out_json.relative_to(REPO_ROOT)}"
@@ -322,11 +335,9 @@ def main() -> int:
 
     versions = {
         "nextpnr": run_capture(["nextpnr-ecp5", "--version"]).strip(),
-        "yosys": subprocess.run(
-            ["docker", "run", "--rm", YOSYS_IMAGE, "-V"],
-            capture_output=True,
-            text=True,
-        ).stdout.strip(),
+        "yosys": run_capture(
+            ["yosys", "-V"] if shutil.which("yosys") is not None else ["docker", "run", "--rm", YOSYS_IMAGE, "-V"]
+        ).strip(),
     }
 
     results = {
