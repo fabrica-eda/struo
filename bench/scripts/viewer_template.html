@@ -685,7 +685,7 @@ function drawIoColumns(layout, parent) {
     if (!srcVisible && insideSinks.length && !/^(clk|clock|rst|rst_n|reset|reset_n)$/i.test(label)) {
       inNets.push({label, targets: insideSinks.map(c => layout.byName.get(c.cell))});
     } else if (srcVisible && insideSinks.length < sinksAll.length) {
-      outNets.push({label, source: layout.byName.get(w.driver.cell)});
+      outNets.push({label, sources: [layout.byName.get(w.driver.cell)].filter(Boolean)});
     }
   }
   if (!inNets.length && !outNets.length) return;
@@ -744,17 +744,14 @@ function drawIoColumns(layout, parent) {
       }
       drawWires("#4a5058", 0.8);
 
-      function setHighlight(on) {
-        for (const we of wireEls) {
-          we.setAttribute("stroke", on ? "#7ab3ff" : (isInput ? "#69d0a8" : "#e0915f"));
-          we.setAttribute("stroke-width", on ? 2.8 : 1.0);
-          we.setAttribute("stroke-opacity", on ? 1 : 0.5);
-        }
-        txt.setAttribute("fill", on ? "#7ab3ff" : "#8b93a1");
-        txt.setAttribute("font-weight", on ? "bold" : "normal");
-      }
-      txt.addEventListener("mouseenter", () => setHighlight(true));
-      txt.addEventListener("mouseleave", () => setHighlight(false));
+      // Click toggles: bold blue = selected, back to normal = deselected
+      txt.style.cursor = "pointer";
+      let hl = false;
+      txt.addEventListener("click", ev => {
+        ev.stopPropagation();
+        hl = !hl;
+        setHighlight(hl);
+      });
     });
     void side;
     return {x, top: y0, bottom: y0 + h};
