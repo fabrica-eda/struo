@@ -193,6 +193,114 @@ jobs:
             build/ci/axi4-smartconnect/seed-*.log
           if-no-files-found: warn
 
+  qor-smoke:
+    name: QoR smoke suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Cache Cargo data
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Veryl
+        env:
+          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.20.3/veryl-x86_64-linux.zip
+          VERYL_SHA256: 8e4f36919dcb676afa037867dd80e98172e2d19487825423f1fdedd1e87e9ab7
+        run: |
+          curl --fail --location --silent --show-error \
+            "$VERYL_URL" --output "$RUNNER_TEMP/veryl.zip"
+          echo "$VERYL_SHA256  $RUNNER_TEMP/veryl.zip" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/veryl-bin"
+          unzip -q "$RUNNER_TEMP/veryl.zip" veryl -d "$RUNNER_TEMP/veryl-bin"
+          chmod 0755 "$RUNNER_TEMP/veryl-bin/veryl"
+          echo "$RUNNER_TEMP/veryl-bin" >> "$GITHUB_PATH"
+
+      - name: Install ECP5 tools and Yosys
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            fpga-trellis nextpnr-ecp5 yosys jq
+
+      - name: Run small-design QoR suite
+        run: python3 bench/scripts/qor.py --designs counter32,shift32,maxtree16 --seeds 1
+
+      - name: Check small-design regressions
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          results = json.load(open("build/qor/results.json"))
+          failures = []
+          for design in results["designs"]:
+              struo = design.get("struo")
+              baseline = design.get("baseline")
+              if not (struo and baseline):
+                  continue
+              comb_limit = baseline["lut"] * 1.25 + 8
+              fmax_floor = baseline["fmax_min_mhz"] * 0.85
+              if struo["lut"] > comb_limit:
+                  failures.append(
+                      f"{design['name']}: {struo['lut']} COMB sites exceeds limit {comb_limit:.0f}"
+                  )
+              if struo["fmax_min_mhz"] < fmax_floor:
+                  failures.append(
+                      f"{design['name']}: routed Fmax {struo['fmax_min_mhz']} MHz below floor {fmax_floor:.0f} MHz"
+                  )
+          for failure in failures:
+              print(failure)
+          sys.exit(1 if failures else 0)
+          PY
+
+      - name: Route axi4-crossbar seed 1 at 300 MHz
+        run: |
+          mkdir -p build/qor-ci/axi4
+          cargo run --locked --release -p struo-cli --example axi4-self-test -- \
+            build/qor-ci/axi4/design.json
+          nextpnr-ecp5 \
+            --um5g-85k \
+            --package CABGA381 \
+            --speed 8 \
+            --json build/qor-ci/axi4/design.json \
+            --lpf examples/axi4-smartconnect/constraints/lfe5um5g-85f-evn.lpf \
+            --textcfg build/qor-ci/axi4/design.config \
+            --report build/qor-ci/axi4/report.json \
+            --log build/qor-ci/axi4/pnr.log \
+            --freq 300 \
+            --placer-budgets \
+            --placer-heap-timingweight 40 \
+            --tmg-ripup \
+            --timing-allow-fail \
+            --seed 1
+          jq -e '[.fmax[] | .achieved >= .constraint] | all' build/qor-ci/axi4/report.json > /dev/null
+
+      - name: Upload QoR results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qor-smoke-results
+          path: |
+            build/qor/results.json
+            build/qor-ci/axi4/report.json
+          if-no-files-found: warn
+
   required:
     # Branch protection requires this stable check name.
     name: Required CI
