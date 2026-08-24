@@ -486,8 +486,7 @@ function renderSchematic() {
 
   const header = svgEl("text", {x: 16, y: 24}, svg);
   header.textContent =
-    `schematic: ${$("groupsel").value || "(top direct)"} — ${shown.length} cells · ` +
-    `${$("groupsel").selectedOptions[0]?.text ?? ""}`;
+    `schematic: ${$("groupsel").value || "(top direct)"} — ${shown.length} cells`;
   $("sch-count").textContent = `${shown.length} cells`;
 
   if (!shown.length) {
@@ -507,31 +506,87 @@ function renderSchematic() {
 
   worldEl = svgEl("g", {}, svg);
 
-  wireRegistry = [];
+  /* ---- pass 1: collect pins per cell ---- */
+  const cellPinMap = new Map();   // cellName -> {inPins: [], outPins: []}
+  function getPinEntry(name) {
+    let e = cellPinMap.get(name);
+    if (!e) { e = {inPins: [], outPins: []}; cellPinMap.set(name, e); }
+    return e;
+  }
+
+  const wireDefs = [];
   for (const bit of Object.keys(WIRES)) {
     const w = WIRES[bit];
     if (!w.driver) continue;
     const src = layout.byName.get(w.driver.cell);
     if (!src) continue;
-    const sinks = (w.consumers || [])
-      .map(c => ({entry: c, dst: layout.byName.get(c.cell)}))
-      .filter(x => x.dst);
-    if (!sinks.length) continue;
     const label = w.name || `w${bit}`;
-    for (const {entry, dst} of sinks) {
-      const pathEl = svgEl("path", {
-        class: "wire",
-        stroke: "#5c6675",
-        "stroke-width": 1.3,
-        fill: "none",
-        "marker-end": "url(#arrow-s)",
-      }, worldEl);
-      pathEl.__update = updateWirePath(pathEl, src, dst);
-      pathEl.__update();
-      wireRegistry.push({pathEl, driver: w.driver, consumer: entry, label});
+    for (const c of w.consumers || []) {
+      const dst = layout.byName.get(c.cell);
+      if (!dst) continue;
+      wireDefs.push({bit, label, srcName: w.driver.cell, dstName: c.cell,
+                     srcNode: src, dstNode: dst});
+      getPinEntry(w.driver.cell).outPins.push({bit, label, peer: c.cell});
+      getPinEntry(c.cell).inPins.push({bit, label, peer: w.driver.cell});
     }
   }
 
+  /* ---- pass 2: assign pin positions on box edges ---- */
+  const PIN_R = 4, PIN_GAP = 8;
+  function assignSidePins(pins, edgeX, sideSign, boxH) {
+    const usable = boxH - 2 * PIN_GAP;
+    const step = pins.length > 1 ? usable / (pins.length - 1) : 0;
+    const start = -boxH / 2 + PIN_GAP;
+    pins.forEach((p, i) => {
+      p.dx = edgeX;
+      p.dy = start + i * step;
+    });
+  }
+
+  const nodeEntries = new Map();
+  for (const node of layout.nodes) {
+    const entry = cellPinMap.get(node.name) || {inPins: [], outPins: []};
+    assignSidePins(entry.inPins, -66, -1, 40);
+    assignSidePins(entry.outPins, +66, +1, 40);
+    nodeEntries.set(node.name, entry);
+  }
+
+  /* ---- pass 3: draw wires under boxes ---- */
+  wireRegistry = [];
+  for (const def of wireDefs) {
+    const srcEntry = nodeEntries.get(def.srcName);
+    const dstEntry = nodeEntries.get(def.dstName);
+    if (!srcEntry || !dstEntry) continue;
+
+    const srcOut = srcEntry.outPins.find(p => p.bit === def.bit && p.peer === def.dstName)
+                || srcEntry.outPins[0];
+    const dstIn = dstEntry.inPins.find(p => p.bit === def.bit)
+               || dstEntry.inPins[0];
+    if (!srcOut || !dstIn) continue;
+
+    const x1 = def.srcNode.x + srcOut.dx;
+    const y1 = def.srcNode.y + srcOut.dy;
+    const x2 = def.dstNode.x + dstIn.dx;
+    const y2 = def.dstNode.y + dstIn.dy;
+    const mx = (x1 + x2) / 2;
+
+    const pathEl = svgEl("path", {
+      class: "wire",
+      stroke: "#5c6675",
+      "stroke-width": 1.3,
+      fill: "none",
+    }, worldEl);
+    pathEl.setAttribute("d",
+      `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`);
+    pathEl.addEventListener("click", ev => {
+      ev.stopPropagation();
+      showNetInfo(def.bit, def.label);
+    });
+    wireRegistry.push({pathEl, driverCell: def.srcName,
+                       consumerCells: [def.dstName], label: def.label});
+  }
+
+  /* ---- pass 4: draw cells with pin circles ---- */
   for (const node of layout.nodes) {
     const g = svgEl("g", {class: `cell ${node.kind}`}, worldEl);
     g.dataset.name = node.name;
@@ -539,6 +594,19 @@ function renderSchematic() {
     const short = node.name.length > 21 ? node.name.slice(0, 20) + "…" : node.name;
     svgEl("text", {x: -58, y: -2}, g).textContent = short;
     svgEl("text", {x: -58, y: 13, fill: "#8b93a1"}, g).textContent = node.kind;
+
+    const entry = nodeEntries.get(node.name);
+    if (entry) {
+      for (const p of entry.inPins) {
+        svgEl("circle", {cx: -66, cy: p.dy, r: PIN_R,
+                         fill: "#69d0a8", class: "pin-in"}, g);
+      }
+      for (const p of entry.outPins) {
+        svgEl("circle", {cx: +66, cy: p.dy, r: PIN_R,
+                         fill: "#e0915f", class: "pin-out"}, g);
+      }
+    }
+
     g.setAttribute("transform", `translate(${node.x},${node.y})`);
     g.addEventListener("click", ev => {
       ev.stopPropagation();
@@ -549,11 +617,19 @@ function renderSchematic() {
     attachDrag(g, node);
   }
 
-  drawIoColumns(layout, worldEl);
-
   applyView();
   fitToContent();
   refreshSelection();
+}
+
+function showNetInfo(bit, label) {
+  const w = WIRES[String(bit)];
+  const lines = [["", `net: ${label}`]];
+  if (!w) { setInfo(lines); return; }
+  if (w.driver) lines.push(["counts", `driver: ${w.driver.cell} (${w.driver.port})`]);
+  for (const c of w.consumers || [])
+    lines.push(["counts", `load: ${c.cell} (${c.port})`]);
+  setInfo(lines);
 }
 
 /* ================= IO columns ================= */
