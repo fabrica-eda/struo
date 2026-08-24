@@ -37,6 +37,7 @@ class Node:
     cells: list = field(default_factory=list)
     internal_wires: set = field(default_factory=set)
     boundary_wires: dict = field(default_factory=dict)
+    edges: list = field(default_factory=list)
 
 
 def cell_hierarchy(name: str) -> list[str]:
@@ -251,11 +252,32 @@ def render_text(node: Node, depth: int = 0, cell_limit: int = 6) -> str:
     return "\n".join(line for line in lines if line != "")
 
 
+def attach_edges(node: Node) -> None:
+    """Aggregates boundary wires into from/to edge records for rendering."""
+    grouped = collections.defaultdict(int)
+    for records in node.boundary_wires.values():
+        record = records[0]
+        grouped[(record["from"], tuple(sorted(record["to"])))] += 1
+    node.edges = [
+        {"from": src, "to": list(targets), "count": count}
+        for (src, targets), count in sorted(grouped.items())
+    ]
+    for child in node.children.values():
+        attach_edges(child)
+
+
 def to_json(node: Node) -> dict:
     data = {
         "module": node.name,
         "cells": count_types(node.cells),
+        "cell_names": compress_cell_names(
+            [cell["name"] for cell in node.cells], 40
+        ),
         "internal_wires": len(node.internal_wires),
+        "edges": [
+            {"from": e["from"], "to": e["to"], "count": e["count"]}
+            for e in node.edges
+        ],
         "boundary_wires": [
             {"net": net, "from": records[0]["from"], "to": records[0]["to"]}
             for net, records in sorted(node.boundary_wires.items())
@@ -265,10 +287,209 @@ def to_json(node: Node) -> dict:
     return data
 
 
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Struo netlist viewer</title>
+<style>
+ :root { --bg:#14161a; --panel:#1d2026; --fg:#d8dbe2; --dim:#8b93a1; --acc:#7ab3ff; --line:#3a404b; }
+ * { box-sizing:border-box; }
+ body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; display:flex; height:100vh; }
+ #tree { width:340px; overflow:auto; border-right:1px solid var(--line); padding:8px; }
+ #main { flex:1; display:flex; flex-direction:column; }
+ #svgwrap { flex:1; overflow:auto; }
+ #info { height:32%; overflow:auto; border-top:1px solid var(--line); padding:8px; white-space:pre-wrap; }
+ details { margin-left:12px; }
+ summary { cursor:pointer; padding:1px 2px; border-radius:3px; }
+ summary:hover { background:#262b33; }
+ summary.selected { background:#2b3a55; outline:1px solid var(--acc); }
+ .counts { color:var(--dim); }
+ .badge { display:inline-block; min-width:34px; text-align:right; margin-right:6px; color:var(--acc); }
+ svg text { fill:var(--fg); font:11px ui-monospace,monospace; }
+ svg .edge { fill:none; stroke-opacity:.65; }
+ h1 { font-size:14px; margin:4px 6px 10px; color:var(--acc); }
+</style>
+</head>
+<body>
+<div id="tree"><h1>struo netlist</h1></div>
+<div id="main">
+  <div id="svgwrap"><svg id="graph" width="1600" height="900"></svg></div>
+  <div id="info">click a module</div>
+</div>
+<script>
+const DATA = __DATA__;
+
+const NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs, parent) {
+  const el = document.createElementNS(NS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+function div(parent, cls, text) {
+  const el = document.createElement("div");
+  if (cls) el.className = cls;
+  if (text !== undefined) el.textContent = text;
+  parent.appendChild(el);
+  return el;
+}
+function countText(node) {
+  const c = node.cells;
+  return `LE ${c.LE} | LUT ${c.LUT4} CCU ${c.CCU2C} FF ${c.FF}`;
+}
+function findByPath(node, path) {
+  let cur = node;
+  for (const part of path) {
+    cur = (cur.children || []).find(c => c.module === part);
+    if (!cur) return null;
+  }
+  return cur;
+}
+
+let selectedPath = [];
+let selectedNode = null;
+
+function buildTree(parentEl, node, path) {
+  const hasKids = (node.children || []).length > 0;
+  const row = document.createElement(hasKids ? "details" : "div");
+  row.style.marginLeft = hasKids ? "0" : "12px";
+  const summary = document.createElement(hasKids ? "summary" : "div");
+  div(summary, null, node.module);
+  div(summary, "counts", ` ${countText(node)} | wires ${node.internal_wires}`);
+  summary.onclick = () => select(path);
+  row.appendChild(summary);
+  parentEl.appendChild(row);
+  const inner = document.createElement("div");
+  row.appendChild(inner);
+  for (const child of node.children || []) buildTree(inner, child, [...path, child.module]);
+  return row;
+}
+
+function select(path) {
+  selectedPath = path;
+  selectedNode = findByPath(DATA, path);
+  document.querySelectorAll("#tree summary").forEach(s => s.classList.remove("selected"));
+  event && event.target && event.target.closest && (() => {})();
+  renderGraph();
+  renderInfo();
+}
+
+function highlightTree(node, path) {
+  // simple: re-render nothing; visual selection handled by browser default focus
+}
+
+function renderInfo() {
+  const n = selectedNode || DATA;
+  const info = document.getElementById("info");
+  info.textContent = "";
+  div(info, null, `module: ${(selectedPath.join("/") || DATA.module) || "/"}`);
+  div(info, null, countText(n) + ` | internal wires ${n.internal_wires} | direct cells shown ${n.cell_names.length}`);
+  for (const e of n.edges || []) {
+    div(info, "counts", `edge ${e.from} -> ${e.to.join(",")} x${e.count}`);
+  }
+  div(info, "counts", "--- cells ---");
+  for (const name of n.cell_names) div(info, null, name);
+}
+
+function renderGraph() {
+  const svg = document.getElementById("graph");
+  svg.innerHTML = "";
+  const W = 1600, H = 900, CX = W/2, CY = H/2 - 20;
+
+  // focus marker
+  svgEl("text", {x: 16, y: 22, "font-size": 13}, svg)
+    .textContent = "focus: " + (selectedPath.join("/") || DATA.module);
+
+  const kids = (selectedNode ? (selectedNode.children || []) : []);
+  const focusEdges = (selectedNode ? (selectedNode.edges || []) : []);
+  const nodes = new Map();
+
+  const zero = {LUT4:0, CCU2C:0, FF:0};
+  if (!selectedNode || (selectedNode.cells && selectedNode.cells.LE > 0)) {
+    const le = selectedNode ? selectedNode.cells.LE : DATA.cells.LE;
+    nodes.set(".", {module: ". (own logic)", isSelf:true, cells: Object.assign({LE: le}, zero)});
+  }
+  for (const c of kids) nodes.set(c.module, Object.assign({isSelf:false}, c));
+  const edgesHere = selectedNode ? (selectedNode.edges || []) : [];
+  if (edgesHere.some(e => e.from === "<external>" || e.to.includes("<external>"))) {
+    nodes.set("<external>", {module: "<external>", isExternal:true, cells: Object.assign({LE: 0}, zero)});
+  }
+
+  const list = [...nodes.entries()];
+  const R = Math.max(240, list.length * 46);
+  list.forEach(([key, node], i) => {
+    const a = -Math.PI/2 + i * 2*Math.PI / list.length;
+    node.x = CX + R * Math.cos(a);
+    node.y = CY + R * Math.sin(a);
+  });
+
+  // edges grouped by (from,to)
+  const groups = new Map();
+  for (const e of focusEdges) {
+    for (const t of e.to) {
+      const key = `${e.from}|${t}`;
+      groups.set(key, (groups.get(key) || 0) + e.count);
+    }
+  }
+  const posOf = label => {
+    if (nodes.has(label)) return nodes.get(label);
+    if (label === "." && selectedNode) return {x:CX, y:CY};
+    return null;
+  };
+  for (const [key, count] of groups) {
+    const [src, dst] = key.split("|");
+    const a = posOf(src) || posOf(dst) && src === ".";
+    const b = posOf(dst) || posOf(src) && dst === ".";
+    if (!posOf(src) && !posOf(dst)) continue;
+    const p1 = posOf(src), p2 = posOf(dst);
+    if (!p1 || !p2 || p1 === p2) continue;
+    const mx = (p1.x + p2.x)/2, my = (p1.y + p2.y)/2 - 30;
+    const path = svgEl("path", {
+      class:"edge",
+      d:`M ${p1.x} ${p1.y} Q ${mx} ${my} ${p2.x} ${p2.y}`,
+      stroke: src === "<external>" ? "#c9746f" : "#7ab3ff",
+      "stroke-width": Math.min(6, 1 + Math.log2(count + 1) * 1.3),
+    }, svg);
+    const title = svgEl("title", {}, path);
+    title.textContent = `${src} -> ${dst}: ${count} nets`;
+  }
+
+  for (const [key, node] of list) {
+    const g = svgEl("g", {}, svg);
+    const w = Math.min(190, 90 + node.module.length * 5.2);
+    const h = 40;
+    svgEl("rect", {
+      x: node.x - w/2, y: node.y - h/2, rx: 9,
+      width: w, height: h,
+      fill: node.isSelf ? "#23303f" : (node.isExternal ? "#3a2528" : "#22262e"),
+      stroke: key === "." ? "#5b87c9" : "#454c59",
+    }, g);
+    svgEl("text", {x: node.x, y: node.y - 2, "text-anchor":"middle"}, g)
+      .textContent = node.module.length > 26 ? node.module.slice(0,25)+"…" : node.module;
+    svgEl("text", {x: node.x, y: node.y + 13, "text-anchor":"middle", fill:"#8b93a1"}, g)
+      .textContent = countText(node).replace("LE ","");
+    g.style.cursor = "pointer";
+    g.addEventListener("click", () => {
+      if (node.isSelf || node.isExternal) return;
+      select([...selectedPath, key]);
+    });
+  }
+}
+
+const treeRoot = document.getElementById("tree");
+buildTree(treeRoot, DATA, []);
+select([]);
+</script>
+</body>
+</html>
+"""
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("design_json")
-    parser.add_argument("--format", choices=["text", "json"], default="text")
+    parser.add_argument("--format", choices=["text", "json", "html"], default="text")
+    parser.add_argument("--output", default="", help="write HTML here (default: stdout for text/json)")
     parser.add_argument("--cell-limit", type=int, default=6)
     parser.add_argument("--top", default="", help="top module name (default: the only module)")
     args = parser.parse_args()
@@ -279,8 +500,16 @@ def main() -> int:
     module = modules[top_name]
 
     root, _ = build_tree(module, top_name)
+    attach_edges(root)
+    tree = to_json(root)
     if args.format == "json":
-        print(json.dumps(to_json(root), indent=1))
+        print(json.dumps(tree, indent=1))
+    elif args.format == "html":
+        html = HTML_TEMPLATE.replace("__DATA__", json.dumps(tree, separators=(",", ":")))
+        output = args.output or "netlist.html"
+        with open(output, "w") as handle:
+            handle.write(html)
+        print(f"wrote {output}")
     else:
         print(render_text(root, cell_limit=args.cell_limit))
     return 0
