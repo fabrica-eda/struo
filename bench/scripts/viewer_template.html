@@ -676,7 +676,7 @@ function drawIoColumns(layout, parent) {
     const sinksAll = w.consumers || [];
     const insideSinks = sinksAll.filter(c => visible.has(c.cell));
     const label = w.name || `w${bit}`;
-    if (!srcVisible && insideSinks.length) {
+    if (!srcVisible && insideSinks.length && !/^(clk|clock|rst|rst_n|reset|reset_n)$/i.test(label)) {
       inNets.push({label, targets: insideSinks.map(c => layout.byName.get(c.cell))});
     } else if (srcVisible && insideSinks.length < sinksAll.length) {
       outNets.push({label, source: layout.byName.get(w.driver.cell)});
