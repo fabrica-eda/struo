@@ -801,7 +801,8 @@ function enablePanZoom(svg, world) {
     const rect = svgRect(svg);
     const cx = ev.clientX - rect.left;
     const cy = ev.clientY - rect.top;
-    const factor = ev.deltaY > 0 ? 1.15 : 1 / 1.15;
+    // scroll up = zoom in, scroll down = zoom out
+    const factor = ev.deltaY > 0 ? 1 / 1.15 : 1.15;
     const k2 = Math.min(6, Math.max(0.12, view.k * factor));
     // keep the cursor point stationary: c2 = c1 - (c1 - off) * (k2/k1 - 1)
     view.x = cx - (cx - view.x) * (k2 / view.k);
