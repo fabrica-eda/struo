@@ -54,8 +54,8 @@ class Design:
 
     def veryl_path(self) -> Path:
         return self.source_file or self.source_dir / f"{self.top}.veryl"
-    # CLI subcommand producing the mapped nextpnr JSON; defaults to the
-    # generic `qor <file> <top>` path.
+    # Example binary producing the mapped nextpnr JSON for designs driven by
+    # committed example harnesses instead of the generic `struo` CLI.
     struo_cli: tuple[str, ...] = field(default=())
     # Designs whose baseline cannot be produced (e.g. interface ports) are
     # reported absolutely but excluded from ratio aggregation.
@@ -110,19 +110,33 @@ def veryl_project_name(source_dir: Path) -> str:
 
 def run_struo(design: Design, out_json: Path, goal_mhz: int) -> None:
     if design.struo_cli:
-        command = ["cargo", "run", "--release", "--quiet", "--", *design.struo_cli]
-        command.append(str(out_json))
+        command = [
+            "cargo",
+            "run",
+            "--release",
+            "--quiet",
+            "-p",
+            "struo-cli",
+            "--example",
+            design.struo_cli[0],
+            "--",
+            str(out_json),
+        ]
     else:
         command = [
             "cargo",
             "run",
             "--release",
             "--quiet",
+            "-p",
+            "struo-cli",
             "--",
-            "qor",
             str(design.veryl_path()),
+            "--top",
             design.top,
+            "--output",
             str(out_json),
+            "--timing-goal-mhz",
             str(goal_mhz),
         ]
     sh(command)

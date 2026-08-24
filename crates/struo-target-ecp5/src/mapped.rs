@@ -802,6 +802,12 @@ fn automatically_retime_mapped_luts(
     let timing_driven = original_profile.overall_period_ps > target_period_ps;
     let cell_limit = original_cells + original_cells.div_ceil(10);
     let register_limit = original_registers + original_registers.div_ceil(5);
+    // Combinational primitives deserve their own ceiling: a candidate can
+    // grow LUTs enormously while keeping cells and registers inside their
+    // caps, and the routing-burden term alone does not catch that (splitting
+    // one loaded net into many cheap ones lowers the burden).
+    let original_comb = mapped_comb_count(original);
+    let comb_limit = original_comb + original_comb.div_ceil(4) + 32;
     let mut control_candidate =
         replicate_high_fanout_enable_luts(original, MAX_ENABLE_FANOUT_PER_REPLICA);
     split_branched_carry_outs(&mut control_candidate);
@@ -813,6 +819,7 @@ fn automatically_retime_mapped_luts(
         maximum_replicable_enable_fanout(&control_candidate, MAX_ENABLE_FANOUT_PER_REPLICA);
     let use_control = control_candidate.cells.len() <= cell_limit
         && control_registers <= register_limit
+        && mapped_comb_count(&control_candidate) <= comb_limit
         && adjusted_overall(&control_profile, &control_candidate)
             <= original_profile.overall_period_ps
         && (retiming_score(
@@ -839,6 +846,7 @@ fn automatically_retime_mapped_luts(
     let forward_registers = mapped_register_count(&forward_candidate);
     let use_forward = forward_candidate.cells.len() <= cell_limit
         && forward_registers <= register_limit
+        && mapped_comb_count(&forward_candidate) <= comb_limit
         && adjusted_overall(&forward_profile, &forward_candidate)
             <= original_profile.overall_period_ps
         && retiming_score(
@@ -902,6 +910,7 @@ fn automatically_retime_mapped_luts(
                 || candidate_overall > original_profile.overall_period_ps
                 || candidate.cells.len() > cell_limit
                 || candidate_registers > register_limit
+                || mapped_comb_count(&candidate) > comb_limit
             {
                 continue;
             }
@@ -1172,6 +1181,14 @@ fn retiming_score(
             registers,
         )
     }
+}
+
+fn mapped_comb_count(netlist: &Ecp5Netlist) -> usize {
+    netlist
+        .cells
+        .iter()
+        .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. }))
+        .count()
 }
 
 fn mapped_register_count(netlist: &Ecp5Netlist) -> usize {
@@ -3434,55 +3451,19 @@ struct MappingQuality {
     period_ps: u32,
 }
 
-/// ECP5 carry routing is a dedicated chain: one CCU2C carry-out may feed only
-/// one downstream carry-in. Chained certified retiming moves can leave a
-/// carry-out driving several slices, which nextpnr cannot pack; candidates
-/// must keep every chain link point-to-point.
-fn carry_outs_are_point_to_point(netlist: &Ecp5Netlist) -> bool {
-    let mut consumers: HashMap<u32, usize> = HashMap::new();
-    for cell in &netlist.cells {
-        let visit = |bit: &Bit, consumers: &mut HashMap<u32, usize>| {
-            if let Bit::Wire(wire) = *bit {
-                *consumers.entry(wire).or_insert(0) += 1;
+fn constant_register_values(netlist: &Netlist) -> HashMap<NetId, bool> {
+    netlist
+        .registers()
+        .iter()
+        .filter_map(|register| {
+            let value = netlist.constant_value(register.data())?;
+            if register.reset().is_none_or(|reset| reset.value == value) {
+                Some((register.output(), value))
+            } else {
+                None
             }
-        };
-        match cell {
-            Ecp5Cell::Lut4 { inputs, .. } => {
-                for input in inputs {
-                    visit(input, &mut consumers);
-                }
-            }
-            Ecp5Cell::Ccu2c {
-                inputs, carry_in, ..
-            } => {
-                for input in inputs.iter().flatten() {
-                    visit(input, &mut consumers);
-                }
-                visit(carry_in, &mut consumers);
-            }
-            Ecp5Cell::FlipFlop {
-                data,
-                clock,
-                enable,
-                reset,
-                ..
-            } => {
-                visit(data, &mut consumers);
-                visit(clock, &mut consumers);
-                if let Some(control) = enable {
-                    visit(&control.signal, &mut consumers);
-                }
-                if let Some(control) = reset {
-                    visit(&control.signal, &mut consumers);
-                }
-            }
-            Ecp5Cell::BlockRam { .. } => {}
-        }
-    }
-    netlist.cells.iter().all(|cell| match cell {
-        Ecp5Cell::Ccu2c { carry_out, .. } => consumers.get(carry_out).copied().unwrap_or(0) <= 1,
-        _ => true,
-    })
+        })
+        .collect()
 }
 
 /// Constant flip-flop outputs must be folded before any consumer logic is
@@ -3499,26 +3480,31 @@ fn fold_constant_registers(
     }
 }
 
-fn constant_register_values(netlist: &Netlist) -> HashMap<NetId, bool> {
-    netlist
-        .registers()
-        .iter()
-        .filter_map(|register| {
-            let value = netlist.constant_value(register.data())?;
-            if register.reset().is_none_or(|reset| reset.value == value) {
-                Some((register.output(), value))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 /// ECP5 carry routing is a dedicated chain: one CCU2C carry-out may feed only
 /// one downstream carry-in. Chained certified retiming moves can leave a
-/// carry-out driving several slices; each extra branch receives a
-/// truth-table-identical slice replica so every chain link stays
-/// point-to-point and nextpnr can pack the chains.
+/// carry-out driving several slices, which nextpnr cannot pack; candidates
+/// must keep every chain link point-to-point.
+fn carry_outs_are_point_to_point(netlist: &Ecp5Netlist) -> bool {
+    // Only downstream carry-ins compete for the dedicated carry routing;
+    // fabric loads (flip-flop data, LUT pins) hang off chain ends legally.
+    let mut cin_consumers: HashMap<u32, usize> = HashMap::new();
+    for cell in &netlist.cells {
+        if let Ecp5Cell::Ccu2c {
+            carry_in: Bit::Wire(wire),
+            ..
+        } = cell
+        {
+            *cin_consumers.entry(*wire).or_insert(0) += 1;
+        }
+    }
+    netlist.cells.iter().all(|cell| match cell {
+        Ecp5Cell::Ccu2c { carry_out, .. } => {
+            cin_consumers.get(carry_out).copied().unwrap_or(0) <= 1
+        }
+        _ => true,
+    })
+}
+
 fn split_branched_carry_outs(netlist: &mut Ecp5Netlist) -> usize {
     // Repairing a branch moves it one slice upstream (the replica shares the
     // parent's carry-in), so passes must repeat until the cascade reaches a
@@ -3561,8 +3547,12 @@ fn split_branched_carry_outs_once(netlist: &mut Ecp5Netlist) -> usize {
             .cells
             .iter()
             .enumerate()
-            .filter(|(consumer_index, cell)| {
-                *consumer_index != index - 1 && cell_consumes_wire(cell, carry_wire)
+            .filter(|(consumer_index, cell)| match cell {
+                Ecp5Cell::Ccu2c {
+                    carry_in: Bit::Wire(wire),
+                    ..
+                } => *consumer_index != index - 1 && *wire == carry_wire,
+                _ => false,
             })
             .map(|(consumer_index, _)| consumer_index)
             .collect::<Vec<_>>();
@@ -3601,42 +3591,6 @@ fn split_branched_carry_outs_once(netlist: &mut Ecp5Netlist) -> usize {
         netlist.equivalence_proof.equivalent_logic_replications += replicas;
     }
     replicas
-}
-
-fn cell_consumes_wire(cell: &Ecp5Cell, wire: u32) -> bool {
-    let mut consumes = false;
-    let mut visit = |bit: &Bit| {
-        if *bit == Bit::Wire(wire) {
-            consumes = true;
-        }
-    };
-    match cell {
-        Ecp5Cell::Lut4 { inputs, .. } => inputs.iter().for_each(&mut visit),
-        Ecp5Cell::Ccu2c {
-            inputs, carry_in, ..
-        } => {
-            inputs.iter().flatten().for_each(&mut visit);
-            visit(carry_in);
-        }
-        Ecp5Cell::FlipFlop {
-            data,
-            clock,
-            enable,
-            reset,
-            ..
-        } => {
-            visit(data);
-            visit(clock);
-            if let Some(control) = enable {
-                visit(&control.signal);
-            }
-            if let Some(control) = reset {
-                visit(&control.signal);
-            }
-        }
-        Ecp5Cell::BlockRam { .. } => {}
-    }
-    consumes
 }
 
 fn map_once(

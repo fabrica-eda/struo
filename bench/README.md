@@ -10,7 +10,8 @@ differences are attributable to synthesis and technology mapping only.
 - Each design has a single committed `.veryl` source used by both flows.
   There are no hand-written reference twins, so the two flows cannot drift.
 - **struo flow**: `analyze_and_lower` -> `synthesize` -> ECP5 technology
-  mapping (`struo qor <file> <top> <out.json> [goal_mhz]`) -> nextpnr JSON.
+  mapping (`struo <file> --top <top> --output <out.json> [--timing-goal-mhz N]`) ->
+           nextpnr JSON.
 - **baseline flow**: `veryl build` emits SystemVerilog from the same source;
   Yosys 0.33 (`bench/docker/yosys.Dockerfile`, Ubuntu 24.04 to match the
   locally installed nextpnr package provenance) runs `synth_ecp5`.
