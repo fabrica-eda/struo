@@ -79,7 +79,6 @@ const GROUPS = DATA.groups || {};
 const UNASSIGNED = DATA.unassigned || [];
 const TIMING = DATA.timing || {paths: [], clocks: {}};
 const NS = "http://www.w3.org/2000/svg";
-const SCHEM_CAP = 420;
 const $ = id => document.getElementById(id);
 
 function svgEl(tag, attrs, parent) {
@@ -352,36 +351,86 @@ function invalidateSchematic() {
 
 function renderSchematic() {
   const key = currentGroupKey();
-  const allNames = schematicCellSet($("groupsel").value, schFilter);
-  const shown = allNames.slice(0, SCHEM_CAP);
+  const shown = schematicCellSet($("groupsel").value, schFilter);
 
   const svg = $("sch-svg");
   svg.innerHTML = "";
 
-  const header = svgEl("text", {x: 16, y: 24}, svg);
-  header.textContent =
-    `schematic: ${$("groupsel").value || "(top direct)"} — ` +
-    `${shown.length}${allNames.length > SCHEM_CAP ? " of " + allNames.length : ""} cells`;
-  $("sch-count").textContent =
-    `${Math.min(shown.length, SCHEM_CAP)}/${allNames.length}`;
-
   if (!shown.length) {
-    svgEl("text", {x: 16, y: 56, fill:"#e0746c"}, svg)
+    svgEl("text", {x: 16, y: 30, fill:"#e0746c"}, svg)
       .textContent = "no cells match";
     return;
   }
 
   if (drawnKey !== key) {
     const layout = buildLayout(shown);
-    simulate(layout, 170);
+    simulate(layout, layout.nodes.length > 450 ? 110 : 170);
     packGrid(layout.nodes);
     layout.key = key;
     layoutCache = layout;
     drawnKey = key;
   }
   const layout = layoutCache;
-
   worldEl = svgEl("g", {}, svg);
+
+  // Input pads on the left edge, output pads on the right edge.
+  const inPads = new Map();
+  const outPads = new Map();
+  for (const bit of Object.keys(WIRES)) {
+    const w = WIRES[bit];
+    if (w.driver && /\$in$/.test(w.driver.cell)) {
+      const port = w.driver.cell.replace(/\$in$/, "");
+      for (const c of w.consumers || []) {
+        const n = layout.byName.get(c.cell);
+        if (n) {
+          if (!inPads.has(port)) inPads.set(port, new Set());
+          inPads.get(port).add(n);
+        }
+      }
+    }
+    for (const c of w.consumers || []) {
+      if (/\$out$/.test(c.cell)) {
+        const port = c.cell.replace(/\$out$/, "");
+        if (!outPads.has(port)) outPads.set(port, new Set());
+        // Wire to the visible source only when it lives in this group.
+        const src = w.driver ? layout.byName.get(w.driver.cell) : null;
+        if (src) outPads.get(port).add(src);
+        outPads.get(port)._hasNet = true;
+      }
+    }
+  }
+
+  let minX = Infinity, maxX = -Infinity;
+  for (const n of layout.nodes) {
+    minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+  }
+
+  function stackPads(pads, x, alignTargets) {
+    // pads: Map port -> Set(nodes); returns list of {port, x, y}
+    const entries = [...pads.entries()].map(([port, set]) => ({
+      port,
+      meanY: [...set].reduce((s, n) => s + n.y, 0) / set.size,
+      nodes: [...set],
+    }));
+    entries.sort((a, b) => a.meanY - b.meanY);
+    let y = entries.length ? Math.max(60, entries[0].meanY) : 60;
+    for (const e of entries) {
+      e.y = Math.max(y, e.meanY - 12);
+      y = e.y + 34;
+      void x; void alignTargets;
+    }
+    return entries.map(e => ({port: e.port, x, y: e.y, nodes: e.nodes}));
+  }
+  const inList = stackPads(inPads, minX - 190);
+  const outList = stackPads(outPads, maxX + 190);
+
+  const header = svgEl("text", {x: 16, y: 24}, svg);
+  header.textContent =
+    `schematic: ${$("groupsel").value || "(top direct)"} — ${shown.length} cells · ` +
+    `${inList.length} inputs (left) · ${outList.length} outputs (right)`;
+  $("sch-count").textContent = `${shown.length} cells`;
+
+  worldEl = worldEl; // keep reference
 
   wireRegistry = [];
   for (const bit of Object.keys(WIRES)) {
@@ -425,8 +474,53 @@ function renderSchematic() {
     attachDrag(g, node);
   }
 
+  // IO pad columns: inputs left (green), outputs right (orange)
+  function drawPadColumn(list, side) {
+    const isInput = side === "in";
+    for (const pad of list) {
+      const h = Math.max(26, Math.min(120, pad.nodes.length * 14));
+      const g = svgEl("g", {class: `pad pad-${side}`}, worldEl);
+      svgEl("rect", {
+        x: pad.x - 60, y: pad.y - 12, width: 120, height: h, rx: 6,
+        fill: isInput ? "#16301f" : "#331d18",
+        stroke: isInput ? "#69d0a8" : "#e0746c",
+        "stroke-width": 1.4,
+      }, g);
+      const label = pad.port.length > 15 ? pad.port.slice(0,14)+"…" : pad.port;
+      svgEl("text", {x: pad.x, y: pad.y + 4, "text-anchor": "middle",
+                     fill: isInput ? "#69d0a8" : "#e0746c"}, g)
+        .textContent = label;
+      svgEl("text", {x: pad.x, y: pad.y + 18, "text-anchor": "middle",
+                     fill:"#8b93a1"}, g)
+        .textContent = `${pad.nodes.length} net${pad.nodes.length===1?"":"s"}`;
+      for (const n of pad.nodes) {
+        const x2 = isInput ? pad.x + 60 : n.x - 64;
+        const x1 = isInput ? n.x - 64 : pad.x - 60;
+        svgEl("path", {
+          d: `M ${isInput ? x1 : x1} ${n.y} L ${isInput ? x2 : x2} ${n.y}`,
+          stroke: isInput ? "#69d0a8" : "#e0746c",
+          "stroke-width": 1.2,
+          "stroke-opacity": 0.7,
+          fill: "none",
+        }, worldEl);
+        void x1; void x2;
+      }
+    }
+  }
+  drawPadColumn(inList, "in");
+  drawPadColumn(outList, "out");
+
   applyView();
   fitToContent();
+  // widen fit to include the pad columns
+  if (inList.length || outList.length) {
+    const extraL = inList.length ? 200 : 0;
+    const extraR = outList.length ? 200 : 0;
+    view.k = Math.max(0.12, view.k * Math.max(0.55, 1 - 0.0009*(extraL+extraR)));
+    view.x -= extraL * view.k * 0.5;
+    view.y += 0;
+    applyView();
+  }
   refreshSelection();
 }
 
