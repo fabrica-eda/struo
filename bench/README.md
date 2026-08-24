@@ -32,7 +32,17 @@ docker build -f bench/docker/yosys.Dockerfile -t struo-qor-yosys:latest .
 python3 bench/scripts/qor.py                     # seeds 1,2,3; goal 300 MHz
 python3 bench/scripts/qor.py --designs counter32,shift32 --seeds 1,2,3,4,5
 python3 bench/scripts/qor.py --summarize-only    # re-render results.json
+python3 bench/scripts/qor.py compare             # delta versus the previous run
 ```
+
+Every completed run appends one JSON line to `build/qor/history.jsonl`
+(timestamp, git revision, goal, seeds, per-design metrics). `compare` prints
+COMB/FF/Fmax deltas against that history and flags regressions beyond 15%
+(area) or 8% (Fmax); its exit code makes it usable as a gate. Each flow record
+also embeds the worst critical path broken into route versus logic
+picoseconds plus the top delay contributors, so an agent reading
+`results.json` gets both the numbers and the reason behind them without
+parsing nextpnr reports.
 
 Results land in `build/qor/results.json` plus per-design nextpnr reports.
 
