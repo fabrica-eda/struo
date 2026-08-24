@@ -293,74 +293,76 @@ HTML_TEMPLATE = r"""<!doctype html>
 <meta charset="utf-8">
 <title>Struo netlist viewer</title>
 <style>
- :root { --bg:#14161a; --panel:#1d2026; --fg:#d8dbe2; --dim:#8b93a1; --acc:#7ab3ff;
-         --route:#e07a72; --logic:#7ad0b3; --ff:#c9a86a; --line:#3a404b; }
+ :root { --bg:#14161a; --panel:#1d2026; --fg:#d8dbe2; --dim:#94a0b4;
+         --acc:#7ab3ff; --route:#e0746c; --logic:#69d0a8; --ff:#d9b06a;
+         --line:#3a404b; }
  * { box-sizing:border-box; }
  body { margin:0; background:var(--bg); color:var(--fg);
         font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; height:100vh;
         display:flex; flex-direction:column; }
- header { display:flex; align-items:center; gap:14px; padding:6px 12px;
+ header { display:flex; align-items:center; gap:12px; padding:7px 12px;
           border-bottom:1px solid var(--line); }
- header .tab { cursor:pointer; padding:4px 10px; border-radius:5px; color:var(--dim); }
- header .tab.active { background:#2b3a55; color:var(--acc); }
- header .stat { margin-left:auto; color:var(--dim); }
+ .tab { cursor:pointer; padding:4px 11px; border-radius:5px; color:var(--dim); }
+ .tab.active { background:#2b3a55; color:var(--acc); }
+ #clockstat { margin-left:auto; color:var(--dim); }
  #body { flex:1; display:flex; min-height:0; }
- #tree { width:300px; overflow:auto; border-right:1px solid var(--line); padding:6px; }
- #view { flex:1; overflow:auto; position:relative; }
- #info { width:340px; overflow:auto; border-left:1px solid var(--line); padding:8px;
-         white-space:pre-wrap; font-size:12px; }
+ #tree { width:290px; overflow:auto; border-right:1px solid var(--line);
+         padding:6px; }
+ #view { flex:1; display:flex; flex-direction:column; min-width:0; }
+ #toolbar { padding:6px 10px; border-bottom:1px solid var(--line);
+            display:flex; gap:10px; align-items:center; }
+ #toolbar input { background:#0e1013; color:var(--fg); border:1px solid var(--line);
+                  border-radius:4px; padding:3px 8px; font:inherit; }
+ #canvaswrap { flex:1; overflow:auto; background:
+   linear-gradient(90deg,#181b20 1px,transparent 1px) 0 0/28px 28px,
+   linear-gradient(#181b20 1px,transparent 1px) 0 0/28px 28px; }
+ #info { width:360px; overflow:auto; border-left:1px solid var(--line);
+         padding:8px; font-size:12px; white-space:pre-wrap; }
  details { margin-left:10px; }
- summary { cursor:pointer; padding:1px 3px; border-radius:3px; list-style:none; }
- summary:before { content:"+ "; color:var(--dim); }
- details[open] > summary:before { content:"- "; }
+ summary { cursor:pointer; padding:1px 3px; border-radius:3px; }
  summary:hover { background:#262b33; }
  .counts { color:var(--dim); }
  .hidden { display:none !important; }
- table.path { border-collapse:collapse; margin:8px 0; width:100%; }
- table.path td, table.path th { border:1px solid var(--line); padding:3px 7px;
-        font-size:12px; text-align:left; }
- .bar-row { display:flex; align-items:center; gap:6px; margin:2px 0; }
- .bar-label { width:330px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
- .bar { height:13px; border-radius:3px; min-width:1px; }
- .bar.route { background:var(--route); }
- .bar.logic { background:var(--logic); }
- .bar.ff { background:var(--ff); }
  svg text { fill:var(--fg); font:11px ui-monospace,monospace; }
- svg .edge { fill:none; stroke-opacity:.6; }
- g.cellbox rect { fill:#22262e; stroke:#454c59; }
- g.cellbox.CCU2C rect { stroke:#b58fd0; }
- g.cellbox.FF rect { stroke:#c9a86a; }
- g.cellbox.selected rect { stroke:var(--acc); stroke-width:2; }
- g.cellbox { cursor:pointer; }
- h3 { margin:8px 0 4px; color:var(--acc); font-size:13px; }
+ g.cell rect { fill:#20242b; stroke:#4a5260; rx:8; }
+ g.cell.CCU2C rect { stroke:#b58fd0; }
+ g.cell.FF rect { stroke:var(--ff); }
+ g.cell.sel rect { stroke:var(--acc); stroke-width:2.5; }
+ g.cell { cursor:pointer; }
+ .legend span { margin-right:14px; }
+ .sw { display:inline-block; width:10px; height:10px; border-radius:2px;
+       margin-right:4px; vertical-align:-1px; }
 </style>
 </head>
 <body>
 <header>
   <span style="color:var(--acc)">struo viewer</span>
-  <span class="tab active" data-tab="schematic">Schematic</span>
-  <span class="tab" data-tab="timing">Timing</span>
+  <span class="tab active" data-tab="timing">Timing</span>
+  <span class="tab" data-tab="schematic">Schematic</span>
   <span class="tab" data-tab="modules">Modules</span>
-  <span class="stat" id="clockstat"></span>
+  <span id="clockstat"></span>
 </header>
 <div id="body">
   <div id="tree"></div>
   <div id="view">
-    <div id="tab-schematic" style="padding:10px">
-      <h3>Schematic — select a module in the tree (leaf modules render cell-by-cell)</h3>
-      <div id="sch-info" class="counts"></div>
-      <svg id="sch-svg" width="1400" height="900"></svg>
+    <div id="toolbar">
+      <span class="counts legend">
+        <span><i class="sw" style="background:var(--route)"></i>route</span>
+        <span><i class="sw" style="background:var(--logic)"></i>logic</span>
+        <span><i class="sw" style="background:var(--ff)"></i>clk-q / FF</span>
+      </span>
+      <input id="cellsearch" placeholder="filter cells (substring)…"
+             style="margin-left:auto; min-width:220px">
+      <span class="counts" id="sch-count"></span>
     </div>
-    <div id="tab-timing" class="hidden" style="padding:10px">
-      <div id="timing-body"></div>
-    </div>
-    <div id="tab-modules" class="hidden"><svg id="mod-svg" width="1600" height="900"></svg></div>
+    <div id="canvaswrap"><svg id="svg" width="2400" height="1400"></svg></div>
   </div>
-  <div id="info">click a module or cell</div>
+  <div id="info"></div>
 </div>
 <script>
 const DATA = __DATA__;
 const WIRES = DATA.connectivity || {};
+const TIMING = DATA.timing || {paths: [], clocks: {}};
 const NS = "http://www.w3.org/2000/svg";
 const $ = id => document.getElementById(id);
 
@@ -371,73 +373,134 @@ function svgEl(tag, attrs, parent) {
   return el;
 }
 function div(parent, cls, text) {
-  if (!parent) return;
+  if (!parent) return null;
   const el = document.createElement("div");
   if (cls) el.className = cls;
   if (text !== undefined) el.textContent = text;
   parent.appendChild(el);
   return el;
 }
-function countText(node) {
-  const c = node.cells || {LE:0,LUT4:0,CCU2C:0,FF:0};
-  return `LE ${c.LE} | LUT ${c.LUT4} CCU ${c.CCU2C} FF ${c.FF}`;
-}
 
-/* ---------- module tree ---------- */
-function buildTree(parentEl, node, path) {
-  const hasKids = (node.children || []).length > 0;
-  const row = document.createElement(hasKids ? "details" : "div");
-  row.style.marginLeft = hasKids ? "0" : "12px";
-  const head = document.createElement(hasKids ? "summary" : "div");
-  div(head, null, node.module);
-  div(head, "counts", ` ${countText(node)} | wires ${node.internal_wires}`);
-  head.onclick = () => { setTab("schematic"); showModule(path.join("/"), node); };
-  row.appendChild(head);
-  const inner = document.createElement("div");
-  row.appendChild(inner);
-  for (const child of node.children || [])
-    buildTree(inner, child, [...path, child.module]);
-  parentEl.appendChild(row);
+/* ================= shared: hierarchy ================= */
+let ROOT = DATA.tree;
+function findNode(path) {
+  let cur = ROOT;
+  for (const part of path) {
+    cur = (cur.children || []).find(c => c.module === part);
+    if (!cur) return null;
+  }
+  return cur;
 }
-
-/* ---------- schematic ---------- */
+let selectedPath = [];
+let selectedNode = ROOT;
 let schSelection = null;
+let schModulePath = [];
+let schFilter = "";
 
-
-function wireInfo(bit) {
-  return WIRES[String(bit)] || null;
+/* ================= info pane ================= */
+function renderInfo(lines) {
+  const info = $("info");
+  info.textContent = "";
+  for (const [cls, text] of lines) div(info, cls, text);
 }
 
-function traceNeighborhood(rootCell) {
-  // BFS over connectivity from one cell through its pins.
-  const cells = new Map([[rootCell, {depth:0}]]);
-  let frontier = [rootCell];
-  for (let depth = 1; depth <= 2 && frontier.length; depth++) {
-    const next = [];
-    for (const name of frontier) {
-      for (const bit of Object.keys(WIRES)) {
-        const w = WIRES[bit];
-        const touchesDriver = w.driver && w.driver.cell === name;
-        const consumerHit = (w.consumers || []).some(c => c.cell === name);
-        if (!touchesDriver && !consumerHit) continue;
-        if (w.driver) {
-          if (!cells.has(w.driver.cell)) {
-            cells.set(w.driver.cell, {depth});
-            next.push(w.driver.cell);
-          }
+/* ================= TIMING: critical-path chains ================= */
+function hopClass(step) {
+  if ("net" in step) return "route";
+  if (/FF/i.test(step.cell) && step.port === "Q") return "ff";
+  return "logic";
+}
+function renderTiming() {
+  const svg = $("svg");
+  svg.innerHTML = "";
+  const t = TIMING;
+  const clocks = Object.entries(t.clocks || {});
+  svgEl("text", {x: 18, y: 26}, svg).textContent =
+    "achieved Fmax: " + (clocks.map(([n,v]) => `${v} MHz`).join(", ") || "n/a");
+  if (!t.paths.length) {
+    svgEl("text", {x: 18, y: 56, fill:"#e0746c"}, svg)
+      .textContent = "no critical paths embedded — regenerate with --report <nextpnr-report.json>";
+    return;
+  }
+
+  let top = 56;
+  let widest = 0;
+  t.paths.forEach((p, pi) => {
+    svgEl("text", {x: 18, y: top}, svg)
+      .textContent = `path ${pi+1}: total ${p.total_ps} ps — ${p.start}`;
+    top += 22;
+
+    // group consecutive steps into boxes (logic) and wires (net hops)
+    const items = [];
+    for (const step of p.steps) {
+      if ("net" in step) {
+        if (items.length && items[items.length-1].kind === "wire") {
+          items[items.length-1].ps += step.delay_ps;
+          items[items.length-1].nets.push(step.net);
+        } else {
+          items.push({kind:"wire", ps:step.delay_ps, nets:[step.net]});
         }
-        for (const c of w.consumers || []) {
-          if (!cells.has(c.cell)) {
-            cells.set(c.cell, {depth});
-            next.push(c.cell);
-          }
-        }
+      } else if (items.length && items[items.length-1].kind === "cell"
+                 && items[items.length-1].cell === step.cell) {
+        items[items.length-1].ps += step.delay_ps;
+        items[items.length-1].ports.push(step.port);
+      } else {
+        items.push({kind:"cell", cell:step.cell, ps:step.delay_ps,
+                    ports:[step.port]});
       }
     }
-    frontier = next;
-    if (cells.size > 120) break;
-  }
-  return [...cells.keys()];
+    // drop leading/trailing wires for cleanliness
+    while (items.length && items[0].kind === "wire") items.shift();
+    while (items.length && items[items.length-1].kind === "wire") items.pop();
+
+    const BOXW = 168, BOXH = 54, WIREW = 118, rowH = BOXH + 46;
+    const nBoxes = items.filter(i => i.kind === "cell").length;
+    widest = Math.max(widest, 30 + nBoxes * (BOXW + WIREW) + 40);
+    let x = 24;
+    const centerY = () => top + BOXH/2 + 6;
+    items.forEach((item, idx) => {
+      if (item.kind === "cell") {
+        const g = svgEl("g", {class:"cell"}, svg);
+        svgEl("rect", {x, y: top + 6, width: BOXW, height: BOXH}, g);
+        const short = item.cell.length > 21
+          ? item.cell.slice(0,20)+"…" : item.cell;
+        svgEl("text", {x: x+10, y: top+24}, g).textContent = short;
+        svgEl("text", {x: x+10, y: top+41, fill:"#8b93a1"}, g)
+          .textContent = `${item.ps} ps · ${item.ports.join("/")}`;
+        const t2 = svgEl("title", {}, g);
+        t2.textContent = `${item.cell}\n${item.ps} ps`;
+        x += BOXW;
+      } else {
+        const wireColor = "var(--route)";
+        const y0 = centerY();
+        svgEl("path", {d:`M ${x} ${y0} L ${x+WIREW-16} ${y0}`,
+                       stroke: wireColor, "stroke-width": 3,
+                       "marker-end":"url(#arrow)"}, svg);
+        svgEl("text", {x: x+4, y: y0 - 9, fill:"#e0746c",
+                       "font-size":"11px"}, svg)
+          .textContent = `${item.ps} ps`;
+        svgEl("text", {x: x+4, y: y0 + 20, fill:"#8b93a1",
+                       "font-size":"10px"}, svg)
+          .textContent = item.nets[0] || "";
+        x += WIREW;
+      }
+    });
+    top += rowH + 34;
+  });
+  svg.setAttribute("width", widest + 60);
+  svgEl("defs", {}, svg).innerHTML =
+    '<marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4"' +
+    ' orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#e0746c"/></marker>';
+}
+
+/* ================= SCHEMATIC: real wires between cells ================= */
+
+function moduleContainerOf(name) {
+  // owning module directory of a flattened cell name
+  const stripped = name.replace(/^(retime_|physical_replicate_)+/, "");
+  const parts = stripped.split(".");
+  parts.pop();
+  return parts.join("/");
 }
 
 let cellIndexCache = null;
@@ -457,185 +520,244 @@ function ensureCellIndex() {
   return cellIndexCache;
 }
 
-function showModule(modulePath) {
-  schSelection = null;
+function schematicCellSet(modulePath, filterText) {
   const index = ensureCellIndex();
-  const prefix = modulePath ? modulePath + "." : "";
-  const own = [];
-  for (const name in index) {
-    if (prefix
-        ? name.startsWith(prefix) && !name.slice(prefix.length).includes(".")
-        : !name.includes(".")) {
-      own.push(name);
-    }
+  const prefix = modulePath ? modulePath + "/" : "";
+  let own = Object.keys(index).filter(name =>
+    prefix
+      ? name.startsWith(prefix) && !name.slice(prefix.length).includes("/")
+      : !name.includes("/")
+  );
+  if (own.length === 0) {
+    // anonymous mapper logic lives at top level; fall back to it
+    own = Object.keys(index).filter(name => !name.includes("/"));
   }
-  drawSchematic(own.sort(), modulePath, prefix);
+  if (filterText) own = own.filter(n => n.includes(filterText));
+  return own;
 }
 
-function drawSchematic(names, modulePath, prefix) {
-  const svg = $("sch-svg");
+function renderSchematic() {
+  const svg = $("svg");
   svg.innerHTML = "";
-  const info = $("sch-info");
-  info.textContent = `module '${modulePath || "(top)"}': ${names.length} direct cells`;
-  if (!names.length) {
-    div(svg.parentNode, "counts", "no directly-named cells here (anonymous mapper logic) — use a cell search below");
+  svgEl("defs", {}, svg).innerHTML =
+    '<marker id="arrow-s" markerWidth="9" markerHeight="9" refX="8" refY="4.5"' +
+    ' orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#94a0b4"/></marker>';
+
+  const moduleLabel = schModulePath.join("/") || "(top)";
+  const allNames = schematicCellSet(schModulePath, schFilter);
+
+  svgEl("text", {x: 16, y: 24, "font-size":"13px"}, svg)
+    .textContent = `schematic: ${moduleLabel} — ${allNames.length} cells` +
+      (allNames.length > 130 ? " (showing first 130; refine the filter)" : "");
+
+  const shown = allNames.slice(0, 130);
+  $("sch-count").textContent = `${shown.length}/${allNames.length}`;
+
+  if (!shown.length) {
+    svgEl("text", {x: 16, y: 56, fill:"#e0746c"}, svg)
+      .textContent = "no cells match";
     return;
   }
-  const COL = 190, ROWH = 64, PERCOL = Math.ceil(Math.sqrt(names.length * 2.2));
-  names.forEach((name, i) => {
-    const col = Math.floor(i / PERCOL), row = i % PERCOL;
-    const x = 16 + col * COL, y = 16 + row * ROWH;
-    const kind = /ccu|arith/i.test(name) ? "CCU2C"
-               : /^ff_|_ff/.test(name) ? "FF" : "LUT";
-    const g = svgEl("g", {class:`cellbox ${kind}`, transform:`translate(${x},${y})`}, svg);
-    svgEl("rect", {width: COL - 26, height: ROWH - 18, rx: 7}, g);
-    const short = name.length > 24 ? name.slice(0, 23) + "…" : name;
-    svgEl("text", {x: 8, y: 17}, g).textContent = short;
-    svgEl("text", {x: 8, y: 33, fill:"#8b93a1"}, g).textContent = kind;
-    g.addEventListener("click", () => {
-      svg.querySelectorAll("g.cellbox").forEach(b => b.classList.remove("selected"));
-      g.classList.add("selected");
-      inspectCell(name);
-    });
-    void col; void row;
-  });
-}
 
-function inspectCell(name) {
-  schSelection = name;
-  const info = $("info");
-  info.textContent = "";
-  div(info, null, `cell: ${name}`);
-  const seen = new Set();
+  // wires internal to the shown set
+  const inSet = new Set(shown);
+  const wires = [];
   for (const bit of Object.keys(WIRES)) {
     const w = WIRES[bit];
-    const isDriver = w.driver && w.driver.cell === name;
-    const used = (w.consumers || []).some(c => c.cell === name);
-    if (!isDriver && !used) continue;
-    const label = w.name || `w${bit}`;
-    const line = div(info, null, "");
-    const dirTxt = isDriver ? "OUT" : "IN ";
-    div(line, null, `${dirTxt} ${label}`);
-    if (isDriver)
-      for (const c of w.consumers || []) div(line, "counts", `   -> ${c.cell} (${c.port})`);
-    if (used && w.driver)
-      div(line, "counts", `   <- ${w.driver.cell} (${w.driver.port})`);
+    if (!w.driver) continue;
+    if (!inSet.has(w.driver.cell)) continue;
+    const sinks = (w.consumers || []).filter(c => inSet.has(c.cell));
+    if (!sinks.length) continue;
+    wires.push({bit, driver: w.driver, sinks, name: w.name || `w${bit}`});
   }
-}
 
-/* ---------- selection ---------- */
-function findByPath(node, path) {
-  let cur = node;
-  for (const part of path) {
-    const next = (cur.children || []).find(c => c.module === part);
-    if (!next) return null;
-    cur = next;
-  }
-  return cur;
-}
-
-function select(path) {
-  selectedPath = path;
-  selectedNode = findByPath(DATA.tree, path);
-  showModule(path.join("/"));
-  renderInfo();
-}
-
-function renderInfo() {
-  const info = $("info");
-  info.textContent = "";
-  const node = selectedNode || DATA.tree;
-  div(info, null, `module: ${selectedPath.join("/") || "(top)"}`);
-  div(info, "counts", countText(node) + ` | internal wires ${node.internal_wires}`);
-  for (const e of node.edges || []) {
-    div(info, "counts", `edge ${e.from} -> ${e.to.join(",")} x${e.count}`);
-  }
-  div(info, "counts", "--- cells (compressed) ---");
-  for (const name of node.cell_names || []) div(info, null, name);
-}
-
-function renderGraph() {
-  /* the schematic pane is the primary graph; kept as a no-op hook */
-}
-
-/* ---------- timing ---------- */
-function renderTiming() {
-  const body = $("timing-body");
-  body.textContent = "";
-  const t = DATA.timing || {paths: [], clocks: {}};
-  const clocks = Object.entries(t.clocks || {});
-  if (clocks.length) {
-    div(body, "counts", "achieved Fmax: " +
-      clocks.map(([n, v]) => `${n}: ${v} MHz`).join(" | "));
-  }
-  if (!t.paths.length) {
-    div(body, "counts", "no critical paths embedded (pass --report when generating)");
-    return;
-  }
-  t.paths.forEach((p, pi) => {
-    const wrap = div(body, null, "");
-    div(wrap, "h3", `path ${pi + 1}: ${p.total_ps} ps — from ${p.start}`);
-    p.steps.forEach((step, si) => {
-      const isRoute = "net" in step;
-      const cls = isRoute ? "route" : /FF/i.test(step.cell) && step.port === "Q" ? "ff" : "logic";
-      const row = div(wrap, "bar-row", "");
-      const label = div(row, "bar-label",
-        `${si === 0 ? "" : ""}${step.cell}@${step.port}${isRoute ? ` [net ${step.net}]` : ""}`);
-      void label;
-      const bar = document.createElement("div");
-      bar.className = `bar ${cls}`;
-      bar.style.width = Math.max(2, step.delay_ps / 20) + "px";
-      bar.title = `${step.delay_ps} ps`;
-      row.appendChild(bar);
-      div(row, "counts", `${step.delay_ps} ps`);
+  // layered layout: depth = longest distance from a driverless cell
+  const depth = new Map();
+  const byName = new Map(shown.map(n => [n, {name:n}]));
+  let remaining = shown.slice();
+  let d = 0;
+  while (remaining.length) {
+    const layer = remaining.filter(name => {
+      const ws = wires.filter(w =>
+        w.sinks.some(c => c.cell === name));
+      return !ws.some(w => depth.has(w.driver.cell) && !depth.has(name));
     });
-  });
+    if (!layer.length) break;
+    for (const name of layer) { depth.set(name, d); }
+    remaining = remaining.filter(n => !depth.has(n));
+    d++;
+    if (d > 64) break;
+  }
+  for (const name of remaining) depth.set(name, d);
+
+  const columns = new Map();
+  for (const name of shown) {
+    const dd = depth.get(name);
+    if (!columns.has(dd)) columns.set(dd, []);
+    columns.get(dd).push(name);
+  }
+  const COLW = 210, ROWH = 62;
+  const ordered = [...columns.keys()].sort((a,b)=>a-b);
+  const maxRows = Math.max(...ordered.map(k => columns.get(k).length), 1);
+  svg.setAttribute("height", Math.max(900, 40 + maxRows*ROWH + 30));
+  svg.setAttribute("width", Math.max(1600, 60 + ordered.length*COLW));
+
+  const pos = new Map();
+  for (const dd of ordered) {
+    const col = columns.get(dd);
+    col.sort();
+    col.forEach((name, i) => pos.set(name, {
+      x: 30 + dd * COLW,
+      y: 46 + i * ROWH,
+    }));
+  }
+
+  // wires first (under boxes)
+  for (const w of wires) {
+    const p1 = pos.get(w.driver.cell), p2s = w.sinks.map(s => pos.get(s.cell));
+    if (!p1) continue;
+    w.sinks.forEach((sink, si) => {
+      const p2 = p2s[si];
+      if (!p2) return;
+      const x1 = p1.x + 158, y1 = p1.y + 26;
+      const x2 = p2.x + 2,   y2 = p2.y + 26;
+      const mx = (x1 + x2)/2;
+      const hot = schSelection === w.driver.cell ||
+                  schSelection === sink.cell;
+      svgEl("path", {
+        d:`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2 - 4} ${y2}`,
+        stroke: hot ? "#7ab3ff" : "#5c6675",
+        "stroke-width": hot ? 2.4 : 1.4,
+        fill:"none",
+        "marker-end":"url(#arrow-s)",
+      }, svg);
+      if (hot) {
+        svgEl("text", {x: mx - 20, y: (y1+y2)/2 - 5,
+          fill:"#7ab3ff", "font-size":"10px"}, svg).textContent = w.name;
+      }
+    });
+  }
+
+  // cells
+  for (const name of shown) {
+    const p = pos.get(name);
+    const kind = /ccu|arith/i.test(name) ? "CCU2C"
+               : /^ff_|(^|_)ff/.test(name) ? "FF" : "LUT4";
+    const g = svgEl("g", {class:`cell ${kind}`}, svg);
+    svgEl("rect", {x: p.x, y: p.y, width: 160, height: 44, rx: 8}, g);
+    const short = name.length > 22 ? name.slice(0,21)+"…" : name;
+    svgEl("text", {x: p.x + 9, y: p.y + 18}, g).textContent = short;
+    svgEl("text", {x: p.x + 9, y: p.y + 34, fill:"#8b93a1"}, g).textContent = kind;
+    g.addEventListener("click", () => {
+      schSelection = schSelection === name ? null : name;
+      renderSchematic();
+      inspectCellInfo(name);
+    });
+  }
 }
 
-/* ---------- modules tab (aggregate graph) ---------- */
+function inspectCellInfo(name) {
+  const lines = [["", `cell: ${name}`]];
+  for (const bit of Object.keys(WIRES)) {
+    const w = WIRES[bit];
+    const drv = w.driver && w.driver.cell === name;
+    const used = (w.consumers || []).some(c => c.cell === name);
+    if (!drv && !used) continue;
+    const label = w.name || `w${bit}`;
+    lines.push(["counts", `${drv ? "OUT" : "IN "} ${label}`]);
+    if (drv) for (const c of w.consumers || [])
+      lines.push(["counts", `   -> ${c.cell} (${c.port})`]);
+    if (used && w.driver)
+      lines.push(["counts", `   <- ${w.driver.cell} (${w.driver.port})`]);
+  }
+  renderInfo(lines);
+}
+
+/* ================= MODULES: aggregate graph ================= */
 function renderModules() {
-  const svg = $("mod-svg");
+  const svg = $("svg");
   svg.innerHTML = "";
-  svgEl("text", {x: 16, y: 22}, svg)
-    .textContent = "top-level structure — click tree nodes to drill down in Schematic";
-  let y = 50;
+  let y = 30;
   const walk = (node, depth) => {
-    svgEl("text", {x: 20 + depth * 24, y}, svg)
-      .textContent = `${node.module}/  ${countText(node)} | internal wires ${node.internal_wires}`;
-    y += 22;
+    svgEl("text", {x: 20 + depth*26, y, "font-size":"13px"}, svg)
+      .textContent = `${node.module}/  ${countText(node)} | internal ${node.internal_wires}`;
+    y += 24;
     for (const e of node.edges || []) {
-      svgEl("text", {x: 40 + depth * 24, y, fill: "#8b93a1"}, svg)
+      svgEl("text", {x: 44 + depth*26, y, fill:"#94a0b4"}, svg)
         .textContent = `↳ ${e.from} → ${e.to.join(",")} ×${e.count}`;
       y += 20;
     }
     for (const c of node.children || []) walk(c, depth + 1);
   };
-  walk(DATA.tree, 0);
+  walk(ROOT, 0);
 }
 
-/* ---------- tabs ---------- */
+/* ================= count helper ================= */
+function countText(node) {
+  const c = node.cells || {LE:0,LUT4:0,CCU2C:0,FF:0};
+  return `LE ${c.LE} | LUT ${c.LUT4} CCU ${c.CCU2C} FF ${c.FF}`;
+}
+
+/* ================= module tree ================= */
+function buildTree(parentEl, node, path) {
+  const hasKids = (node.children || []).length > 0;
+  const row = document.createElement(hasKids ? "details" : "div");
+  row.style.marginLeft = hasKids ? "0" : "12px";
+  const head = document.createElement(hasKids ? "summary" : "div");
+  div(head, null, node.module);
+  div(head, "counts", ` ${countText(node)} | wires ${node.internal_wires}`);
+  head.addEventListener("click", () => {
+    selectedPath = path;
+    selectedNode = node;
+    schModulePath = path;
+    schSelection = null;
+    setTab("schematic");
+    renderSchematic();
+    renderTreeSelection(path);
+    renderInfoHead(node, path);
+  });
+  row.appendChild(head);
+  const inner = document.createElement("div");
+  row.appendChild(inner);
+  for (const child of node.children || [])
+    buildTree(inner, child, [...path, child.module]);
+  parentEl.appendChild(row);
+}
+function renderTreeSelection(path) { void path; }
+function renderInfoHead(node, path) {
+  renderInfo([
+    ["", `module: ${path.join("/") || "(top)"}`],
+    ["counts", countText(node)],
+    ["counts", `internal wires: ${node.internal_wires}`],
+  ]);
+}
+
+/* ================= tabs & boot ================= */
 function setTab(name) {
   for (const tab of document.querySelectorAll("header .tab"))
     tab.classList.toggle("active", tab.dataset.tab === name);
-  for (const pane of ["schematic", "timing", "modules"])
-    $("tab-" + pane).classList.toggle("hidden", pane !== name);
+  $("tab-timing").classList.toggle("hidden", name !== "timing");
+  $("tab-schematic").classList.toggle("hidden", name !== "schematic");
+  $("tab-modules").classList.toggle("hidden", name !== "modules");
   if (name === "timing") renderTiming();
+  if (name === "schematic") renderSchematic();
   if (name === "modules") renderModules();
 }
-for (const tab of document.querySelectorAll("header .tab")) {
+for (const tab of document.querySelectorAll("header .tab"))
   tab.addEventListener("click", () => setTab(tab.dataset.tab));
-}
+$("cellsearch").addEventListener("input", e => {
+  schFilter = e.target.value.trim();
+  renderSchematic();
+});
 
-buildTree($("tree"), DATA.tree, []);
-showModule("");
-renderModules();
+buildTree($("tree"), ROOT, []);
+schModulePath = [];
+setTab("timing");
 
-/* clocks banner */
 (function () {
-  const t = DATA.timing || {};
-  const el = $("clockstat");
-  const parts = Object.entries(t.clocks || {}).map(([n, v]) => `${n}: ${v} MHz`);
-  el.textContent = parts.join(" | ");
+  const clocks = Object.entries(TIMING.clocks || {})
+    .map(([n, v]) => `${v} MHz`).join(", ");
+  $("clockstat").textContent = clocks ? `Fmax: ${clocks}` : "";
 })();
 </script>
 </body>
