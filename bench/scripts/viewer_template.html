@@ -390,7 +390,23 @@ function updateWirePath(pathEl, src, dst) {
     const y1 = src.y + (dy / dd) * 20;
     const x2 = dst.x - (dx / dd) * 66;
     const y2 = dst.y - (dy / dd) * 20;
-    pathEl.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
+
+    if (x2 >= x1 - 10) {
+      // Forward edge: smooth bezier left-to-right
+      const mx = (x1 + x2) / 2;
+      pathEl.setAttribute("d", `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`);
+    } else {
+      // Back edge: exit right, arc around, enter destination from the left
+      const outX = Math.max(x1, x2) + 90;
+      const arcY = Math.min(y1, y2) - Math.max(60, Math.abs(dy) * 0.3);
+      pathEl.setAttribute("d",
+        `M ${x1} ${y1}` +
+        ` C ${outX} ${y1}, ${outX} ${arcY}, ${(x1 + x2) / 2} ${arcY}` +
+        ` L ${(x1 + x2) / 2} ${arcY}` +
+        ` C ${(x1 + x2) / 2} ${arcY}, ${x2 - 80} ${arcY}, ${x2 - 80} ${y2}` +
+        ` L ${x2} ${y2}`
+      );
+    }
   };
 }
 
