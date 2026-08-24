@@ -28,12 +28,12 @@
  #toolbar input, #toolbar select { background:#0e1013; color:var(--fg);
    border:1px solid var(--line); border-radius:4px; padding:3px 8px;
    font:inherit; }
- #canvaswrap { flex:1; overflow:auto; }
+ #canvaswrap { flex:1; overflow:auto; position:relative; }
  svg.fill { width:100%; height:100%; display:block; }
  #info { width:360px; overflow:auto; border-left:1px solid var(--line);
          padding:8px; font-size:12px; white-space:pre-wrap; }
  details { margin-left:10px; }
- summary { cursor:pointer; padding:1px 3px; border-radius:3px; }
+ summary { cursor:pointer; padding:1px 3px; border-radius:3px; list-style:none; }
  summary:hover { background:#262b33; }
  .counts { color:var(--dim); }
  svg text { fill:var(--fg); font:11px ui-monospace,monospace; }
@@ -42,10 +42,11 @@
  g.cell.FF rect { stroke:var(--ff); }
  g.cell.sel rect { stroke:var(--acc); stroke-width:2.5; }
  g.cell { cursor:pointer; }
- .pad-in rect { fill:#16301f; stroke:var(--in); stroke-width:1.4; }
- .pad-out rect { fill:#33241a; stroke:var(--out); stroke-width:1.4; }
- .pad-in text { fill:var(--in); }
- .pad-out text { fill:var(--out); }
+ g.io-in rect { fill:#16301f; stroke:var(--in); stroke-width:1.4; }
+ g.io-out rect { fill:#33241a; stroke:var(--out); stroke-width:1.4; }
+ g.io-in text { fill:var(--in); }
+ g.io-out text { fill:var(--out); }
+ path.wire.hot { stroke:#7ab3ff !important; stroke-width:2.4 !important; }
 </style>
 </head>
 <body>
@@ -62,8 +63,11 @@
       <div id="toolbar">
         <select id="groupsel" style="min-width:300px"></select>
         <input id="cellsearch" placeholder="filter cells (substring)…"
-               style="min-width:180px">
+               style="min-width:170px">
         <span id="sch-count" class="counts"></span>
+        <span class="counts" style="margin-left:auto">
+          inputs ◀ left · outputs ▶ right · wheel zoom · drag pan/cells
+        </span>
       </div>
       <div id="canvaswrap"><svg id="sch-svg" class="fill"></svg></div>
     </div>
@@ -105,7 +109,7 @@ function countText(node) {
   return `LE ${c.LE} | LUT ${c.LUT4} CCU ${c.CCU2C} FF ${c.FF}`;
 }
 
-/* ================= hierarchy tree ================= */
+/* ================= hierarchy ================= */
 const TREE = DATA.tree;
 let selectedPath = [];
 let selectedNode = null;
@@ -154,6 +158,7 @@ function ensureCellIndex() {
 /* ================= schematic state ================= */
 let schSelection = null;
 let drawnKey = null;
+let drawnSig = null;
 let layoutCache = null;
 let wireRegistry = [];
 let worldEl = null;
@@ -209,6 +214,16 @@ function showCellInfo(name) {
   }
   setInfo(lines);
 }
+function showNetInfo(netKey) {
+  const w = WIRES[netKey] || WIRES[String(netKey)];
+  const lines = [["", `net: ${w && w.name ? w.name : netKey}`]];
+  if (w) {
+    if (w.driver) lines.push(["counts", `driver: ${w.driver.cell} (${w.driver.port})`]);
+    for (const c of w.consumers || [])
+      lines.push(["counts", `load: ${c.cell} (${c.port})`]);
+  }
+  setInfo(lines);
+}
 
 /* ================= groups selector ================= */
 function populateGroups() {
@@ -258,11 +273,12 @@ function buildLayout(names) {
   const nodes = names.map(name => ({
     name,
     kind: cellKind(name),
+    col: 0,
     x: 0, y: 0,
   }));
   const byName = new Map(nodes.map(n => [n.name, n]));
   const outMap = new Map();   // srcName -> [dstNode]
-  const indeg = new Map();    // dstName -> incoming wire count
+  const indeg = new Map();    // dstName -> incoming edge count
   for (const bit of Object.keys(WIRES)) {
     const w = WIRES[bit];
     if (!w.driver || !inSet.has(w.driver.cell)) continue;
@@ -279,7 +295,7 @@ function buildLayout(names) {
   }
 
   // Longest-path layering over the acyclic visible subgraph (Kahn order).
-  // Cells that never drain (feed no other cell) keep depth 0.
+  // Cells that neither feed nor read anything keep depth 0.
   const queue = nodes.filter(n => !indeg.get(n.name)).map(n => n.name);
   const depth = new Map(queue.map(n => [n, 0]));
   for (let head = 0; head < queue.length; head++) {
@@ -292,7 +308,7 @@ function buildLayout(names) {
       if (indeg.get(dst.name) === 0) queue.push(dst.name);
     }
   }
-  // Anything left over sits in a cycle or feeds nothing: give it column 0.
+  // Anything stuck in a cycle or feeding nothing lands in column 0.
   for (const n of nodes)
     if (!depth.has(n.name)) depth.set(n.name, 0);
   for (const n of nodes) n.col = depth.get(n.name);
@@ -344,25 +360,135 @@ function placeColumns(layout) {
 
   let maxRows = 1;
   for (const [, col] of columns) maxRows = Math.max(maxRows, col.length);
-  return {cols, ROWH, maxRows};
+  return {cols, ROWH, maxRows, columns};
 }
 
 /* ================= schematic drawing ================= */
+function updateWirePath(pathEl, src, dst) {
+  return () => {
+    const dx = dst.x - src.x, dy = dst.y - src.y;
+    const dd = Math.hypot(dx, dy) || 1;
+    const x1 = src.x + (dx / dd) * 66;
+    const y1 = src.y + (dy / dd) * 20;
+    const x2 = dst.x - (dx / dd) * 66;
+    const y2 = dst.y - (dy / dd) * 20;
+    pathEl.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
+  };
+}
 
+function attachDrag(g, node) {
+  let dragging = false;
+  g.addEventListener("pointerdown", ev => {
+    dragging = true;
+    ev.stopPropagation();
+  });
+  window.addEventListener("pointermove", ev => {
+    if (!dragging) return;
+    const rect = $("sch-svg").getBoundingClientRect();
+    node.x = (ev.clientX - rect.left - view.x) / view.k;
+    node.y = (ev.clientY - rect.top - view.y) / view.k;
+    g.setAttribute("transform", `translate(${node.x},${node.y})`);
+    for (const w of wireRegistry) w.pathEl.__update();
+  });
+  window.addEventListener("pointerup", () => { dragging = false; });
+}
+
+function applyView() {
+  if (worldEl)
+    worldEl.setAttribute("transform",
+      `translate(${view.x},${view.y}) scale(${view.k})`);
+}
+function fitToContent() {
+  if (!worldEl || !layoutCache) return;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of layoutCache.nodes) {
+    minX = Math.min(minX, n.x - 80); maxX = Math.max(maxX, n.x + 80);
+    minY = Math.min(minY, n.y - 34); maxY = Math.max(maxY, n.y + 34);
+  }
+  const rect = $("sch-svg").getBoundingClientRect();
+  const width = rect.width || 1600, height = rect.height || 900;
+  const bw = maxX - minX, bh = maxY - minY;
+  view.k = Math.min(2.2, Math.max(0.15, Math.min(width / bw, height / bh)));
+  view.x = (width - bw * view.k) / 2 - minX * view.k;
+  view.y = (height - bh * view.k) / 2 - minY * view.k;
+  applyView();
+}
+(function wirePanZoom() {
+  const svg = $("sch-svg");
+  svg.addEventListener("wheel", ev => {
+    ev.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
+    // scroll up = zoom in, scroll down = zoom out
+    const factor = ev.deltaY > 0 ? 1 / 1.15 : 1.15;
+    const k2 = Math.min(6, Math.max(0.12, view.k * factor));
+    view.x = cx - (cx - view.x) * (k2 / view.k);
+    view.y = cy - (cy - view.y) * (k2 / view.k);
+    view.k = k2;
+    applyView();
+  }, {passive: false});
+  let panning = null;
+  svg.addEventListener("pointerdown", ev => {
+    if (ev.target.closest && ev.target.closest("g.cell")) return;
+    panning = {x: ev.clientX, y: ev.clientY, vx: view.x, vy: view.y};
+  });
+  window.addEventListener("pointermove", ev => {
+    if (!panning) return;
+    view.x = panning.vx + (ev.clientX - panning.x);
+    view.y = panning.vy + (ev.clientY - panning.y);
+    applyView();
+  });
+  window.addEventListener("pointerup", () => { panning = null; });
+})();
+
+function refreshSelection() {
+  for (const w of wireRegistry) {
+    const hot = schSelection != null &&
+      (w.driverCell === schSelection || w.consumerCell === schSelection);
+    w.pathEl.setAttribute("stroke", hot ? "#7ab3ff" : "#5c6675");
+    w.pathEl.setAttribute("stroke-width", hot ? 2.4 : 1.3);
+  }
+  document.querySelectorAll("#sch-svg g.cell").forEach(g => {
+    g.classList.toggle("sel", g.dataset.name === schSelection);
+  });
+}
+function showCellInfo(name) {
+  const lines = [["", `cell: ${name}`]];
+  const entry = ensureCellIndex()[name];
+  if (!entry) { setInfo(lines); return; }
+  const seen = new Set();
+  for (const bit of entry.pins) {
+    const w = WIRES[bit];
+    if (!w) continue;
+    const label = w.name || `w${bit}`;
+    if (w.driver && w.driver.cell !== name) {
+      lines.push(["counts", `IN  ${label} <- ${w.driver.cell} (${w.driver.port})`]);
+    }
+    for (const c of w.consumers || []) {
+      const key = `OUT ${label} -> ${c.cell}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        lines.push(["counts", `OUT ${label} -> ${c.cell} (${c.port})`]);
+      }
+    }
+  }
+  setInfo(lines);
+}
+
+/* ================= schematic drawing ================= */
 function renderSchematic() {
   const key = `${$("groupsel").value}|${schFilter}`;
   const allNames = schematicCellSet($("groupsel").value, schFilter);
-  const shown = allNames.slice(0, SCHEM_CAP);
+  const shown = allNames;
 
   const svg = $("sch-svg");
   svg.innerHTML = "";
 
   const header = svgEl("text", {x: 16, y: 24}, svg);
   header.textContent =
-    `schematic: ${$("groupsel").value || "(top direct)"} — ` +
-    `${shown.length}${allNames.length > SCHEM_CAP ? " of " + allNames.length : ""} cells`;
-  $("sch-count").textContent =
-    `${Math.min(shown.length, SCHEM_CAP)}/${allNames.length}`;
+    `schematic: ${$("groupsel").value || "(top direct)"} — ${shown.length} cells · ` +
+    `${$("groupsel").selectedOptions[0]?.text ?? ""}`;
+  $("sch-count").textContent = `${shown.length} cells`;
 
   if (!shown.length) {
     svgEl("text", {x: 16, y: 56, fill:"#e0746c"}, svg)
@@ -423,200 +549,9 @@ function renderSchematic() {
     attachDrag(g, node);
   }
 
-  drawIoPads(layout, worldEl);
-
   applyView();
   fitToContent();
   refreshSelection();
-}
-
-function updateWirePath(pathEl, src, dst) {
-  return () => {
-    const dx = dst.x - src.x, dy = dst.y - src.y;
-    const dd = Math.hypot(dx, dy) || 1;
-    const x1 = src.x + (dx / dd) * 66;
-    const y1 = src.y + (dy / dd) * 20;
-    const x2 = dst.x - (dx / dd) * 66;
-    const y2 = dst.y - (dy / dd) * 20;
-    pathEl.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
-  };
-}
-
-/* IO pads: inputs on the far left column, outputs on the far right. */
-function drawIoPads(layout, parent) {
-  const inPads = new Map();   // port -> [targetNode]
-  const outPads = new Map();  // port -> [sourceNode]
-  for (const bit of Object.keys(WIRES)) {
-    const w = WIRES[bit];
-    if (w.driver && /\$in$/.test(w.driver.cell)) {
-      const port = w.driver.cell.replace(/\$in$/, "");
-      for (const c of w.consumers || []) {
-        const n = layout.byName.get(c.cell);
-        if (n) {
-          if (!inPads.has(port)) inPads.set(port, []);
-          inPads.get(port).push(n);
-        }
-      }
-    }
-    for (const c of w.consumers || []) {
-      if (!/\$out$/.test(c.cell)) continue;
-      const port = c.cell.replace(/\$out$/, "");
-      // Show the pad even when its driver sits outside the selected
-      // group; wires attach only to sources that are visible.
-      if (!outPads.has(port)) outPads.set(port, []);
-      const src = w.driver ? layout.byName.get(w.driver.cell) : null;
-      if (src) outPads.get(port).push(src);
-    }
-  }
-
-  let minX = Infinity, maxX = -Infinity;
-  let minY = Infinity, maxY = -Infinity;
-  for (const n of layout.nodes) {
-    minX = Math.min(minX, n.x - 70); maxX = Math.max(maxX, n.x + 70);
-    minY = Math.min(minY, n.y - 26); maxY = Math.max(maxY, n.y + 26);
-  }
-
-  function drawColumn(pads, x, side) {
-    const isInput = side === "in";
-    const entries = [...pads.entries()].map(([port, list]) => ({
-      port,
-      list,
-      meanY: list.length ? list.reduce((s, n) => s + n.y, 0) / list.length : minY,
-    })).sort((a, b) => a.meanY - b.meanY);
-    let cursor = minY + 10;
-    for (const e of entries) {
-      e.y = Math.max(cursor, e.meanY - 14);
-      cursor = e.y + 34;
-      const g = svgEl("g", {class: `pad pad-${side}`}, parent);
-      svgEl("rect", {x: x - 62, y: e.y - 13, width: 124, height: 26, rx: 6}, g);
-      const label = e.port.length > 15 ? e.port.slice(0,14)+"…" : e.port;
-      svgEl("text", {x, y: e.y + 4, "text-anchor": "middle",
-                     "font-size": "11px"}, g).textContent = label;
-      for (const item of e.list) {
-        const x1 = isInput ? item.x - 66 : x - 62;
-        const x2 = isInput ? x + 62 : item.x - 66;
-        svgEl("path", {d: `M ${x1} ${item.y} L ${x2} ${item.y}`,
-                       stroke: isInput ? "#69d0a8" : "#e0915f",
-                       "stroke-opacity": 0.75,
-                       "stroke-width": 1.2}, parent);
-      }
-      if (!e.list.length) {
-        svgEl("text", {x, y: e.y + 18, "text-anchor": "middle",
-                       fill:"#8b93a1", "font-size":"10px"}, g)
-          .textContent = "driver outside group";
-      }
-    }
-  }
-  drawColumn(inPads, minX - 130, "in");
-  drawColumn(outPads, maxX + 130, "out");
-
-  // widen fit to include both pad columns
-  minX -= 200; maxX += 200;
-  const rect = $("sch-svg").getBoundingClientRect();
-  const width = rect.width || 1600, height = rect.height || 900;
-  const bw = maxX - minX;
-  view.k = Math.min(view.k, Math.max(0.15, width / bw));
-  view.x = (width - bw * view.k) / 2 - minX * view.k;
-  void height; void maxY;
-  applyView();
-}
-
-function attachDrag(g, node) {
-  let dragging = false;
-  g.addEventListener("pointerdown", ev => {
-    dragging = true;
-    ev.stopPropagation();
-  });
-  window.addEventListener("pointermove", ev => {
-    if (!dragging) return;
-    const rect = $("sch-svg").getBoundingClientRect();
-    node.x = (ev.clientX - rect.left - view.x) / view.k;
-    node.y = (ev.clientY - rect.top - view.y) / view.k;
-    g.setAttribute("transform", `translate(${node.x},${node.y})`);
-    for (const w of wireRegistry) w.pathEl.__update();
-  });
-  window.addEventListener("pointerup", () => { dragging = false; });
-}
-
-function applyView() {
-  if (worldEl)
-    worldEl.setAttribute("transform",
-      `translate(${view.x},${view.y}) scale(${view.k})`);
-}
-function fitToContent() {
-  if (!worldEl || !layoutCache) return;
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const n of layoutCache.nodes) {
-    minX = Math.min(minX, n.x - 80); maxX = Math.max(maxX, n.x + 80);
-    minY = Math.min(minY, n.y - 34); maxY = Math.max(maxY, n.y + 34);
-  }
-  const rect = $("sch-svg").getBoundingClientRect();
-  const width = rect.width || 1600, height = rect.height || 900;
-  const bw = maxX - minX, bh = maxY - minY;
-  view.k = Math.min(2.2, Math.max(0.15, Math.min(width / bw, height / bh)));
-  view.x = (width - bw * view.k) / 2 - minX * view.k;
-  view.y = (height - bh * view.k) / 2 - minY * view.k;
-  applyView();
-}
-(function wirePanZoom() {
-  const svg = $("sch-svg");
-  svg.addEventListener("wheel", ev => {
-    ev.preventDefault();
-    const rect = svg.getBoundingClientRect();
-    const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
-    const factor = ev.deltaY > 0 ? 1 / 1.15 : 1.15;
-    const k2 = Math.min(6, Math.max(0.12, view.k * factor));
-    view.x = cx - (cx - view.x) * (k2 / view.k);
-    view.y = cy - (cy - view.y) * (k2 / view.k);
-    view.k = k2;
-    applyView();
-  }, {passive: false});
-  let panning = null;
-  svg.addEventListener("pointerdown", ev => {
-    if (ev.target.closest && ev.target.closest("g.cell")) return;
-    panning = {x: ev.clientX, y: ev.clientY, vx: view.x, vy: view.y};
-  });
-  window.addEventListener("pointermove", ev => {
-    if (!panning) return;
-    view.x = panning.vx + (ev.clientX - panning.x);
-    view.y = panning.vy + (ev.clientY - panning.y);
-    applyView();
-  });
-  window.addEventListener("pointerup", () => { panning = null; });
-})();
-
-function refreshSelection() {
-  for (const w of wireRegistry) {
-    const hot = schSelection != null &&
-      (w.driver.cell === schSelection || w.consumer.cell === schSelection);
-    w.pathEl.setAttribute("stroke", hot ? "#7ab3ff" : "#5c6675");
-    w.pathEl.setAttribute("stroke-width", hot ? 2.4 : 1.3);
-  }
-  document.querySelectorAll("#sch-svg g.cell").forEach(g => {
-    g.classList.toggle("sel", g.dataset.name === schSelection);
-  });
-}
-function showCellInfo(name) {
-  const lines = [["", `cell: ${name}`]];
-  const entry = ensureCellIndex()[name];
-  if (!entry) { setInfo(lines); return; }
-  const seen = new Set();
-  for (const bit of entry.pins) {
-    const w = WIRES[bit];
-    if (!w) continue;
-    const label = w.name || `w${bit}`;
-    if (w.driver && w.driver.cell !== name) {
-      lines.push(["counts", `IN  ${label} <- ${w.driver.cell} (${w.driver.port})`]);
-    }
-    for (const c of w.consumers || []) {
-      const key = `OUT ${label} -> ${c.cell}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        lines.push(["counts", `OUT ${label} -> ${c.cell} (${c.port})`]);
-      }
-    }
-  }
-  setInfo(lines);
 }
 
 /* ================= timing view ================= */
@@ -706,6 +641,35 @@ window.addEventListener("error", event => {
   bar.textContent = "viewer error: " + event.message + " @ line " + event.lineno;
   document.body.appendChild(bar);
 });
+
+/* ================= groups selector ================= */
+function populateGroups() {
+  const sel = $("groupsel");
+  sel.innerHTML = "";
+  const entries = Object.entries(GROUPS).sort(
+    ([, a], [, b]) => b.length - a.length
+  );
+  for (const [label, cells] of entries) {
+    const opt = document.createElement("option");
+    opt.value = label;
+    opt.textContent = `${label} (${cells.length})`;
+    sel.appendChild(opt);
+  }
+  if (UNASSIGNED.length) {
+    const opt = document.createElement("option");
+    opt.value = "@unassigned";
+    opt.textContent = `(shared / unattributed) (${UNASSIGNED.length})`;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener("change", () => {
+    schSelection = null;
+    invalidateSchematic();
+  });
+  $("cellsearch").addEventListener("input", () => {
+    schFilter = $("cellsearch").value.trim();
+    invalidateSchematic();
+  });
+}
 
 /* ================= boot ================= */
 buildTree($("tree"), TREE, []);

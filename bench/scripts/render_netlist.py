@@ -31,6 +31,15 @@ PRIMITIVE_PREFIXES = (
 BIT_SUFFIX = re.compile(r"\[(\d+)\]$")
 
 
+@dataclass
+class Node:
+    name: str
+    children: dict = field(default_factory=dict)
+    cells: list = field(default_factory=list)
+    internal_wires: set = field(default_factory=set)
+    boundary_wires: dict = field(default_factory=dict)
+
+
 def cell_hierarchy(name: str) -> list[str]:
     stripped = name
     changed = True
@@ -70,15 +79,6 @@ def lca(path_a: list[str], path_b: list[str]) -> list[str]:
             break
         common.append(a)
     return common
-
-
-@dataclass
-class Node:
-    name: str
-    children: dict = field(default_factory=dict)
-    cells: list = field(default_factory=list)
-    internal_wires: set = field(default_factory=set)
-    boundary_wires: dict = field(default_factory=dict)
 
 
 def build_tree(module: dict, top_name: str) -> tuple[Node, dict]:
@@ -138,8 +138,7 @@ def build_tree(module: dict, top_name: str) -> tuple[Node, dict]:
             node.internal_wires.add(net_name)
             continue
 
-        record = {"net": net_name}
-        record["from"] = (
+        record_from = (
             "<external>" if driver_path is None
             else driver_path[len(common)] if len(driver_path) > len(common)
             else "."
@@ -150,8 +149,10 @@ def build_tree(module: dict, top_name: str) -> tuple[Node, dict]:
         }
         if bit in output_bits or not targets:
             targets.add("<external>")
-        record["to"] = sorted(targets - {"."}) or ["."]
-        node.boundary_wires.setdefault(net_name, []).append(record)
+        record_to = sorted(targets - {"."}) or ["."]
+        node.boundary_wires.setdefault(net_name, []).append({
+            "net": net_name, "from": record_from, "to": record_to,
+        })
 
     return root, cell_paths
 
@@ -444,9 +445,9 @@ def main() -> int:
     parser.add_argument("design_json")
     parser.add_argument("--format", choices=["text", "json", "html"], default="text")
     parser.add_argument("--output", default="", help="write HTML here")
-    parser.add_argument("--cell-limit", type=int, default=6)
     parser.add_argument("--top", default="", help="top module name (default: the only module)")
-    parser.add_argument("--report", default="", help="nextpnr --report JSON; embeds critical paths into the HTML viewer")
+    parser.add_argument("--report", default="",
+                        help="nextpnr --report JSON; embeds critical paths into the HTML viewer")
     args = parser.parse_args()
 
     data = json.load(open(args.design_json))
