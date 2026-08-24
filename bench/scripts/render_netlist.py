@@ -86,10 +86,11 @@ def build_tree(module: dict, top_name: str) -> tuple[Node, dict]:
     cell_paths: dict[str, list[str]] = {}
 
     for name, cell in module["cells"].items():
-        path = cell_hierarchy(name)
-        cell_paths[name] = path
+        # The final path component is the cell itself; its parent chain is
+        # the owning module.
+        cell_paths[name] = cell_hierarchy(name)[:-1]
         node = root
-        for part in path[:-1]:
+        for part in cell_paths[name]:
             node = node.children.setdefault(part, Node(part))
         node.cells.append(
             {
@@ -98,77 +99,81 @@ def build_tree(module: dict, top_name: str) -> tuple[Node, dict]:
             }
         )
 
+    # Enumerate every wire from cell connections; nextpnr JSON leaves most
+    # interior nets anonymous, so netnames serve only as an optional label.
     drivers: dict[int, tuple[str, list[str]]] = {}
+    consumers: dict[int, list[tuple[str, list[str]]]] = {}
+    input_bits: set[int] = set()
+    output_bits: set[int] = set()
     for name, cell in module["cells"].items():
         for port, bits in cell["connections"].items():
-            if cell["port_directions"].get(port) != "output":
-                continue
+            direction = cell["port_directions"].get(port)
             for bit in bits:
-                if isinstance(bit, int):
+                if not isinstance(bit, int):
+                    continue
+                if direction == "output":
                     drivers.setdefault(bit, (name, cell_paths[name]))
+                else:
+                    consumers.setdefault(bit, []).append((name, cell_paths[name]))
+    for port in module.get("ports", {}).values():
+        bits = [bit for bit in port.get("bits", []) if isinstance(bit, int)]
+        if port.get("direction") == "input":
+            input_bits.update(bits)
+        else:
+            output_bits.update(bits)
 
-    input_bits = {
-        bit
-        for port in module.get("ports", {}).values()
-        if port.get("direction") == "input"
-        for bit in port.get("bits", [])
-        if isinstance(bit, int)
-    }
-    output_bits = {
-        bit
-        for port in module.get("ports", {}).values()
-        if port.get("direction") == "output"
-        for bit in port.get("bits", [])
-        if isinstance(bit, int)
-    }
-
+    net_labels: dict[int, str] = {}
     for bit, net_name in wire_bits(module):
-        if bit in output_bits:
-            continue
+        net_labels.setdefault(bit, net_name)
+
+    all_wires = set(drivers) | set(consumers) | input_bits | output_bits
+    for bit in sorted(all_wires):
         driver = drivers.get(bit)
         driver_path = driver[1] if driver else None
-        consumer_paths = [
-            cell_paths[cname]
-            for cname, cell in module["cells"].items()
-            for port, bits in cell["connections"].items()
-            if cell["port_directions"].get(port) == "input"
-            and bit in bits
-            and isinstance(bit, int)
-        ]
-        if not consumer_paths:
-            continue
+        rides = consumers.get(bit, [])
+        consumer_paths = [path for _, path in rides]
+        net_name = net_labels.get(bit) or f"w{bit}"
+
         endpoints = ([driver_path] if driver_path else []) + consumer_paths
+        if not endpoints:
+            continue
         common = endpoints[0]
         for other in endpoints[1:]:
             common = lca(common, other)
         node = root
         for part in common:
             node = node.children.setdefault(part, Node(part))
-        fully_internal = (
-            driver_path is not None
-            and all(path == driver_path for path in consumer_paths)
-            and len(driver_path) == len(common)
-        )
-        if fully_internal:
+
+        # Internal when every endpoint lives in this exact module; otherwise
+        # the wire crosses at least one module boundary here.
+        if all(path == common for path in endpoints):
             node.internal_wires.add(net_name)
             continue
+
         record = {"net": net_name}
+        if bit in output_bits and driver is None:
+            continue
         if driver_path is None:
             record["from"] = "<external>"
         elif len(driver_path) > len(common):
             record["from"] = driver_path[len(common)]
         else:
             record["from"] = "."
-        record["to"] = sorted(
-            {
-                path[len(common)] if len(path) > len(common) else "."
-                for path in consumer_paths
-            }
-        )
+        targets = {
+            path[len(common)] if len(path) > len(common) else "."
+            for path in consumer_paths
+        }
+        if bit in output_bits or not targets:
+            targets.add("<external>")
+        record["to"] = sorted(targets - {"."}) or ["."]
         node.boundary_wires.setdefault(net_name, []).append(record)
 
     def prune_external(node: Node) -> None:
-        for name in [n for n, c in node.children.items() if n == "<external>" and not c.cells]:
+        for name in [
+            n
+            for n, c in node.children.items()
+            if n == "<external>" and not c.cells and not c.boundary_wires
+        ]:
             del node.children[name]
         for child in node.children.values():
             prune_external(child)
