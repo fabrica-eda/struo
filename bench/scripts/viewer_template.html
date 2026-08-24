@@ -407,7 +407,7 @@ function attachDrag(g, node) {
     node.x = (ev.clientX - rect.left - view.x) / view.k;
     node.y = (ev.clientY - rect.top - view.y) / view.k;
     g.setAttribute("transform", `translate(${node.x},${node.y})`);
-    for (const w of wireRegistry) w.pathEl.__update();
+    for (const w of wireRegistry) { if (w.pathEl.__update) w.pathEl.__update(); }
   });
   window.addEventListener("pointerup", () => { dragging = false; });
 }
@@ -463,7 +463,8 @@ function fitToContent() {
 function refreshSelection() {
   for (const w of wireRegistry) {
     const hot = schSelection != null &&
-      (w.driverCell === schSelection || w.consumerCell === schSelection);
+      (w.driverCell === schSelection ||
+       (w.consumerCells && w.consumerCells.includes(schSelection)));
     w.pathEl.setAttribute("stroke", hot ? "#7ab3ff" : "#5c6675");
     w.pathEl.setAttribute("stroke-width", hot ? 2.4 : 1.3);
   }
