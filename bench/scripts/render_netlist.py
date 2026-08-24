@@ -858,7 +858,10 @@ def wire_label(module: dict, bit: int) -> str:
 def embed_timing(report_path: str) -> dict:
     if not report_path:
         return {"paths": []}
-    report = json.load(open(report_path))
+    try:
+        report = json.load(open(report_path))
+    except (OSError, json.JSONDecodeError):
+        return {"paths": []}
     paths = []
 
     def total(path: dict) -> float:
