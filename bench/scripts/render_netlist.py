@@ -314,6 +314,7 @@ HTML_TEMPLATE = r"""<!doctype html>
    display:flex; flex-direction:column; height:100%; min-height:0;
  }
  #canvaswrap { flex:1; overflow:auto; }
+ svg.fill { width:100%; height:100%; display:block; }
  #toolbar { padding:6px 10px; border-bottom:1px solid var(--line);
             display:flex; gap:10px; align-items:center; }
  #toolbar input { background:#0e1013; color:var(--fg); border:1px solid var(--line);
@@ -367,7 +368,7 @@ HTML_TEMPLATE = r"""<!doctype html>
                style="margin-left:auto; min-width:220px">
         <span class="counts" id="sch-count"></span>
       </div>
-      <div id="canvaswrap"><svg id="svg" width="2400" height="1400"></svg></div>
+      <div id="canvaswrap"><svg id="svg" class="fill"></svg></div>
     </div>
     <div id="tab-modules" class="hidden">
       <div style="padding:10px"><svg id="svg-m" width="1600" height="1200"></svg></div>
@@ -673,6 +674,7 @@ function renderSchematic() {
   simulate(layout, 170);
 
   const world = svgEl("g", {id: "world"}, svg);
+  $("svg").classList.add("fill");
 
   // wires under boxes
   const wireEls = [];
@@ -732,7 +734,82 @@ function renderSchematic() {
     dragHandler(g, node, wireEls.filter(w => w.srcNode === node || w.dstNode === node));
   }
 
-  enablePanZoom(svg, world, layout.nodes.map(n => ({x: n.x, y: n.y})));
+  enablePanZoom(svg, world);
+  fitToContent(world, layout.nodes);
+}
+
+
+/* ---- view transform: screen = world * k + offset (uniform scale) ---- */
+let view = {k: 0.9, x: 40, y: 40};
+let worldEl = null;
+
+function applyView() {
+  if (!worldEl) return;
+  worldEl.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`);
+}
+
+function svgRect(svg) {
+  const r = svg.getBoundingClientRect();
+  return {
+    left: r.left, top: r.top,
+    width: r.width || 1600,
+    height: r.height || 900,
+  };
+}
+
+function screenToWorld(svg, cx, cy) {
+  const rect = svgRect(svg);
+  return {
+    x: (cx - rect.left - view.x) / view.k,
+    y: (cy - rect.top - view.y) / view.k,
+  };
+}
+
+function enablePanZoom(svg, world) {
+  worldEl = world;
+  applyView();
+  svg.addEventListener("wheel", ev => {
+    ev.preventDefault();
+    const rect = svgRect(svg);
+    const cx = ev.clientX - rect.left;
+    const cy = ev.clientY - rect.top;
+    const factor = ev.deltaY > 0 ? 1.15 : 1 / 1.15;
+    const k2 = Math.min(6, Math.max(0.12, view.k * factor));
+    // keep the cursor point stationary: c2 = c1 - (c1 - off) * (k2/k1 - 1)
+    view.x = cx - (cx - view.x) * (k2 / view.k);
+    view.y = cy - (cy - view.y) * (k2 / view.k);
+    view.k = k2;
+    applyView();
+  }, {passive: false});
+
+  let panning = null;
+  svg.addEventListener("pointerdown", ev => {
+    if (ev.target.closest && ev.target.closest("g.cell")) return;
+    panning = {x: ev.clientX, y: ev.clientY, vx: view.x, vy: view.y};
+  });
+  window.addEventListener("pointermove", ev => {
+    if (!panning) return;
+    view.x = panning.vx + (ev.clientX - panning.x);
+    view.y = panning.vy + (ev.clientY - panning.y);
+    applyView();
+  });
+  window.addEventListener("pointerup", () => { panning = null; });
+}
+
+function fitToContent(world, nodes) {
+  if (!nodes.length) return;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x - 80); maxX = Math.max(maxX, n.x + 80);
+    minY = Math.min(minY, n.y - 34); maxY = Math.max(maxY, n.y + 34);
+  }
+  const svg = $("svg");
+  const rect = svgRect(svg);
+  const bw = maxX - minX, bh = maxY - minY;
+  view.k = Math.min(2.2, Math.max(0.15, Math.min(rect.width / bw, rect.height / bh)));
+  view.x = (rect.width - bw * view.k) / 2 - minX * view.k;
+  view.y = (rect.height - bh * view.k) / 2 - minY * view.k;
+  applyView();
 }
 
 function dragHandler(g, node, wireEls) {
@@ -743,48 +820,12 @@ function dragHandler(g, node, wireEls) {
   });
   window.addEventListener("pointermove", ev => {
     if (!dragging) return;
-    const pt = screenToWorld(ev.clientX, ev.clientY);
+    const pt = screenToWorld($("svg"), ev.clientX, ev.clientY);
     node.x = pt.x; node.y = pt.y;
     g.setAttribute("transform", `translate(${node.x},${node.y})`);
     for (const w of wireEls) w.pathEl.__update();
   });
   window.addEventListener("pointerup", () => { dragging = false; });
-}
-
-/* pan & zoom via viewBox */
-let vb = {x: -80, y: -80, w: 2560, h: 1560};
-function applyViewBox(svg) {
-  svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
-}
-function enablePanZoom(svg, world, seedPositions) {
-  applyViewBox(svg);
-  void world; void seedPositions;
-  svg.addEventListener("wheel", ev => {
-    ev.preventDefault();
-    const factor = ev.deltaY > 0 ? 1.12 : 0.89;
-    vb.w *= factor; vb.h *= factor;
-    applyViewBox(svg);
-  }, {passive: false});
-  let panning = null;
-  svg.addEventListener("pointerdown", ev => {
-    if (ev.target.closest && ev.target.closest("g.cell")) return;
-    panning = {x: ev.clientX, y: ev.clientY, vx: vb.x, vy: vb.y};
-  });
-  window.addEventListener("pointermove", ev => {
-    if (!panning) return;
-    vb.x = panning.vx - (ev.clientX - panning.x) * (vb.w / svg.clientWidth);
-    vb.y = panning.vy - (ev.clientY - panning.y) * (vb.h / svg.clientHeight);
-    applyViewBox(svg);
-  });
-  window.addEventListener("pointerup", () => { panning = null; });
-}
-function screenToWorld(cx, cy) {
-  const svg = $("svg");
-  const rect = svg.getBoundingClientRect();
-  return {
-    x: vb.x + (cx - rect.left) * (vb.w / rect.width),
-    y: vb.y + (cy - rect.top) * (vb.h / rect.height),
-  };
 }
 
 function inspectCellInfo(name) {
