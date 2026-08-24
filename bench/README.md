@@ -52,6 +52,13 @@ crossings labeled. `--format json` emits the same tree for agents; note that
 mapper-created cells without hierarchical names (`lut1724`, `ccu_arith0_5`)
 report at the top level.
 
+The HTML view adds cone attribution: anonymous combinational cells are
+assigned to the register module they feed (single-label reachability), so
+the Schematic tab draws meaningful blocks — e.g. an AXI4 decoder appears as
+one ~280-cell group instead of being scattered across 2,000 anonymous LUTs.
+Unattributed cross-module glue lands in "(shared / unattributed)". Add
+`--report <nextpnr-report.json>` to embed critical-path timing.
+
 Results land in `build/qor/results.json` plus per-design nextpnr reports.
 
 ## Designs

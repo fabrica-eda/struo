@@ -360,6 +360,9 @@ HTML_TEMPLATE = r"""<!doctype html>
           <span><i class="sw" style="background:var(--logic)"></i>logic</span>
           <span><i class="sw" style="background:var(--ff)"></i>clk-q / FF</span>
         </span>
+        <select id="groupsel" style="min-width:300px; background:#0e1013;
+                color:var(--fg); border:1px solid var(--line); border-radius:4px;
+                padding:3px 6px; font:inherit"></select>
         <input id="cellsearch" placeholder="filter cells (substring)…"
                style="margin-left:auto; min-width:220px">
         <span class="counts" id="sch-count"></span>
@@ -375,8 +378,11 @@ HTML_TEMPLATE = r"""<!doctype html>
 <script>
 const DATA = __DATA__;
 const WIRES = DATA.connectivity || {};
+const GROUPS = DATA.groups || {};
+const UNASSIGNED = DATA.unassigned || [];
 const TIMING = DATA.timing || {paths: [], clocks: {}};
 const NS = "http://www.w3.org/2000/svg";
+const SCHEM_CAP = 420;
 const $ = id => document.getElementById(id);
 
 function svgEl(tag, attrs, parent) {
@@ -534,20 +540,18 @@ function ensureCellIndex() {
   return cellIndexCache;
 }
 
-function schematicCellSet(modulePath, filterText) {
-  const index = ensureCellIndex();
-  const prefix = modulePath ? modulePath + "/" : "";
-  let own = Object.keys(index).filter(name =>
-    prefix
-      ? name.startsWith(prefix) && !name.slice(prefix.length).includes("/")
-      : !name.includes("/")
-  );
-  if (own.length === 0) {
-    // anonymous mapper logic lives at top level; fall back to it
-    own = Object.keys(index).filter(name => !name.includes("/"));
+function schematicCellSet(groupLabel, filterText) {
+  let names;
+  if (groupLabel === "@unassigned") {
+    names = UNASSIGNED.slice();
+  } else if (groupLabel && GROUPS[groupLabel]) {
+    names = GROUPS[groupLabel].slice();
+  } else {
+    const index = ensureCellIndex();
+    names = Object.keys(index).filter(n => !n.includes("."));
   }
-  if (filterText) own = own.filter(n => n.includes(filterText));
-  return own;
+  if (filterText) names = names.filter(n => n.includes(filterText));
+  return names;
 }
 
 function renderSchematic() {
@@ -562,9 +566,9 @@ function renderSchematic() {
 
   svgEl("text", {x: 16, y: 24, "font-size":"13px"}, svg)
     .textContent = `schematic: ${moduleLabel} — ${allNames.length} cells` +
-      (allNames.length > 130 ? " (showing first 130; refine the filter)" : "");
+      (allNames.length > SCHEM_CAP ? ` (showing first ${SCHEM_CAP})` : "");
 
-  const shown = allNames.slice(0, 130);
+  const shown = allNames.slice(0, SCHEM_CAP);
   $("sch-count").textContent = `${shown.length}/${allNames.length}`;
 
   if (!shown.length) {
@@ -727,9 +731,10 @@ function buildTree(parentEl, node, path) {
     selectedNode = node;
     schModulePath = path;
     schSelection = null;
+    const label = path.join("/");
+    if (GROUPS[label]) $("groupsel").value = label;
     setTab("schematic");
     renderSchematic();
-    renderTreeSelection(path);
     renderInfoHead(node, path);
   });
   row.appendChild(head);
@@ -739,7 +744,6 @@ function buildTree(parentEl, node, path) {
     buildTree(inner, child, [...path, child.module]);
   parentEl.appendChild(row);
 }
-function renderTreeSelection(path) { void path; }
 function renderInfoHead(node, path) {
   renderInfo([
     ["", `module: ${path.join("/") || "(top)"}`],
@@ -775,7 +779,33 @@ $("cellsearch").addEventListener("input", e => {
   renderSchematic();
 });
 
+function populateGroups() {
+  const sel = $("groupsel");
+  sel.innerHTML = "";
+  const entries = Object.entries(GROUPS).sort(
+    ([, a], [, b]) => b.length - a.length
+  );
+  for (const [label, cells] of entries) {
+    const opt = document.createElement("option");
+    opt.value = label;
+    opt.textContent = `${label} (${cells.length})`;
+    sel.appendChild(opt);
+  }
+  if (UNASSIGNED.length) {
+    const opt = document.createElement("option");
+    opt.value = "@unassigned";
+    opt.textContent = `(shared / unattributed) (${UNASSIGNED.length})`;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener("change", () => {
+    schModulePath = sel.value ? sel.value.split("/") : [];
+    schSelection = null;
+    renderSchematic();
+  });
+}
+
 buildTree($("tree"), ROOT, []);
+populateGroups();
 schModulePath = [];
 setTab("timing");
 
@@ -816,6 +846,10 @@ def main() -> int:
             # Full connectivity so the schematic can trace wires across the
             # whole design: bit -> driver and consumers by cell/port.
             "connectivity": extract_connectivity(module),
+            # Cone attribution: which register module each combinational
+            # cell ultimately feeds, so anonymous mapper logic groups into
+            # meaningful blocks in the viewer.
+            **cone_groups(module),
             "timing": embed_timing(args.report),
         }
         html = HTML_TEMPLATE.replace("__DATA__", json.dumps(payload, separators=(",", ":")))
@@ -826,6 +860,106 @@ def main() -> int:
         return 0
     print(render_text(root, cell_limit=args.cell_limit))
     return 0
+
+
+def cone_groups(module: dict) -> dict:
+    """Attributes every combinational cell to the register module it feeds.
+
+    Labels flow from flip-flop outputs backward? No — forward: a flip-flop
+    seeds its own module label on its Q net, labels propagate through
+    combinational cells toward consuming flip-flops, and each cell inherits
+    the union of the labels reaching it. A cell with exactly one distinct
+    label is owned by that module; anything else stays unattributed.
+    """
+
+    drivers: dict[int, tuple[str, str]] = {}
+    cell_inputs: dict[str, list[int]] = {}
+    cell_outputs: dict[str, list[int]] = {}
+    for name, cell in module["cells"].items():
+        ins: list[int] = []
+        outs: list[int] = []
+        for port, bits in cell["connections"].items():
+            direction = cell["port_directions"].get(port)
+            for bit in bits:
+                if not isinstance(bit, int):
+                    continue
+                if direction == "output":
+                    outs.append(bit)
+                    drivers[bit] = (name, "cell")
+                else:
+                    ins.append(bit)
+        cell_inputs[name] = ins
+        cell_outputs[name] = outs
+
+    def module_dir(name: str) -> str:
+        stripped = re.sub(r"^(?:retime_|physical_replicate_)+", "", name)
+        parts = stripped.split(".")
+        parts.pop()
+        return "/".join(parts)
+
+    ff_label_by_output: dict[int, str] = {}
+    ff_cells: dict[str, list[str]] = collections.defaultdict(list)
+    for name in cell_outputs:
+        stripped = re.sub(r"^(?:retime_|physical_replicate_)+", "", name)
+        if not stripped.startswith("ff_"):
+            continue
+        label = module_dir(name)
+        ff_cells[label].append(name)
+        for bit in cell_outputs[name]:
+            ff_label_by_output[bit] = label
+
+    port_in_bits = {
+        bit
+        for port in module.get("ports", {}).values()
+        if port.get("direction") == "input"
+        for bit in port.get("bits", [])
+        if isinstance(bit, int)
+    }
+
+    bit_memo: dict[int, frozenset | None] = {}
+
+    def labels_of_bit(bit: int, stack: frozenset) -> frozenset:
+        if bit in bit_memo:
+            return bit_memo[bit] or frozenset()
+        if bit in stack:
+            return frozenset()
+        if bit in ff_label_by_output:
+            return frozenset({ff_label_by_output[bit]})
+        if bit in port_in_bits:
+            return frozenset({"<inputs>"})
+        driver = drivers.get(bit)
+        if driver is None:
+            return frozenset()
+        bit_memo[bit] = None  # cycle guard placeholder
+        result: set = set()
+        for in_bit in cell_inputs[driver[0]]:
+            result |= labels_of_bit(in_bit, stack | {bit})
+        frozen = frozenset(result)
+        bit_memo[bit] = frozen
+        return frozen
+
+    def cell_labels(name: str) -> frozenset:
+        result: set = set()
+        for in_bit in cell_inputs[name]:
+            result |= labels_of_bit(in_bit, frozenset())
+        return frozenset(result)
+
+    groups: dict[str, list[str]] = {
+        label: sorted(cells) for label, cells in ff_cells.items()
+    }
+    unassigned: list[str] = []
+    for name in sorted(cell_outputs):
+        stripped = re.sub(r"^(?:retime_|physical_replicate_)+", "", name)
+        if stripped.startswith("ff_"):
+            continue
+        labels = cell_labels(name)
+        if len(labels) == 1:
+            groups[next(iter(labels))].append(name)
+        elif not labels:
+            unassigned.append(name)
+        else:
+            unassigned.append(name)
+    return {"groups": dict(sorted(groups.items())), "unassigned": unassigned}
 
 
 def extract_connectivity(module: dict) -> dict:
