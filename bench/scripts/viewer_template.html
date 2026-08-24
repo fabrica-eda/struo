@@ -549,9 +549,93 @@ function renderSchematic() {
     attachDrag(g, node);
   }
 
+  drawIoColumns(layout, worldEl);
+
   applyView();
   fitToContent();
   refreshSelection();
+}
+
+/* ================= IO columns ================= */
+// Module-boundary IO: nets entering from outside sit in a green column on
+// the left; nets leaving to outside sit in an orange column on the right,
+// so signal flow reads left-to-right along the layers.
+function drawIoColumns(layout, parent) {
+  const visible = new Set(layout.nodes.map(n => n.name));
+  const inNets = [];
+  const outNets = [];
+  for (const bit of Object.keys(WIRES)) {
+    const w = WIRES[bit];
+    if (!w.driver) continue;
+    const srcVisible = visible.has(w.driver.cell);
+    const sinksAll = w.consumers || [];
+    const insideSinks = sinksAll.filter(c => visible.has(c.cell));
+    const label = w.name || `w${bit}`;
+    if (!srcVisible && insideSinks.length) {
+      inNets.push({
+        label,
+        targets: insideSinks.map(c => layout.byName.get(c.cell)),
+      });
+    } else if (srcVisible && insideSinks.length < sinksAll.length) {
+      outNets.push({label, source: layout.byName.get(w.driver.cell)});
+    }
+  }
+  if (!inNets.length && !outNets.length) return;
+
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  for (const n of layout.nodes) {
+    minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
+    minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
+  }
+
+  function drawColumn(nets, x, cls) {
+    const BOXW = 128, LINEH = 15;
+    const shownNets = nets.slice(0, 16);
+    const h = 30 + shownNets.length * LINEH;
+    const y = (minY + maxY) / 2 - h / 2;
+    const g = svgEl("g", {class: cls}, parent);
+    svgEl("rect", {x: x - BOXW / 2, y, width: BOXW, height: h, rx: 8}, g);
+    svgEl("text", {x, y: y + 18, "text-anchor": "middle",
+                   "font-size": "11px"}, g).textContent =
+      `${cls === "io-in" ? "inputs" : "outputs"} (${nets.length})`;
+    shownNets.forEach((net, i) => {
+      svgEl("text", {x: x - BOXW / 2 + 8, y: y + 34 + i * LINEH,
+                     "font-size": "10px", fill: "#8b93a1"}, g)
+        .textContent = net.label.slice(0, 18);
+    });
+    void x;
+    return {x, top: y, bottom: y + h};
+  }
+  const inCol = drawColumn(inNets, minX - 110, "io-in");
+  const outCol = drawColumn(outNets, maxX + 110, "io-out");
+
+  // stub wires from each column edge toward its nearest endpoint so the
+  // direction of flow stays visible at a glance.
+  function stub(net, side, i, count) {
+    const isInput = side === "in";
+    const spread = (i - (count - 1) / 2) * 14;
+    if (isInput) {
+      for (const t of net.targets) {
+        svgEl("path", {
+          d: `M ${inCol.x + 64} ${t.y} L ${t.x - 66} ${t.y}`,
+          stroke: "#69d0a8", "stroke-opacity": 0.55,
+          "stroke-width": 1.2, fill: "none",
+        }, parent);
+      }
+    } else {
+      for (const s of net.sources || []) {
+        svgEl("path", {
+          d: `M ${s.x + 66} ${s.y} L ${outCol.x - 64} ${s.y}`,
+          stroke: "#e0915f", "stroke-opacity": 0.55,
+          "stroke-width": 1.2, fill: "none",
+        }, parent);
+      }
+    }
+    void spread;
+  }
+  inNets.forEach((net, i) => stub(net, "in", i, inNets.length));
+  outNets.forEach((net, i) => stub(net, "out", i, outNets.length));
 }
 
 /* ================= timing view ================= */
