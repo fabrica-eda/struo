@@ -378,8 +378,6 @@ HTML_TEMPLATE = r"""<!doctype html>
 <script>
 const DATA = __DATA__;
 const WIRES = DATA.connectivity || {};
-const GROUPS = DATA.groups || {};
-const UNASSIGNED = DATA.unassigned || [];
 const TIMING = DATA.timing || {paths: [], clocks: {}};
 const NS = "http://www.w3.org/2000/svg";
 const SCHEM_CAP = 420;
@@ -513,16 +511,7 @@ function renderTiming() {
     ' orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#e0746c"/></marker>';
 }
 
-/* ================= SCHEMATIC: real wires between cells ================= */
-
-function moduleContainerOf(name) {
-  // owning module directory of a flattened cell name
-  const stripped = name.replace(/^(retime_|physical_replicate_)+/, "");
-  const parts = stripped.split(".");
-  parts.pop();
-  return parts.join("/");
-}
-
+/* ================= SCHEMATIC: force-directed cell graph ================= */
 let cellIndexCache = null;
 function ensureCellIndex() {
   if (cellIndexCache) return cellIndexCache;
@@ -540,6 +529,9 @@ function ensureCellIndex() {
   return cellIndexCache;
 }
 
+const GROUPS = DATA.groups || {};
+const UNASSIGNED = DATA.unassigned || [];
+
 function schematicCellSet(groupLabel, filterText) {
   let names;
   if (groupLabel === "@unassigned") {
@@ -554,6 +546,107 @@ function schematicCellSet(groupLabel, filterText) {
   return names;
 }
 
+function hashSeed(text) {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967296;
+}
+function mulberry(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function cellKind(name) {
+  if (/ccu|arith|compare/i.test(name)) return "CCU2C";
+  if (/^ff_|(^|[./_])ff/.test(name)) return "FF";
+  return "LUT4";
+}
+
+/* ---- force simulation over the visible cell set ---- */
+function buildLayout(names) {
+  const inSet = new Set(names);
+  const nodes = names.map((name, i) => ({
+    name,
+    kind: cellKind(name),
+    x: 0, y: 0,
+    vx: 0, vy: 0,
+    fixed: false,
+  }));
+  const byName = new Map(nodes.map(n => [n.name, n]));
+  const links = [];
+  for (const bit of Object.keys(WIRES)) {
+    const w = WIRES[bit];
+    if (!w.driver || !inSet.has(w.driver.cell)) continue;
+    const src = byName.get(w.driver.cell);
+    for (const c of w.consumers || []) {
+      const dst = byName.get(c.cell);
+      if (!dst || dst === src) continue;
+      links.push({src, dst, bit});
+    }
+  }
+  // deterministic initial placement on a spiral
+  const rnd = mulberry(1234);
+  nodes.forEach((n, i) => {
+    const a = i * 2.399963;
+    const r = 30 + 11 * Math.sqrt(i);
+    n.x = 600 + r * Math.cos(a) + rnd() * 8;
+    n.y = 420 + r * Math.sin(a) + rnd() * 8;
+    void rnd;
+  });
+  return {nodes, links, byName};
+}
+
+function simulate(layout, ticks) {
+  const {nodes, links} = layout;
+  const n = nodes.length;
+  const REPULSE = 5200 / Math.max(60, n) * Math.max(60, n) ** 0.5 * 8; // scales mildly with size
+  for (let iter = 0; iter < ticks; iter++) {
+    const alpha = Math.pow(1 - iter / ticks, 1.4);
+    // repulsion (n^2 — fine up to ~450)
+    for (let i = 0; i < n; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < n; j++) {
+        const b = nodes[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d2 = dx*dx + dy*dy;
+        if (d2 < 1) { dx = (hashSeed(a.name)%7-3)||1; dy = (hashSeed(b.name)%5-2)||1; d2 = dx*dx+dy*dy; }
+        if (d2 > 260000) continue;
+        const f = (REPULSE * alpha) / d2;
+        const dd = Math.sqrt(d2);
+        a.vx -= (dx/dd)*f; a.vy -= (dy/dd)*f;
+        b.vx += (dx/dd)*f; b.vy += (dy/dd)*f;
+      }
+    }
+    // springs
+    for (const l of links) {
+      const dx = l.dst.x - l.src.x, dy = l.dst.y - l.src.y;
+      const dd = Math.sqrt(dx*dx + dy*dy) || 1;
+      const f = ((dd - 130) * 0.045) * alpha;
+      l.src.vx += (dx/dd)*f*2; l.src.vy += (dy/dd)*f*2;
+      l.dst.vx -= (dx/dd)*f*2; l.dst.vy -= (dy/dd)*f*2;
+    }
+    // gentle centering + integrate
+    for (const node of nodes) {
+      node.vx += (600 - node.x) * 0.0015 * alpha;
+      node.vy += (400 - node.y) * 0.0015 * alpha;
+      if (node.fixed) { node.vx = node.vy = 0; continue; }
+      node.vx *= 0.82; node.vy *= 0.82;
+      node.x += Math.max(-24, Math.min(24, node.vx));
+      node.y += Math.max(-24, Math.min(24, node.vy));
+      node.x = Math.max(20, Math.min(1180, node.x));
+      node.y = Math.max(20, Math.min(780, node.y));
+    }
+  }
+}
+
 function renderSchematic() {
   const svg = $("svg");
   svg.innerHTML = "";
@@ -561,117 +654,137 @@ function renderSchematic() {
     '<marker id="arrow-s" markerWidth="9" markerHeight="9" refX="8" refY="4.5"' +
     ' orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#94a0b4"/></marker>';
 
-  const moduleLabel = schModulePath.join("/") || "(top)";
-  const allNames = schematicCellSet(schModulePath, schFilter);
+  const groupLabel = $("groupsel").value;
+  schFilter = $("cellsearch").value.trim();
+  const allNames = schematicCellSet(groupLabel, schFilter);
 
-  svgEl("text", {x: 16, y: 24, "font-size":"13px"}, svg)
-    .textContent = `schematic: ${moduleLabel} — ${allNames.length} cells` +
-      (allNames.length > SCHEM_CAP ? ` (showing first ${SCHEM_CAP})` : "");
+  const header = svgEl("text", {x: 16, y: 24, "font-size": "13px"}, svg);
+  header.textContent = `schematic: ${groupLabel || "(top)"} — ${allNames.length} cells` +
+    (allNames.length > SCHEM_CAP ? ` (showing ${SCHEM_CAP}; refine filter or pick another group)` : "");
+  $("sch-count").textContent = `${Math.min(allNames.length, SCHEM_CAP)}/${allNames.length}`;
 
   const shown = allNames.slice(0, SCHEM_CAP);
-  $("sch-count").textContent = `${shown.length}/${allNames.length}`;
-
   if (!shown.length) {
-    svgEl("text", {x: 16, y: 56, fill:"#e0746c"}, svg)
-      .textContent = "no cells match";
+    svgEl("text", {x: 16, y: 56, fill: "#e0746c"}, svg).textContent = "no cells match";
     return;
   }
 
-  // wires internal to the shown set
-  const inSet = new Set(shown);
-  const wires = [];
+  const layout = buildLayout(shown);
+  simulate(layout, 170);
+
+  const world = svgEl("g", {id: "world"}, svg);
+
+  // wires under boxes
+  const wireEls = [];
   for (const bit of Object.keys(WIRES)) {
     const w = WIRES[bit];
     if (!w.driver) continue;
-    if (!inSet.has(w.driver.cell)) continue;
-    const sinks = (w.consumers || []).filter(c => inSet.has(c.cell));
+    const srcNode = layout.byName.get(w.driver.cell);
+    if (!srcNode) continue;
+    const sinks = (w.consumers || [])
+      .map(c => ({c, node: layout.byName.get(c.cell)}))
+      .filter(x => x.node);
     if (!sinks.length) continue;
-    wires.push({bit, driver: w.driver, sinks, name: w.name || `w${bit}`});
-  }
-
-  // layered layout: depth = longest distance from a driverless cell
-  const depth = new Map();
-  const byName = new Map(shown.map(n => [n, {name:n}]));
-  let remaining = shown.slice();
-  let d = 0;
-  while (remaining.length) {
-    const layer = remaining.filter(name => {
-      const ws = wires.filter(w =>
-        w.sinks.some(c => c.cell === name));
-      return !ws.some(w => depth.has(w.driver.cell) && !depth.has(name));
-    });
-    if (!layer.length) break;
-    for (const name of layer) { depth.set(name, d); }
-    remaining = remaining.filter(n => !depth.has(n));
-    d++;
-    if (d > 64) break;
-  }
-  for (const name of remaining) depth.set(name, d);
-
-  const columns = new Map();
-  for (const name of shown) {
-    const dd = depth.get(name);
-    if (!columns.has(dd)) columns.set(dd, []);
-    columns.get(dd).push(name);
-  }
-  const COLW = 210, ROWH = 62;
-  const ordered = [...columns.keys()].sort((a,b)=>a-b);
-  const maxRows = Math.max(...ordered.map(k => columns.get(k).length), 1);
-  svg.setAttribute("height", Math.max(900, 40 + maxRows*ROWH + 30));
-  svg.setAttribute("width", Math.max(1600, 60 + ordered.length*COLW));
-
-  const pos = new Map();
-  for (const dd of ordered) {
-    const col = columns.get(dd);
-    col.sort();
-    col.forEach((name, i) => pos.set(name, {
-      x: 30 + dd * COLW,
-      y: 46 + i * ROWH,
-    }));
-  }
-
-  // wires first (under boxes)
-  for (const w of wires) {
-    const p1 = pos.get(w.driver.cell), p2s = w.sinks.map(s => pos.get(s.cell));
-    if (!p1) continue;
-    w.sinks.forEach((sink, si) => {
-      const p2 = p2s[si];
-      if (!p2) return;
-      const x1 = p1.x + 158, y1 = p1.y + 26;
-      const x2 = p2.x + 2,   y2 = p2.y + 26;
-      const mx = (x1 + x2)/2;
-      const hot = schSelection === w.driver.cell ||
-                  schSelection === sink.cell;
-      svgEl("path", {
-        d:`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2 - 4} ${y2}`,
+    const hot = schSelection === w.driver.cell ||
+                sinks.some(s => s.c.cell === schSelection);
+    const label = w.name || `w${bit}`;
+    for (const {c: sink, node: dstNode} of sinks) {
+      const pathEl = svgEl("path", {
+        class: "wire",
         stroke: hot ? "#7ab3ff" : "#5c6675",
-        "stroke-width": hot ? 2.4 : 1.4,
-        fill:"none",
-        "marker-end":"url(#arrow-s)",
-      }, svg);
+        "stroke-width": hot ? 2.2 : 1.3,
+        fill: "none",
+        "marker-end": "url(#arrow-s)",
+      }, world);
+      pathEl.__update = () => {
+        const dx = dstNode.x - srcNode.x, dy = dstNode.y - srcNode.y;
+        const dd = Math.hypot(dx, dy) || 1;
+        const x1 = srcNode.x + (dx / dd) * 62, y1 = srcNode.y + (dy / dd) * 31;
+        const x2 = dstNode.x - (dx / dd) * 62, y2 = dstNode.y - (dy / dd) * 31;
+        pathEl.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
+      };
+      pathEl.__update();
+      wireEls.push({pathEl, srcNode, dstNode, label, hot});
       if (hot) {
-        svgEl("text", {x: mx - 20, y: (y1+y2)/2 - 5,
-          fill:"#7ab3ff", "font-size":"10px"}, svg).textContent = w.name;
+        const mx = (srcNode.x + dstNode.x) / 2, my = (srcNode.y + dstNode.y) / 2 - 6;
+        const t = svgEl("text", {x: mx, y: my, fill: "#7ab3ff", "font-size": "10px"}, world);
+        t.textContent = `${label} · ${c.port}`;
       }
-    });
+    }
   }
 
-  // cells
-  for (const name of shown) {
-    const p = pos.get(name);
-    const kind = /ccu|arith/i.test(name) ? "CCU2C"
-               : /^ff_|(^|_)ff/.test(name) ? "FF" : "LUT4";
-    const g = svgEl("g", {class:`cell ${kind}`}, svg);
-    svgEl("rect", {x: p.x, y: p.y, width: 160, height: 44, rx: 8}, g);
-    const short = name.length > 22 ? name.slice(0,21)+"…" : name;
-    svgEl("text", {x: p.x + 9, y: p.y + 18}, g).textContent = short;
-    svgEl("text", {x: p.x + 9, y: p.y + 34, fill:"#8b93a1"}, g).textContent = kind;
-    g.addEventListener("click", () => {
-      schSelection = schSelection === name ? null : name;
+  // cells on top
+  for (const node of layout.nodes) {
+    const kindTxt = node.kind;
+    const g = svgEl("g", {class: `cell ${node.kind}`}, world);
+    g.dataset.name = node.name;
+    svgEl("rect", {x: -66, y: -20, width: 132, height: 40, rx: 8}, g);
+    const short = node.name.length > 21 ? node.name.slice(0, 20) + "…" : node.name;
+    svgEl("text", {x: -58, y: -2}, g).textContent = short;
+    svgEl("text", {x: -58, y: 13, fill: "#8b93a1"}, g).textContent = kindTxt;
+    g.setAttribute("transform", `translate(${node.x},${node.y})`);
+    g.addEventListener("click", ev => {
+      ev.stopPropagation();
+      schSelection = schSelection === node.name ? null : node.name;
       renderSchematic();
-      inspectCellInfo(name);
+      inspectCellInfo(node.name);
     });
+    dragHandler(g, node, wireEls.filter(w => w.srcNode === node || w.dstNode === node));
   }
+
+  enablePanZoom(svg, world, layout.nodes.map(n => ({x: n.x, y: n.y})));
+}
+
+function dragHandler(g, node, wireEls) {
+  let dragging = false;
+  g.addEventListener("pointerdown", ev => {
+    dragging = true;
+    ev.stopPropagation();
+  });
+  window.addEventListener("pointermove", ev => {
+    if (!dragging) return;
+    const pt = screenToWorld(ev.clientX, ev.clientY);
+    node.x = pt.x; node.y = pt.y;
+    g.setAttribute("transform", `translate(${node.x},${node.y})`);
+    for (const w of wireEls) w.pathEl.__update();
+  });
+  window.addEventListener("pointerup", () => { dragging = false; });
+}
+
+/* pan & zoom via viewBox */
+let vb = {x: -80, y: -80, w: 2560, h: 1560};
+function applyViewBox(svg) {
+  svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+}
+function enablePanZoom(svg, world, seedPositions) {
+  applyViewBox(svg);
+  void world; void seedPositions;
+  svg.addEventListener("wheel", ev => {
+    ev.preventDefault();
+    const factor = ev.deltaY > 0 ? 1.12 : 0.89;
+    vb.w *= factor; vb.h *= factor;
+    applyViewBox(svg);
+  }, {passive: false});
+  let panning = null;
+  svg.addEventListener("pointerdown", ev => {
+    if (ev.target.closest && ev.target.closest("g.cell")) return;
+    panning = {x: ev.clientX, y: ev.clientY, vx: vb.x, vy: vb.y};
+  });
+  window.addEventListener("pointermove", ev => {
+    if (!panning) return;
+    vb.x = panning.vx - (ev.clientX - panning.x) * (vb.w / svg.clientWidth);
+    vb.y = panning.vy - (ev.clientY - panning.y) * (vb.h / svg.clientHeight);
+    applyViewBox(svg);
+  });
+  window.addEventListener("pointerup", () => { panning = null; });
+}
+function screenToWorld(cx, cy) {
+  const svg = $("svg");
+  const rect = svg.getBoundingClientRect();
+  return {
+    x: vb.x + (cx - rect.left) * (vb.w / rect.width),
+    y: vb.y + (cy - rect.top) * (vb.h / rect.height),
+  };
 }
 
 function inspectCellInfo(name) {
@@ -690,6 +803,7 @@ function inspectCellInfo(name) {
   }
   renderInfo(lines);
 }
+
 
 /* ================= MODULES: aggregate graph ================= */
 function renderModules() {
