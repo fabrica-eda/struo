@@ -260,36 +260,29 @@ traffic, and local error completion through both the reference and post-map
 paths.
 
 On nextpnr 0.6, LFE5UM5G-85F speed grade 8, and seeds 1 through 10, the 300 MHz
-flow passes all ten seeds and reaches 302.48--315.36 MHz (308.45 MHz mean). The
-burst decoder is natural three-cycle RTL: its registered operands feed the
-17-bit address addition and the output holding state directly, without a
-hand-written carry-result pipeline stage. Its single-flight handshake keeps the
-address and protocol metadata stable until the result is consumed. Removing
-that explicit boundary reduces the RTL from 1,365 to 1,293 registers. Automatic
-post-map retiming reconstructs a balanced physical boundary with 1,361
-`TRELLIS_FF` and 1,205 `TRELLIS_COMB` sites; four replicated decoder-enable
-LUTs reduce the worst 320 MHz stress-run seed from 297.71 to 306.84 MHz while
-keeping the 300 MHz release gate at ten of ten seeds. The fanout caps prevent
-equivalent retimed state or control logic from becoming a routing hotspot. The
-mapped timing model scores
-both CCU2C carry hops and ordinary LUT routing, including a post-map routing
-guard calibrated against the routed AXI paths. The qualified-payload pass
-removes 69 inferred clock enables and makes the eight QoS comparison
-preregisters unnecessary. The remaining result combines the mapper's 300 MHz
-required-time cover with registered write-completion, read-slot reservation,
-scoreboard, and arbitration boundaries in the RTL.
+flow passes all ten seeds and reaches 302.66--313.77 MHz (306.78 MHz mean) with
+1,189 `TRELLIS_FF` and 1,197 `TRELLIS_COMB` sites. The burst decoder is natural
+three-cycle RTL: its registered operands feed the 17-bit address addition and
+the output holding state directly, without a hand-written carry-result pipeline
+stage. Its single-flight handshake keeps the address and protocol metadata
+stable until the result is consumed. Removing that explicit boundary reduces
+the RTL from 1,365 to 1,293 registers, and certified retiming trims another 104
+registers through twenty accepted moves. The retiming score prices
+routing-burden growth into every candidate, so moves that would trade placement
+pressure for model period are rejected rather than degrading routed results;
+moving the last-address addition into stage zero was evaluated exactly this way
+and rejected after routed results collapsed to 239--256 MHz across all seeds.
+The mapped timing model scores both CCU2C carry hops and ordinary LUT routing,
+including a post-map routing guard calibrated against the routed AXI paths.
+The qualified-payload pass removes 69 inferred clock enables and makes the
+eight QoS comparison preregisters unnecessary. The remaining result combines
+the mapper's 300 MHz required-time cover with registered write-completion,
+read-slot reservation, scoreboard, and arbitration boundaries in the RTL.
 nextpnr uses timing budgets, a heap timing weight of 40,
 and timing-driven routing rip-up for every seed; no successful seed is selected
 after the fact. The CI timing gate repeats all ten fixed seeds and requires each
 one to reach 300 MHz. nextpnr timing remains the sign-off result because
 placement-dependent routing cannot be predicted by the pre-route mapper.
-At the separate 320 MHz stress target, the routed drafts reach
-306.84--325.10 MHz (318.01 MHz mean) and pass five of ten seeds. Physical
-feedback qualifies only seed 2, adds two LUT replicas, and improves that same
-seed from 317.46 to 324.15 MHz. Route-guided certified retiming improves seed 3
-from 316.26 to 320.51 MHz and seed 4 from 306.84 to 313.28 MHz. Slower candidates
-for seeds 8 and 10 are rolled back to their drafts. The selected set reaches
-308.55--325.10 MHz (319.75 MHz mean) and passes seven of ten seeds.
 The timing tradeoff is additional address/control latency. Address decode
 admits one request at a time per address channel and initiator, while W and R
 data still stream at one beat per cycle; place and route should be repeated for
