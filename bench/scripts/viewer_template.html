@@ -644,6 +644,8 @@ function renderSchematic() {
     attachDrag(g, node);
   }
 
+  drawIoColumns(layout, worldEl);
+
   applyView();
   fitToContent();
   refreshSelection();
@@ -675,10 +677,7 @@ function drawIoColumns(layout, parent) {
     const insideSinks = sinksAll.filter(c => visible.has(c.cell));
     const label = w.name || `w${bit}`;
     if (!srcVisible && insideSinks.length) {
-      inNets.push({
-        label,
-        targets: insideSinks.map(c => layout.byName.get(c.cell)),
-      });
+      inNets.push({label, targets: insideSinks.map(c => layout.byName.get(c.cell))});
     } else if (srcVisible && insideSinks.length < sinksAll.length) {
       outNets.push({label, source: layout.byName.get(w.driver.cell)});
     }
@@ -692,53 +691,70 @@ function drawIoColumns(layout, parent) {
     minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y);
   }
 
-  function drawColumn(nets, x, cls) {
-    const BOXW = 128, LINEH = 15;
-    const shownNets = nets.slice(0, 16);
-    const h = 30 + shownNets.length * LINEH;
-    const y = (minY + maxY) / 2 - h / 2;
-    const g = svgEl("g", {class: cls}, parent);
-    svgEl("rect", {x: x - BOXW / 2, y, width: BOXW, height: h, rx: 8}, g);
-    svgEl("text", {x, y: y + 18, "text-anchor": "middle",
-                   "font-size": "11px"}, g).textContent =
-      `${cls === "io-in" ? "inputs" : "outputs"} (${nets.length})`;
-    shownNets.forEach((net, i) => {
-      svgEl("text", {x: x - BOXW / 2 + 8, y: y + 34 + i * LINEH,
-                     "font-size": "10px", fill: "#8b93a1"}, g)
-        .textContent = net.label.slice(0, 18);
-    });
-    void x;
-    return {x, top: y, bottom: y + h};
-  }
-  const inCol = drawColumn(inNets, minX - 110, "io-in");
-  const outCol = drawColumn(outNets, maxX + 110, "io-out");
-
-  // stub wires from each column edge toward its nearest endpoint so the
-  // direction of flow stays visible at a glance.
-  function stub(net, side, i, count) {
+  function drawColumn(nets, x, cls, side) {
     const isInput = side === "in";
-    const spread = (i - (count - 1) / 2) * 14;
-    if (isInput) {
-      for (const t of net.targets) {
-        svgEl("path", {
-          d: `M ${inCol.x + 64} ${t.y} L ${t.x - 66} ${t.y}`,
-          stroke: "#69d0a8", "stroke-opacity": 0.55,
-          "stroke-width": 1.2, fill: "none",
-        }, parent);
+    const BOXW = 128, LINEH = 16;
+    const shownNets = nets.slice(0, 20);
+    const h = 28 + shownNets.length * LINEH;
+    const y0 = (minY + maxY) / 2 - h / 2;
+    const g = svgEl("g", {class: cls}, parent);
+    svgEl("rect", {x: x - BOXW/2, y: y0, width: BOXW, height: h, rx: 8}, g);
+    svgEl("text", {x, y: y0 + 18, "text-anchor": "middle",
+                   "font-size": "11px"}, g).textContent =
+      `${isInput ? "inputs ◀" : "outputs ▶"} (${nets.length})`;
+
+    shownNets.forEach((net, i) => {
+      const ny = y0 + 34 + i * LINEH;
+      // net name label (clickable)
+      const txt = svgEl("text", {
+        x: x - BOXW/2 + 8, y: ny + 4, "font-size": "10px",
+        fill: "#8b93a1", cursor: "pointer",
+      }, g);
+      txt.textContent = net.label.slice(0, 18);
+
+      // hover/click → highlight this net's wires
+      const wireEls = [];
+      function drawWires(color, width) {
+        if (isInput) {
+          for (const t of net.targets) {
+            const mx = (x + BOXW/2 + t.x - 66) / 2;
+            const p = svgEl("path", {
+              d: `M ${x + BOXW/2} ${ny} C ${mx} ${ny}, ${mx} ${t.y}, ${t.x - 66} ${t.y}`,
+              stroke: color, "stroke-width": width, fill: "none",
+              "marker-end": "url(#arrow-s)",
+            }, parent);
+            wireEls.push(p);
+          }
+        } else {
+          for (const s of net.sources || []) {
+            const mx = (s.x + 66 + x - BOXW/2) / 2;
+            const p = svgEl("path", {
+              d: `M ${s.x + 66} ${s.y} C ${mx} ${s.y}, ${mx} ${ny}, ${x - BOXW/2} ${ny}`,
+              stroke: color, "stroke-width": width, fill: "none",
+            }, parent);
+            wireEls.push(p);
+          }
+        }
       }
-    } else {
-      for (const s of net.sources || []) {
-        svgEl("path", {
-          d: `M ${s.x + 66} ${s.y} L ${outCol.x - 64} ${s.y}`,
-          stroke: "#e0915f", "stroke-opacity": 0.55,
-          "stroke-width": 1.2, fill: "none",
-        }, parent);
+      drawWires(isInput ? "#69d0a8" : "#e0915f", 1.0);
+
+      function setHighlight(on) {
+        for (const we of wireEls) {
+          we.setAttribute("stroke", on ? "#7ab3ff" : (isInput ? "#69d0a8" : "#e0915f"));
+          we.setAttribute("stroke-width", on ? 2.8 : 1.0);
+          we.setAttribute("stroke-opacity", on ? 1 : 0.5);
+        }
+        txt.setAttribute("fill", on ? "#7ab3ff" : "#8b93a1");
+        txt.setAttribute("font-weight", on ? "bold" : "normal");
       }
-    }
-    void spread;
+      txt.addEventListener("mouseenter", () => setHighlight(true));
+      txt.addEventListener("mouseleave", () => setHighlight(false));
+    });
+    void side;
+    return {x, top: y0, bottom: y0 + h};
   }
-  inNets.forEach((net, i) => stub(net, "in", i, inNets.length));
-  outNets.forEach((net, i) => stub(net, "out", i, outNets.length));
+  drawColumn(inNets, minX - 130, "io-in", "in");
+  drawColumn(outNets, maxX + 130, "io-out", "out");
 }
 
 /* ================= timing view ================= */
