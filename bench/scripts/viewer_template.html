@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Struo netlist viewer</title>
+<style>
+ :root { --bg:#14161a; --panel:#1d2026; --fg:#d8dbe2; --dim:#94a0b4;
+         --acc:#7ab3ff; --route:#e0746c; --logic:#69d0a8; --ff:#d9b06a;
+         --line:#3a404b; }
+ * { box-sizing:border-box; }
+ body { margin:0; background:var(--bg); color:var(--fg);
+        font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; height:100vh;
+        display:flex; flex-direction:column; }
+ header { display:flex; align-items:center; gap:12px; padding:7px 12px;
+          border-bottom:1px solid var(--line); }
+ .tab { cursor:pointer; padding:4px 11px; border-radius:5px; color:var(--dim); }
+ .tab.active { background:#2b3a55; color:var(--acc); }
+ #clockstat { margin-left:auto; color:var(--dim); }
+ #body { flex:1; display:flex; min-height:0; }
+ #tree { width:290px; overflow:auto; border-right:1px solid var(--line);
+         padding:6px; }
+ #view { flex:1; display:flex; flex-direction:column; min-width:0;
+         min-height:0; }
+ .pane { display:flex; flex-direction:column; height:100%; min-height:0; }
+ .hidden { display:none !important; }
+ #toolbar { padding:6px 10px; border-bottom:1px solid var(--line);
+            display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+ #toolbar input, #toolbar select { background:#0e1013; color:var(--fg);
+   border:1px solid var(--line); border-radius:4px; padding:3px 8px;
+   font:inherit; }
+ #canvaswrap { flex:1; overflow:auto; }
+ svg.fill { width:100%; height:100%; display:block; }
+ #info { width:360px; overflow:auto; border-left:1px solid var(--line);
+         padding:8px; font-size:12px; white-space:pre-wrap; }
+ details { margin-left:10px; }
+ summary { cursor:pointer; padding:1px 3px; border-radius:3px; }
+ summary:hover { background:#262b33; }
+ .counts { color:var(--dim); }
+ svg text { fill:var(--fg); font:11px ui-monospace,monospace; }
+ g.cell rect { fill:#20242b; stroke:#4a5260; rx:8; }
+ g.cell.CCU2C rect { stroke:#b58fd0; }
+ g.cell.FF rect { stroke:var(--ff); }
+ g.cell.sel rect { stroke:var(--acc); stroke-width:2.5; }
+ g.cell { cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <span style="color:var(--acc)">struo viewer</span>
+  <span class="tab active" data-tab="schematic">Schematic</span>
+  <span class="tab" data-tab="timing">Timing</span>
+  <span id="clockstat"></span>
+</header>
+<div id="body">
+  <div id="tree"></div>
+  <div id="view">
+    <div id="pane-schematic" class="pane">
+      <div id="toolbar">
+        <select id="groupsel" style="min-width:300px"></select>
+        <input id="cellsearch" placeholder="filter cells (substring)…"
+               style="min-width:180px">
+        <span id="sch-count" class="counts"></span>
+      </div>
+      <div id="canvaswrap"><svg id="sch-svg" class="fill"></svg></div>
+    </div>
+    <div id="pane-timing" class="pane hidden">
+      <div style="flex:1; overflow:auto">
+        <svg id="tim-svg" width="2400" height="1400"></svg>
+      </div>
+    </div>
+  </div>
+  <div id="info"></div>
+</div>
+<script>
+"use strict";
+const DATA = __DATA__;
+const WIRES = DATA.connectivity || {};
+const GROUPS = DATA.groups || {};
+const UNASSIGNED = DATA.unassigned || [];
+const TIMING = DATA.timing || {paths: [], clocks: {}};
+const NS = "http://www.w3.org/2000/svg";
+const SCHEM_CAP = 420;
+const $ = id => document.getElementById(id);
+
+function svgEl(tag, attrs, parent) {
+  const el = document.createElementNS(NS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+function div(parent, cls, text) {
+  if (!parent) return null;
+  const el = document.createElement("div");
+  if (cls) el.className = cls;
+  if (text !== undefined) el.textContent = text;
+  parent.appendChild(el);
+  return el;
+}
+function countText(node) {
+  const c = node.cells || {LE:0, LUT4:0, CCU2C:0, FF:0};
+  return `LE ${c.LE} | LUT ${c.LUT4} CCU ${c.CCU2C} FF ${c.FF}`;
+}
+
+/* ================= hierarchy ================= */
+const TREE = DATA.tree;
+function findNode(path) {
+  let cur = TREE;
+  for (const part of path) {
+    cur = (cur.children || []).find(c => c.module === part);
+    if (!cur) return null;
+  }
+  return cur;
+}
+
+/* ================= connectivity index ================= */
+let cellIndexCache = null;
+function ensureCellIndex() {
+  if (cellIndexCache) return cellIndexCache;
+  cellIndexCache = {};
+  for (const bit of Object.keys(WIRES)) {
+    const w = WIRES[bit];
+    const names = [];
+    if (w.driver) names.push(w.driver.cell);
+    for (const c of w.consumers || []) names.push(c.cell);
+    for (const n of names) {
+      const entry = (cellIndexCache[n] ||= {pins: []});
+      entry.pins.push(bit);
+    }
+  }
+  return cellIndexCache;
+}
+
+function schematicCellSet(groupLabel, filterText) {
+  let names;
+  if (groupLabel === "@unassigned") {
+    names = UNASSIGNED.slice();
+  } else if (groupLabel && GROUPS[groupLabel]) {
+    names = GROUPS[groupLabel].slice();
+  } else {
+    const index = ensureCellIndex();
+    names = Object.keys(index).filter(n => !n.includes("."));
+  }
+  if (filterText) names = names.filter(n => n.includes(filterText));
+  return names;
+}
+
+/* ================= state ================= */
+let schSelection = null;
+let schModuleLabel = "";
+let schFilter = "";
+let selectedPath = [];
+let selectedNode = null;
+let layoutCache = null;
+let layoutKey = "";
+let wireRegistry = [];
+let worldEl = null;
+let view = {k: 1, x: 0, y: 0};
+
+/* ================= info pane ================= */
+function setInfo(lines) {
+  const info = $("info");
+  info.textContent = "";
+  for (const [cls, text] of lines) div(info, cls, text);
+}
+function showDefaultInfo() {
+  setInfo([["", "click a module group or cell"]]);
+}
+
+/* ================= module tree ================= */
+function buildTree(parentEl, node, path) {
+  const hasKids = (node.children || []).length > 0;
+  const row = document.createElement(hasKids ? "details" : "div");
+  row.style.marginLeft = hasKids ? "0" : "12px";
+  const head = document.createElement(hasKids ? "summary" : "div");
+  div(head, null, node.module);
+  div(head, "counts", ` ${countText(node)} | wires ${node.internal_wires}`);
+  head.addEventListener("click", () => {
+    selectedPath = path.slice();
+    selectedNode = node;
+    const label = path.join("/");
+    if (GROUPS[label]) $("groupsel").value = label;
+    else $("groupsel").value = "";
+    schSelection = null;
+    setTab("schematic");
+    invalidateSchematic();
+  });
+  row.appendChild(head);
+  const inner = document.createElement("div");
+  row.appendChild(inner);
+  for (const child of node.children || [])
+    buildTree(inner, child, [...path, child.module]);
+  parentEl.appendChild(row);
+}
+
+/* ================= groups selector ================= */
+function populateGroups() {
+  const sel = $("groupsel");
+  sel.innerHTML = "";
+  const entries = Object.entries(GROUPS).sort(
+    ([, a], [, b]) => b.length - a.length
+  );
+  for (const [label, cells] of entries) {
+    const opt = document.createElement("option");
+    opt.value = label;
+    opt.textContent = `${label} (${cells.length})`;
+    sel.appendChild(opt);
+  }
+  if (UNASSIGNED.length) {
+    const opt = document.createElement("option");
+    opt.value = "@unassigned";
+    opt.textContent = `(shared / unattributed) (${UNASSIGNED.length})`;
+    sel.appendChild(opt);
+  }
+  sel.value = sel.options.length ? sel.options[0].value : "";
+  sel.addEventListener("change", () => {
+    schSelection = null;
+    invalidateSchematic();
+  });
+  $("cellsearch").addEventListener("input", () => {
+    schFilter = $("cellsearch").value.trim();
+    invalidateSchematic();
+  });
+}
+
+/* ================= layout engine ================= */
+function hashSeed(text) {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967296;
+}
+function mulberry(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function cellKind(name) {
+  if (/ccu|arith|compare/i.test(name)) return "CCU2C";
+  if (/^ff_|(^|[./_])ff/.test(name)) return "FF";
+  return "LUT4";
+}
+function buildLayout(names) {
+  const inSet = new Set(names);
+  const nodes = names.map((name, i) => ({
+    name,
+    kind: cellKind(name),
+    x: 0, y: 0,
+  }));
+  const byName = new Map(nodes.map(n => [n.name, n]));
+  const links = [];
+  for (const bit of Object.keys(WIRES)) {
+    const w = WIRES[bit];
+    if (!w.driver || !inSet.has(w.driver.cell)) continue;
+    const src = byName.get(w.driver.cell);
+    for (const c of w.consumers || []) {
+      const dst = byName.get(c.cell);
+      if (!dst || dst === src) continue;
+      links.push({src, dst});
+    }
+  }
+  const rnd = mulberry(1234);
+  nodes.forEach((n, i) => {
+    const a = i * 2.399963;
+    const r = 30 + 11 * Math.sqrt(i);
+    n.x = 600 + r * Math.cos(a) + rnd() * 8;
+    n.y = 400 + r * Math.sin(a) + rnd() * 8;
+    void rnd;
+  });
+  return {nodes, links, byName};
+}
+function simulate(layout, ticks) {
+  const nodes = layout.nodes;
+  const n = nodes.length;
+  for (let iter = 0; iter < ticks; iter++) {
+    const alpha = Math.pow(1 - iter / ticks, 1.4);
+    for (let i = 0; i < n; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < n; j++) {
+        const b = nodes[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d2 = dx*dx + dy*dy;
+        if (d2 < 1) { dx = 1; dy = 1; d2 = 2; }
+        if (d2 > 260000) continue;
+        const f = (90000 * alpha) / d2;
+        const dd = Math.sqrt(d2);
+        a.vx = (a.vx||0) - (dx/dd)*f;
+        a.vy = (a.vy||0) - (dy/dd)*f;
+        b.vx = (b.vx||0) + (dx/dd)*f;
+        b.vy = (b.vy||0) + (dy/dd)*f;
+      }
+    }
+    for (const l of layout.links) {
+      const dx = l.dst.x - l.src.x, dy = l.dst.y - l.src.y;
+      const dd = Math.sqrt(dx*dx + dy*dy) || 1;
+      const f = ((dd - 130) * 0.045) * alpha;
+      l.src.vx = (l.src.vx||0) + (dx/dd)*f*2;
+      l.src.vy = (l.src.vy||0) + (dy/dd)*f*2;
+      l.dst.vx = (l.dst.vx||0) - (dx/dd)*f*2;
+      l.dst.vy = (l.dst.vy||0) - (dy/dd)*f*2;
+    }
+    for (const node of nodes) {
+      node.vx = (node.vx||0) * 0.82 + (600 - node.x) * 0.0015 * alpha;
+      node.vy = (node.vy||0) * 0.82 + (400 - node.y) * 0.0015 * alpha;
+      node.x += Math.max(-24, Math.min(24, node.vx));
+      node.y += Math.max(-24, Math.min(24, node.vy));
+      node.x = Math.max(20, Math.min(1180, node.x));
+      node.y = Math.max(20, Math.min(780, node.y));
+    }
+  }
+}
+function packGrid(nodes) {
+  // Same-size boxes snap onto a coarse grid: rows are scanned top-to-bottom
+  // and each row lays its cells out left-to-right around their mean x.
+  const W = 152, H = 58;
+  const sorted = nodes.slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  const rows = [];
+  let current = null;
+  for (const n of sorted) {
+    if (!current || n.y - current.startY > H * 0.6) {
+      current = {startY: n.y, items: []};
+      rows.push(current);
+    }
+    current.items.push(n);
+  }
+  rows.forEach((row, ri) => {
+    row.items.sort((a, b) => a.x - b.x);
+    const meanX = row.items.reduce((sum, n) => sum + n.x, 0) / row.items.length;
+    const startX = meanX - ((row.items.length - 1) * W) / 2;
+    row.items.forEach((n, ci) => {
+      n.x = startX + ci * W;
+      n.y = 60 + ri * H;
+    });
+  });
+}
+
+/* ================= schematic drawing ================= */
+let drawnKey = null;
+
+function currentGroupKey() {
+  return `${$("groupsel").value}|${schFilter}`;
+}
+function invalidateSchematic() {
+  drawnKey = null;
+  renderSchematic();
+}
+
+function renderSchematic() {
+  const key = currentGroupKey();
+  const allNames = schematicCellSet($("groupsel").value, schFilter);
+  const shown = allNames.slice(0, SCHEM_CAP);
+
+  const svg = $("sch-svg");
+  svg.innerHTML = "";
+
+  const header = svgEl("text", {x: 16, y: 24}, svg);
+  header.textContent =
+    `schematic: ${$("groupsel").value || "(top direct)"} — ` +
+    `${shown.length}${allNames.length > SCHEM_CAP ? " of " + allNames.length : ""} cells`;
+  $("sch-count").textContent =
+    `${Math.min(shown.length, SCHEM_CAP)}/${allNames.length}`;
+
+  if (!shown.length) {
+    svgEl("text", {x: 16, y: 56, fill:"#e0746c"}, svg)
+      .textContent = "no cells match";
+    return;
+  }
+
+  if (drawnKey !== key) {
+    const layout = buildLayout(shown);
+    simulate(layout, 170);
+    packGrid(layout.nodes);
+    layout.key = key;
+    layoutCache = layout;
+    drawnKey = key;
+  }
+  const layout = layoutCache;
+
+  worldEl = svgEl("g", {}, svg);
+
+  wireRegistry = [];
+  for (const bit of Object.keys(WIRES)) {
+    const w = WIRES[bit];
+    if (!w.driver) continue;
+    const src = layout.byName.get(w.driver.cell);
+    if (!src) continue;
+    const sinks = (w.consumers || [])
+      .map(c => ({entry: c, dst: layout.byName.get(c.cell)}))
+      .filter(x => x.dst);
+    if (!sinks.length) continue;
+    const label = w.name || `w${bit}`;
+    for (const {entry, dst} of sinks) {
+      const pathEl = svgEl("path", {
+        class: "wire",
+        stroke: "#5c6675",
+        "stroke-width": 1.3,
+        fill: "none",
+        "marker-end": "url(#arrow-s)",
+      }, worldEl);
+      pathEl.__update = updateWirePath(pathEl, src, dst);
+      pathEl.__update();
+      wireRegistry.push({pathEl, driver: w.driver, consumer: entry, label});
+    }
+  }
+
+  for (const node of layout.nodes) {
+    const g = svgEl("g", {class: `cell ${node.kind}`}, worldEl);
+    g.dataset.name = node.name;
+    svgEl("rect", {x: -66, y: -20, width: 132, height: 40, rx: 8}, g);
+    const short = node.name.length > 21 ? node.name.slice(0, 20) + "…" : node.name;
+    svgEl("text", {x: -58, y: -2}, g).textContent = short;
+    svgEl("text", {x: -58, y: 13, fill: "#8b93a1"}, g).textContent = node.kind;
+    g.setAttribute("transform", `translate(${node.x},${node.y})`);
+    g.addEventListener("click", ev => {
+      ev.stopPropagation();
+      schSelection = schSelection === node.name ? null : node.name;
+      refreshSelection();
+      showCellInfo(node.name);
+    });
+    attachDrag(g, node);
+  }
+
+  applyView();
+  fitToContent();
+  refreshSelection();
+}
+
+function updateWirePath(pathEl, src, dst) {
+  return () => {
+    const dx = dst.x - src.x, dy = dst.y - src.y;
+    const dd = Math.hypot(dx, dy) || 1;
+    const x1 = src.x + (dx / dd) * 64;
+    const y1 = src.y + (dy / dd) * 22;
+    const x2 = dst.x - (dx / dd) * 64;
+    const y2 = dst.y - (dy / dd) * 22;
+    pathEl.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
+  };
+}
+
+function attachDrag(g, node) {
+  let dragging = false;
+  g.addEventListener("pointerdown", ev => {
+    dragging = true;
+    ev.stopPropagation();
+  });
+  window.addEventListener("pointermove", ev => {
+    if (!dragging) return;
+    const rect = $("sch-svg").getBoundingClientRect();
+    node.x = (ev.clientX - rect.left - view.x) / view.k;
+    node.y = (ev.clientY - rect.top - view.y) / view.k;
+    g.setAttribute("transform", `translate(${node.x},${node.y})`);
+    for (const w of wireRegistry) w.pathEl.__update();
+  });
+  window.addEventListener("pointerup", () => { dragging = false; });
+}
+
+function applyView() {
+  if (worldEl)
+    worldEl.setAttribute("transform",
+      `translate(${view.x},${view.y}) scale(${view.k})`);
+}
+function fitToContent() {
+  if (!worldEl || !layoutCache) return;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of layoutCache.nodes) {
+    minX = Math.min(minX, n.x - 80); maxX = Math.max(maxX, n.x + 80);
+    minY = Math.min(minY, n.y - 34); maxY = Math.max(maxY, n.y + 34);
+  }
+  const rect = $("sch-svg").getBoundingClientRect();
+  const width = rect.width || 1600, height = rect.height || 900;
+  const bw = maxX - minX, bh = maxY - minY;
+  view.k = Math.min(2.2, Math.max(0.15, Math.min(width / bw, height / bh)));
+  view.x = (width - bw * view.k) / 2 - minX * view.k;
+  view.y = (height - bh * view.k) / 2 - minY * view.k;
+  applyView();
+}
+(function wirePanZoom() {
+  const svg = $("sch-svg");
+  svg.addEventListener("wheel", ev => {
+    ev.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
+    const factor = ev.deltaY > 0 ? 1 / 1.15 : 1.15;
+    const k2 = Math.min(6, Math.max(0.12, view.k * factor));
+    view.x = cx - (cx - view.x) * (k2 / view.k);
+    view.y = cy - (cy - view.y) * (k2 / view.k);
+    view.k = k2;
+    applyView();
+  }, {passive: false});
+  let panning = null;
+  svg.addEventListener("pointerdown", ev => {
+    if (ev.target.closest && ev.target.closest("g.cell")) return;
+    panning = {x: ev.clientX, y: ev.clientY, vx: view.x, vy: view.y};
+  });
+  window.addEventListener("pointermove", ev => {
+    if (!panning) return;
+    view.x = panning.vx + (ev.clientX - panning.x);
+    view.y = panning.vy + (ev.clientY - panning.y);
+    applyView();
+  });
+  window.addEventListener("pointerup", () => { panning = null; });
+})();
+
+function refreshSelection() {
+  for (const w of wireRegistry) {
+    const hot = schSelection != null &&
+      (w.driver.cell === schSelection || w.consumer.cell === schSelection);
+    w.pathEl.setAttribute("stroke", hot ? "#7ab3ff" : "#5c6675");
+    w.pathEl.setAttribute("stroke-width", hot ? 2.4 : 1.3);
+  }
+  document.querySelectorAll("#sch-svg g.cell").forEach(g => {
+    g.classList.toggle("sel", g.dataset.name === schSelection);
+  });
+}
+function showCellInfo(name) {
+  const lines = [["", `cell: ${name}`]];
+  const entry = ensureCellIndex()[name];
+  if (!entry) {
+    setInfo(lines);
+    return;
+  }
+  const seen = new Set();
+  for (const bit of entry.pins) {
+    const w = WIRES[bit];
+    if (!w) continue;
+    const label = w.name || `w${bit}`;
+    if (w.driver && w.driver.cell !== name) {
+      lines.push(["counts", `IN  ${label} <- ${w.driver.cell} (${w.driver.port})`]);
+    }
+    for (const c of w.consumers || []) {
+      const key = `OUT ${label} -> ${c.cell}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        lines.push(["counts", `OUT ${label} -> ${c.cell} (${c.port})`]);
+      }
+    }
+  }
+  setInfo(lines);
+}
+
+/* ================= timing view ================= */
+function renderTiming() {
+  const svg = $("tim-svg");
+  svg.innerHTML = "";
+  svgEl("defs", {}, svg).innerHTML =
+    '<marker id="arrow-t" markerWidth="9" markerHeight="9" refX="8" refY="4.5"' +
+    ' orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#e0746c"/></marker>';
+  const clocks = Object.entries(TIMING.clocks || {});
+  svgEl("text", {x: 18, y: 26}, svg).textContent =
+    "achieved Fmax: " + (clocks.map(([n, v]) => `${v} MHz`).join(", ") || "n/a");
+  if (!TIMING.paths.length) {
+    svgEl("text", {x: 18, y: 56, fill:"#e0746c"}, svg)
+      .textContent = "no critical paths embedded — regenerate with --report";
+    return;
+  }
+  let top = 56;
+  let widest = 0;
+  TIMING.paths.forEach((p, pi) => {
+    svgEl("text", {x: 18, y: top}, svg)
+      .textContent = `path ${pi+1}: total ${p.total_ps} ps — from ${p.start}`;
+    top += 24;
+    const items = [];
+    for (const step of p.steps) {
+      if ("net" in step) {
+        if (items.length && items[items.length-1].kind === "wire") {
+          items[items.length-1].ps += step.delay_ps;
+        } else {
+          items.push({kind:"wire", ps:step.delay_ps});
+        }
+      } else if (items.length && items[items.length-1].kind === "cell"
+                 && items[items.length-1].cell === step.cell) {
+        items[items.length-1].ps += step.delay_ps;
+      } else {
+        items.push({kind:"cell", cell:step.cell, ps:step.delay_ps});
+      }
+    }
+    while (items.length && items[0].kind === "wire") items.shift();
+    while (items.length && items[items.length-1].kind === "wire") items.pop();
+
+    const BOXW = 168, BOXH = 50, WIREW = 116;
+    let x = 24;
+    const cy = top + BOXH/2 + 4;
+    items.forEach(item => {
+      if (item.kind === "cell") {
+        const g = svgEl("g", {class:"cell"}, svg);
+        svgEl("rect", {x, y: top + 4, width: BOXW, height: BOXH}, g);
+        const short = item.cell.length > 21 ? item.cell.slice(0,20)+"…" : item.cell;
+        svgEl("text", {x: x+9, y: top+20}, g).textContent = short;
+        svgEl("text", {x: x+9, y: top+38, fill:"#8b93a1"}, g)
+          .textContent = `${item.ps} ps`;
+        x += BOXW;
+      } else {
+        const y0 = cy;
+        svgEl("path", {d:`M ${x} ${y0} L ${x+WIREW-14} ${y0}`,
+                       stroke:"#e0746c", "stroke-width":3,
+                       "marker-end":"url(#arrow-t)"}, svg);
+        svgEl("text", {x: x+4, y: y0-9, fill:"#e0746c"}, svg)
+          .textContent = `${item.ps} ps`;
+        x += WIREW;
+      }
+    });
+    widest = Math.max(widest, x + 60);
+    top += BOXH + 52;
+  });
+  svg.setAttribute("width", widest + 40);
+}
+
+/* ================= tabs ================= */
+function setTab(name) {
+  for (const tab of document.querySelectorAll("header .tab"))
+    tab.classList.toggle("active", tab.dataset.tab === name);
+  $("pane-schematic").classList.toggle("hidden", name !== "schematic");
+  $("pane-timing").classList.toggle("hidden", name !== "timing");
+  if (name === "timing") renderTiming();
+  if (name === "schematic") invalidateSchematic();
+}
+for (const tab of document.querySelectorAll("header .tab"))
+  tab.addEventListener("click", () => setTab(tab.dataset.tab));
+window.addEventListener("error", event => {
+  const bar = document.createElement("div");
+  bar.style.cssText =
+    "position:fixed;bottom:0;left:0;right:0;background:#5a1e1e;color:#ffd9d9;" +
+    "padding:6px 12px;font:12px monospace;z-index:99";
+  bar.textContent = "viewer error: " + event.message + " @ line " + event.lineno;
+  document.body.appendChild(bar);
+});
+
+/* ================= boot ================= */
+buildTree($("tree"), TREE, []);
+populateGroups();
+showDefaultInfo();
+setTab("schematic");
+</script>
+</body>
+</html>
