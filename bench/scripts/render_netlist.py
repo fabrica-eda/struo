@@ -308,7 +308,12 @@ HTML_TEMPLATE = r"""<!doctype html>
  #body { flex:1; display:flex; min-height:0; }
  #tree { width:290px; overflow:auto; border-right:1px solid var(--line);
          padding:6px; }
- #view { flex:1; display:flex; flex-direction:column; min-width:0; }
+ #view { flex:1; display:flex; flex-direction:column; min-width:0;
+         min-height:0; }
+ #tab-timing, #tab-schematic, #tab-modules {
+   display:flex; flex-direction:column; height:100%; min-height:0;
+ }
+ #canvaswrap { flex:1; overflow:auto; }
  #toolbar { padding:6px 10px; border-bottom:1px solid var(--line);
             display:flex; gap:10px; align-items:center; }
  #toolbar input { background:#0e1013; color:var(--fg); border:1px solid var(--line);
@@ -496,6 +501,7 @@ function renderTiming() {
     top += rowH + 34;
   });
   svg.setAttribute("width", widest + 60);
+  svg.setAttribute("height", top + 40);
   svgEl("defs", {}, svg).innerHTML =
     '<marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4"' +
     ' orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#e0746c"/></marker>';
