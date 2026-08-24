@@ -750,7 +750,12 @@ function drawIoColumns(layout, parent) {
       txt.addEventListener("click", ev => {
         ev.stopPropagation();
         hl = !hl;
-        setHighlight(hl);
+        for (const we of wireEls) {
+          we.setAttribute("stroke", hl ? "#7ab3ff" : "#4a5058");
+          we.setAttribute("stroke-width", hl ? 2.6 : 0.8);
+        }
+        txt.setAttribute("fill", hl ? "#7ab3ff" : "#8b93a1");
+        txt.setAttribute("font-weight", hl ? "bold" : "normal");
       });
     });
     void side;
