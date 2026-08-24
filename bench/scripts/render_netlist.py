@@ -345,17 +345,25 @@ HTML_TEMPLATE = r"""<!doctype html>
 <div id="body">
   <div id="tree"></div>
   <div id="view">
-    <div id="toolbar">
-      <span class="counts legend">
-        <span><i class="sw" style="background:var(--route)"></i>route</span>
-        <span><i class="sw" style="background:var(--logic)"></i>logic</span>
-        <span><i class="sw" style="background:var(--ff)"></i>clk-q / FF</span>
-      </span>
-      <input id="cellsearch" placeholder="filter cells (substring)…"
-             style="margin-left:auto; min-width:220px">
-      <span class="counts" id="sch-count"></span>
+    <div id="tab-timing" class="hidden">
+      <div id="canvaswrap"><svg id="svg-t" width="2400" height="1400"></svg></div>
     </div>
-    <div id="canvaswrap"><svg id="svg" width="2400" height="1400"></svg></div>
+    <div id="tab-schematic">
+      <div id="toolbar">
+        <span class="counts legend">
+          <span><i class="sw" style="background:var(--route)"></i>route</span>
+          <span><i class="sw" style="background:var(--logic)"></i>logic</span>
+          <span><i class="sw" style="background:var(--ff)"></i>clk-q / FF</span>
+        </span>
+        <input id="cellsearch" placeholder="filter cells (substring)…"
+               style="margin-left:auto; min-width:220px">
+        <span class="counts" id="sch-count"></span>
+      </div>
+      <div id="canvaswrap"><svg id="svg" width="2400" height="1400"></svg></div>
+    </div>
+    <div id="tab-modules" class="hidden">
+      <div style="padding:10px"><svg id="svg-m" width="1600" height="1200"></svg></div>
+    </div>
   </div>
   <div id="info"></div>
 </div>
@@ -411,7 +419,7 @@ function hopClass(step) {
   return "logic";
 }
 function renderTiming() {
-  const svg = $("svg");
+  const svg = $("svg-t");
   svg.innerHTML = "";
   const t = TIMING;
   const clocks = Object.entries(t.clocks || {});
@@ -675,7 +683,7 @@ function inspectCellInfo(name) {
 
 /* ================= MODULES: aggregate graph ================= */
 function renderModules() {
-  const svg = $("svg");
+  const svg = $("svg-m");
   svg.innerHTML = "";
   let y = 30;
   const walk = (node, depth) => {
@@ -690,6 +698,8 @@ function renderModules() {
     for (const c of node.children || []) walk(c, depth + 1);
   };
   walk(ROOT, 0);
+  svg.setAttribute("height", y + 40);
+  svg.setAttribute("width", 1600);
 }
 
 /* ================= count helper ================= */
@@ -736,13 +746,22 @@ function renderInfoHead(node, path) {
 function setTab(name) {
   for (const tab of document.querySelectorAll("header .tab"))
     tab.classList.toggle("active", tab.dataset.tab === name);
-  $("tab-timing").classList.toggle("hidden", name !== "timing");
-  $("tab-schematic").classList.toggle("hidden", name !== "schematic");
-  $("tab-modules").classList.toggle("hidden", name !== "modules");
+  for (const pane of ["timing", "schematic", "modules"]) {
+    const el = $("tab-" + pane);
+    if (el) el.classList.toggle("hidden", pane !== name);
+  }
   if (name === "timing") renderTiming();
   if (name === "schematic") renderSchematic();
   if (name === "modules") renderModules();
 }
+window.addEventListener("error", event => {
+  const bar = document.createElement("div");
+  bar.style.cssText =
+    "position:fixed;bottom:0;left:0;right:0;background:#5a1e1e;color:#ffd9d9;" +
+    "padding:6px 12px;font:12px monospace;z-index:99";
+  bar.textContent = "viewer error: " + event.message + " @ line " + event.lineno;
+  document.body.appendChild(bar);
+});
 for (const tab of document.querySelectorAll("header .tab"))
   tab.addEventListener("click", () => setTab(tab.dataset.tab));
 $("cellsearch").addEventListener("input", e => {
