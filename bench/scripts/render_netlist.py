@@ -648,6 +648,33 @@ function simulate(layout, ticks) {
   }
 }
 
+function packGrid(nodes) {
+  // All boxes share one size, so snapping to a coarse grid guarantees
+  // non-overlap deterministically: rows are scanned top-to-bottom, and
+  // each row lays its cells out left-to-right around their mean position.
+  const W = 152, H = 56;
+  const sorted = nodes.slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  let rows = [];
+  let current = null;
+  for (const n of sorted) {
+    if (!current || n.y - current.startY > H * 0.6) {
+      current = {startY: n.y, items: []};
+      rows.push(current);
+    }
+    current.items.push(n);
+  }
+  rows.forEach((row, ri) => {
+    row.items.sort((a, b) => a.x - b.x);
+    const meanX = row.items.reduce((sum, n) => sum + n.x, 0) / row.items.length;
+    const startX = meanX - ((row.items.length - 1) * W) / 2;
+    row.items.forEach((n, ci) => {
+      n.x = startX + ci * W;
+      n.y = 60 + ri * H;
+    });
+  });
+}
+
+
 function renderSchematic() {
   const svg = $("svg");
   svg.innerHTML = "";
@@ -672,6 +699,7 @@ function renderSchematic() {
 
   const layout = buildLayout(shown);
   simulate(layout, 170);
+  packGrid(layout.nodes);
 
   const world = svgEl("g", {id: "world"}, svg);
   $("svg").classList.add("fill");
