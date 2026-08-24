@@ -44,6 +44,14 @@ picoseconds plus the top delay contributors, so an agent reading
 `results.json` gets both the numbers and the reason behind them without
 parsing nextpnr reports.
 
+`bench/scripts/render_netlist.py <design.json>` renders a mapped netlist
+while preserving module structure: flattened cell names carry the original
+hierarchy, so logic elements group under their owning module and every wire
+attaches to the deepest common ancestor of its endpoints, with boundary
+crossings labeled. `--format json` emits the same tree for agents; note that
+mapper-created cells without hierarchical names (`lut1724`, `ccu_arith0_5`)
+report at the top level.
+
 Results land in `build/qor/results.json` plus per-design nextpnr reports.
 
 ## Designs
