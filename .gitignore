@@ -8,3 +8,4 @@
 bench/**/.build/
 bench/**/build/
 bench/designs/*/Veryl.lock
+__pycache__/
