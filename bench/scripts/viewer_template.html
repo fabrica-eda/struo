@@ -461,11 +461,17 @@ function fitToContent() {
 
 function refreshSelection() {
   for (const w of wireRegistry) {
-    const hot = schSelection != null &&
-      (w.driverCell === schSelection ||
-       (w.consumerCells && w.consumerCells.includes(schSelection)));
-    w.pathEl.setAttribute("stroke", hot ? "#7ab3ff" : "#5c6675");
-    w.pathEl.setAttribute("stroke-width", hot ? 2.4 : 1.3);
+    if (schSelection == null) {
+      w.pathEl.setAttribute("stroke", "#5c6675");
+      w.pathEl.setAttribute("stroke-width", 1.3);
+      continue;
+    }
+    const isOut = w.driverCell === schSelection;
+    const isIn = (w.consumerCells || []).includes(schSelection);
+    // Output wires from the selected cell: orange. Input wires to it: green.
+    w.pathEl.setAttribute("stroke", isOut ? "#e0915f" : isIn ? "#69d0a8" : "#5c6675");
+    w.pathEl.setAttribute("stroke-width", (isOut || isIn) ? 2.4 : 1.3);
+    w.pathEl.setAttribute("stroke-opacity", (isOut || isIn) ? 1 : 0.35);
   }
   document.querySelectorAll("#sch-svg g.cell").forEach(g => {
     g.classList.toggle("sel", g.dataset.name === schSelection);
