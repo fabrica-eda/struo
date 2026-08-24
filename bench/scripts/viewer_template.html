@@ -327,6 +327,7 @@ function placeColumns(layout) {
   }
   const cols = [...columns.keys()].sort((a, b) => a - b);
   const ROWH = 58;
+  const COLW = 240;
 
   for (const cidx of cols) {
     columns.get(cidx).sort((a, b) =>
@@ -356,6 +357,24 @@ function placeColumns(layout) {
       col.sort((a, b) => a.y - b.y);
       col.forEach((n, i) => { n.y = 80 + i * ROWH; });
     }
+  }
+
+  // Wrap tall columns into multiple sub-columns side-by-side so no
+  // single column exceeds maxSub entries. Sub-columns progress
+  // left-to-right alongside their parent layer.
+  const maxSub = Math.max(12, Math.ceil(Math.sqrt(layout.nodes.length * 3)));
+  let colX = 120;
+  for (const cidx of cols) {
+    const col = columns.get(cidx);
+    const numSub = Math.max(1, Math.ceil(col.length / maxSub));
+    for (let sc = 0; sc < numSub; sc++) {
+      const subX = colX + sc * COLW;
+      col.slice(sc * maxSub, (sc + 1) * maxSub).forEach((n, i) => {
+        n.x = subX;
+        n.y = 80 + i * ROWH;
+      });
+    }
+    colX += numSub * COLW;
   }
 
   let maxRows = 1;
