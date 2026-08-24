@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -225,6 +226,63 @@ def run_nextpnr(
         "ff": ff,
         "fmax_mhz": min(fmax_clocks),
         "timing_pass": passed,
+        "critical_path": summarize_critical_path(data),
+    }
+
+
+def summarize_critical_path(report_data: dict) -> dict | None:
+    """Aggregates the slowest register-to-register path into route versus
+    logic time plus the largest individual contributors."""
+
+    def path_total(path: dict) -> float:
+        return sum(step.get("delay", 0) for step in path.get("path", []))
+
+    raw_paths = report_data.get("critical_paths")
+    if isinstance(raw_paths, dict):
+        raw_paths = list(raw_paths.values())
+    paths = [p for p in (raw_paths or []) if isinstance(p, dict)]
+    def is_register_to_register(path: dict) -> bool:
+        steps = path.get("path", [])
+        if not steps:
+            return False
+        endpoints = [steps[0].get("from", {}), steps[-1].get("to", {})]
+        return all(
+            isinstance(endpoint, dict)
+            and not str(endpoint.get("cell", "")).endswith("$tr_io")
+            for endpoint in endpoints
+        )
+
+    interior = [
+        p
+        for p in paths
+        if isinstance(p.get("from"), dict)
+        and p["from"].get("cell", "").startswith(("ff_", "retime_"))
+    ]
+    candidates = [p for p in interior if is_register_to_register(p)] or interior or paths
+    if not candidates:
+        return None
+    worst = max(candidates, key=path_total)
+    steps = worst.get("path", [])
+    route_ps = round(1000 * sum(step.get("delay", 0) for step in steps if "net" in step))
+    logic_ps = round(1000 * sum(step.get("delay", 0) for step in steps if "net" not in step))
+    contributors = sorted(
+        (
+            {
+                "cell": step.get("from", {}).get("cell", "?"),
+                "port": step.get("from", {}).get("port", ""),
+                "ps": round(1000 * step.get("delay", 0)),
+            }
+            for step in steps
+            if step.get("delay")
+        ),
+        key=lambda item: item["ps"],
+        reverse=True,
+    )
+    return {
+        "total_ps": round(1000 * path_total(worst)),
+        "route_ps": route_ps,
+        "logic_ps": logic_ps,
+        "top_contributors": contributors[:6],
     }
 
 
@@ -238,7 +296,12 @@ def geomean(values) -> float:
 
 
 def collect_flow_metrics(runs: list[dict]) -> dict:
-    return {
+    worst_path = min(
+        (r.get("critical_path") for r in runs),
+        key=lambda cp: (cp is not None, -(cp["total_ps"] if cp else 0)),
+        default=None,
+    )
+    metrics = {
         "lut": runs[0]["lut"],
         "ccu2c": runs[0]["ccu2c"],
         "ff": runs[0]["ff"],
@@ -248,6 +311,9 @@ def collect_flow_metrics(runs: list[dict]) -> dict:
         "seeds_passed": sum(1 for r in runs if r["timing_pass"]),
         "seeds_total": len(runs),
     }
+    if worst_path is not None:
+        metrics["critical_path"] = worst_path
+    return metrics
 
 
 def render_summary(results: dict) -> str:
@@ -300,6 +366,21 @@ def render_summary(results: dict) -> str:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "compare":
+        rest = sys.argv[2:]
+        parser = argparse.ArgumentParser(prog="qor.py compare")
+        parser.add_argument("--against", type=int, default=1, help="how many runs back to compare against")
+        parser.add_argument("--comb-percent", type=float, default=DEFAULT_COMB_REGRESSION_PERCENT)
+        parser.add_argument("--fmax-percent", type=float, default=DEFAULT_FMAX_REGRESSION_PERCENT)
+        parser.add_argument("--json", action="store_true", help="emit machine-readable run records")
+        compare_args = parser.parse_args(rest)
+        return run_compare(
+            compare_args.against,
+            compare_args.comb_percent,
+            compare_args.fmax_percent,
+            compare_args.json,
+        )
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seeds", default="1,2,3", help="comma-separated nextpnr seeds")
     parser.add_argument("--goal-mhz", type=int, default=300, help="nextpnr --freq value")
@@ -386,6 +467,109 @@ def main() -> int:
 
     print()
     print(render_summary(results))
+    append_history(results)
+    return 0
+
+
+def git_revision() -> str | None:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() or None if result.returncode == 0 else None
+
+
+def append_history(results: dict) -> Path:
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "revision": git_revision(),
+        "goal_mhz": results["goal_mhz"],
+        "seeds": results["seeds"],
+        "designs": [
+            {"name": d["name"], "struo": d.get("struo"), "baseline": d.get("baseline")}
+            for d in results["designs"]
+        ],
+    }
+    history = BUILD_ROOT / "history.jsonl"
+    history.parent.mkdir(parents=True, exist_ok=True)
+    with history.open("a") as handle:
+        handle.write(json.dumps(record) + "\n")
+    return history
+
+
+FLOWS = ("struo", "baseline")
+DEFAULT_COMB_REGRESSION_PERCENT = 15.0
+DEFAULT_FMAX_REGRESSION_PERCENT = 8.0
+
+
+def compare_runs(current: dict, previous: dict, comb_percent: float, fmax_percent: float) -> tuple[str, list[str]]:
+    lines = ["| design | flow | COMB delta | FF delta | Fmax min delta | flags |"]
+    lines.append("|---|---|---|---|---|---|")
+    flags: list[str] = []
+    previous_by_name = {d["name"]: d for d in previous["designs"]}
+    for entry in current["designs"]:
+        prior = previous_by_name.get(entry["name"])
+        if not prior:
+            continue
+        for flow in FLOWS:
+            now_metrics = entry.get(flow)
+            was_metrics = prior.get(flow)
+            if not (now_metrics and was_metrics):
+                continue
+            comb_delta = percent_delta(now_metrics["lut"], was_metrics["lut"])
+            ff_delta = percent_delta(now_metrics["ff"], was_metrics["ff"])
+            fmax_delta = -percent_delta(now_metrics["fmax_min_mhz"], was_metrics["fmax_min_mhz"])
+            row_flags = []
+            if comb_delta > comb_percent:
+                row_flags.append(f"COMB +{comb_delta:.1f}%")
+            if ff_delta > comb_percent:
+                row_flags.append(f"FF +{ff_delta:.1f}%")
+            if fmax_delta > fmax_percent:
+                row_flags.append(f"Fmax -{fmax_delta:.1f}%")
+            marker = ", ".join(row_flags) or "-"
+            if row_flags:
+                flags.append(f"{entry['name']}/{flow}: {marker}")
+            lines.append(
+                f"| {entry['name']} | {flow} "
+                f"| {comb_delta:+.1f}% | {ff_delta:+.1f}% | {-fmax_delta:+.1f}% | {marker} |"
+            )
+    lines.append("")
+    lines.append(f"flags ({len(flags)}):" if flags else "flags: none")
+    for flag in flags:
+        lines.append(f"- {flag}")
+    return "\n".join(lines), flags
+
+
+def percent_delta(now: float, then: float) -> float:
+    if then == 0:
+        return 0.0
+    return (now - then) / abs(then) * 100.0
+
+
+def load_history_entry(offset: int) -> dict | None:
+    history = BUILD_ROOT / "history.jsonl"
+    if not history.exists():
+        return None
+    lines = [line for line in history.read_text().splitlines() if line.strip()]
+    if len(lines) < offset + 1:
+        return None
+    return json.loads(lines[-1 - offset])
+
+
+def run_compare(against: int, comb_percent: float, fmax_percent: float, as_json: bool) -> int:
+    current = load_history_entry(0)
+    previous = load_history_entry(against)
+    if current is None or previous is None:
+        print("compare needs at least two recorded runs in build/qor/history.jsonl")
+        return 2
+    text, _ = compare_runs(current, previous, comb_percent, fmax_percent)
+    if as_json:
+        print(json.dumps({"current": current, "previous": previous}))
+    else:
+        print(text)
     return 0
 
 
