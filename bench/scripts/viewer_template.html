@@ -41,6 +41,9 @@
  g.cell.CCU2C rect { stroke:#b58fd0; }
  g.cell.FF rect { stroke:var(--ff); }
  g.cell.sel rect { stroke:var(--acc); stroke-width:2.5; }
+ g.cell.hit rect { stroke:#7ab3ff; stroke-width:2.5; fill:#1d2c42; }
+ #sch-svg.dim-nonhit g.cell:not(.hit) { opacity:0.16; }
+ #sch-svg.dim-nonhit path.wire { opacity:0.08; }
  g.cell { cursor:pointer; }
 </style>
 </head>
@@ -152,6 +155,7 @@ let selectedNode = null;
 let layoutCache = null;
 let layoutKey = "";
 let wireRegistry = [];
+const cellGByName = new Map();
 let worldEl = null;
 let view = {k: 1, x: 0, y: 0};
 
@@ -457,8 +461,10 @@ function renderSchematic() {
     }
   }
 
+  cellGByName.clear();
   for (const node of layout.nodes) {
     const g = svgEl("g", {class: `cell ${node.kind}`}, worldEl);
+    cellGByName.set(node.name, g);
     g.dataset.name = node.name;
     svgEl("rect", {x: -66, y: -20, width: 132, height: 40, rx: 8}, g);
     const short = node.name.length > 21 ? node.name.slice(0, 20) + "…" : node.name;
@@ -475,7 +481,7 @@ function renderSchematic() {
   }
 
   // IO pad columns: inputs left (green), outputs right (orange)
-  function drawPadColumn(list, side) {
+  function drawPadColumn(list, side, cellGByName) {
     const isInput = side === "in";
     for (const pad of list) {
       const h = Math.max(26, Math.min(120, pad.nodes.length * 14));
@@ -493,22 +499,52 @@ function renderSchematic() {
       svgEl("text", {x: pad.x, y: pad.y + 18, "text-anchor": "middle",
                      fill:"#8b93a1"}, g)
         .textContent = `${pad.nodes.length} net${pad.nodes.length===1?"":"s"}`;
+
+      // Low-fanout nets draw individual wires; a high-fanout pad (clk,
+      // reset…) draws a stub instead — clicking it highlights every load
+      // so the fanout is inspectable without painting five hundred lines.
+      const FANOUT_WIRE_LIMIT = 10;
+      const stubX = isInput ? pad.x + 62 : pad.x - 62;
+      let highlightOn = false;
+      const hitCells = [];
       for (const n of pad.nodes) {
-        const x2 = isInput ? pad.x + 60 : n.x - 64;
-        const x1 = isInput ? n.x - 64 : pad.x - 60;
+        const cellG = cellGByName.get(n.name);
+        if (!cellG) continue;
+        hitCells.push(cellG);
+      }
+      function applyHighlight() {
+        for (const cg of hitCells) cg.classList.toggle("hit", highlightOn);
+        $("sch-svg").classList.toggle("dim-nonhit", highlightOn);
+      }
+      if (pad.nodes.length > 0 && pad.nodes.length <= FANOUT_WIRE_LIMIT) {
+        for (const n of pad.nodes) {
+          const x2 = isInput ? pad.x + 60 : n.x - 66;
+          const x1 = isInput ? n.x - 66 : pad.x + 60;
+          svgEl("path", {
+            d: `M ${isInput ? x1 : x1} ${n.y} L ${isInput ? x2 : x2} ${n.y}`,
+            stroke: isInput ? "#69d0a8" : "#e0746c",
+            "stroke-width": 1.2,
+            "stroke-opacity": 0.7,
+            fill: "none",
+          }, worldEl);
+        }
+      } else if (pad.nodes.length) {
         svgEl("path", {
-          d: `M ${isInput ? x1 : x1} ${n.y} L ${isInput ? x2 : x2} ${n.y}`,
+          d: `M ${pad.x} ${pad.y + h/2 - 6} L ${stubX} ${pad.y + h/2 - 6}`,
           stroke: isInput ? "#69d0a8" : "#e0746c",
-          "stroke-width": 1.2,
-          "stroke-opacity": 0.7,
-          fill: "none",
+          "stroke-width": 3,
         }, worldEl);
-        void x1; void x2;
+        g.style.cursor = "pointer";
+        g.addEventListener("click", ev => {
+          ev.stopPropagation();
+          highlightOn = !highlightOn;
+          applyHighlight();
+        });
       }
     }
   }
-  drawPadColumn(inList, "in");
-  drawPadColumn(outList, "out");
+  drawPadColumn(inList, "in", cellGByName);
+  drawPadColumn(outList, "out", cellGByName);
 
   applyView();
   fitToContent();
