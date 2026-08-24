@@ -5,8 +5,8 @@
 <title>Struo netlist viewer</title>
 <style>
  :root { --bg:#14161a; --panel:#1d2026; --fg:#d8dbe2; --dim:#94a0b4;
-         --acc:#7ab3ff; --route:#e0746c; --logic:#69d0a8; --ff:#d9b06a;
-         --line:#3a404b; }
+         --acc:#7ab3ff; --route:#e0746c; --in:#69d0a8; --out:#e0915f;
+         --ff:#d9b06a; --line:#3a404b; }
  * { box-sizing:border-box; }
  body { margin:0; background:var(--bg); color:var(--fg);
         font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; height:100vh;
@@ -37,14 +37,15 @@
  summary:hover { background:#262b33; }
  .counts { color:var(--dim); }
  svg text { fill:var(--fg); font:11px ui-monospace,monospace; }
- g.cell rect { fill:#20242b; stroke:#4a5260; rx:8; }
+ g.cell rect { fill:#22262b; stroke:#4a5260; rx:8; }
  g.cell.CCU2C rect { stroke:#b58fd0; }
  g.cell.FF rect { stroke:var(--ff); }
  g.cell.sel rect { stroke:var(--acc); stroke-width:2.5; }
- g.cell.hit rect { stroke:#7ab3ff; stroke-width:2.5; fill:#1d2c42; }
- #sch-svg.dim-nonhit g.cell:not(.hit) { opacity:0.16; }
- #sch-svg.dim-nonhit path.wire { opacity:0.08; }
  g.cell { cursor:pointer; }
+ .pad-in rect { fill:#16301f; stroke:var(--in); stroke-width:1.4; }
+ .pad-out rect { fill:#33241a; stroke:var(--out); stroke-width:1.4; }
+ .pad-in text { fill:var(--in); }
+ .pad-out text { fill:var(--out); }
 </style>
 </head>
 <body>
@@ -82,6 +83,7 @@ const GROUPS = DATA.groups || {};
 const UNASSIGNED = DATA.unassigned || [];
 const TIMING = DATA.timing || {paths: [], clocks: {}};
 const NS = "http://www.w3.org/2000/svg";
+const SCHEM_CAP = 420;
 const $ = id => document.getElementById(id);
 
 function svgEl(tag, attrs, parent) {
@@ -103,15 +105,32 @@ function countText(node) {
   return `LE ${c.LE} | LUT ${c.LUT4} CCU ${c.CCU2C} FF ${c.FF}`;
 }
 
-/* ================= hierarchy ================= */
+/* ================= hierarchy tree ================= */
 const TREE = DATA.tree;
-function findNode(path) {
-  let cur = TREE;
-  for (const part of path) {
-    cur = (cur.children || []).find(c => c.module === part);
-    if (!cur) return null;
-  }
-  return cur;
+let selectedPath = [];
+let selectedNode = null;
+
+function buildTree(parentEl, node, path) {
+  const hasKids = (node.children || []).length > 0;
+  const row = document.createElement(hasKids ? "details" : "div");
+  row.style.marginLeft = hasKids ? "0" : "12px";
+  const head = document.createElement(hasKids ? "summary" : "div");
+  div(head, null, node.module);
+  div(head, "counts", ` ${countText(node)} | wires ${node.internal_wires}`);
+  head.addEventListener("click", () => {
+    selectedPath = path.slice();
+    selectedNode = node;
+    const label = path.join("/");
+    $("groupsel").value = GROUPS[label] ? label : "";
+    schSelection = null;
+    invalidateSchematic();
+  });
+  row.appendChild(head);
+  const inner = document.createElement("div");
+  row.appendChild(inner);
+  for (const child of node.children || [])
+    buildTree(inner, child, [...path, child.module]);
+  parentEl.appendChild(row);
 }
 
 /* ================= connectivity index ================= */
@@ -132,6 +151,15 @@ function ensureCellIndex() {
   return cellIndexCache;
 }
 
+/* ================= schematic state ================= */
+let schSelection = null;
+let drawnKey = null;
+let layoutCache = null;
+let wireRegistry = [];
+let worldEl = null;
+let view = {k: 1, x: 40, y: 40};
+let schFilter = "";
+
 function schematicCellSet(groupLabel, filterText) {
   let names;
   if (groupLabel === "@unassigned") {
@@ -145,19 +173,13 @@ function schematicCellSet(groupLabel, filterText) {
   if (filterText) names = names.filter(n => n.includes(filterText));
   return names;
 }
-
-/* ================= state ================= */
-let schSelection = null;
-let schModuleLabel = "";
-let schFilter = "";
-let selectedPath = [];
-let selectedNode = null;
-let layoutCache = null;
-let layoutKey = "";
-let wireRegistry = [];
-const cellGByName = new Map();
-let worldEl = null;
-let view = {k: 1, x: 0, y: 0};
+function currentGroupKey() {
+  return `${$("groupsel").value}|${schFilter}`;
+}
+function invalidateSchematic() {
+  drawnKey = null;
+  renderSchematic();
+}
 
 /* ================= info pane ================= */
 function setInfo(lines) {
@@ -165,34 +187,27 @@ function setInfo(lines) {
   info.textContent = "";
   for (const [cls, text] of lines) div(info, cls, text);
 }
-function showDefaultInfo() {
-  setInfo([["", "click a module group or cell"]]);
-}
-
-/* ================= module tree ================= */
-function buildTree(parentEl, node, path) {
-  const hasKids = (node.children || []).length > 0;
-  const row = document.createElement(hasKids ? "details" : "div");
-  row.style.marginLeft = hasKids ? "0" : "12px";
-  const head = document.createElement(hasKids ? "summary" : "div");
-  div(head, null, node.module);
-  div(head, "counts", ` ${countText(node)} | wires ${node.internal_wires}`);
-  head.addEventListener("click", () => {
-    selectedPath = path.slice();
-    selectedNode = node;
-    const label = path.join("/");
-    if (GROUPS[label]) $("groupsel").value = label;
-    else $("groupsel").value = "";
-    schSelection = null;
-    setTab("schematic");
-    invalidateSchematic();
-  });
-  row.appendChild(head);
-  const inner = document.createElement("div");
-  row.appendChild(inner);
-  for (const child of node.children || [])
-    buildTree(inner, child, [...path, child.module]);
-  parentEl.appendChild(row);
+function showCellInfo(name) {
+  const lines = [["", `cell: ${name}`]];
+  const entry = ensureCellIndex()[name];
+  if (!entry) { setInfo(lines); return; }
+  const seen = new Set();
+  for (const bit of entry.pins) {
+    const w = WIRES[bit];
+    if (!w) continue;
+    const label = w.name || `w${bit}`;
+    if (w.driver && w.driver.cell !== name) {
+      lines.push(["counts", `IN  ${label} <- ${w.driver.cell} (${w.driver.port})`]);
+    }
+    for (const c of w.consumers || []) {
+      const key = `OUT ${label} -> ${c.cell}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        lines.push(["counts", `OUT ${label} -> ${c.cell} (${c.port})`]);
+      }
+    }
+  }
+  setInfo(lines);
 }
 
 /* ================= groups selector ================= */
@@ -214,7 +229,6 @@ function populateGroups() {
     opt.textContent = `(shared / unattributed) (${UNASSIGNED.length})`;
     sel.appendChild(opt);
   }
-  sel.value = sel.options.length ? sel.options[0].value : "";
   sel.addEventListener("change", () => {
     schSelection = null;
     invalidateSchematic();
@@ -225,23 +239,14 @@ function populateGroups() {
   });
 }
 
-/* ================= layout engine ================= */
+/* ================= layered left-to-right layout ================= */
 function hashSeed(text) {
   let h = 2166136261;
   for (let i = 0; i < text.length; i++) {
     h ^= text.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
-  return (h >>> 0) / 4294967296;
-}
-function mulberry(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+  return h >>> 0;
 }
 function cellKind(name) {
   if (/ccu|arith|compare/i.test(name)) return "CCU2C";
@@ -250,191 +255,131 @@ function cellKind(name) {
 }
 function buildLayout(names) {
   const inSet = new Set(names);
-  const nodes = names.map((name, i) => ({
+  const nodes = names.map(name => ({
     name,
     kind: cellKind(name),
     x: 0, y: 0,
   }));
   const byName = new Map(nodes.map(n => [n.name, n]));
-  const links = [];
+  const outMap = new Map();   // srcName -> [dstNode]
+  const indeg = new Map();    // dstName -> incoming wire count
   for (const bit of Object.keys(WIRES)) {
     const w = WIRES[bit];
     if (!w.driver || !inSet.has(w.driver.cell)) continue;
     const src = byName.get(w.driver.cell);
+    if (!src) continue;
     for (const c of w.consumers || []) {
       const dst = byName.get(c.cell);
       if (!dst || dst === src) continue;
-      links.push({src, dst});
+      const list = outMap.get(src.name) || [];
+      list.push(dst);
+      outMap.set(src.name, list);
+      indeg.set(dst.name, (indeg.get(dst.name) || 0) + 1);
     }
   }
-  const rnd = mulberry(1234);
-  nodes.forEach((n, i) => {
-    const a = i * 2.399963;
-    const r = 30 + 11 * Math.sqrt(i);
-    n.x = 600 + r * Math.cos(a) + rnd() * 8;
-    n.y = 400 + r * Math.sin(a) + rnd() * 8;
-    void rnd;
-  });
-  return {nodes, links, byName};
+
+  // Longest-path layering over the acyclic visible subgraph (Kahn order).
+  // Cells that never drain (feed no other cell) keep depth 0.
+  const queue = nodes.filter(n => !indeg.get(n.name)).map(n => n.name);
+  const depth = new Map(queue.map(n => [n, 0]));
+  for (let head = 0; head < queue.length; head++) {
+    const name = queue[head];
+    const d = depth.get(name);
+    for (const dst of outMap.get(name) || []) {
+      indeg.set(dst.name, indeg.get(dst.name) - 1);
+      if (!depth.has(dst.name) || depth.get(dst.name) < d + 1)
+        depth.set(dst.name, d + 1);
+      if (indeg.get(dst.name) === 0) queue.push(dst.name);
+    }
+  }
+  // Anything left over sits in a cycle or feeds nothing: give it column 0.
+  for (const n of nodes)
+    if (!depth.has(n.name)) depth.set(n.name, 0);
+  for (const n of nodes) n.col = depth.get(n.name);
+
+  return {nodes, byName, outMap};
 }
-function simulate(layout, ticks) {
-  const nodes = layout.nodes;
-  const n = nodes.length;
-  for (let iter = 0; iter < ticks; iter++) {
-    const alpha = Math.pow(1 - iter / ticks, 1.4);
-    for (let i = 0; i < n; i++) {
-      const a = nodes[i];
-      for (let j = i + 1; j < n; j++) {
-        const b = nodes[j];
-        let dx = b.x - a.x, dy = b.y - a.y;
-        let d2 = dx*dx + dy*dy;
-        if (d2 < 1) { dx = 1; dy = 1; d2 = 2; }
-        if (d2 > 260000) continue;
-        const f = (90000 * alpha) / d2;
-        const dd = Math.sqrt(d2);
-        a.vx = (a.vx||0) - (dx/dd)*f;
-        a.vy = (a.vy||0) - (dy/dd)*f;
-        b.vx = (b.vx||0) + (dx/dd)*f;
-        b.vy = (b.vy||0) + (dy/dd)*f;
+
+function placeColumns(layout) {
+  // Group nodes per layer, then two barycenter sweeps pull each cell toward
+  // the mean y of its wired neighbors in the previous column so wires stay
+  // short and crossings stay low.
+  const columns = new Map();
+  for (const n of layout.nodes) {
+    if (!columns.has(n.col)) columns.set(n.col, []);
+    columns.get(n.col).push(n);
+  }
+  const cols = [...columns.keys()].sort((a, b) => a - b);
+  const ROWH = 58;
+
+  for (const cidx of cols) {
+    columns.get(cidx).sort((a, b) =>
+      hashSeed(a.name) - hashSeed(b.name));
+    columns.get(cidx).forEach((n, i) => { n.y = 80 + i * ROWH; });
+  }
+
+  const predsOf = name => {
+    const result = [];
+    for (const [srcName, dsts] of layout.outMap)
+      if (dsts.includes(name))
+        result.push(layout.byName.get(srcName));
+    return result.filter(Boolean);
+  };
+
+  for (let pass = 0; pass < 2; pass++) {
+    const order = pass % 2 === 0 ? cols : [...cols].reverse();
+    for (const cidx of order) {
+      const col = columns.get(cidx);
+      for (const n of col) {
+        const ys = predsOf(n.name)
+          .filter(p => p.col === cidx - 1)
+          .map(p => p.y);
+        if (ys.length)
+          n.y = ys.reduce((s, v) => s + v, 0) / ys.length;
       }
-    }
-    for (const l of layout.links) {
-      const dx = l.dst.x - l.src.x, dy = l.dst.y - l.src.y;
-      const dd = Math.sqrt(dx*dx + dy*dy) || 1;
-      const f = ((dd - 130) * 0.045) * alpha;
-      l.src.vx = (l.src.vx||0) + (dx/dd)*f*2;
-      l.src.vy = (l.src.vy||0) + (dy/dd)*f*2;
-      l.dst.vx = (l.dst.vx||0) - (dx/dd)*f*2;
-      l.dst.vy = (l.dst.vy||0) - (dy/dd)*f*2;
-    }
-    for (const node of nodes) {
-      node.vx = (node.vx||0) * 0.82 + (600 - node.x) * 0.0015 * alpha;
-      node.vy = (node.vy||0) * 0.82 + (400 - node.y) * 0.0015 * alpha;
-      node.x += Math.max(-24, Math.min(24, node.vx));
-      node.y += Math.max(-24, Math.min(24, node.vy));
-      node.x = Math.max(20, Math.min(1180, node.x));
-      node.y = Math.max(20, Math.min(780, node.y));
+      col.sort((a, b) => a.y - b.y);
+      col.forEach((n, i) => { n.y = 80 + i * ROWH; });
     }
   }
-}
-function packGrid(nodes) {
-  // Same-size boxes snap onto a coarse grid: rows are scanned top-to-bottom
-  // and each row lays its cells out left-to-right around their mean x.
-  const W = 152, H = 58;
-  const sorted = nodes.slice().sort((a, b) => a.y - b.y || a.x - b.x);
-  const rows = [];
-  let current = null;
-  for (const n of sorted) {
-    if (!current || n.y - current.startY > H * 0.6) {
-      current = {startY: n.y, items: []};
-      rows.push(current);
-    }
-    current.items.push(n);
-  }
-  rows.forEach((row, ri) => {
-    row.items.sort((a, b) => a.x - b.x);
-    const meanX = row.items.reduce((sum, n) => sum + n.x, 0) / row.items.length;
-    const startX = meanX - ((row.items.length - 1) * W) / 2;
-    row.items.forEach((n, ci) => {
-      n.x = startX + ci * W;
-      n.y = 60 + ri * H;
-    });
-  });
+
+  let maxRows = 1;
+  for (const [, col] of columns) maxRows = Math.max(maxRows, col.length);
+  return {cols, ROWH, maxRows};
 }
 
 /* ================= schematic drawing ================= */
-let drawnKey = null;
-
-function currentGroupKey() {
-  return `${$("groupsel").value}|${schFilter}`;
-}
-function invalidateSchematic() {
-  drawnKey = null;
-  renderSchematic();
-}
 
 function renderSchematic() {
-  const key = currentGroupKey();
-  const shown = schematicCellSet($("groupsel").value, schFilter);
+  const key = `${$("groupsel").value}|${schFilter}`;
+  const allNames = schematicCellSet($("groupsel").value, schFilter);
+  const shown = allNames.slice(0, SCHEM_CAP);
 
   const svg = $("sch-svg");
   svg.innerHTML = "";
 
+  const header = svgEl("text", {x: 16, y: 24}, svg);
+  header.textContent =
+    `schematic: ${$("groupsel").value || "(top direct)"} — ` +
+    `${shown.length}${allNames.length > SCHEM_CAP ? " of " + allNames.length : ""} cells`;
+  $("sch-count").textContent =
+    `${Math.min(shown.length, SCHEM_CAP)}/${allNames.length}`;
+
   if (!shown.length) {
-    svgEl("text", {x: 16, y: 30, fill:"#e0746c"}, svg)
+    svgEl("text", {x: 16, y: 56, fill:"#e0746c"}, svg)
       .textContent = "no cells match";
     return;
   }
 
   if (drawnKey !== key) {
     const layout = buildLayout(shown);
-    simulate(layout, layout.nodes.length > 450 ? 110 : 170);
-    packGrid(layout.nodes);
+    placeColumns(layout);
     layout.key = key;
     layoutCache = layout;
     drawnKey = key;
   }
   const layout = layoutCache;
+
   worldEl = svgEl("g", {}, svg);
-
-  // Input pads on the left edge, output pads on the right edge.
-  const inPads = new Map();
-  const outPads = new Map();
-  for (const bit of Object.keys(WIRES)) {
-    const w = WIRES[bit];
-    if (w.driver && /\$in$/.test(w.driver.cell)) {
-      const port = w.driver.cell.replace(/\$in$/, "");
-      for (const c of w.consumers || []) {
-        const n = layout.byName.get(c.cell);
-        if (n) {
-          if (!inPads.has(port)) inPads.set(port, new Set());
-          inPads.get(port).add(n);
-        }
-      }
-    }
-    for (const c of w.consumers || []) {
-      if (/\$out$/.test(c.cell)) {
-        const port = c.cell.replace(/\$out$/, "");
-        if (!outPads.has(port)) outPads.set(port, new Set());
-        // Wire to the visible source only when it lives in this group.
-        const src = w.driver ? layout.byName.get(w.driver.cell) : null;
-        if (src) outPads.get(port).add(src);
-        outPads.get(port)._hasNet = true;
-      }
-    }
-  }
-
-  let minX = Infinity, maxX = -Infinity;
-  for (const n of layout.nodes) {
-    minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x);
-  }
-
-  function stackPads(pads, x, alignTargets) {
-    // pads: Map port -> Set(nodes); returns list of {port, x, y}
-    const entries = [...pads.entries()].map(([port, set]) => ({
-      port,
-      meanY: [...set].reduce((s, n) => s + n.y, 0) / set.size,
-      nodes: [...set],
-    }));
-    entries.sort((a, b) => a.meanY - b.meanY);
-    let y = entries.length ? Math.max(60, entries[0].meanY) : 60;
-    for (const e of entries) {
-      e.y = Math.max(y, e.meanY - 12);
-      y = e.y + 34;
-      void x; void alignTargets;
-    }
-    return entries.map(e => ({port: e.port, x, y: e.y, nodes: e.nodes}));
-  }
-  const inList = stackPads(inPads, minX - 190);
-  const outList = stackPads(outPads, maxX + 190);
-
-  const header = svgEl("text", {x: 16, y: 24}, svg);
-  header.textContent =
-    `schematic: ${$("groupsel").value || "(top direct)"} — ${shown.length} cells · ` +
-    `${inList.length} inputs (left) · ${outList.length} outputs (right)`;
-  $("sch-count").textContent = `${shown.length} cells`;
-
-  worldEl = worldEl; // keep reference
 
   wireRegistry = [];
   for (const bit of Object.keys(WIRES)) {
@@ -461,10 +406,8 @@ function renderSchematic() {
     }
   }
 
-  cellGByName.clear();
   for (const node of layout.nodes) {
     const g = svgEl("g", {class: `cell ${node.kind}`}, worldEl);
-    cellGByName.set(node.name, g);
     g.dataset.name = node.name;
     svgEl("rect", {x: -66, y: -20, width: 132, height: 40, rx: 8}, g);
     const short = node.name.length > 21 ? node.name.slice(0, 20) + "…" : node.name;
@@ -480,83 +423,10 @@ function renderSchematic() {
     attachDrag(g, node);
   }
 
-  // IO pad columns: inputs left (green), outputs right (orange)
-  function drawPadColumn(list, side, cellGByName) {
-    const isInput = side === "in";
-    for (const pad of list) {
-      const h = Math.max(26, Math.min(120, pad.nodes.length * 14));
-      const g = svgEl("g", {class: `pad pad-${side}`}, worldEl);
-      svgEl("rect", {
-        x: pad.x - 60, y: pad.y - 12, width: 120, height: h, rx: 6,
-        fill: isInput ? "#16301f" : "#331d18",
-        stroke: isInput ? "#69d0a8" : "#e0746c",
-        "stroke-width": 1.4,
-      }, g);
-      const label = pad.port.length > 15 ? pad.port.slice(0,14)+"…" : pad.port;
-      svgEl("text", {x: pad.x, y: pad.y + 4, "text-anchor": "middle",
-                     fill: isInput ? "#69d0a8" : "#e0746c"}, g)
-        .textContent = label;
-      svgEl("text", {x: pad.x, y: pad.y + 18, "text-anchor": "middle",
-                     fill:"#8b93a1"}, g)
-        .textContent = `${pad.nodes.length} net${pad.nodes.length===1?"":"s"}`;
-
-      // Low-fanout nets draw individual wires; a high-fanout pad (clk,
-      // reset…) draws a stub instead — clicking it highlights every load
-      // so the fanout is inspectable without painting five hundred lines.
-      const FANOUT_WIRE_LIMIT = 10;
-      const stubX = isInput ? pad.x + 62 : pad.x - 62;
-      let highlightOn = false;
-      const hitCells = [];
-      for (const n of pad.nodes) {
-        const cellG = cellGByName.get(n.name);
-        if (!cellG) continue;
-        hitCells.push(cellG);
-      }
-      function applyHighlight() {
-        for (const cg of hitCells) cg.classList.toggle("hit", highlightOn);
-        $("sch-svg").classList.toggle("dim-nonhit", highlightOn);
-      }
-      if (pad.nodes.length > 0 && pad.nodes.length <= FANOUT_WIRE_LIMIT) {
-        for (const n of pad.nodes) {
-          const x2 = isInput ? pad.x + 60 : n.x - 66;
-          const x1 = isInput ? n.x - 66 : pad.x + 60;
-          svgEl("path", {
-            d: `M ${isInput ? x1 : x1} ${n.y} L ${isInput ? x2 : x2} ${n.y}`,
-            stroke: isInput ? "#69d0a8" : "#e0746c",
-            "stroke-width": 1.2,
-            "stroke-opacity": 0.7,
-            fill: "none",
-          }, worldEl);
-        }
-      } else if (pad.nodes.length) {
-        svgEl("path", {
-          d: `M ${pad.x} ${pad.y + h/2 - 6} L ${stubX} ${pad.y + h/2 - 6}`,
-          stroke: isInput ? "#69d0a8" : "#e0746c",
-          "stroke-width": 3,
-        }, worldEl);
-        g.style.cursor = "pointer";
-        g.addEventListener("click", ev => {
-          ev.stopPropagation();
-          highlightOn = !highlightOn;
-          applyHighlight();
-        });
-      }
-    }
-  }
-  drawPadColumn(inList, "in", cellGByName);
-  drawPadColumn(outList, "out", cellGByName);
+  drawIoPads(layout, worldEl);
 
   applyView();
   fitToContent();
-  // widen fit to include the pad columns
-  if (inList.length || outList.length) {
-    const extraL = inList.length ? 200 : 0;
-    const extraR = outList.length ? 200 : 0;
-    view.k = Math.max(0.12, view.k * Math.max(0.55, 1 - 0.0009*(extraL+extraR)));
-    view.x -= extraL * view.k * 0.5;
-    view.y += 0;
-    applyView();
-  }
   refreshSelection();
 }
 
@@ -564,12 +434,91 @@ function updateWirePath(pathEl, src, dst) {
   return () => {
     const dx = dst.x - src.x, dy = dst.y - src.y;
     const dd = Math.hypot(dx, dy) || 1;
-    const x1 = src.x + (dx / dd) * 64;
-    const y1 = src.y + (dy / dd) * 22;
-    const x2 = dst.x - (dx / dd) * 64;
-    const y2 = dst.y - (dy / dd) * 22;
+    const x1 = src.x + (dx / dd) * 66;
+    const y1 = src.y + (dy / dd) * 20;
+    const x2 = dst.x - (dx / dd) * 66;
+    const y2 = dst.y - (dy / dd) * 20;
     pathEl.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
   };
+}
+
+/* IO pads: inputs on the far left column, outputs on the far right. */
+function drawIoPads(layout, parent) {
+  const inPads = new Map();   // port -> [targetNode]
+  const outPads = new Map();  // port -> [sourceNode]
+  for (const bit of Object.keys(WIRES)) {
+    const w = WIRES[bit];
+    if (w.driver && /\$in$/.test(w.driver.cell)) {
+      const port = w.driver.cell.replace(/\$in$/, "");
+      for (const c of w.consumers || []) {
+        const n = layout.byName.get(c.cell);
+        if (n) {
+          if (!inPads.has(port)) inPads.set(port, []);
+          inPads.get(port).push(n);
+        }
+      }
+    }
+    for (const c of w.consumers || []) {
+      if (!/\$out$/.test(c.cell)) continue;
+      const port = c.cell.replace(/\$out$/, "");
+      // Show the pad even when its driver sits outside the selected
+      // group; wires attach only to sources that are visible.
+      if (!outPads.has(port)) outPads.set(port, []);
+      const src = w.driver ? layout.byName.get(w.driver.cell) : null;
+      if (src) outPads.get(port).push(src);
+    }
+  }
+
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  for (const n of layout.nodes) {
+    minX = Math.min(minX, n.x - 70); maxX = Math.max(maxX, n.x + 70);
+    minY = Math.min(minY, n.y - 26); maxY = Math.max(maxY, n.y + 26);
+  }
+
+  function drawColumn(pads, x, side) {
+    const isInput = side === "in";
+    const entries = [...pads.entries()].map(([port, list]) => ({
+      port,
+      list,
+      meanY: list.length ? list.reduce((s, n) => s + n.y, 0) / list.length : minY,
+    })).sort((a, b) => a.meanY - b.meanY);
+    let cursor = minY + 10;
+    for (const e of entries) {
+      e.y = Math.max(cursor, e.meanY - 14);
+      cursor = e.y + 34;
+      const g = svgEl("g", {class: `pad pad-${side}`}, parent);
+      svgEl("rect", {x: x - 62, y: e.y - 13, width: 124, height: 26, rx: 6}, g);
+      const label = e.port.length > 15 ? e.port.slice(0,14)+"…" : e.port;
+      svgEl("text", {x, y: e.y + 4, "text-anchor": "middle",
+                     "font-size": "11px"}, g).textContent = label;
+      for (const item of e.list) {
+        const x1 = isInput ? item.x - 66 : x - 62;
+        const x2 = isInput ? x + 62 : item.x - 66;
+        svgEl("path", {d: `M ${x1} ${item.y} L ${x2} ${item.y}`,
+                       stroke: isInput ? "#69d0a8" : "#e0915f",
+                       "stroke-opacity": 0.75,
+                       "stroke-width": 1.2}, parent);
+      }
+      if (!e.list.length) {
+        svgEl("text", {x, y: e.y + 18, "text-anchor": "middle",
+                       fill:"#8b93a1", "font-size":"10px"}, g)
+          .textContent = "driver outside group";
+      }
+    }
+  }
+  drawColumn(inPads, minX - 130, "in");
+  drawColumn(outPads, maxX + 130, "out");
+
+  // widen fit to include both pad columns
+  minX -= 200; maxX += 200;
+  const rect = $("sch-svg").getBoundingClientRect();
+  const width = rect.width || 1600, height = rect.height || 900;
+  const bw = maxX - minX;
+  view.k = Math.min(view.k, Math.max(0.15, width / bw));
+  view.x = (width - bw * view.k) / 2 - minX * view.k;
+  void height; void maxY;
+  applyView();
 }
 
 function attachDrag(g, node) {
@@ -650,10 +599,7 @@ function refreshSelection() {
 function showCellInfo(name) {
   const lines = [["", `cell: ${name}`]];
   const entry = ensureCellIndex()[name];
-  if (!entry) {
-    setInfo(lines);
-    return;
-  }
+  if (!entry) { setInfo(lines); return; }
   const seen = new Set();
   for (const bit of entry.pins) {
     const w = WIRES[bit];
@@ -699,8 +645,9 @@ function renderTiming() {
       if ("net" in step) {
         if (items.length && items[items.length-1].kind === "wire") {
           items[items.length-1].ps += step.delay_ps;
+          items[items.length-1].net = step.net;
         } else {
-          items.push({kind:"wire", ps:step.delay_ps});
+          items.push({kind:"wire", ps:step.delay_ps, net:step.net});
         }
       } else if (items.length && items[items.length-1].kind === "cell"
                  && items[items.length-1].cell === step.cell) {
@@ -730,7 +677,7 @@ function renderTiming() {
                        stroke:"#e0746c", "stroke-width":3,
                        "marker-end":"url(#arrow-t)"}, svg);
         svgEl("text", {x: x+4, y: y0-9, fill:"#e0746c"}, svg)
-          .textContent = `${item.ps} ps`;
+          .textContent = `${item.ps} ps · ${item.net}`;
         x += WIREW;
       }
     });
@@ -763,7 +710,6 @@ window.addEventListener("error", event => {
 /* ================= boot ================= */
 buildTree($("tree"), TREE, []);
 populateGroups();
-showDefaultInfo();
 setTab("schematic");
 </script>
 </body>
