@@ -3,7 +3,7 @@
 
 Runs each bench design through two ECP5 implementation flows and compares:
 
-- struo:   committed Veryl source -> analyze_and_lower -> synthesize ->
+- struo:   Veryl project -> analyze_project_and_lower -> synthesize ->
            ECP5 technology mapping -> nextpnr-ecp5
 - baseline: same committed Veryl source -> `veryl build` SystemVerilog ->
            Yosys synth_ecp5 (Docker image bench/docker/yosys.Dockerfile) ->
@@ -131,7 +131,7 @@ def run_struo(design: Design, out_json: Path, goal_mhz: int) -> None:
             "-p",
             "struo-cli",
             "--",
-            str(design.veryl_path()),
+            str(design.source_dir),
             "--top",
             design.top,
             "--output",

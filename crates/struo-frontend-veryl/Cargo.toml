@@ -18,6 +18,7 @@ celox = "=0.3.1"
 struo-celox = { path = "../struo-celox" }
 struo-synth = { path = "../struo-synth" }
 struo-target-ecp5 = { path = "../struo-target-ecp5" }
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -9,17 +9,17 @@ use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
 use struo_celox::ecp5_simulator;
-use struo_frontend_veryl::analyze_and_lower;
+use struo_frontend_veryl::{analyze_and_lower, analyze_project_and_lower};
 use struo_rtl::Design;
 use struo_synth::synthesize;
 use struo_target_ecp5::{ECP5_QOR_TARGET_MHZ, MappingOptions, map_to_ecp5_with_options};
 
-/// Synthesize an arbitrary self-contained Veryl source to an ECP5 netlist.
+/// Synthesize a Veryl project to an ECP5 netlist.
 #[derive(Parser)]
 #[command(name = "struo", version, about, propagate_version = true)]
 struct Cli {
-    /// Veryl source file.
-    veryl_file: PathBuf,
+    /// Veryl project directory, Veryl.toml, or standalone source file.
+    project: PathBuf,
 
     /// Top module name.
     #[arg(short, long)]
@@ -69,15 +69,48 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
     if timing_goal_mhz == 0 {
         return Err("timing goal must be greater than zero".into());
     }
-    let source = std::fs::read_to_string(&cli.veryl_file)?;
-    let project = cli
-        .veryl_file
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .map_or_else(|| "design".to_owned(), str::to_owned);
-    let design = analyze_and_lower(&source, &project, &cli.top)?;
+    let design = load_design(&cli.project, &cli.top)?;
     synthesize_and_map(&design, &cli.top, timing_goal_mhz, cli.output.as_deref())
+}
+
+fn load_design(input: &Path, top: &str) -> Result<Design, Box<dyn Error>> {
+    if input.is_dir() {
+        return Ok(analyze_project_and_lower(input, top)?);
+    }
+    if input.file_name().is_some_and(|name| name == "Veryl.toml") {
+        return Ok(analyze_project_and_lower(input, top)?);
+    }
+    if input
+        .extension()
+        .is_some_and(|extension| extension == "veryl")
+    {
+        if let Some(manifest) = input
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .ancestors()
+            .map(|directory| directory.join("Veryl.toml"))
+            .find(|manifest| manifest.is_file())
+        {
+            return Ok(analyze_project_and_lower(manifest, top)?);
+        }
+
+        // Keep truly standalone sources working. A source contained in a
+        // project always takes the project path above, so sibling compilation
+        // units and dependencies cannot be skipped accidentally.
+        let source = std::fs::read_to_string(input)?;
+        let project = input
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map_or_else(|| "design".to_owned(), str::to_owned);
+        return Ok(analyze_and_lower(&source, &project, top)?);
+    }
+
+    Err(format!(
+        "input `{}` must be a Veryl project directory, Veryl.toml, or .veryl source",
+        input.display()
+    )
+    .into())
 }
 
 fn synthesize_and_map(
@@ -172,7 +205,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            cli.veryl_file,
+            cli.project,
             Path::new("bench/designs/counter32/counter32.veryl")
         );
         assert_eq!(cli.top, "counter32");
@@ -184,6 +217,11 @@ mod tests {
         assert_eq!(defaults.output, None);
         assert_eq!(defaults.timing_goal_mhz, None);
         assert_eq!(defaults.verbose, 0);
+
+        let project =
+            Cli::try_parse_from(["struo", "bench/designs/counter32", "--top", "counter32"])
+                .unwrap();
+        assert_eq!(project.project, Path::new("bench/designs/counter32"));
 
         assert!(Cli::try_parse_from(["struo", "design.veryl"]).is_err());
         assert!(

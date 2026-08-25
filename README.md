@@ -168,7 +168,7 @@ cargo run -p struo-cli --example demo -- /tmp/struo-blinky.nextpnr.json
 cargo run -p struo-cli --example axi4-demo -- /tmp/struo-axi4.nextpnr.json
 cargo run -p struo-cli --example axi4-self-test -- /tmp/struo-axi4-self-test.nextpnr.json
 cargo run -p struo-cli --example carry-benchmark -- /tmp/struo-carry-benchmark
-struo bench/designs/counter32/counter32.veryl --top counter32 --output /tmp/struo-counter32.nextpnr.json
+struo bench/designs/counter32 --top counter32 --output /tmp/struo-counter32.nextpnr.json
 python3 bench/scripts/qor.py
 (cd examples/axi4-smartconnect && veryl fmt --check && veryl check)
 ```
@@ -177,6 +177,12 @@ python3 bench/scripts/qor.py
 a pinned Yosys `synth_ecp5` baseline on shared Veryl sources with identical
 nextpnr seeds and timing goals; methodology and current results are in
 [`bench/README.md`](bench/README.md).
+
+The `struo` positional input is a Veryl project directory or its `Veryl.toml`.
+Struo resolves every configured source, the standard library, and locked
+dependencies before running the analyzer. Passing a `.veryl` file remains
+supported; when it belongs to a project, Struo discovers the nearest manifest
+and analyzes the complete project rather than only that file.
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
 addition and subtraction, signed and unsigned comparisons, variable logical

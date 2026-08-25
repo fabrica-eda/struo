@@ -5,6 +5,8 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use struo_rtl::{BitWidth, Design, Module, Port, PortDirection, RtlError, StateDomain, ValueType};
 use veryl_analyzer::ir::{Component, Declaration, Ir, VarKind};
@@ -19,27 +21,95 @@ pub use lower::lower_analyzed_ir;
 /// Analyzes one self-contained Veryl source and lowers its selected top.
 ///
 /// This convenience entry point exists for direct source-to-synthesis flows.
-/// Projects with multiple compilation units may run the analyzer themselves
-/// and call [`lower_analyzed_ir`] with the combined AIR.
+/// Use [`analyze_project_and_lower`] for manifest-backed projects with multiple
+/// compilation units or dependencies.
 ///
 /// # Errors
 ///
 /// Returns an error for parser or analyzer diagnostics, metadata setup, or
 /// semantic lowering failures.
 pub fn analyze_and_lower(source: &str, project: &str, top: &str) -> Result<Design, ImportError> {
+    let metadata = Metadata::create_default(project)
+        .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
+    reset_analyzer();
+    let parsed = Parser::parse(source, &"")
+        .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
+    analyze_parsed_and_lower(&metadata, &[(project.to_owned(), parsed)], top)
+}
+
+/// Loads and analyzes an entire Veryl project, then lowers its selected top.
+///
+/// `project` may point either to a project directory or directly to its
+/// `Veryl.toml`. All sources declared by the manifest, the Veryl standard
+/// library, and locked dependency sources participate in the same analyzer
+/// passes, matching Veryl's project compilation model.
+///
+/// # Errors
+///
+/// Returns an error when the manifest or a source cannot be loaded, dependency
+/// resolution fails, Veryl reports a diagnostic, or semantic lowering fails.
+pub fn analyze_project_and_lower(
+    project: impl AsRef<Path>,
+    top: &str,
+) -> Result<Design, ImportError> {
+    let project = project.as_ref();
+    let manifest = if project.is_dir() {
+        project.join("Veryl.toml")
+    } else {
+        project.to_path_buf()
+    };
+    let mut metadata = Metadata::load(&manifest).map_err(|error| {
+        ImportError::AnalysisFailed(format!(
+            "failed to load Veryl project `{}`: {error}",
+            manifest.display()
+        ))
+    })?;
+    let files: &[PathBuf] = &[];
+    let paths = metadata.paths(files, true, true).map_err(|error| {
+        ImportError::AnalysisFailed(format!(
+            "failed to resolve sources for `{}`: {error}",
+            manifest.display()
+        ))
+    })?;
+
+    reset_analyzer();
+    let mut parsed = Vec::with_capacity(paths.len());
+    for path in paths {
+        let source = fs::read_to_string(&path.src).map_err(|error| {
+            ImportError::AnalysisFailed(format!(
+                "failed to read Veryl source `{}`: {error}",
+                path.src.display()
+            ))
+        })?;
+        let parser = Parser::parse(&source, &path.src)
+            .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
+        parsed.push((path.prj, parser));
+    }
+
+    analyze_parsed_and_lower(&metadata, &parsed, top)
+}
+
+fn reset_analyzer() {
     // Veryl's resource, symbol, and attribute tables are thread-local. Reset
     // this worker's analyzer state without serializing independent analyses on
     // other threads.
     veryl_analyzer::symbol_table::clear();
     veryl_analyzer::attribute_table::clear();
-    let metadata = Metadata::create_default(project)
-        .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
-    let parsed = Parser::parse(source, &"")
-        .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
-    let analyzer = Analyzer::new(&metadata);
+}
+
+fn analyze_parsed_and_lower(
+    metadata: &Metadata,
+    parsed: &[(String, Parser)],
+    top: &str,
+) -> Result<Design, ImportError> {
+    let analyzer = Analyzer::new(metadata);
     let mut context = Context::default();
     let mut ir = Ir::default();
-    let pass1 = analyzer.analyze_pass1(project, &parsed.veryl);
+
+    let mut pass1 = Vec::new();
+    for (project, parser) in parsed {
+        pass1.append(&mut analyzer.analyze_pass1(project, &parser.veryl));
+    }
     if !pass1.is_empty() {
         return Err(ImportError::AnalysisFailed(format!("{pass1:?}")));
     }
@@ -47,7 +117,12 @@ pub fn analyze_and_lower(source: &str, project: &str, top: &str) -> Result<Desig
     if !post1.is_empty() {
         return Err(ImportError::AnalysisFailed(format!("{post1:?}")));
     }
-    let pass2 = analyzer.analyze_pass2(&parsed.veryl, &mut context, Some(&mut ir));
+
+    let mut pass2 = Vec::new();
+    for (project, parser) in parsed {
+        context.set_project_name(project);
+        pass2.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
+    }
     if !pass2.is_empty() {
         return Err(ImportError::AnalysisFailed(format!("{pass2:?}")));
     }
@@ -276,9 +351,12 @@ impl From<RtlError> for ImportError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
     use veryl_analyzer::ir::Ir;
 
-    use super::{SUPPORTED_VERYL_VERSION, import_analyzed_shell};
+    use super::{SUPPORTED_VERYL_VERSION, analyze_project_and_lower, import_analyzed_shell};
 
     #[test]
     fn empty_analyzer_ir_is_not_silently_made_valid() {
@@ -286,5 +364,57 @@ mod tests {
 
         assert_eq!(SUPPORTED_VERYL_VERSION, "0.20.3");
         assert!(imported.design.validate().is_err());
+    }
+
+    #[test]
+    fn analyzes_all_compilation_units_in_a_project() {
+        let directory = tempdir().unwrap();
+        let source_directory = directory.path().join("src");
+        fs::create_dir(&source_directory).unwrap();
+        fs::write(
+            directory.path().join("Veryl.toml"),
+            r#"[project]
+name = "multi_file"
+version = "0.1.0"
+
+[build]
+sources = ["src"]
+exclude_std = true
+target = { type = "directory", path = "target" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            source_directory.join("Child.veryl"),
+            r"module Child (
+    value : input  logic<8>,
+    result: output logic<8>,
+) {
+    always_comb {
+        result = value + 8'h01;
+    }
+}
+",
+        )
+        .unwrap();
+        fs::write(
+            source_directory.join("Top.veryl"),
+            r"module Top (
+    value : input  logic<8>,
+    result: output logic<8>,
+) {
+    inst child: Child (
+        value : value ,
+        result: result,
+    );
+}
+",
+        )
+        .unwrap();
+
+        let design = analyze_project_and_lower(directory.path(), "Top").unwrap();
+        let top = design.top_module().unwrap();
+        assert_eq!(top.name(), "Top");
+        assert!(top.instances().is_empty());
     }
 }
