@@ -6,12 +6,9 @@
 
 use std::error::Error;
 
-use struo_celox::ecp5_simulator;
+use struo::target::ecp5::{ECP5_QOR_TARGET_MHZ, PhysicalFeedback};
+use struo::{MappingOptions, ecp5_simulator, map_to_ecp5_with_options, synthesize};
 use struo_example_axi4_smartconnect::axi4_crossbar_self_test;
-use struo_synth::synthesize;
-use struo_target_ecp5::{
-    ECP5_QOR_TARGET_MHZ, MappingOptions, PhysicalFeedback, map_to_ecp5_with_options,
-};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);

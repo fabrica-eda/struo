@@ -8,11 +8,12 @@ use clap::Parser;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
-use struo_celox::ecp5_simulator;
-use struo_frontend_veryl::analyze_project_and_lower;
-use struo_rtl::Design;
-use struo_synth::synthesize;
-use struo_target_ecp5::{ECP5_QOR_TARGET_MHZ, MappingOptions, map_to_ecp5_with_options};
+use struo::rtl::Design;
+use struo::target::ecp5 as struo_target_ecp5;
+use struo::target::ecp5::ECP5_QOR_TARGET_MHZ;
+use struo::{
+    MappingOptions, analyze_project_and_lower, ecp5_simulator, map_to_ecp5_with_options, synthesize,
+};
 
 /// Synthesize a Veryl project to an ECP5 netlist.
 #[derive(Parser)]

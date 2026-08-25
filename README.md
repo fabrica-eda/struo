@@ -6,6 +6,36 @@ A Rust workspace implementing logic synthesis from Veryl to Lattice ECP5.
 Frontend-specific types do not leak into the synthesis core. Post-synthesis
 simulation and equivalence checking are mandatory gates for bitstream release.
 
+## Install
+
+Applications only need the `struo` facade crate:
+
+```toml
+[dependencies]
+struo = "0.1.0"
+```
+
+Its default features include the complete Veryl-to-ECP5 flow and Celox
+post-synthesis adapter. The implementation layers are available through stable
+namespaces without adding each crate separately:
+
+```rust,no_run
+use struo::{analyze_project_and_lower, ecp5_simulator, map_to_ecp5, synthesize};
+
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let design = analyze_project_and_lower(".", "Top")?;
+let synthesized = synthesize(&design)?;
+let mapped = map_to_ecp5(&synthesized.netlist)?;
+let simulator = ecp5_simulator(&mapped)?.build_native()?;
+# let _ = simulator;
+# Ok(())
+# }
+```
+
+For lower-level integrations, disable default features and opt into only the
+adapters required: `veryl`, `ecp5`, and `celox` (`celox` implies `ecp5`). The
+core `rtl`, `ir`, `synth`, `formal`, and `sim` modules are always available.
+
 ## Compiler pipeline
 
 ```text
@@ -28,6 +58,7 @@ ECP5 mapped netlist    LUT4 / TRELLIS_FF primitives
 
 Crate responsibilities:
 
+- `struo`: single-dependency facade for applications
 - `struo-frontend-veryl`: adapter pinned to an exact `veryl-analyzer` version
 - `struo-rtl`: frontend-independent RTL that preserves hardware semantics
 - `struo-ir`: low-level netlist manipulated by synthesis passes

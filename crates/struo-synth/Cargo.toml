@@ -8,9 +8,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-struo-formal = { path = "../struo-formal" }
-struo-ir = { path = "../struo-ir" }
-struo-rtl = { path = "../struo-rtl" }
+struo-formal.workspace = true
+struo-ir.workspace = true
+struo-rtl.workspace = true
 
 [lints]
 workspace = true

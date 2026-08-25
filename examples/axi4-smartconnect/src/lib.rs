@@ -1,7 +1,7 @@
 //! Veryl-authored AXI4 synthesis and simulation design.
 
-use struo_frontend_veryl::{ImportError, analyze_and_lower};
-use struo_rtl::Design;
+use struo::rtl::Design;
+use struo::{ImportError, analyze_and_lower};
 
 /// Source text of the two-by-two AXI4 crossbar.
 pub const AXI4_CROSSBAR_SOURCE: &str = include_str!("../veryl/axi4_crossbar_2x2.veryl");
@@ -47,11 +47,9 @@ mod tests {
     use std::sync::OnceLock;
 
     use celox::{NativeBackend, NativeProgramImage, SignalRef, Simulator, SimulatorBuilder};
-    use struo_celox::ecp5_simulator;
-    use struo_formal::{EquivalenceStatus, TransitionSystem, prove_sequential_equivalence};
-    use struo_ir::ActiveLevel;
-    use struo_synth::synthesize;
-    use struo_target_ecp5::map_to_ecp5;
+    use struo::formal::{EquivalenceStatus, TransitionSystem, prove_sequential_equivalence};
+    use struo::ir::ActiveLevel;
+    use struo::{ecp5_simulator, map_to_ecp5, synthesize};
 
     use super::{
         axi4_crossbar_2x2, axi4_crossbar_self_test, axi4_id_release_pipeline, axi4_qos_arbiter_4,

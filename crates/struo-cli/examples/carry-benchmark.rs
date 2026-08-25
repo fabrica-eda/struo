@@ -9,15 +9,13 @@
 
 use std::error::Error;
 
-use struo_celox::ecp5_simulator;
-use struo_rtl::{
+use struo::rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Module, Port, PortDirection, Register,
     StateDomain, ValueType,
 };
-use struo_synth::synthesize;
-use struo_target_ecp5::{
-    ArithmeticMapping, ECP5_QOR_TARGET_MHZ, MappingOptions, map_to_ecp5_with_options,
-};
+use struo::target::ecp5 as struo_target_ecp5;
+use struo::target::ecp5::{ArithmeticMapping, ECP5_QOR_TARGET_MHZ};
+use struo::{MappingOptions, ecp5_simulator, map_to_ecp5_with_options, synthesize};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let directory = std::env::args()

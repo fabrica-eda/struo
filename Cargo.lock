@@ -3074,6 +3074,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "struo"
+version = "0.1.0"
+dependencies = [
+ "struo-celox",
+ "struo-formal",
+ "struo-frontend-veryl",
+ "struo-ir",
+ "struo-rtl",
+ "struo-sim",
+ "struo-synth",
+ "struo-target-ecp5",
+]
+
+[[package]]
 name = "struo-celox"
 version = "0.1.0"
 dependencies = [
@@ -3089,13 +3103,8 @@ name = "struo-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "struo-celox",
+ "struo",
  "struo-example-axi4-smartconnect",
- "struo-frontend-veryl",
- "struo-rtl",
- "struo-sim",
- "struo-synth",
- "struo-target-ecp5",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3105,13 +3114,7 @@ name = "struo-example-axi4-smartconnect"
 version = "0.1.0"
 dependencies = [
  "celox",
- "struo-celox",
- "struo-formal",
- "struo-frontend-veryl",
- "struo-ir",
- "struo-rtl",
- "struo-synth",
- "struo-target-ecp5",
+ "struo",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/struo",
     "crates/struo-cli",
     "crates/struo-celox",
     "crates/struo-formal",
@@ -20,6 +21,17 @@ edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 authors = ["Struo contributors"]
+
+[workspace.dependencies]
+struo = { version = "=0.1.0", path = "crates/struo" }
+struo-celox = { version = "=0.1.0", path = "crates/struo-celox" }
+struo-formal = { version = "=0.1.0", path = "crates/struo-formal" }
+struo-frontend-veryl = { version = "=0.1.0", path = "crates/struo-frontend-veryl" }
+struo-ir = { version = "=0.1.0", path = "crates/struo-ir" }
+struo-rtl = { version = "=0.1.0", path = "crates/struo-rtl" }
+struo-sim = { version = "=0.1.0", path = "crates/struo-sim" }
+struo-synth = { version = "=0.1.0", path = "crates/struo-synth" }
+struo-target-ecp5 = { version = "=0.1.0", path = "crates/struo-target-ecp5" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
