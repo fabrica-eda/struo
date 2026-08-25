@@ -180,9 +180,7 @@ nextpnr seeds and timing goals; methodology and current results are in
 
 The `struo` positional input is a Veryl project directory or its `Veryl.toml`.
 Struo resolves every configured source, the standard library, and locked
-dependencies before running the analyzer. Passing a `.veryl` file remains
-supported; when it belongs to a project, Struo discovers the nearest manifest
-and analyzes the complete project rather than only that file.
+dependencies before running the analyzer.
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
 addition and subtraction, signed and unsigned comparisons, variable logical
