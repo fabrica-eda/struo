@@ -4,10 +4,8 @@
 
 use std::error::Error;
 
-use struo_celox::ecp5_simulator;
+use struo::{ecp5_simulator, map_to_ecp5, synthesize};
 use struo_example_axi4_smartconnect::axi4_crossbar_2x2;
-use struo_synth::synthesize;
-use struo_target_ecp5::map_to_ecp5;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mapped_path = std::env::args().nth(1);

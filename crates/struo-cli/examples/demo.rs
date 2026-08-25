@@ -4,14 +4,13 @@
 
 use std::error::Error;
 
-use struo_celox::ecp5_simulator;
-use struo_rtl::{
+use struo::rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Module, Polarity, Port, PortDirection,
     Register, Reset, ResetMode, StateDomain, ValueType,
 };
-use struo_sim::VerificationPolicy;
-use struo_synth::synthesize;
-use struo_target_ecp5::{Ecp5Flow, map_to_ecp5};
+use struo::sim::VerificationPolicy;
+use struo::target::ecp5::Ecp5Flow;
+use struo::{ecp5_simulator, map_to_ecp5, synthesize};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let nextpnr_path = std::env::args().nth(1);

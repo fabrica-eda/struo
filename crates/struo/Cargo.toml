@@ -1,0 +1,27 @@
+[package]
+name = "struo"
+description = "Logic synthesis toolkit from Veryl to FPGA targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["veryl", "ecp5", "celox"]
+veryl = ["dep:struo-frontend-veryl"]
+ecp5 = ["dep:struo-target-ecp5"]
+celox = ["ecp5", "dep:struo-celox"]
+
+[dependencies]
+struo-celox = { workspace = true, optional = true }
+struo-formal.workspace = true
+struo-frontend-veryl = { workspace = true, optional = true }
+struo-ir.workspace = true
+struo-rtl.workspace = true
+struo-sim.workspace = true
+struo-synth.workspace = true
+struo-target-ecp5 = { workspace = true, optional = true }
+
+[lints]
+workspace = true

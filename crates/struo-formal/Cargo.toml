@@ -8,7 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-struo-ir = { path = "../struo-ir" }
+struo-ir.workspace = true
 
 [lints]
 workspace = true

@@ -4,8 +4,8 @@
 
 use std::fs;
 
-use struo_frontend_veryl::analyze_and_lower;
-use struo_rtl::{ExprId, ExprKind, Module, SignalId, SignalSlice};
+use struo::analyze_and_lower;
+use struo::rtl::{ExprId, ExprKind, Module, SignalId, SignalSlice};
 
 fn signal_name(module: &Module, id: SignalId) -> String {
     module

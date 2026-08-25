@@ -8,16 +8,16 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-struo-rtl = { path = "../struo-rtl" }
+struo-rtl.workspace = true
 veryl-analyzer = "=0.20.3"
 veryl-metadata = "=0.20.3"
 veryl-parser = { version = "=0.20.3", default-features = false }
 
 [dev-dependencies]
 celox = "=0.3.1"
-struo-celox = { path = "../struo-celox" }
-struo-synth = { path = "../struo-synth" }
-struo-target-ecp5 = { path = "../struo-target-ecp5" }
+struo-celox.workspace = true
+struo-synth.workspace = true
+struo-target-ecp5.workspace = true
 tempfile = "3"
 
 [lints]

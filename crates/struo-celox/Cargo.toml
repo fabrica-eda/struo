@@ -9,12 +9,12 @@ authors.workspace = true
 
 [dependencies]
 celox = "=0.3.1"
-struo-ir = { path = "../struo-ir" }
-struo-target-ecp5 = { path = "../struo-target-ecp5" }
+struo-ir.workspace = true
+struo-target-ecp5.workspace = true
 
 [dev-dependencies]
-struo-rtl = { path = "../struo-rtl" }
-struo-synth = { path = "../struo-synth" }
+struo-rtl.workspace = true
+struo-synth.workspace = true
 
 [lints]
 workspace = true
