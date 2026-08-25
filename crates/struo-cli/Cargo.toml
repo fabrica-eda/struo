@@ -1,11 +1,18 @@
 [package]
 name = "struo-cli"
 description = "Command-line interface for Struo"
+publish = ["crates-io"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["examples/axi4-demo.rs", "examples/axi4-self-test.rs"]
 
 [[bin]]
 name = "struo"

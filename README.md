@@ -1,6 +1,7 @@
 # Struo
 
 [![CI](https://github.com/fabrica-eda/struo/actions/workflows/ci.yml/badge.svg)](https://github.com/fabrica-eda/struo/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/struo.svg)](https://crates.io/crates/struo)
 
 A Rust workspace implementing logic synthesis from Veryl to Lattice ECP5.
 Frontend-specific types do not leak into the synthesis core. Post-synthesis
@@ -344,3 +345,8 @@ nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
 ecppack --svf build/axi4-self-test/design.svf \
   build/axi4-self-test/design.config build/axi4-self-test/design.bit
 ```
+
+## License
+
+Licensed under either [Apache License 2.0](LICENSE-APACHE) or
+[MIT](LICENSE-MIT), at your option.
