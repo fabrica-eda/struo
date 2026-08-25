@@ -3130,6 +3130,7 @@ dependencies = [
  "struo-rtl",
  "struo-synth",
  "struo-target-ecp5",
+ "tempfile",
  "veryl-analyzer",
  "veryl-metadata",
  "veryl-parser",
