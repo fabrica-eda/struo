@@ -5,8 +5,8 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::hash::{BuildHasherDefault, Hasher};
 
-use serde::Serialize;
 use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
 use struo_formal::{
     LogicFunction, RetimingCertificate, RetimingDomain, RetimingEdge, RetimingGraph,
     RetimingVertex, derive_retimed_graph, verify_retiming_certificate,
@@ -139,7 +139,8 @@ pub struct JtaggBinding {
     pub tdo_ports: [String; 2],
     /// Registered data received from the external TAP (`JTDI`).
     pub tdi_port: String,
-    /// Clock exported by the external TAP (`JTCK`).
+    /// Transport clock exported by the external TAP (`JTCK`); this is not a
+    /// fabric system-clock or PLL binding.
     pub clock_port: String,
     /// Run-test/idle indications for extension registers one and two.
     pub run_test_idle_ports: [String; 2],
@@ -176,6 +177,83 @@ impl JtaggBinding {
             clock_enable_ports: [port("ce1"), port("ce2")],
             extension_register_1: true,
             extension_register_2: true,
+        }
+    }
+}
+
+/// One clock output of an ECP5 `EHXPLLL` primitive.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub enum PllOutput {
+    /// Primary output (`CLKOP`).
+    #[serde(rename = "CLKOP")]
+    Clkop,
+    /// Secondary output (`CLKOS`).
+    #[serde(rename = "CLKOS")]
+    Clkos,
+    /// Secondary output two (`CLKOS2`).
+    #[serde(rename = "CLKOS2")]
+    Clkos2,
+    /// Secondary output three (`CLKOS3`).
+    #[serde(rename = "CLKOS3")]
+    Clkos3,
+}
+
+impl PllOutput {
+    fn port(self) -> &'static str {
+        match self {
+            Self::Clkop => "CLKOP",
+            Self::Clkos => "CLKOS",
+            Self::Clkos2 => "CLKOS2",
+            Self::Clkos3 => "CLKOS3",
+        }
+    }
+}
+
+/// User-supplied top-boundary binding for an ECP5 `EHXPLLL`.
+///
+/// Struo owns only the boundary rewrite. The user supplies the PLL parameters
+/// and frequency attributes, normally copied from `ecppll` or another
+/// device-qualified clock configuration. The reference port remains physical;
+/// the logical clock and lock inputs are removed and driven by the primitive.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PllBinding {
+    /// Physical reference-clock input retained on the mapped top.
+    pub reference_clock_port: String,
+    /// Logical core-clock input replaced by the selected PLL output.
+    pub output_clock_port: String,
+    /// Logical core input replaced by `LOCK`.
+    pub locked_port: String,
+    /// PLL output routed into the core.
+    pub fabric_output: PllOutput,
+    /// PLL output looped back to `CLKFB`.
+    pub feedback_output: PllOutput,
+    /// Raw `EHXPLLL` parameters written to nextpnr JSON.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
+    /// Raw `EHXPLLL` attributes written to nextpnr JSON.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
+
+impl PllBinding {
+    /// Creates an empty user-configured PLL binding.
+    #[must_use]
+    pub fn new(
+        reference_clock_port: impl Into<String>,
+        output_clock_port: impl Into<String>,
+        locked_port: impl Into<String>,
+        fabric_output: PllOutput,
+        feedback_output: PllOutput,
+    ) -> Self {
+        Self {
+            reference_clock_port: reference_clock_port.into(),
+            output_clock_port: output_clock_port.into(),
+            locked_port: locked_port.into(),
+            fabric_output,
+            feedback_output,
+            parameters: BTreeMap::new(),
+            attributes: BTreeMap::new(),
         }
     }
 }
@@ -414,6 +492,27 @@ pub enum Ecp5Cell {
         /// Whether extension register two is present.
         extension_register_2: bool,
     },
+    /// User-configured ECP5 phase-locked loop.
+    Pll {
+        /// Stable cell name.
+        name: String,
+        /// Physical reference-clock input.
+        reference_clock: Bit,
+        /// Internal feedback output wire.
+        feedback_clock: u32,
+        /// Fabric clock output wire.
+        output_clock: u32,
+        /// Lock indication output wire.
+        locked: u32,
+        /// PLL output routed into the core.
+        fabric_output: PllOutput,
+        /// PLL output looped back to `CLKFB`.
+        feedback_output: PllOutput,
+        /// Raw primitive parameters.
+        parameters: BTreeMap<String, String>,
+        /// Raw primitive attributes.
+        attributes: BTreeMap<String, String>,
+    },
 }
 
 /// Technology-mapped ECP5 netlist used by both simulation and nextpnr.
@@ -495,6 +594,83 @@ impl Ecp5Netlist {
         &self.cells
     }
 
+    /// Replaces logical clock/lock inputs with a user-configured `EHXPLLL`.
+    ///
+    /// The reference-clock port remains on the physical top. The output-clock
+    /// and lock ports are removed and driven by the selected primitive output
+    /// and `LOCK`. This is deliberately separate from [`Self::bind_jtagg`].
+    ///
+    /// Post-map cycle simulation models the configured fabric clock as the
+    /// reference clock and `LOCK` as asserted; frequency generation and lock
+    /// acquisition must be verified by implementation timing and hardware.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for repeated, missing, non-scalar, incorrectly
+    /// directed, or constant input ports, or wire overflow.
+    pub fn bind_pll(&mut self, binding: &PllBinding) -> Result<(), MappingError> {
+        let roles = [
+            &binding.reference_clock_port,
+            &binding.output_clock_port,
+            &binding.locked_port,
+        ];
+        let mut names = HashSet::new();
+        let mut resolved = Vec::with_capacity(roles.len());
+        for name in roles {
+            if !names.insert(name.as_str()) {
+                return Err(MappingError::PllPortRepeated(name.clone()));
+            }
+            let (index, port) = self
+                .ports
+                .iter()
+                .enumerate()
+                .find(|(_, port)| port.name == *name)
+                .ok_or_else(|| MappingError::PllPortNotFound(name.clone()))?;
+            if port.direction != PortDirection::Input {
+                return Err(MappingError::PllPortDirection {
+                    port: name.clone(),
+                    actual: port.direction,
+                });
+            }
+            if port.bits.len() != 1 {
+                return Err(MappingError::PllPortNotScalar {
+                    port: name.clone(),
+                    width: port.bits.len(),
+                });
+            }
+            let Bit::Wire(wire) = port.bits[0] else {
+                return Err(MappingError::PllOutputIsConstant(name.clone()));
+            };
+            resolved.push((index, wire));
+        }
+        let output_clock = resolved[1].1;
+        let feedback_clock = if binding.fabric_output == binding.feedback_output {
+            output_clock
+        } else {
+            maximum_mapped_wire(self)
+                .unwrap_or(1)
+                .checked_add(1)
+                .ok_or(MappingError::MappedWireOverflow)?
+        };
+        self.cells.push(Ecp5Cell::Pll {
+            name: unique_cell_name("pll", &self.cells, None),
+            reference_clock: Bit::Wire(resolved[0].1),
+            feedback_clock,
+            output_clock,
+            locked: resolved[2].1,
+            fabric_output: binding.fabric_output,
+            feedback_output: binding.feedback_output,
+            parameters: binding.parameters.clone(),
+            attributes: binding.attributes.clone(),
+        });
+        let mut removed = [resolved[1].0, resolved[2].0];
+        removed.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        for index in removed {
+            self.ports.remove(index);
+        }
+        Ok(())
+    }
+
     /// Replaces a scalar top-level JTAG fabric interface with the dedicated
     /// ECP5 `JTAGG` primitive.
     ///
@@ -502,6 +678,10 @@ impl Ecp5Netlist {
     /// ordinary ports during RTL simulation. The returned mapped design no
     /// longer exposes those ports as package pins; they are connected to the
     /// device's built-in TAP instead.
+    ///
+    /// This operation only binds the JTAG transport. A user top or wrapper is
+    /// responsible for any PLL primitive and reference/derived clock
+    /// constraints required by fabric logic.
     ///
     /// # Errors
     ///
@@ -1059,6 +1239,7 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
         Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD"),
         Ecp5Cell::TrellisIo { .. } => bel.contains("PIO"),
         Ecp5Cell::Jtagg { .. } => bel.contains("JTAGG"),
+        Ecp5Cell::Pll { .. } => bel.contains("PLL"),
         Ecp5Cell::Ccu2c { .. } => false,
     }
 }
@@ -1097,6 +1278,20 @@ pub fn map_to_ecp5_with_jtagg(
 ) -> Result<Ecp5Netlist, MappingError> {
     let mut mapped = map_to_ecp5(netlist)?;
     mapped.bind_jtagg(binding)?;
+    Ok(mapped)
+}
+
+/// Maps a core and applies a user-configured ECP5 PLL boundary binding.
+///
+/// # Errors
+///
+/// Returns an error if logic mapping or the PLL binding fails.
+pub fn map_to_ecp5_with_pll(
+    netlist: &Netlist,
+    binding: &PllBinding,
+) -> Result<Ecp5Netlist, MappingError> {
+    let mut mapped = map_to_ecp5(netlist)?;
+    mapped.bind_pll(binding)?;
     Ok(mapped)
 }
 
@@ -1708,7 +1903,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
-            | Ecp5Cell::Jtagg { .. } => None,
+            | Ecp5Cell::Jtagg { .. }
+            | Ecp5Cell::Pll { .. } => None,
         })
         .collect::<HashSet<_>>();
     netlist
@@ -1730,7 +1926,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
-            | Ecp5Cell::Jtagg { .. } => None,
+            | Ecp5Cell::Jtagg { .. }
+            | Ecp5Cell::Pll { .. } => None,
         })
         .max()
         .unwrap_or(0)
@@ -2041,6 +2238,9 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
                 replace(bit);
             }
         }
+        Ecp5Cell::Pll {
+            reference_clock, ..
+        } => replace(reference_clock),
     }
     replacements
 }
@@ -2112,7 +2312,10 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
             tristate,
             ..
         } => Some(bit_lut_depth(*fabric_output, &depths).max(bit_lut_depth(*tristate, &depths))),
-        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } | Ecp5Cell::Jtagg { .. } => None,
+        Ecp5Cell::Lut4 { .. }
+        | Ecp5Cell::Ccu2c { .. }
+        | Ecp5Cell::Jtagg { .. }
+        | Ecp5Cell::Pll { .. } => None,
     });
     let output_depths = netlist
         .ports
@@ -2179,7 +2382,10 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
             mapped_setup_period(*fabric_output, &arrivals, &fanouts)
                 .max(mapped_setup_period(*tristate, &arrivals, &fanouts)),
         ),
-        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } | Ecp5Cell::Jtagg { .. } => None,
+        Ecp5Cell::Lut4 { .. }
+        | Ecp5Cell::Ccu2c { .. }
+        | Ecp5Cell::Jtagg { .. }
+        | Ecp5Cell::Pll { .. } => None,
     });
     let output_periods = netlist
         .ports
@@ -2251,6 +2457,16 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
                     .chain(*run_test_idle)
                     .chain(*clock_enable)
                 {
+                    depths.insert(output, 0);
+                }
+            }
+            Ecp5Cell::Pll {
+                feedback_clock,
+                output_clock,
+                locked,
+                ..
+            } => {
+                for output in [*feedback_clock, *output_clock, *locked] {
                     depths.insert(output, 0);
                 }
             }
@@ -2346,6 +2562,16 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                     arrivals.insert(output, 0);
                 }
             }
+            Ecp5Cell::Pll {
+                feedback_clock,
+                output_clock,
+                locked,
+                ..
+            } => {
+                for output in [*feedback_clock, *output_clock, *locked] {
+                    arrivals.insert(output, 0);
+                }
+            }
             Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => {}
         }
     }
@@ -2407,7 +2633,8 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                 Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
                 | Ecp5Cell::TrellisIo { .. }
-                | Ecp5Cell::Jtagg { .. } => {}
+                | Ecp5Cell::Jtagg { .. }
+                | Ecp5Cell::Pll { .. } => {}
             }
         }
         if !progress {
@@ -2893,7 +3120,8 @@ fn ccu_chain_names(netlist: &Ecp5Netlist) -> Vec<Vec<String>> {
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
-            | Ecp5Cell::Jtagg { .. } => None,
+            | Ecp5Cell::Jtagg { .. }
+            | Ecp5Cell::Pll { .. } => None,
         })
         .collect::<Vec<_>>();
     let carry_producers = ccus
@@ -3015,7 +3243,8 @@ fn forward_retime_ccu2c(netlist: &Ecp5Netlist, ccu_index: usize) -> Option<Ecp5N
                     | Ecp5Cell::FlipFlop { .. }
                     | Ecp5Cell::BlockRam { .. }
                     | Ecp5Cell::TrellisIo { .. }
-                    | Ecp5Cell::Jtagg { .. } => None,
+                    | Ecp5Cell::Jtagg { .. }
+                    | Ecp5Cell::Pll { .. } => None,
                 })?;
         if let Some((domain_clock, domain_edge, domain_enable, domain_reset)) = domain {
             if (clock, edge, enable) != (domain_clock, domain_edge, domain_enable)
@@ -3254,7 +3483,8 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
-            | Ecp5Cell::Jtagg { .. } => None,
+            | Ecp5Cell::Jtagg { .. }
+            | Ecp5Cell::Pll { .. } => None,
         })?;
 
     let mut vertices = Vec::new();
@@ -3727,6 +3957,9 @@ fn replace_mapped_wire_uses(netlist: &mut Ecp5Netlist, from: u32, to: u32) {
                     replace(bit);
                 }
             }
+            Ecp5Cell::Pll {
+                reference_clock, ..
+            } => replace(reference_clock),
         }
     }
 }
@@ -3755,7 +3988,8 @@ fn mapped_cell_name(cell: &Ecp5Cell) -> &str {
         | Ecp5Cell::FlipFlop { name, .. }
         | Ecp5Cell::BlockRam { name, .. }
         | Ecp5Cell::TrellisIo { name, .. }
-        | Ecp5Cell::Jtagg { name, .. } => name,
+        | Ecp5Cell::Jtagg { name, .. }
+        | Ecp5Cell::Pll { name, .. } => name,
     }
 }
 
@@ -3783,7 +4017,8 @@ fn mapped_wire_is_clock_or_reset(netlist: &Ecp5Netlist, wire: u32) -> bool {
         Ecp5Cell::Lut4 { .. }
         | Ecp5Cell::Ccu2c { .. }
         | Ecp5Cell::TrellisIo { .. }
-        | Ecp5Cell::Jtagg { .. } => false,
+        | Ecp5Cell::Jtagg { .. }
+        | Ecp5Cell::Pll { .. } => false,
     })
 }
 
@@ -3919,6 +4154,14 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
                 visit(*bit);
             }
         }
+        Ecp5Cell::Pll {
+            reference_clock,
+            feedback_clock,
+            ..
+        } => {
+            visit(*reference_clock);
+            visit(Bit::Wire(*feedback_clock));
+        }
     }
 }
 
@@ -3950,6 +4193,15 @@ fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
             .into_iter()
             .chain(*run_test_idle)
             .chain(*clock_enable)
+            .map(Bit::Wire)
+            .collect(),
+        Ecp5Cell::Pll {
+            feedback_clock,
+            output_clock,
+            locked,
+            ..
+        } => [*feedback_clock, *output_clock, *locked]
+            .into_iter()
             .map(Bit::Wire)
             .collect(),
     }
@@ -4615,6 +4867,26 @@ pub enum MappingError {
     },
     /// A JTAGG output cannot drive a constant top-level input.
     JtaggOutputIsConstant(String),
+    /// A named PLL boundary port does not exist.
+    PllPortNotFound(String),
+    /// One top-level port was assigned to more than one PLL role.
+    PllPortRepeated(String),
+    /// A PLL boundary port is not a core input.
+    PllPortDirection {
+        /// Port name.
+        port: String,
+        /// Actual mapped direction.
+        actual: PortDirection,
+    },
+    /// PLL boundary bindings operate on scalar ports.
+    PllPortNotScalar {
+        /// Port name.
+        port: String,
+        /// Actual bit width.
+        width: usize,
+    },
+    /// A PLL output cannot drive a constant logical input.
+    PllOutputIsConstant(String),
 }
 
 impl Display for MappingError {
@@ -4658,9 +4930,8 @@ impl Display for MappingError {
                 formatter,
                 "open-drain input port `{port}` is a constant rather than a mapped wire"
             ),
-            Self::MappedWireOverflow => {
-                formatter.write_str("mapped wire number overflow while inserting open-drain I/O")
-            }
+            Self::MappedWireOverflow => formatter
+                .write_str("mapped wire number overflow while inserting a target primitive"),
             Self::JtaggAlreadyBound => {
                 formatter.write_str("the ECP5 netlist already contains a JTAGG primitive")
             }
@@ -4689,6 +4960,27 @@ impl Display for MappingError {
                 formatter,
                 "JTAGG output port `{port}` is a constant rather than a mapped wire"
             ),
+            Self::PllPortNotFound(port) => {
+                write!(formatter, "PLL boundary port `{port}` was not found")
+            }
+            Self::PllPortRepeated(port) => {
+                write!(
+                    formatter,
+                    "PLL boundary port `{port}` is assigned more than once"
+                )
+            }
+            Self::PllPortDirection { port, actual } => write!(
+                formatter,
+                "PLL boundary port `{port}` has direction {actual:?}, expected Input"
+            ),
+            Self::PllPortNotScalar { port, width } => write!(
+                formatter,
+                "PLL boundary port `{port}` has width {width}, expected a scalar port"
+            ),
+            Self::PllOutputIsConstant(port) => write!(
+                formatter,
+                "PLL output port `{port}` is a constant rather than a mapped wire"
+            ),
         }
     }
 }
@@ -4710,7 +5002,12 @@ impl Error for MappingError {
             | Self::JtaggPortRepeated(_)
             | Self::JtaggPortDirection { .. }
             | Self::JtaggPortNotScalar { .. }
-            | Self::JtaggOutputIsConstant(_) => None,
+            | Self::JtaggOutputIsConstant(_)
+            | Self::PllPortNotFound(_)
+            | Self::PllPortRepeated(_)
+            | Self::PllPortDirection { .. }
+            | Self::PllPortNotScalar { .. }
+            | Self::PllOutputIsConstant(_) => None,
         }
     }
 }
@@ -4855,6 +5152,7 @@ impl From<&Ecp5Netlist> for JsonDesign {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
     match cell {
         Ecp5Cell::Lut4 {
@@ -4950,6 +5248,85 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
                 *extension_register_2,
             ),
         ),
+        Ecp5Cell::Pll {
+            name,
+            reference_clock,
+            feedback_clock,
+            output_clock,
+            locked,
+            fabric_output,
+            feedback_output,
+            parameters,
+            attributes,
+        } => (
+            name.clone(),
+            json_pll(
+                *reference_clock,
+                *feedback_clock,
+                *output_clock,
+                *locked,
+                *fabric_output,
+                *feedback_output,
+                parameters,
+                attributes,
+            ),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn json_pll(
+    reference_clock: Bit,
+    feedback_clock: u32,
+    output_clock: u32,
+    locked: u32,
+    fabric_output: PllOutput,
+    feedback_output: PllOutput,
+    parameters: &BTreeMap<String, String>,
+    attributes: &BTreeMap<String, String>,
+) -> JsonCell {
+    let mut port_directions = BTreeMap::from([
+        ("RST".into(), "input"),
+        ("STDBY".into(), "input"),
+        ("CLKI".into(), "input"),
+        ("CLKFB".into(), "input"),
+        ("PHASESEL0".into(), "input"),
+        ("PHASESEL1".into(), "input"),
+        ("PHASEDIR".into(), "input"),
+        ("PHASESTEP".into(), "input"),
+        ("PHASELOADREG".into(), "input"),
+        ("PLLWAKESYNC".into(), "input"),
+        ("ENCLKOP".into(), "input"),
+        ("LOCK".into(), "output"),
+    ]);
+    let mut connections = BTreeMap::from([
+        ("RST".into(), vec![Bit::Zero]),
+        ("STDBY".into(), vec![Bit::Zero]),
+        ("CLKI".into(), vec![reference_clock]),
+        ("CLKFB".into(), vec![Bit::Wire(feedback_clock)]),
+        ("PHASESEL0".into(), vec![Bit::Zero]),
+        ("PHASESEL1".into(), vec![Bit::Zero]),
+        ("PHASEDIR".into(), vec![Bit::One]),
+        ("PHASESTEP".into(), vec![Bit::One]),
+        ("PHASELOADREG".into(), vec![Bit::One]),
+        ("PLLWAKESYNC".into(), vec![Bit::Zero]),
+        ("ENCLKOP".into(), vec![Bit::Zero]),
+        ("LOCK".into(), vec![Bit::Wire(locked)]),
+    ]);
+    port_directions.insert(feedback_output.port().into(), "output");
+    connections.insert(
+        feedback_output.port().into(),
+        vec![Bit::Wire(feedback_clock)],
+    );
+    port_directions.insert(fabric_output.port().into(), "output");
+    connections.insert(fabric_output.port().into(), vec![Bit::Wire(output_clock)]);
+    JsonCell {
+        hide_name: 0,
+        r#type: "EHXPLLL",
+        parameters: parameters.clone(),
+        attributes: attributes.clone(),
+        port_directions,
+        connections,
     }
 }
 
@@ -5353,11 +5730,12 @@ mod tests {
 
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, JtaggBinding, MappingOptions,
-        NextpnrJsonError, OpenDrainIo, PortDirection, backward_retime_ccu2c, backward_retime_lut,
-        carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c, forward_retime_lut,
-        map_once, map_to_ecp5, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
-        map_to_ecp5_with_options, mapped_cell_name, mapped_wire_fanout,
-        merge_equivalent_flip_flops, replicate_high_fanout_enable_luts, split_branched_carry_outs,
+        NextpnrJsonError, OpenDrainIo, PllBinding, PllOutput, PortDirection, backward_retime_ccu2c,
+        backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c,
+        forward_retime_lut, map_once, map_to_ecp5, map_to_ecp5_with_jtagg,
+        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
+        mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
+        replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
     use crate::PhysicalFeedback;
@@ -5973,7 +6351,8 @@ mod tests {
                     Ecp5Cell::Ccu2c { .. }
                     | Ecp5Cell::BlockRam { .. }
                     | Ecp5Cell::TrellisIo { .. }
-                    | Ecp5Cell::Jtagg { .. } => unreachable!(),
+                    | Ecp5Cell::Jtagg { .. }
+                    | Ecp5Cell::Pll { .. } => unreachable!(),
                 };
                 format!(
                     r#""{}":{{"attributes":{{"NEXTPNR_BEL":"{bel}"}}}}"#,
@@ -6539,7 +6918,8 @@ mod tests {
                 | Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
                 | Ecp5Cell::TrellisIo { .. }
-                | Ecp5Cell::Jtagg { .. } => None,
+                | Ecp5Cell::Jtagg { .. }
+                | Ecp5Cell::Pll { .. } => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(truth_tables, [0x8888, 0xeeee, 0x6666, 0x5555, 0xd8d8]);
@@ -6567,7 +6947,8 @@ mod tests {
                 | Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
                 | Ecp5Cell::TrellisIo { .. }
-                | Ecp5Cell::Jtagg { .. } => None,
+                | Ecp5Cell::Jtagg { .. }
+                | Ecp5Cell::Pll { .. } => None,
             })
             .collect::<Vec<_>>();
 
@@ -6775,6 +7156,62 @@ mod tests {
                 .is_err()
         );
         assert_eq!(mapped, original);
+    }
+
+    #[test]
+    fn binds_user_configured_pll_to_logical_clock_ports() {
+        let mut source = Netlist::new("pll_top");
+        source.add_input("clk");
+        source.add_input("clk_250");
+        source.add_input("pll_locked");
+        let mut binding = PllBinding::new(
+            "clk",
+            "clk_250",
+            "pll_locked",
+            PllOutput::Clkos,
+            PllOutput::Clkop,
+        );
+        binding.parameters.extend(
+            [
+                ("CLKI_DIV", "3"),
+                ("CLKFB_DIV", "5"),
+                ("CLKOP_DIV", "25"),
+                ("CLKOS_DIV", "2"),
+                ("FEEDBK_PATH", "CLKOP"),
+            ]
+            .map(|(name, value)| (name.into(), value.into())),
+        );
+        binding
+            .attributes
+            .insert("FREQUENCY_PIN_CLKI".into(), "12".into());
+
+        let mapped = map_to_ecp5_with_pll(&source, &binding).unwrap();
+
+        assert_eq!(
+            mapped
+                .ports()
+                .iter()
+                .map(|port| port.name.as_str())
+                .collect::<Vec<_>>(),
+            ["clk"]
+        );
+        assert!(matches!(
+            mapped.cells(),
+            [Ecp5Cell::Pll {
+                fabric_output: PllOutput::Clkos,
+                feedback_output: PllOutput::Clkop,
+                ..
+            }]
+        ));
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let cell = &json["modules"]["pll_top"]["cells"]["pll"];
+        assert_eq!(cell["type"], "EHXPLLL");
+        assert_eq!(cell["parameters"]["CLKI_DIV"], "3");
+        assert_eq!(cell["attributes"]["FREQUENCY_PIN_CLKI"], "12");
+        assert_eq!(cell["connections"]["CLKFB"], cell["connections"]["CLKOP"]);
+        assert_ne!(cell["connections"]["CLKOP"], cell["connections"]["CLKOS"]);
+        assert_eq!(cell["port_directions"]["CLKOS"], "output");
     }
 
     #[test]

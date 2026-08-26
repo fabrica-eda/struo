@@ -24,6 +24,9 @@ use struo_target_ecp5::{Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection
 /// has no package-pin interface in this artifact, so its fabric outputs use the
 /// inactive TAP state; exercise the ordinary top-level ports before target
 /// binding when simulating JTAG transactions.
+/// A bound `EHXPLLL` uses a cycle-level model which forwards the reference
+/// clock to its clock outputs and holds `LOCK` asserted; implementation timing
+/// remains responsible for the configured physical frequencies.
 ///
 /// # Errors
 ///
@@ -115,6 +118,7 @@ fn finish_artifact(builder: ModuleBuilder) -> Result<FrontendArtifact, CeloxAdap
     Ok(artifact)
 }
 
+#[allow(clippy::too_many_lines)]
 fn reserve_cell_output(
     builder: &mut ModuleBuilder,
     wires: &mut BTreeMap<u32, WireRef>,
@@ -198,6 +202,30 @@ fn reserve_cell_output(
             }
             None
         }
+        Ecp5Cell::Pll {
+            name,
+            feedback_clock,
+            output_clock,
+            locked,
+            ..
+        } => {
+            for (label, wire) in [
+                ("feedback", *feedback_clock),
+                ("output", *output_clock),
+                ("locked", *locked),
+            ] {
+                if !wires.contains_key(&wire) {
+                    reserve_scalar(
+                        builder,
+                        wires,
+                        wire,
+                        format!("__struo_pll_{name}_{label}_{wire}"),
+                        bit_type,
+                    )?;
+                }
+            }
+            None
+        }
     };
     if let Some((wire, name)) = scalar {
         reserve_scalar(builder, wires, wire, name, bit_type)?;
@@ -224,6 +252,7 @@ fn reserve_scalar(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_cell(
     builder: &mut ModuleBuilder,
     wires: &BTreeMap<u32, WireRef>,
@@ -328,7 +357,43 @@ fn emit_cell(
             ],
             *reset_n,
         ),
+        Ecp5Cell::Pll {
+            reference_clock,
+            feedback_clock,
+            output_clock,
+            locked,
+            ..
+        } => emit_cycle_pll(
+            builder,
+            wires,
+            constants,
+            *reference_clock,
+            *feedback_clock,
+            *output_clock,
+            *locked,
+        ),
     }
+}
+
+fn emit_cycle_pll(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    reference_clock: Bit,
+    feedback_clock: u32,
+    output_clock: u32,
+    locked: u32,
+) -> Result<(), CeloxAdapterError> {
+    let reference = bit_expression(builder, wires, constants, reference_clock)?;
+    let feedback = builder.whole(wire_ref(wires, feedback_clock)?.signal)?;
+    builder.assign(feedback, reference)?;
+    if output_clock != feedback_clock {
+        let output = builder.whole(wire_ref(wires, output_clock)?.signal)?;
+        builder.assign(output, reference)?;
+    }
+    let locked = builder.whole(wire_ref(wires, locked)?.signal)?;
+    builder.assign(locked, constants.one_expression)?;
+    Ok(())
 }
 
 fn emit_idle_jtagg(
@@ -879,8 +944,9 @@ mod tests {
     };
     use struo_synth::synthesize;
     use struo_target_ecp5::{
-        ArithmeticMapping, JtaggBinding, MappingOptions, OpenDrainIo, map_to_ecp5,
-        map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
+        ArithmeticMapping, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding, PllOutput,
+        map_to_ecp5, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
+        map_to_ecp5_with_options, map_to_ecp5_with_pll,
     };
 
     use super::{ecp5_frontend_artifact, ecp5_simulator};
@@ -1163,6 +1229,42 @@ mod tests {
         assert_eq!(simulator.get(simulator.signal("observed_tdi")), 0u8.into());
         assert_eq!(
             simulator.get(simulator.signal("observed_reset_n")),
+            1u8.into()
+        );
+    }
+
+    #[test]
+    fn models_bound_pll_as_a_cycle_level_clock_source() {
+        let mut source = Netlist::new("pll_top");
+        let reference = source.add_input("clk");
+        let fabric_clock = source.add_input("fabric_clock");
+        let locked = source.add_input("pll_locked");
+        source.add_output("observed_reference", reference);
+        source.add_output("observed_clock", fabric_clock);
+        source.add_output("observed_locked", locked);
+        let binding = PllBinding::new(
+            "clk",
+            "fabric_clock",
+            "pll_locked",
+            PllOutput::Clkos,
+            PllOutput::Clkop,
+        );
+        let mapped = map_to_ecp5_with_pll(&source, &binding).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let clk = simulator.signal("clk");
+
+        simulator.modify(|io| io.set(clk, 1u8)).unwrap();
+
+        assert_eq!(
+            simulator.get(simulator.signal("observed_reference")),
+            1u8.into()
+        );
+        assert_eq!(
+            simulator.get(simulator.signal("observed_clock")),
+            1u8.into()
+        );
+        assert_eq!(
+            simulator.get(simulator.signal("observed_locked")),
             1u8.into()
         );
     }

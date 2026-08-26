@@ -1,4 +1,7 @@
 //! Emits a minimal ECP5 dedicated-JTAG netlist for nextpnr.
+//!
+//! JTCK is only the JTAG transport clock. A user-owned top or wrapper must
+//! separately bind and constrain any PLL-backed fabric execution clock.
 
 use std::error::Error;
 
