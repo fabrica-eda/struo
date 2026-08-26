@@ -215,10 +215,11 @@ dependencies before running the analyzer.
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
 addition and subtraction, signed and unsigned comparisons, variable logical
-and arithmetic shifts, muxes, concatenation, slicing, registers, enables, and
-synchronous or asynchronous constant resets. It performs constant folding and
-structural hashing, balances associative reductions, and uses parallel-prefix
-comparison networks. A conservative sequential don't-care pass removes a
+and arithmetic shifts, muxes, concatenation, static slicing, dynamic packed
+bit selection, module constants, registers, enables, and synchronous or
+asynchronous constant resets. It performs constant folding and structural
+hashing, balances associative reductions, and uses parallel-prefix comparison
+networks. A conservative sequential don't-care pass removes a
 payload register's clock enable when a same-clock valid register and structural
 influence analysis prove that the payload is unobservable while invalid. This
 lets source RTL retain natural conditional assignments without putting their
