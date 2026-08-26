@@ -1,11 +1,17 @@
 [package]
 name = "struo-synth"
 description = "Synthesis passes and pipeline for Struo"
+publish = ["crates-io"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 struo-formal.workspace = true

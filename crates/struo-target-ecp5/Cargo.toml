@@ -1,11 +1,17 @@
 [package]
 name = "struo-target-ecp5"
 description = "Lattice ECP5 synthesis, verification, and place-and-route target"
+publish = ["crates-io"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
