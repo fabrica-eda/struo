@@ -264,6 +264,56 @@ stretching or multi-controller arbitration is required. The mapped Celox model
 treats the physical pad as an external input while released and forces its
 readback low while the core is pulling it low.
 
+### Dedicated ECP5 JTAG access
+
+Model `JTAGG` in Veryl as an ordinary top-level fabric interface, rather than
+as an SV attribute or a vendor-named source instance. This keeps the core
+portable and makes JTAG transactions directly driveable in RTL simulation.
+For a `jtag` prefix, declare these scalar ports on the selected top:
+
+```veryl
+module Top (
+    // Signals driven by the ECP5 TAP into the core.
+    jtag_tdi   : input logic,
+    jtag_tck   : input clock,
+    jtag_rti1  : input logic,
+    jtag_rti2  : input logic,
+    jtag_shift : input logic,
+    jtag_update: input logic,
+    jtag_rst_n : input reset_async_low,
+    jtag_ce1   : input logic,
+    jtag_ce2   : input logic,
+
+    // Data returned from the core to extension registers one and two.
+    jtag_tdo1  : output logic,
+    jtag_tdo2  : output logic,
+) {
+    always_comb {
+        // Replace these with extension-register shift logic.
+        jtag_tdo1 = 0;
+        jtag_tdo2 = 0;
+    }
+}
+```
+
+After synthesis, bind all eleven ports atomically at the ECP5 boundary:
+
+```rust
+use struo::{JtaggBinding, map_to_ecp5_with_jtagg};
+
+let mut jtagg = JtaggBinding::with_prefix("jtag");
+jtagg.extension_register_2 = false; // when only ER1 is used
+let mapped = map_to_ecp5_with_jtagg(&synthesized.netlist, &jtagg)?;
+```
+
+The compiler driver provides the equivalent `--jtagg-prefix jtag` option. The
+binding removes the logical ports from the package-pin list and emits one
+`JTAGG` cell using the device's dedicated JTAG pins. Missing, repeated,
+non-scalar, or incorrectly directed ports fail mapping instead of producing a
+partially connected primitive. Post-map Celox simulation holds the inaccessible
+physical TAP in its inactive state; simulate JTAG traffic before binding when
+the protocol itself is under test.
+
 `carry-benchmark` emits two equivalent 32-bit registered counters as
 `carry.json` and `lut.json`. On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seed 1,
 and a 250 MHz timing target, the routed carry version used 38 `TRELLIS_COMB`

@@ -1710,7 +1710,7 @@ mod tests {
     use celox::{NativeBackend, Simulator};
     use struo_celox::ecp5_simulator;
     use struo_synth::synthesize;
-    use struo_target_ecp5::map_to_ecp5;
+    use struo_target_ecp5::{JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg};
 
     use crate::analyze_and_lower;
 
@@ -2280,6 +2280,43 @@ module NbaTop (
             assert_value(&mut simulator, "state", if selected == 0 { 0 } else { 7 });
             assert_value(&mut simulator, "drive_low", 1 - selected);
         }
+    }
+
+    #[test]
+    fn maps_a_veryl_top_interface_to_jtagg() {
+        let source = r"
+module DebugTop (
+    jtag_tdi   : input logic,
+    jtag_tck   : input clock,
+    jtag_rti1  : input logic,
+    jtag_rti2  : input logic,
+    jtag_shift : input logic,
+    jtag_update: input logic,
+    jtag_rst_n : input reset_async_low,
+    jtag_ce1   : input logic,
+    jtag_ce2   : input logic,
+    jtag_tdo1  : output logic,
+    jtag_tdo2  : output logic,
+) {
+    always_comb {
+        jtag_tdo1 = 0;
+        jtag_tdo2 = 0;
+    }
+}
+";
+        let design = analyze_and_lower(source, "jtagg_lowering", "DebugTop").unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped =
+            map_to_ecp5_with_jtagg(&synthesized.netlist, &JtaggBinding::with_prefix("jtag"))
+                .unwrap();
+
+        assert!(mapped.ports().is_empty());
+        assert!(
+            mapped
+                .to_nextpnr_json()
+                .unwrap()
+                .contains("\"type\": \"JTAGG\"")
+        );
     }
 
     fn reset(simulator: &mut Simulator<NativeBackend>) {
