@@ -288,10 +288,8 @@ mod tests {
 
     #[test]
     fn parses_the_bundled_pll_binding() {
-        let binding: struo::PllBinding = serde_json::from_str(include_str!(
-            "../../../boards/lfe5um5g-85f-evn/pll-12-to-250.json"
-        ))
-        .unwrap();
+        let binding: struo::PllBinding =
+            serde_json::from_str(include_str!("../tests/fixtures/pll-12-to-250.json")).unwrap();
 
         assert_eq!(binding.reference_clock_port, "clk");
         assert_eq!(binding.output_clock_port, "clk_250");

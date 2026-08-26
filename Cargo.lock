@@ -3075,7 +3075,7 @@ dependencies = [
 
 [[package]]
 name = "struo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "struo-celox",
  "struo-formal",
@@ -3089,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "struo-celox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "celox",
  "struo-ir",
@@ -3100,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "struo-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "serde_json",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "struo-example-axi4-smartconnect"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "celox",
  "struo",
@@ -3120,14 +3120,14 @@ dependencies = [
 
 [[package]]
 name = "struo-formal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "struo-ir",
 ]
 
 [[package]]
 name = "struo-frontend-veryl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "celox",
  "struo-celox",
@@ -3142,19 +3142,19 @@ dependencies = [
 
 [[package]]
 name = "struo-ir"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "struo-rtl"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "struo-sim"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "struo-synth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "struo-formal",
  "struo-ir",
@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "struo-target-ecp5"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
