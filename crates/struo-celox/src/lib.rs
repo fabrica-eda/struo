@@ -38,11 +38,13 @@ pub fn ecp5_frontend_artifact(
     for port in netlist.ports() {
         let port_type = ValueType::bits(port.bits.len())?;
         let signal = match port.direction {
-            MappedPortDirection::Input => builder.input(&port.name, port_type)?,
+            MappedPortDirection::Input | MappedPortDirection::Inout => {
+                builder.input(&port.name, port_type)?
+            }
             MappedPortDirection::Output => builder.output(&port.name, port_type)?,
         };
         match port.direction {
-            MappedPortDirection::Input => {
+            MappedPortDirection::Input | MappedPortDirection::Inout => {
                 for (lsb, bit) in port.bits.iter().enumerate() {
                     insert_wire(
                         &mut wires,
@@ -158,6 +160,9 @@ fn reserve_cell_output(
             }
             None
         }
+        Ecp5Cell::TrellisIo {
+            name, fabric_input, ..
+        } => Some((*fabric_input, format!("__struo_io_{name}_{fabric_input}"))),
     };
     if let Some((wire, name)) = scalar {
         reserve_scalar(builder, wires, wire, name, bit_type)?;
@@ -248,6 +253,21 @@ fn emit_cell(
             *clock,
             *edge,
         ),
+        Ecp5Cell::TrellisIo {
+            pad,
+            fabric_output,
+            fabric_input,
+            tristate,
+            ..
+        } => {
+            let pad = bit_expression(builder, wires, constants, Bit::Wire(*pad))?;
+            let driven = bit_expression(builder, wires, constants, *fabric_output)?;
+            let tristate = bit_expression(builder, wires, constants, *tristate)?;
+            let resolved = builder.mux(tristate, pad, driven)?;
+            let target = builder.whole(wire_ref(wires, *fabric_input)?.signal)?;
+            builder.assign(target, resolved)?;
+            Ok(())
+        }
     }
 }
 
@@ -783,7 +803,8 @@ mod tests {
     };
     use struo_synth::synthesize;
     use struo_target_ecp5::{
-        ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+        ArithmeticMapping, MappingOptions, OpenDrainIo, map_to_ecp5,
+        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
     };
 
     use super::{ecp5_frontend_artifact, ecp5_simulator};
@@ -1002,6 +1023,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(simulator.get(value), 1u8.into());
+    }
+
+    #[test]
+    fn simulates_open_drain_pad_readback() {
+        let mut source = Netlist::new("i2c_top");
+        let sda_i = source.add_input("sda_i");
+        let request = source.add_input("request");
+        source.add_output("sda_drive_low", request);
+        source.add_output("sampled_sda", sda_i);
+        let mapped = map_to_ecp5_with_open_drain_ios(
+            &source,
+            &[OpenDrainIo::new("sda", "sda_i", "sda_drive_low")],
+        )
+        .unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let sda = simulator.signal("sda");
+        let request = simulator.signal("request");
+        let sampled = simulator.signal("sampled_sda");
+
+        simulator
+            .modify(|io| {
+                io.set(sda, 1u8);
+                io.set(request, 0u8);
+            })
+            .unwrap();
+        assert_eq!(simulator.get(sampled), 1u8.into());
+
+        simulator
+            .modify(|io| {
+                io.set(sda, 1u8);
+                io.set(request, 1u8);
+            })
+            .unwrap();
+        assert_eq!(simulator.get(sampled), 0u8.into());
     }
 
     #[test]

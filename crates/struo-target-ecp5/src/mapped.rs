@@ -97,6 +97,8 @@ pub enum PortDirection {
     Input,
     /// FPGA output.
     Output,
+    /// Bidirectional FPGA pad.
+    Inout,
 }
 
 /// One physical port with bits stored least-significant first.
@@ -108,6 +110,37 @@ pub struct MappedPort {
     pub direction: PortDirection,
     /// Connected mapped bits, least-significant first.
     pub bits: Vec<Bit>,
+}
+
+/// Connects a split, scalar open-drain interface to one physical FPGA pad.
+///
+/// The input port continuously observes the pad. The active-high drive-low
+/// port may only pull the pad low; when it is deasserted the pad is high
+/// impedance and must be raised by an external pull-up resistor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenDrainIo {
+    /// Physical bidirectional port name used by the LPF constraint file.
+    pub pin: String,
+    /// Scalar input port through which the core observes the physical pad.
+    pub input_port: String,
+    /// Scalar output port which pulls the pad low when asserted.
+    pub drive_low_port: String,
+}
+
+impl OpenDrainIo {
+    /// Creates one scalar open-drain I/O binding.
+    #[must_use]
+    pub fn new(
+        pin: impl Into<String>,
+        input_port: impl Into<String>,
+        drive_low_port: impl Into<String>,
+    ) -> Self {
+        Self {
+            pin: pin.into(),
+            input_port: input_port.into(),
+            drive_low_port: drive_low_port.into(),
+        }
+    }
 }
 
 /// Control input and its assertion level.
@@ -290,6 +323,19 @@ pub enum Ecp5Cell {
         /// Shared active clock edge.
         edge: ClockEdge,
     },
+    /// Bidirectional ECP5 I/O buffer.
+    TrellisIo {
+        /// Stable cell name.
+        name: String,
+        /// Wire shared with the physical top-level pad.
+        pad: u32,
+        /// Value driven from the FPGA fabric toward the pad.
+        fabric_output: Bit,
+        /// Wire carrying the observed pad value into the FPGA fabric.
+        fabric_input: u32,
+        /// Active-high high-impedance control.
+        tristate: Bit,
+    },
 }
 
 /// Technology-mapped ECP5 netlist used by both simulation and nextpnr.
@@ -369,6 +415,132 @@ impl Ecp5Netlist {
     #[must_use]
     pub fn cells(&self) -> &[Ecp5Cell] {
         &self.cells
+    }
+
+    /// Replaces one split scalar input/output pair with an open-drain pad.
+    ///
+    /// Mapping the core first keeps its two-state verification interface
+    /// intact. This boundary operation then removes `input_port` and
+    /// `drive_low_port`, adds the bidirectional `pin`, and emits a
+    /// `TRELLIS_IO` which can only drive zero or high impedance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, non-scalar, incorrectly directed, or
+    /// conflicting ports, or if no mapped wire number remains available.
+    pub fn bind_open_drain_io(&mut self, binding: &OpenDrainIo) -> Result<(), MappingError> {
+        let input_index = self
+            .ports
+            .iter()
+            .position(|port| port.name == binding.input_port)
+            .ok_or_else(|| MappingError::IoPortNotFound(binding.input_port.clone()))?;
+        let drive_index = self
+            .ports
+            .iter()
+            .position(|port| port.name == binding.drive_low_port)
+            .ok_or_else(|| MappingError::IoPortNotFound(binding.drive_low_port.clone()))?;
+        if input_index == drive_index {
+            return Err(MappingError::IoPortsMustDiffer {
+                input: binding.input_port.clone(),
+                drive_low: binding.drive_low_port.clone(),
+            });
+        }
+        if self.ports.iter().any(|port| port.name == binding.pin) {
+            return Err(MappingError::IoPortAlreadyExists(binding.pin.clone()));
+        }
+
+        let input_port = &self.ports[input_index];
+        if input_port.direction != PortDirection::Input {
+            return Err(MappingError::IoPortDirection {
+                port: binding.input_port.clone(),
+                expected: PortDirection::Input,
+                actual: input_port.direction,
+            });
+        }
+        let drive_port = &self.ports[drive_index];
+        if drive_port.direction != PortDirection::Output {
+            return Err(MappingError::IoPortDirection {
+                port: binding.drive_low_port.clone(),
+                expected: PortDirection::Output,
+                actual: drive_port.direction,
+            });
+        }
+        if input_port.bits.len() != 1 {
+            return Err(MappingError::IoPortNotScalar {
+                port: binding.input_port.clone(),
+                width: input_port.bits.len(),
+            });
+        }
+        if drive_port.bits.len() != 1 {
+            return Err(MappingError::IoPortNotScalar {
+                port: binding.drive_low_port.clone(),
+                width: drive_port.bits.len(),
+            });
+        }
+        let Bit::Wire(fabric_input) = input_port.bits[0] else {
+            return Err(MappingError::IoInputIsConstant(binding.input_port.clone()));
+        };
+        let drive_low = drive_port.bits[0];
+        let pad = maximum_mapped_wire(self)
+            .unwrap_or(1)
+            .checked_add(1)
+            .ok_or(MappingError::MappedWireOverflow)?;
+        let tristate = match drive_low {
+            Bit::Zero => Bit::One,
+            Bit::One => Bit::Zero,
+            Bit::Wire(wire) => {
+                let inverted = pad.checked_add(1).ok_or(MappingError::MappedWireOverflow)?;
+                self.cells.push(Ecp5Cell::Lut4 {
+                    name: unique_cell_name(
+                        &format!("io_{}_drive_low_invert", binding.pin),
+                        &self.cells,
+                        None,
+                    ),
+                    inputs: [Bit::Wire(wire), Bit::Zero, Bit::Zero, Bit::Zero],
+                    output: inverted,
+                    // A is the least-significant LUT index bit.
+                    init: 0x5555,
+                });
+                Bit::Wire(inverted)
+            }
+        };
+        self.cells.push(Ecp5Cell::TrellisIo {
+            name: unique_cell_name(&format!("io_{}", binding.pin), &self.cells, None),
+            pad,
+            fabric_output: Bit::Zero,
+            fabric_input,
+            tristate,
+        });
+
+        let insertion_index = input_index.min(drive_index);
+        let mut removed = [input_index, drive_index];
+        removed.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        for index in removed {
+            self.ports.remove(index);
+        }
+        self.ports.insert(
+            insertion_index,
+            MappedPort {
+                name: binding.pin.clone(),
+                direction: PortDirection::Inout,
+                bits: vec![Bit::Wire(pad)],
+            },
+        );
+        Ok(())
+    }
+
+    /// Atomically binds multiple split interfaces to open-drain pads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first binding error without changing this netlist.
+    pub fn bind_open_drain_ios(&mut self, bindings: &[OpenDrainIo]) -> Result<(), MappingError> {
+        let mut candidate = self.clone();
+        for binding in bindings {
+            candidate.bind_open_drain_io(binding)?;
+        }
+        *self = candidate;
+        Ok(())
     }
 
     /// Returns the technology-scored retiming decision made during mapping.
@@ -713,6 +885,7 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
         Ecp5Cell::Lut4 { .. } => bel.contains(".K"),
         Ecp5Cell::FlipFlop { .. } => bel.contains(".FF"),
         Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD"),
+        Ecp5Cell::TrellisIo { .. } => bel.contains("PIO"),
         Ecp5Cell::Ccu2c { .. } => false,
     }
 }
@@ -724,6 +897,20 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
 /// Returns an error if the source netlist is invalid.
 pub fn map_to_ecp5(netlist: &Netlist) -> Result<Ecp5Netlist, MappingError> {
     map_to_ecp5_with_options(netlist, MappingOptions::default())
+}
+
+/// Maps a core and binds its split open-drain interfaces to physical pads.
+///
+/// # Errors
+///
+/// Returns an error if logic mapping or any I/O binding fails.
+pub fn map_to_ecp5_with_open_drain_ios(
+    netlist: &Netlist,
+    bindings: &[OpenDrainIo],
+) -> Result<Ecp5Netlist, MappingError> {
+    let mut mapped = map_to_ecp5(netlist)?;
+    mapped.bind_open_drain_ios(bindings)?;
+    Ok(mapped)
 }
 
 /// Maps a target-independent netlist with explicit arithmetic choices.
@@ -1330,7 +1517,10 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
         .iter()
         .filter_map(|cell| match cell {
             Ecp5Cell::Lut4 { output, .. } => Some(*output),
-            Ecp5Cell::Ccu2c { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+            Ecp5Cell::Ccu2c { .. }
+            | Ecp5Cell::FlipFlop { .. }
+            | Ecp5Cell::BlockRam { .. }
+            | Ecp5Cell::TrellisIo { .. } => None,
         })
         .collect::<HashSet<_>>();
     netlist
@@ -1350,7 +1540,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
             Ecp5Cell::Lut4 { .. }
             | Ecp5Cell::Ccu2c { .. }
             | Ecp5Cell::FlipFlop { .. }
-            | Ecp5Cell::BlockRam { .. } => None,
+            | Ecp5Cell::BlockRam { .. }
+            | Ecp5Cell::TrellisIo { .. } => None,
         })
         .max()
         .unwrap_or(0)
@@ -1648,6 +1839,14 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
             }
             replace(clock);
         }
+        Ecp5Cell::TrellisIo {
+            fabric_output,
+            tristate,
+            ..
+        } => {
+            replace(fabric_output);
+            replace(tristate);
+        }
     }
     replacements
 }
@@ -1714,6 +1913,11 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
                 .map_or(0, |control| bit_lut_depth(control.signal, &depths))
                 .max(bit_lut_depth(write_enable.signal, &depths)),
         ),
+        Ecp5Cell::TrellisIo {
+            fabric_output,
+            tristate,
+            ..
+        } => Some(bit_lut_depth(*fabric_output, &depths).max(bit_lut_depth(*tristate, &depths))),
         Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => None,
     });
     let output_depths = netlist
@@ -1773,6 +1977,14 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
                     &fanouts,
                 )),
         ),
+        Ecp5Cell::TrellisIo {
+            fabric_output,
+            tristate,
+            ..
+        } => Some(
+            mapped_setup_period(*fabric_output, &arrivals, &fanouts)
+                .max(mapped_setup_period(*tristate, &arrivals, &fanouts)),
+        ),
         Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => None,
     });
     let output_periods = netlist
@@ -1827,6 +2039,9 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
                     depths.entry(*output).or_insert(0);
                 }
             }
+            Ecp5Cell::TrellisIo { fabric_input, .. } => {
+                depths.insert(*fabric_input, 0);
+            }
             Ecp5Cell::Lut4 { .. } => {}
         }
     }
@@ -1866,6 +2081,7 @@ fn bit_lut_depth(bit: Bit, depths: &WireMap<usize>) -> usize {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
     let fanouts = mapped_wire_fanouts(netlist);
     let carry_outputs = netlist
@@ -1896,6 +2112,9 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                 for output in read_data {
                     arrivals.insert(*output, BRAM_CLOCK_TO_OUTPUT_PS);
                 }
+            }
+            Ecp5Cell::TrellisIo { fabric_input, .. } => {
+                arrivals.insert(*fabric_input, 0);
             }
             Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => {}
         }
@@ -1955,7 +2174,9 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                     progress |=
                         arrivals.insert(*carry_out, carry_out_arrival) != Some(carry_out_arrival);
                 }
-                Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => {}
+                Ecp5Cell::FlipFlop { .. }
+                | Ecp5Cell::BlockRam { .. }
+                | Ecp5Cell::TrellisIo { .. } => {}
             }
         }
         if !progress {
@@ -2437,7 +2658,10 @@ fn ccu_chain_names(netlist: &Ecp5Netlist) -> Vec<Vec<String>> {
                 carry_out,
                 ..
             } => Some((name.clone(), *carry_in, *carry_out)),
-            Ecp5Cell::Lut4 { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+            Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::FlipFlop { .. }
+            | Ecp5Cell::BlockRam { .. }
+            | Ecp5Cell::TrellisIo { .. } => None,
         })
         .collect::<Vec<_>>();
     let carry_producers = ccus
@@ -2557,7 +2781,8 @@ fn forward_retime_ccu2c(netlist: &Ecp5Netlist, ccu_index: usize) -> Option<Ecp5N
                     Ecp5Cell::Lut4 { .. }
                     | Ecp5Cell::Ccu2c { .. }
                     | Ecp5Cell::FlipFlop { .. }
-                    | Ecp5Cell::BlockRam { .. } => None,
+                    | Ecp5Cell::BlockRam { .. }
+                    | Ecp5Cell::TrellisIo { .. } => None,
                 })?;
         if let Some((domain_clock, domain_edge, domain_enable, domain_reset)) = domain {
             if (clock, edge, enable) != (domain_clock, domain_edge, domain_enable)
@@ -2792,7 +3017,10 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
                     output,
                 ))
             }
-            Ecp5Cell::Lut4 { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => None,
+            Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::FlipFlop { .. }
+            | Ecp5Cell::BlockRam { .. }
+            | Ecp5Cell::TrellisIo { .. } => None,
         })?;
 
     let mut vertices = Vec::new();
@@ -3252,6 +3480,14 @@ fn replace_mapped_wire_uses(netlist: &mut Ecp5Netlist, from: u32, to: u32) {
                 }
                 replace(clock);
             }
+            Ecp5Cell::TrellisIo {
+                fabric_output,
+                tristate,
+                ..
+            } => {
+                replace(fabric_output);
+                replace(tristate);
+            }
         }
     }
 }
@@ -3278,7 +3514,8 @@ fn mapped_cell_name(cell: &Ecp5Cell) -> &str {
         Ecp5Cell::Lut4 { name, .. }
         | Ecp5Cell::Ccu2c { name, .. }
         | Ecp5Cell::FlipFlop { name, .. }
-        | Ecp5Cell::BlockRam { name, .. } => name,
+        | Ecp5Cell::BlockRam { name, .. }
+        | Ecp5Cell::TrellisIo { name, .. } => name,
     }
 }
 
@@ -3303,7 +3540,7 @@ fn mapped_wire_is_clock_or_reset(netlist: &Ecp5Netlist, wire: u32) -> bool {
                 || reset.is_some_and(|control| control.signal == Bit::Wire(wire))
         }
         Ecp5Cell::BlockRam { clock, .. } => *clock == Bit::Wire(wire),
-        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => false,
+        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } | Ecp5Cell::TrellisIo { .. } => false,
     })
 }
 
@@ -3426,6 +3663,14 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
                 visit(control.signal);
             }
         }
+        Ecp5Cell::TrellisIo {
+            fabric_output,
+            tristate,
+            ..
+        } => {
+            visit(*fabric_output);
+            visit(*tristate);
+        }
     }
 }
 
@@ -3443,6 +3688,7 @@ fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
             .map(Bit::Wire)
             .collect(),
         Ecp5Cell::BlockRam { read_data, .. } => read_data.iter().copied().map(Bit::Wire).collect(),
+        Ecp5Cell::TrellisIo { fabric_input, .. } => vec![Bit::Wire(*fabric_input)],
     }
 }
 
@@ -4051,6 +4297,37 @@ pub enum MappingError {
         /// Requested word width.
         width: usize,
     },
+    /// A named split I/O port does not exist.
+    IoPortNotFound(String),
+    /// The physical pad name conflicts with an existing mapped port.
+    IoPortAlreadyExists(String),
+    /// The two logical sides of an open-drain binding name the same port.
+    IoPortsMustDiffer {
+        /// Core input port.
+        input: String,
+        /// Core drive-low output port.
+        drive_low: String,
+    },
+    /// A split I/O port has the wrong direction.
+    IoPortDirection {
+        /// Port name.
+        port: String,
+        /// Direction required by the binding role.
+        expected: PortDirection,
+        /// Actual mapped direction.
+        actual: PortDirection,
+    },
+    /// Open-drain bindings currently operate on scalar ports.
+    IoPortNotScalar {
+        /// Port name.
+        port: String,
+        /// Actual bit width.
+        width: usize,
+    },
+    /// A mapped input unexpectedly contains a constant instead of a wire.
+    IoInputIsConstant(String),
+    /// No wire number remains for an inserted I/O primitive.
+    MappedWireOverflow,
 }
 
 impl Display for MappingError {
@@ -4065,6 +4342,38 @@ impl Display for MappingError {
                 formatter,
                 "memory {memory} ({depth}x{width}) cannot be mapped to ECP5 DP16KD primitives"
             ),
+            Self::IoPortNotFound(port) => {
+                write!(formatter, "open-drain I/O port `{port}` was not found")
+            }
+            Self::IoPortAlreadyExists(port) => {
+                write!(
+                    formatter,
+                    "open-drain physical port `{port}` already exists"
+                )
+            }
+            Self::IoPortsMustDiffer { input, drive_low } => write!(
+                formatter,
+                "open-drain input `{input}` and drive-low output `{drive_low}` must be different ports"
+            ),
+            Self::IoPortDirection {
+                port,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "open-drain port `{port}` has direction {actual:?}, expected {expected:?}"
+            ),
+            Self::IoPortNotScalar { port, width } => write!(
+                formatter,
+                "open-drain port `{port}` has width {width}, expected a scalar port"
+            ),
+            Self::IoInputIsConstant(port) => write!(
+                formatter,
+                "open-drain input port `{port}` is a constant rather than a mapped wire"
+            ),
+            Self::MappedWireOverflow => {
+                formatter.write_str("mapped wire number overflow while inserting open-drain I/O")
+            }
         }
     }
 }
@@ -4073,7 +4382,14 @@ impl Error for MappingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidNetlist(error) => Some(error),
-            Self::UnsupportedMemoryGeometry { .. } => None,
+            Self::UnsupportedMemoryGeometry { .. }
+            | Self::IoPortNotFound(_)
+            | Self::IoPortAlreadyExists(_)
+            | Self::IoPortsMustDiffer { .. }
+            | Self::IoPortDirection { .. }
+            | Self::IoPortNotScalar { .. }
+            | Self::IoInputIsConstant(_)
+            | Self::MappedWireOverflow => None,
         }
     }
 }
@@ -4165,6 +4481,7 @@ impl From<&Ecp5Netlist> for JsonDesign {
                         direction: match port.direction {
                             PortDirection::Input => "input",
                             PortDirection::Output => "output",
+                            PortDirection::Inout => "inout",
                         },
                         bits: port.bits.clone(),
                     },
@@ -4275,6 +4592,41 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
                 *edge,
             ),
         ),
+        Ecp5Cell::TrellisIo {
+            name,
+            pad,
+            fabric_output,
+            fabric_input,
+            tristate,
+        } => (
+            name.clone(),
+            json_trellis_io(*pad, *fabric_output, *fabric_input, *tristate),
+        ),
+    }
+}
+
+fn json_trellis_io(pad: u32, fabric_output: Bit, fabric_input: u32, tristate: Bit) -> JsonCell {
+    JsonCell {
+        hide_name: 0,
+        r#type: "TRELLIS_IO",
+        parameters: [("DIR".into(), "BIDIR".into())].into_iter().collect(),
+        attributes: [("PULLMODE".into(), "NONE".into())].into_iter().collect(),
+        port_directions: [
+            ("B".into(), "inout"),
+            ("I".into(), "input"),
+            ("O".into(), "output"),
+            ("T".into(), "input"),
+        ]
+        .into_iter()
+        .collect(),
+        connections: [
+            ("B".into(), vec![Bit::Wire(pad)]),
+            ("I".into(), vec![fabric_output]),
+            ("O".into(), vec![Bit::Wire(fabric_input)]),
+            ("T".into(), vec![tristate]),
+        ]
+        .into_iter()
+        .collect(),
     }
 }
 
@@ -4581,8 +4933,9 @@ mod tests {
 
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, MappingOptions, NextpnrJsonError,
-        backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names,
-        forward_retime_ccu2c, forward_retime_lut, map_once, map_to_ecp5, map_to_ecp5_with_options,
+        OpenDrainIo, PortDirection, backward_retime_ccu2c, backward_retime_lut,
+        carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c, forward_retime_lut,
+        map_once, map_to_ecp5, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
         mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
         replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
@@ -5197,7 +5550,9 @@ mod tests {
                 let bel = match cell {
                     Ecp5Cell::Lut4 { .. } => format!("X{index}/Y1/SLICEA.K0"),
                     Ecp5Cell::FlipFlop { .. } => format!("X{index}/Y1/SLICEA.FF0"),
-                    Ecp5Cell::Ccu2c { .. } | Ecp5Cell::BlockRam { .. } => unreachable!(),
+                    Ecp5Cell::Ccu2c { .. }
+                    | Ecp5Cell::BlockRam { .. }
+                    | Ecp5Cell::TrellisIo { .. } => unreachable!(),
                 };
                 format!(
                     r#""{}":{{"attributes":{{"NEXTPNR_BEL":"{bel}"}}}}"#,
@@ -5759,9 +6114,10 @@ mod tests {
             .iter()
             .filter_map(|cell| match cell {
                 Ecp5Cell::Lut4 { init, .. } => Some(*init),
-                Ecp5Cell::Ccu2c { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => {
-                    None
-                }
+                Ecp5Cell::Ccu2c { .. }
+                | Ecp5Cell::FlipFlop { .. }
+                | Ecp5Cell::BlockRam { .. }
+                | Ecp5Cell::TrellisIo { .. } => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(truth_tables, [0x8888, 0xeeee, 0x6666, 0x5555, 0xd8d8]);
@@ -5785,9 +6141,10 @@ mod tests {
             .iter()
             .filter_map(|cell| match cell {
                 Ecp5Cell::Lut4 { inputs, init, .. } => Some((*inputs, *init)),
-                Ecp5Cell::Ccu2c { .. } | Ecp5Cell::FlipFlop { .. } | Ecp5Cell::BlockRam { .. } => {
-                    None
-                }
+                Ecp5Cell::Ccu2c { .. }
+                | Ecp5Cell::FlipFlop { .. }
+                | Ecp5Cell::BlockRam { .. }
+                | Ecp5Cell::TrellisIo { .. } => None,
             })
             .collect::<Vec<_>>();
 
@@ -5929,6 +6286,104 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn binds_split_open_drain_interface_to_trellis_io() {
+        let mut source = Netlist::new("i2c_top");
+        let sda_i = source.add_input("sda_i");
+        let request = source.add_input("request");
+        source.add_output("sda_drive_low", request);
+        source.add_output("sampled_sda", sda_i);
+
+        let mapped = map_to_ecp5_with_open_drain_ios(
+            &source,
+            &[OpenDrainIo::new("sda", "sda_i", "sda_drive_low")],
+        )
+        .unwrap();
+
+        assert!(
+            mapped
+                .ports()
+                .iter()
+                .all(|port| { port.name != "sda_i" && port.name != "sda_drive_low" })
+        );
+        let pin = mapped
+            .ports()
+            .iter()
+            .find(|port| port.name == "sda")
+            .unwrap();
+        assert_eq!(pin.direction, PortDirection::Inout);
+        assert_eq!(pin.bits.len(), 1);
+        assert!(
+            mapped
+                .cells()
+                .iter()
+                .any(|cell| matches!(cell, Ecp5Cell::Lut4 { init: 0x5555, .. }))
+        );
+        let Ecp5Cell::TrellisIo {
+            pad,
+            fabric_output,
+            fabric_input,
+            tristate,
+            ..
+        } = mapped
+            .cells()
+            .iter()
+            .find(|cell| matches!(cell, Ecp5Cell::TrellisIo { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(pin.bits, vec![Bit::Wire(*pad)]);
+        assert_eq!(*fabric_output, Bit::Zero);
+        assert_eq!(*fabric_input, sda_i.index() + 2);
+        assert!(matches!(tristate, Bit::Wire(_)));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let module = &json["modules"]["i2c_top"];
+        assert_eq!(module["ports"]["sda"]["direction"], "inout");
+        assert!(module["ports"].get("sda_i").is_none());
+        assert!(module["ports"].get("sda_drive_low").is_none());
+        let io = module["cells"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|cell| cell["type"] == "TRELLIS_IO")
+            .unwrap();
+        assert_eq!(io["parameters"]["DIR"], "BIDIR");
+        assert_eq!(io["connections"]["I"][0], "0");
+        assert_eq!(io["port_directions"]["B"], "inout");
+    }
+
+    #[test]
+    fn constant_released_open_drain_needs_no_inverter_lut() {
+        let mut source = Netlist::new("released_i2c");
+        source.add_input("sda_i");
+        let released = source.add_constant(false);
+        source.add_output("sda_drive_low", released);
+
+        let mapped = map_to_ecp5_with_open_drain_ios(
+            &source,
+            &[OpenDrainIo::new("sda", "sda_i", "sda_drive_low")],
+        )
+        .unwrap();
+
+        assert!(
+            !mapped
+                .cells()
+                .iter()
+                .any(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+        );
+        assert!(mapped.cells().iter().any(|cell| matches!(
+            cell,
+            Ecp5Cell::TrellisIo {
+                fabric_output: Bit::Zero,
+                tristate: Bit::One,
+                ..
+            }
+        )));
     }
 
     #[test]
