@@ -3103,6 +3103,7 @@ name = "struo-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde_json",
  "struo",
  "struo-example-axi4-smartconnect",
  "tracing",

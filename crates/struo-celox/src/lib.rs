@@ -20,7 +20,13 @@ use struo_target_ecp5::{Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection
 ///
 /// LUT truth tables are expanded as mux trees. `TRELLIS_FF` asynchronous resets
 /// map directly to the SDK register reset, while synchronous resets are folded
-/// into next-state logic with reset-over-enable priority.
+/// into next-state logic with reset-over-enable priority. A dedicated `JTAGG`
+/// has no package-pin interface in this artifact, so its fabric outputs use the
+/// inactive TAP state; exercise the ordinary top-level ports before target
+/// binding when simulating JTAG transactions.
+/// A bound `EHXPLLL` uses a cycle-level model which forwards the reference
+/// clock to its clock outputs and holds `LOCK` asserted; implementation timing
+/// remains responsible for the configured physical frequencies.
 ///
 /// # Errors
 ///
@@ -38,11 +44,13 @@ pub fn ecp5_frontend_artifact(
     for port in netlist.ports() {
         let port_type = ValueType::bits(port.bits.len())?;
         let signal = match port.direction {
-            MappedPortDirection::Input => builder.input(&port.name, port_type)?,
+            MappedPortDirection::Input | MappedPortDirection::Inout => {
+                builder.input(&port.name, port_type)?
+            }
             MappedPortDirection::Output => builder.output(&port.name, port_type)?,
         };
         match port.direction {
-            MappedPortDirection::Input => {
+            MappedPortDirection::Input | MappedPortDirection::Inout => {
                 for (lsb, bit) in port.bits.iter().enumerate() {
                     insert_wire(
                         &mut wires,
@@ -110,6 +118,7 @@ fn finish_artifact(builder: ModuleBuilder) -> Result<FrontendArtifact, CeloxAdap
     Ok(artifact)
 }
 
+#[allow(clippy::too_many_lines)]
 fn reserve_cell_output(
     builder: &mut ModuleBuilder,
     wires: &mut BTreeMap<u32, WireRef>,
@@ -158,6 +167,65 @@ fn reserve_cell_output(
             }
             None
         }
+        Ecp5Cell::TrellisIo {
+            name, fabric_input, ..
+        } => Some((*fabric_input, format!("__struo_io_{name}_{fabric_input}"))),
+        Ecp5Cell::Jtagg {
+            name,
+            tdi,
+            clock,
+            run_test_idle,
+            shift,
+            update,
+            reset_n,
+            clock_enable,
+            ..
+        } => {
+            for (label, wire) in [
+                ("tdi", *tdi),
+                ("tck", *clock),
+                ("rti1", run_test_idle[0]),
+                ("rti2", run_test_idle[1]),
+                ("shift", *shift),
+                ("update", *update),
+                ("rst_n", *reset_n),
+                ("ce1", clock_enable[0]),
+                ("ce2", clock_enable[1]),
+            ] {
+                reserve_scalar(
+                    builder,
+                    wires,
+                    wire,
+                    format!("__struo_jtagg_{name}_{label}_{wire}"),
+                    bit_type,
+                )?;
+            }
+            None
+        }
+        Ecp5Cell::Pll {
+            name,
+            feedback_clock,
+            output_clock,
+            locked,
+            ..
+        } => {
+            for (label, wire) in [
+                ("feedback", *feedback_clock),
+                ("output", *output_clock),
+                ("locked", *locked),
+            ] {
+                if !wires.contains_key(&wire) {
+                    reserve_scalar(
+                        builder,
+                        wires,
+                        wire,
+                        format!("__struo_pll_{name}_{label}_{wire}"),
+                        bit_type,
+                    )?;
+                }
+            }
+            None
+        }
     };
     if let Some((wire, name)) = scalar {
         reserve_scalar(builder, wires, wire, name, bit_type)?;
@@ -184,6 +252,7 @@ fn reserve_scalar(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_cell(
     builder: &mut ModuleBuilder,
     wires: &BTreeMap<u32, WireRef>,
@@ -248,7 +317,99 @@ fn emit_cell(
             *clock,
             *edge,
         ),
+        Ecp5Cell::TrellisIo {
+            pad,
+            fabric_output,
+            fabric_input,
+            tristate,
+            ..
+        } => {
+            let pad = bit_expression(builder, wires, constants, Bit::Wire(*pad))?;
+            let driven = bit_expression(builder, wires, constants, *fabric_output)?;
+            let tristate = bit_expression(builder, wires, constants, *tristate)?;
+            let resolved = builder.mux(tristate, pad, driven)?;
+            let target = builder.whole(wire_ref(wires, *fabric_input)?.signal)?;
+            builder.assign(target, resolved)?;
+            Ok(())
+        }
+        Ecp5Cell::Jtagg {
+            tdi,
+            clock,
+            run_test_idle,
+            shift,
+            update,
+            reset_n,
+            clock_enable,
+            ..
+        } => emit_idle_jtagg(
+            builder,
+            wires,
+            constants,
+            [
+                *tdi,
+                *clock,
+                run_test_idle[0],
+                run_test_idle[1],
+                *shift,
+                *update,
+                clock_enable[0],
+                clock_enable[1],
+            ],
+            *reset_n,
+        ),
+        Ecp5Cell::Pll {
+            reference_clock,
+            feedback_clock,
+            output_clock,
+            locked,
+            ..
+        } => emit_cycle_pll(
+            builder,
+            wires,
+            constants,
+            *reference_clock,
+            *feedback_clock,
+            *output_clock,
+            *locked,
+        ),
     }
+}
+
+fn emit_cycle_pll(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    reference_clock: Bit,
+    feedback_clock: u32,
+    output_clock: u32,
+    locked: u32,
+) -> Result<(), CeloxAdapterError> {
+    let reference = bit_expression(builder, wires, constants, reference_clock)?;
+    let feedback = builder.whole(wire_ref(wires, feedback_clock)?.signal)?;
+    builder.assign(feedback, reference)?;
+    if output_clock != feedback_clock {
+        let output = builder.whole(wire_ref(wires, output_clock)?.signal)?;
+        builder.assign(output, reference)?;
+    }
+    let locked = builder.whole(wire_ref(wires, locked)?.signal)?;
+    builder.assign(locked, constants.one_expression)?;
+    Ok(())
+}
+
+fn emit_idle_jtagg(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    inactive_outputs: [u32; 8],
+    reset_n: u32,
+) -> Result<(), CeloxAdapterError> {
+    for wire in inactive_outputs {
+        let target = builder.whole(wire_ref(wires, wire)?.signal)?;
+        builder.assign(target, constants.zero_expression)?;
+    }
+    let reset_target = builder.whole(wire_ref(wires, reset_n)?.signal)?;
+    builder.assign(reset_target, constants.one_expression)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -783,7 +944,9 @@ mod tests {
     };
     use struo_synth::synthesize;
     use struo_target_ecp5::{
-        ArithmeticMapping, MappingOptions, map_to_ecp5, map_to_ecp5_with_options,
+        ArithmeticMapping, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding, PllOutput,
+        map_to_ecp5, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
+        map_to_ecp5_with_options, map_to_ecp5_with_pll,
     };
 
     use super::{ecp5_frontend_artifact, ecp5_simulator};
@@ -1002,6 +1165,108 @@ mod tests {
             .unwrap();
 
         assert_eq!(simulator.get(value), 1u8.into());
+    }
+
+    #[test]
+    fn simulates_open_drain_pad_readback() {
+        let mut source = Netlist::new("i2c_top");
+        let sda_i = source.add_input("sda_i");
+        let request = source.add_input("request");
+        source.add_output("sda_drive_low", request);
+        source.add_output("sampled_sda", sda_i);
+        let mapped = map_to_ecp5_with_open_drain_ios(
+            &source,
+            &[OpenDrainIo::new("sda", "sda_i", "sda_drive_low")],
+        )
+        .unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let sda = simulator.signal("sda");
+        let request = simulator.signal("request");
+        let sampled = simulator.signal("sampled_sda");
+
+        simulator
+            .modify(|io| {
+                io.set(sda, 1u8);
+                io.set(request, 0u8);
+            })
+            .unwrap();
+        assert_eq!(simulator.get(sampled), 1u8.into());
+
+        simulator
+            .modify(|io| {
+                io.set(sda, 1u8);
+                io.set(request, 1u8);
+            })
+            .unwrap();
+        assert_eq!(simulator.get(sampled), 0u8.into());
+    }
+
+    #[test]
+    fn models_bound_jtagg_in_its_inactive_state() {
+        let mut source = Netlist::new("debug_top");
+        let mut fabric_outputs = Vec::new();
+        for name in [
+            "jtag_tdi",
+            "jtag_tck",
+            "jtag_rti1",
+            "jtag_rti2",
+            "jtag_shift",
+            "jtag_update",
+            "jtag_rst_n",
+            "jtag_ce1",
+            "jtag_ce2",
+        ] {
+            fabric_outputs.push((name, source.add_input(name)));
+        }
+        let zero = source.add_constant(false);
+        source.add_output("jtag_tdo1", zero);
+        source.add_output("jtag_tdo2", zero);
+        source.add_output("observed_tdi", fabric_outputs[0].1);
+        source.add_output("observed_reset_n", fabric_outputs[6].1);
+        let mapped = map_to_ecp5_with_jtagg(&source, &JtaggBinding::with_prefix("jtag")).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        assert_eq!(simulator.get(simulator.signal("observed_tdi")), 0u8.into());
+        assert_eq!(
+            simulator.get(simulator.signal("observed_reset_n")),
+            1u8.into()
+        );
+    }
+
+    #[test]
+    fn models_bound_pll_as_a_cycle_level_clock_source() {
+        let mut source = Netlist::new("pll_top");
+        let reference = source.add_input("clk");
+        let fabric_clock = source.add_input("fabric_clock");
+        let locked = source.add_input("pll_locked");
+        source.add_output("observed_reference", reference);
+        source.add_output("observed_clock", fabric_clock);
+        source.add_output("observed_locked", locked);
+        let binding = PllBinding::new(
+            "clk",
+            "fabric_clock",
+            "pll_locked",
+            PllOutput::Clkos,
+            PllOutput::Clkop,
+        );
+        let mapped = map_to_ecp5_with_pll(&source, &binding).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let clk = simulator.signal("clk");
+
+        simulator.modify(|io| io.set(clk, 1u8)).unwrap();
+
+        assert_eq!(
+            simulator.get(simulator.signal("observed_reference")),
+            1u8.into()
+        );
+        assert_eq!(
+            simulator.get(simulator.signal("observed_clock")),
+            1u8.into()
+        );
+        assert_eq!(
+            simulator.get(simulator.signal("observed_locked")),
+            1u8.into()
+        );
     }
 
     #[test]

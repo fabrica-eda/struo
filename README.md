@@ -96,7 +96,8 @@ block memories. Other unsupported constructs fail explicitly.
 The base pin constraints are in
 [`boards/lfe5um5g-85f-evn/base.lpf`](boards/lfe5um5g-85f-evn/base.lpf)
 and are based on the Project Trellis `ecp5_evn` example and the Lattice board
-manual.
+manual. The matching nextpnr pre-pack clock constraint is
+[`boards/lfe5um5g-85f-evn/clock-12.py`](boards/lfe5um5g-85f-evn/clock-12.py).
 
 The 12 MHz value describes the no-PLL board smoke-test clock, not an ECP5
 performance target. Struo targets 300 MHz for ECP5 implementation QoR; designs
@@ -216,10 +217,11 @@ dependencies before running the analyzer.
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
 addition and subtraction, signed and unsigned comparisons, variable logical
-and arithmetic shifts, muxes, concatenation, slicing, registers, enables, and
-synchronous or asynchronous constant resets. It performs constant folding and
-structural hashing, balances associative reductions, and uses parallel-prefix
-comparison networks. A conservative sequential don't-care pass removes a
+and arithmetic shifts, muxes, concatenation, static slicing, dynamic packed
+bit selection, module constants, registers, enables, and synchronous or
+asynchronous constant resets. It performs constant folding and structural
+hashing, balances associative reductions, and uses parallel-prefix comparison
+networks. A conservative sequential don't-care pass removes a
 payload register's clock enable when a same-clock valid register and structural
 influence analysis prove that the payload is unobservable while invalid. This
 lets source RTL retain natural conditional assignments without putting their
@@ -234,8 +236,146 @@ for cones that consume about half the available period before exact
 referenced-area recovery. Unreachable Boolean logic is omitted and the
 selected cover maps to `LUT4`; registers map to `TRELLIS_FF`.
 Synchronous 1R1W memories map directly to ECP5 `DP16KD`
-primitives, including width tiling across multiple blocks; inout ports are
-rejected explicitly.
+primitives, including width tiling across multiple blocks. General four-state
+RTL `inout` ports remain rejected explicitly. Split open-drain interfaces can
+instead be bound at the ECP5 boundary to a physical `TRELLIS_IO`.
+
+For I²C and similar wired-AND buses, keep the verified core interface split
+into an input and an active-high drive-low output, then bind the pair after
+synthesis:
+
+```rust
+use struo::{OpenDrainIo, map_to_ecp5_with_open_drain_ios};
+
+let bindings = [OpenDrainIo::new("sda", "sda_i", "sda_drive_low")];
+let mapped = map_to_ecp5_with_open_drain_ios(&synthesized.netlist, &bindings)?;
+```
+
+The compiler driver accepts the same binding as a repeatable option:
+
+```sh
+struo . --top Top --output Top.json \
+  --open-drain sda:sda_i:sda_drive_low
+```
+
+The two logical ports are replaced by one scalar `inout sda` port. ECP5
+mapping emits `TRELLIS_IO` with `DIR=BIDIR`, drives only zero, and uses the
+inverted `sda_drive_low` signal for the active-high tristate input. The board
+must provide the normal external I²C pull-up. Bind SCL the same way when clock
+stretching or multi-controller arbitration is required. The mapped Celox model
+treats the physical pad as an external input while released and forces its
+readback low while the core is pulling it low.
+
+### Dedicated ECP5 JTAG access
+
+Model `JTAGG` in Veryl as an ordinary top-level fabric interface, rather than
+as an SV attribute or a vendor-named source instance. This keeps the core
+portable and makes JTAG transactions directly driveable in RTL simulation.
+For a `jtag` prefix, declare these scalar ports on the selected top:
+
+```veryl
+module Top (
+    // Signals driven by the ECP5 TAP into the core.
+    jtag_tdi   : input logic,
+    jtag_tck   : input clock,
+    jtag_rti1  : input logic,
+    jtag_rti2  : input logic,
+    jtag_shift : input logic,
+    jtag_update: input logic,
+    jtag_rst_n : input reset_async_low,
+    jtag_ce1   : input logic,
+    jtag_ce2   : input logic,
+
+    // Data returned from the core to extension registers one and two.
+    jtag_tdo1  : output logic,
+    jtag_tdo2  : output logic,
+) {
+    always_comb {
+        // Replace these with extension-register shift logic.
+        jtag_tdo1 = 0;
+        jtag_tdo2 = 0;
+    }
+}
+```
+
+After synthesis, bind all eleven ports atomically at the ECP5 boundary:
+
+```rust
+use struo::{JtaggBinding, map_to_ecp5_with_jtagg};
+
+let mut jtagg = JtaggBinding::with_prefix("jtag");
+jtagg.extension_register_2 = false; // when only ER1 is used
+let mapped = map_to_ecp5_with_jtagg(&synthesized.netlist, &jtagg)?;
+```
+
+The compiler driver provides the equivalent `--jtagg-prefix jtag` option. The
+binding removes the logical ports from the package-pin list and emits one
+`JTAGG` cell using the device's dedicated JTAG pins. Missing, repeated,
+non-scalar, or incorrectly directed ports fail mapping instead of producing a
+partially connected primitive. Post-map Celox simulation holds the inaccessible
+physical TAP in its inactive state; simulate JTAG traffic before binding when
+the protocol itself is under test.
+
+`jtag_tck` is only the TAP transport clock; binding `JTAGG` does not create or
+replace a fabric system clock. The evaluation board's direct FTDI clock remains
+12 MHz. A user top or wrapper whose logic is intended to run at 250 MHz must
+provide a supported PLL path and constrain both its 12 MHz reference and the
+derived 250 MHz clock. That user-owned boundary is independent of
+`--jtagg-prefix` and of the JTAG programming transport.
+
+### User-configured ECP5 PLL
+
+The current Veryl analyzer IR does not retain enough named-port, parameter, and
+SV-attribute metadata for Struo to reproduce a vendor primitive instance.
+Until that upstream boundary is extended, declare the reference clock,
+generated clock, and lock signal as ordinary scalar inputs for RTL simulation,
+then apply `PllBinding` after synthesis. The binding owns no frequency policy:
+the user supplies the `EHXPLLL` parameters and attributes.
+
+For example, the Veryl top-level boundary for the supplied board configuration
+contains these ports; the core uses `clk_250`, while a testbench drives the
+logical generated clock and lock inputs before target binding:
+
+```veryl
+module Top (
+    clk:        input 'a clock,
+    clk_250:    input 'b clock,
+    pll_locked: input 'b logic,
+) {
+    // Core sequential logic uses clk_250.
+}
+```
+
+The compiler driver removes `clk_250` and `pll_locked` from the physical pin
+list and connects them to one `EHXPLLL` selected by the user-owned JSON:
+
+```sh
+struo . --top Top --output build/Top.json \
+  --pll-binding boards/lfe5um5g-85f-evn/pll-12-to-250.json
+```
+
+[`crates/struo-target-ecp5/examples/pll.rs`](crates/struo-target-ecp5/examples/pll.rs)
+contains a complete 12 MHz to 250 MHz high-resolution configuration generated
+with `ecppll -i 12 -o 250 --highres`. It retains physical port `clk`, replaces
+logical inputs `clk_250` and `pll_locked`, uses `CLKOS` for the fabric clock,
+and feeds `CLKOP` back to `CLKFB`. The same configuration is available as
+[`boards/lfe5um5g-85f-evn/pll-12-to-250.json`](boards/lfe5um5g-85f-evn/pll-12-to-250.json);
+replace that file with another valid device configuration to choose a different
+frequency or PLL topology.
+
+```sh
+cargo run -q -p struo-target-ecp5 --example pll > /tmp/struo-pll.json
+nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
+  --json /tmp/struo-pll.json --lpf-allow-unconstrained \
+  --pre-pack boards/lfe5um5g-85f-evn/clock-12.py \
+  --textcfg /tmp/struo-pll.config --freq 250
+```
+
+The pre-pack constraint names the physical `clk` net at 12 MHz. nextpnr then
+derives the generated constraint from the supplied PLL dividers; `--freq 250`
+is the default for otherwise unconstrained clocks and the implementation target.
+Use the normal complete LPF rather than `--lpf-allow-unconstrained` for a
+programmable board build.
 
 `carry-benchmark` emits two equivalent 32-bit registered counters as
 `carry.json` and `lut.json`. On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seed 1,
@@ -243,6 +383,8 @@ and a 250 MHz timing target, the routed carry version used 38 `TRELLIS_COMB`
 sites and reached 472.14 MHz; the LUT-ripple baseline used 65 sites and reached
 60.22 MHz. These figures are a reproducible comparison point, not a guaranteed
 device specification; rerun place-and-route for the installed nextpnr/chipdb.
+Here `--freq 250` is a timing constraint for the benchmark's logical clock, not
+a board clock configuration or a PLL implementation.
 
 ```sh
 for implementation in carry lut; do
