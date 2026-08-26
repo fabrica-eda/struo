@@ -5,8 +5,8 @@ mod physical;
 
 pub use mapped::{
     ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPort, MappingError,
-    MappingOptions, NextpnrJsonError, PortDirection as MappedPortDirection, Reset,
-    RetimingSelection, map_to_ecp5, map_to_ecp5_with_options,
+    MappingOptions, NextpnrJsonError, OpenDrainIo, PortDirection as MappedPortDirection, Reset,
+    RetimingSelection, map_to_ecp5, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
 };
 pub use physical::{
     PhysicalCriticalPath, PhysicalFeedback, PhysicalLocation, PhysicalNetTiming,

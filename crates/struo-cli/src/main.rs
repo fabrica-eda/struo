@@ -12,7 +12,8 @@ use struo::rtl::Design;
 use struo::target::ecp5 as struo_target_ecp5;
 use struo::target::ecp5::ECP5_QOR_TARGET_MHZ;
 use struo::{
-    MappingOptions, analyze_project_and_lower, ecp5_simulator, map_to_ecp5_with_options, synthesize,
+    MappingOptions, OpenDrainIo, analyze_project_and_lower, ecp5_simulator,
+    map_to_ecp5_with_options, synthesize,
 };
 
 /// Synthesize a Veryl project to an ECP5 netlist.
@@ -33,6 +34,14 @@ struct Cli {
     /// Timing goal in MHz (default: 300).
     #[arg(long)]
     timing_goal_mhz: Option<u32>,
+
+    /// Bind `PIN:INPUT:DRIVE_LOW` as one physical open-drain pad (repeatable).
+    #[arg(
+        long,
+        value_name = "PIN:INPUT:DRIVE_LOW",
+        value_parser = parse_open_drain
+    )]
+    open_drain: Vec<OpenDrainIo>,
 
     /// Raise diagnostic logging (-v info to stderr by default; -vv debug).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -71,7 +80,24 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         return Err("timing goal must be greater than zero".into());
     }
     let design = load_design(&cli.project, &cli.top)?;
-    synthesize_and_map(&design, &cli.top, timing_goal_mhz, cli.output.as_deref())
+    synthesize_and_map(
+        &design,
+        &cli.top,
+        timing_goal_mhz,
+        &cli.open_drain,
+        cli.output.as_deref(),
+    )
+}
+
+fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
+    let mut fields = value.split(':');
+    let pin = fields.next().unwrap_or_default();
+    let input = fields.next().unwrap_or_default();
+    let drive_low = fields.next().unwrap_or_default();
+    if pin.is_empty() || input.is_empty() || drive_low.is_empty() || fields.next().is_some() {
+        return Err("expected PIN:INPUT:DRIVE_LOW with three non-empty port names".into());
+    }
+    Ok(OpenDrainIo::new(pin, input, drive_low))
 }
 
 fn load_design(input: &Path, top: &str) -> Result<Design, Box<dyn Error>> {
@@ -93,19 +119,21 @@ fn synthesize_and_map(
     design: &Design,
     label: &str,
     timing_goal_mhz: u32,
+    open_drain: &[OpenDrainIo],
     mapped_path: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let synthesized = synthesize(design)?;
     for report in &synthesized.reports {
         tracing::info!("{}: {}", report.pass, report.message);
     }
-    let mapped = map_to_ecp5_with_options(
+    let mut mapped = map_to_ecp5_with_options(
         &synthesized.netlist,
         MappingOptions {
             timing_goal_mhz,
             ..MappingOptions::default()
         },
     )?;
+    mapped.bind_open_drain_ios(open_drain)?;
     log_retiming_decision(&mapped);
     tracing::info!(
         "{label}: {} Boolean nodes, {} registers, {} ECP5 cells, goal {timing_goal_mhz} MHz",
@@ -177,6 +205,10 @@ mod tests {
             "out.json",
             "--timing-goal-mhz",
             "310",
+            "--open-drain",
+            "sda:sda_i:sda_drive_low",
+            "--open-drain",
+            "scl:scl_i:scl_drive_low",
             "-vv",
         ])
         .unwrap();
@@ -184,11 +216,19 @@ mod tests {
         assert_eq!(cli.top, "counter32");
         assert_eq!(cli.output.as_deref(), Some(Path::new("out.json")));
         assert_eq!(cli.timing_goal_mhz, Some(310));
+        assert_eq!(
+            cli.open_drain,
+            [
+                struo::OpenDrainIo::new("sda", "sda_i", "sda_drive_low"),
+                struo::OpenDrainIo::new("scl", "scl_i", "scl_drive_low"),
+            ]
+        );
         assert_eq!(cli.verbose, 2);
 
         let defaults = Cli::try_parse_from(["struo", "Veryl.toml", "--top", "Top"]).unwrap();
         assert_eq!(defaults.output, None);
         assert_eq!(defaults.timing_goal_mhz, None);
+        assert!(defaults.open_drain.is_empty());
         assert_eq!(defaults.verbose, 0);
 
         let project =
@@ -201,6 +241,10 @@ mod tests {
         assert!(
             Cli::try_parse_from(["struo", "project", "--top", "T", "--timing-goal-mhz", "0"])
                 .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["struo", "project", "--top", "T", "--open-drain", "sda:x"])
+                .is_err()
         );
     }
 }

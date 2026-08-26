@@ -233,8 +233,35 @@ for cones that consume about half the available period before exact
 referenced-area recovery. Unreachable Boolean logic is omitted and the
 selected cover maps to `LUT4`; registers map to `TRELLIS_FF`.
 Synchronous 1R1W memories map directly to ECP5 `DP16KD`
-primitives, including width tiling across multiple blocks; inout ports are
-rejected explicitly.
+primitives, including width tiling across multiple blocks. General four-state
+RTL `inout` ports remain rejected explicitly. Split open-drain interfaces can
+instead be bound at the ECP5 boundary to a physical `TRELLIS_IO`.
+
+For I²C and similar wired-AND buses, keep the verified core interface split
+into an input and an active-high drive-low output, then bind the pair after
+synthesis:
+
+```rust
+use struo::{OpenDrainIo, map_to_ecp5_with_open_drain_ios};
+
+let bindings = [OpenDrainIo::new("sda", "sda_i", "sda_drive_low")];
+let mapped = map_to_ecp5_with_open_drain_ios(&synthesized.netlist, &bindings)?;
+```
+
+The compiler driver accepts the same binding as a repeatable option:
+
+```sh
+struo . --top Top --output Top.json \
+  --open-drain sda:sda_i:sda_drive_low
+```
+
+The two logical ports are replaced by one scalar `inout sda` port. ECP5
+mapping emits `TRELLIS_IO` with `DIR=BIDIR`, drives only zero, and uses the
+inverted `sda_drive_low` signal for the active-high tristate input. The board
+must provide the normal external I²C pull-up. Bind SCL the same way when clock
+stretching or multi-controller arbitration is required. The mapped Celox model
+treats the physical pad as an external input while released and forces its
+readback low while the core is pulling it low.
 
 `carry-benchmark` emits two equivalent 32-bit registered counters as
 `carry.json` and `lut.json`. On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seed 1,
