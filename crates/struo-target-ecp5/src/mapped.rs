@@ -127,6 +127,59 @@ pub struct OpenDrainIo {
     pub drive_low_port: String,
 }
 
+/// Maps a scalar top-level debug interface onto the ECP5 dedicated JTAG block.
+///
+/// The port directions are from the Veryl/core point of view: `tdo` ports are
+/// core outputs consumed by `JTAGG`; every other named port is a core input
+/// driven by `JTAGG`. [`JtaggBinding::with_prefix`] provides the conventional
+/// `<prefix>_<signal>` spelling for all eleven fabric-side signals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JtaggBinding {
+    /// Data returned by extension registers one and two (`JTDO1`, `JTDO2`).
+    pub tdo_ports: [String; 2],
+    /// Registered data received from the external TAP (`JTDI`).
+    pub tdi_port: String,
+    /// Clock exported by the external TAP (`JTCK`).
+    pub clock_port: String,
+    /// Run-test/idle indications for extension registers one and two.
+    pub run_test_idle_ports: [String; 2],
+    /// Shift-DR indication (`JSHIFT`).
+    pub shift_port: String,
+    /// Update-DR indication (`JUPDATE`).
+    pub update_port: String,
+    /// Active-low TAP reset indication (`JRSTN`).
+    pub reset_n_port: String,
+    /// Extension-register clock enables (`JCE1`, `JCE2`).
+    pub clock_enable_ports: [String; 2],
+    /// Whether extension register one is present.
+    pub extension_register_1: bool,
+    /// Whether extension register two is present.
+    pub extension_register_2: bool,
+}
+
+impl JtaggBinding {
+    /// Creates a complete binding using `<prefix>_tdo1`, `<prefix>_tdo2`,
+    /// `<prefix>_tdi`, `<prefix>_tck`, `<prefix>_rti1`, `<prefix>_rti2`,
+    /// `<prefix>_shift`, `<prefix>_update`, `<prefix>_rst_n`,
+    /// `<prefix>_ce1`, and `<prefix>_ce2`.
+    #[must_use]
+    pub fn with_prefix(prefix: &str) -> Self {
+        let port = |suffix: &str| format!("{prefix}_{suffix}");
+        Self {
+            tdo_ports: [port("tdo1"), port("tdo2")],
+            tdi_port: port("tdi"),
+            clock_port: port("tck"),
+            run_test_idle_ports: [port("rti1"), port("rti2")],
+            shift_port: port("shift"),
+            update_port: port("update"),
+            reset_n_port: port("rst_n"),
+            clock_enable_ports: [port("ce1"), port("ce2")],
+            extension_register_1: true,
+            extension_register_2: true,
+        }
+    }
+}
+
 impl OpenDrainIo {
     /// Creates one scalar open-drain I/O binding.
     #[must_use]
@@ -336,6 +389,31 @@ pub enum Ecp5Cell {
         /// Active-high high-impedance control.
         tristate: Bit,
     },
+    /// Dedicated ECP5 JTAG TAP access block.
+    Jtagg {
+        /// Stable cell name.
+        name: String,
+        /// Fabric data returned by extension registers one and two.
+        tdo: [Bit; 2],
+        /// Registered data received from the external TAP.
+        tdi: u32,
+        /// Clock exported by the external TAP.
+        clock: u32,
+        /// Run-test/idle indications for extension registers one and two.
+        run_test_idle: [u32; 2],
+        /// Shift-DR indication.
+        shift: u32,
+        /// Update-DR indication.
+        update: u32,
+        /// Active-low TAP reset indication.
+        reset_n: u32,
+        /// Extension-register clock enables.
+        clock_enable: [u32; 2],
+        /// Whether extension register one is present.
+        extension_register_1: bool,
+        /// Whether extension register two is present.
+        extension_register_2: bool,
+    },
 }
 
 /// Technology-mapped ECP5 netlist used by both simulation and nextpnr.
@@ -415,6 +493,100 @@ impl Ecp5Netlist {
     #[must_use]
     pub fn cells(&self) -> &[Ecp5Cell] {
         &self.cells
+    }
+
+    /// Replaces a scalar top-level JTAG fabric interface with the dedicated
+    /// ECP5 `JTAGG` primitive.
+    ///
+    /// Keeping this operation at the target boundary lets the Veryl source use
+    /// ordinary ports during RTL simulation. The returned mapped design no
+    /// longer exposes those ports as package pins; they are connected to the
+    /// device's built-in TAP instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a second `JTAGG`, repeated names, or missing,
+    /// non-scalar, incorrectly directed, or constant-driven input ports.
+    pub fn bind_jtagg(&mut self, binding: &JtaggBinding) -> Result<(), MappingError> {
+        if self
+            .cells
+            .iter()
+            .any(|cell| matches!(cell, Ecp5Cell::Jtagg { .. }))
+        {
+            return Err(MappingError::JtaggAlreadyBound);
+        }
+
+        let roles = [
+            (&binding.tdo_ports[0], PortDirection::Output),
+            (&binding.tdo_ports[1], PortDirection::Output),
+            (&binding.tdi_port, PortDirection::Input),
+            (&binding.clock_port, PortDirection::Input),
+            (&binding.run_test_idle_ports[0], PortDirection::Input),
+            (&binding.run_test_idle_ports[1], PortDirection::Input),
+            (&binding.shift_port, PortDirection::Input),
+            (&binding.update_port, PortDirection::Input),
+            (&binding.reset_n_port, PortDirection::Input),
+            (&binding.clock_enable_ports[0], PortDirection::Input),
+            (&binding.clock_enable_ports[1], PortDirection::Input),
+        ];
+        let mut names = HashSet::new();
+        let mut resolved = Vec::with_capacity(roles.len());
+        for (name, expected) in roles {
+            if !names.insert(name.as_str()) {
+                return Err(MappingError::JtaggPortRepeated(name.clone()));
+            }
+            let (index, port) = self
+                .ports
+                .iter()
+                .enumerate()
+                .find(|(_, port)| port.name == *name)
+                .ok_or_else(|| MappingError::JtaggPortNotFound(name.clone()))?;
+            if port.direction != expected {
+                return Err(MappingError::JtaggPortDirection {
+                    port: name.clone(),
+                    expected,
+                    actual: port.direction,
+                });
+            }
+            if port.bits.len() != 1 {
+                return Err(MappingError::JtaggPortNotScalar {
+                    port: name.clone(),
+                    width: port.bits.len(),
+                });
+            }
+            resolved.push((index, name.clone(), port.bits[0]));
+        }
+
+        let output_wire = |index: usize| match &resolved[index] {
+            (_, _, Bit::Wire(wire)) => Ok(*wire),
+            (_, name, Bit::Zero | Bit::One) => {
+                Err(MappingError::JtaggOutputIsConstant(name.clone()))
+            }
+        };
+        let cell = Ecp5Cell::Jtagg {
+            name: unique_cell_name("jtagg", &self.cells, None),
+            tdo: [resolved[0].2, resolved[1].2],
+            tdi: output_wire(2)?,
+            clock: output_wire(3)?,
+            run_test_idle: [output_wire(4)?, output_wire(5)?],
+            shift: output_wire(6)?,
+            update: output_wire(7)?,
+            reset_n: output_wire(8)?,
+            clock_enable: [output_wire(9)?, output_wire(10)?],
+            extension_register_1: binding.extension_register_1,
+            extension_register_2: binding.extension_register_2,
+        };
+
+        let mut removed = resolved
+            .into_iter()
+            .map(|(index, _, _)| index)
+            .collect::<Vec<_>>();
+        removed.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        for index in removed {
+            self.ports.remove(index);
+        }
+        self.cells.push(cell);
+        Ok(())
     }
 
     /// Replaces one split scalar input/output pair with an open-drain pad.
@@ -886,6 +1058,7 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
         Ecp5Cell::FlipFlop { .. } => bel.contains(".FF"),
         Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD"),
         Ecp5Cell::TrellisIo { .. } => bel.contains("PIO"),
+        Ecp5Cell::Jtagg { .. } => bel.contains("JTAGG"),
         Ecp5Cell::Ccu2c { .. } => false,
     }
 }
@@ -910,6 +1083,20 @@ pub fn map_to_ecp5_with_open_drain_ios(
 ) -> Result<Ecp5Netlist, MappingError> {
     let mut mapped = map_to_ecp5(netlist)?;
     mapped.bind_open_drain_ios(bindings)?;
+    Ok(mapped)
+}
+
+/// Maps a core and binds its scalar debug interface to the dedicated ECP5 TAP.
+///
+/// # Errors
+///
+/// Returns an error if logic mapping or the `JTAGG` binding fails.
+pub fn map_to_ecp5_with_jtagg(
+    netlist: &Netlist,
+    binding: &JtaggBinding,
+) -> Result<Ecp5Netlist, MappingError> {
+    let mut mapped = map_to_ecp5(netlist)?;
+    mapped.bind_jtagg(binding)?;
     Ok(mapped)
 }
 
@@ -1520,7 +1707,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
             Ecp5Cell::Ccu2c { .. }
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
-            | Ecp5Cell::TrellisIo { .. } => None,
+            | Ecp5Cell::TrellisIo { .. }
+            | Ecp5Cell::Jtagg { .. } => None,
         })
         .collect::<HashSet<_>>();
     netlist
@@ -1541,7 +1729,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
             | Ecp5Cell::Ccu2c { .. }
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
-            | Ecp5Cell::TrellisIo { .. } => None,
+            | Ecp5Cell::TrellisIo { .. }
+            | Ecp5Cell::Jtagg { .. } => None,
         })
         .max()
         .unwrap_or(0)
@@ -1847,6 +2036,11 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
             replace(fabric_output);
             replace(tristate);
         }
+        Ecp5Cell::Jtagg { tdo, .. } => {
+            for bit in tdo {
+                replace(bit);
+            }
+        }
     }
     replacements
 }
@@ -1918,7 +2112,7 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
             tristate,
             ..
         } => Some(bit_lut_depth(*fabric_output, &depths).max(bit_lut_depth(*tristate, &depths))),
-        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => None,
+        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } | Ecp5Cell::Jtagg { .. } => None,
     });
     let output_depths = netlist
         .ports
@@ -1985,7 +2179,7 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
             mapped_setup_period(*fabric_output, &arrivals, &fanouts)
                 .max(mapped_setup_period(*tristate, &arrivals, &fanouts)),
         ),
-        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => None,
+        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } | Ecp5Cell::Jtagg { .. } => None,
     });
     let output_periods = netlist
         .ports
@@ -2041,6 +2235,24 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
             }
             Ecp5Cell::TrellisIo { fabric_input, .. } => {
                 depths.insert(*fabric_input, 0);
+            }
+            Ecp5Cell::Jtagg {
+                tdi,
+                clock,
+                run_test_idle,
+                shift,
+                update,
+                reset_n,
+                clock_enable,
+                ..
+            } => {
+                for output in [*tdi, *clock, *shift, *update, *reset_n]
+                    .into_iter()
+                    .chain(*run_test_idle)
+                    .chain(*clock_enable)
+                {
+                    depths.insert(output, 0);
+                }
             }
             Ecp5Cell::Lut4 { .. } => {}
         }
@@ -2116,6 +2328,24 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
             Ecp5Cell::TrellisIo { fabric_input, .. } => {
                 arrivals.insert(*fabric_input, 0);
             }
+            Ecp5Cell::Jtagg {
+                tdi,
+                clock,
+                run_test_idle,
+                shift,
+                update,
+                reset_n,
+                clock_enable,
+                ..
+            } => {
+                for output in [*tdi, *clock, *shift, *update, *reset_n]
+                    .into_iter()
+                    .chain(*run_test_idle)
+                    .chain(*clock_enable)
+                {
+                    arrivals.insert(output, 0);
+                }
+            }
             Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => {}
         }
     }
@@ -2176,7 +2406,8 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                 }
                 Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
-                | Ecp5Cell::TrellisIo { .. } => {}
+                | Ecp5Cell::TrellisIo { .. }
+                | Ecp5Cell::Jtagg { .. } => {}
             }
         }
         if !progress {
@@ -2661,7 +2892,8 @@ fn ccu_chain_names(netlist: &Ecp5Netlist) -> Vec<Vec<String>> {
             Ecp5Cell::Lut4 { .. }
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
-            | Ecp5Cell::TrellisIo { .. } => None,
+            | Ecp5Cell::TrellisIo { .. }
+            | Ecp5Cell::Jtagg { .. } => None,
         })
         .collect::<Vec<_>>();
     let carry_producers = ccus
@@ -2782,7 +3014,8 @@ fn forward_retime_ccu2c(netlist: &Ecp5Netlist, ccu_index: usize) -> Option<Ecp5N
                     | Ecp5Cell::Ccu2c { .. }
                     | Ecp5Cell::FlipFlop { .. }
                     | Ecp5Cell::BlockRam { .. }
-                    | Ecp5Cell::TrellisIo { .. } => None,
+                    | Ecp5Cell::TrellisIo { .. }
+                    | Ecp5Cell::Jtagg { .. } => None,
                 })?;
         if let Some((domain_clock, domain_edge, domain_enable, domain_reset)) = domain {
             if (clock, edge, enable) != (domain_clock, domain_edge, domain_enable)
@@ -3020,7 +3253,8 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
             Ecp5Cell::Lut4 { .. }
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
-            | Ecp5Cell::TrellisIo { .. } => None,
+            | Ecp5Cell::TrellisIo { .. }
+            | Ecp5Cell::Jtagg { .. } => None,
         })?;
 
     let mut vertices = Vec::new();
@@ -3488,6 +3722,11 @@ fn replace_mapped_wire_uses(netlist: &mut Ecp5Netlist, from: u32, to: u32) {
                 replace(fabric_output);
                 replace(tristate);
             }
+            Ecp5Cell::Jtagg { tdo, .. } => {
+                for bit in tdo {
+                    replace(bit);
+                }
+            }
         }
     }
 }
@@ -3515,7 +3754,8 @@ fn mapped_cell_name(cell: &Ecp5Cell) -> &str {
         | Ecp5Cell::Ccu2c { name, .. }
         | Ecp5Cell::FlipFlop { name, .. }
         | Ecp5Cell::BlockRam { name, .. }
-        | Ecp5Cell::TrellisIo { name, .. } => name,
+        | Ecp5Cell::TrellisIo { name, .. }
+        | Ecp5Cell::Jtagg { name, .. } => name,
     }
 }
 
@@ -3540,7 +3780,10 @@ fn mapped_wire_is_clock_or_reset(netlist: &Ecp5Netlist, wire: u32) -> bool {
                 || reset.is_some_and(|control| control.signal == Bit::Wire(wire))
         }
         Ecp5Cell::BlockRam { clock, .. } => *clock == Bit::Wire(wire),
-        Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } | Ecp5Cell::TrellisIo { .. } => false,
+        Ecp5Cell::Lut4 { .. }
+        | Ecp5Cell::Ccu2c { .. }
+        | Ecp5Cell::TrellisIo { .. }
+        | Ecp5Cell::Jtagg { .. } => false,
     })
 }
 
@@ -3671,6 +3914,11 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
             visit(*fabric_output);
             visit(*tristate);
         }
+        Ecp5Cell::Jtagg { tdo, .. } => {
+            for bit in tdo {
+                visit(*bit);
+            }
+        }
     }
 }
 
@@ -3689,6 +3937,21 @@ fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
             .collect(),
         Ecp5Cell::BlockRam { read_data, .. } => read_data.iter().copied().map(Bit::Wire).collect(),
         Ecp5Cell::TrellisIo { fabric_input, .. } => vec![Bit::Wire(*fabric_input)],
+        Ecp5Cell::Jtagg {
+            tdi,
+            clock,
+            run_test_idle,
+            shift,
+            update,
+            reset_n,
+            clock_enable,
+            ..
+        } => [*tdi, *clock, *shift, *update, *reset_n]
+            .into_iter()
+            .chain(*run_test_idle)
+            .chain(*clock_enable)
+            .map(Bit::Wire)
+            .collect(),
     }
 }
 
@@ -4328,6 +4591,30 @@ pub enum MappingError {
     IoInputIsConstant(String),
     /// No wire number remains for an inserted I/O primitive.
     MappedWireOverflow,
+    /// The mapped design already contains the device's single JTAG block.
+    JtaggAlreadyBound,
+    /// A named JTAG fabric port does not exist.
+    JtaggPortNotFound(String),
+    /// One top-level port was assigned to more than one JTAG role.
+    JtaggPortRepeated(String),
+    /// A JTAG fabric port has the wrong direction.
+    JtaggPortDirection {
+        /// Port name.
+        port: String,
+        /// Direction required by the binding role.
+        expected: PortDirection,
+        /// Actual mapped direction.
+        actual: PortDirection,
+    },
+    /// JTAG bindings operate on scalar ports.
+    JtaggPortNotScalar {
+        /// Port name.
+        port: String,
+        /// Actual bit width.
+        width: usize,
+    },
+    /// A JTAGG output cannot drive a constant top-level input.
+    JtaggOutputIsConstant(String),
 }
 
 impl Display for MappingError {
@@ -4374,6 +4661,34 @@ impl Display for MappingError {
             Self::MappedWireOverflow => {
                 formatter.write_str("mapped wire number overflow while inserting open-drain I/O")
             }
+            Self::JtaggAlreadyBound => {
+                formatter.write_str("the ECP5 netlist already contains a JTAGG primitive")
+            }
+            Self::JtaggPortNotFound(port) => {
+                write!(formatter, "JTAGG fabric port `{port}` was not found")
+            }
+            Self::JtaggPortRepeated(port) => {
+                write!(
+                    formatter,
+                    "JTAGG fabric port `{port}` is assigned more than once"
+                )
+            }
+            Self::JtaggPortDirection {
+                port,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "JTAGG fabric port `{port}` has direction {actual:?}, expected {expected:?}"
+            ),
+            Self::JtaggPortNotScalar { port, width } => write!(
+                formatter,
+                "JTAGG fabric port `{port}` has width {width}, expected a scalar port"
+            ),
+            Self::JtaggOutputIsConstant(port) => write!(
+                formatter,
+                "JTAGG output port `{port}` is a constant rather than a mapped wire"
+            ),
         }
     }
 }
@@ -4389,7 +4704,13 @@ impl Error for MappingError {
             | Self::IoPortDirection { .. }
             | Self::IoPortNotScalar { .. }
             | Self::IoInputIsConstant(_)
-            | Self::MappedWireOverflow => None,
+            | Self::MappedWireOverflow
+            | Self::JtaggAlreadyBound
+            | Self::JtaggPortNotFound(_)
+            | Self::JtaggPortRepeated(_)
+            | Self::JtaggPortDirection { .. }
+            | Self::JtaggPortNotScalar { .. }
+            | Self::JtaggOutputIsConstant(_) => None,
         }
     }
 }
@@ -4602,6 +4923,105 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
             name.clone(),
             json_trellis_io(*pad, *fabric_output, *fabric_input, *tristate),
         ),
+        Ecp5Cell::Jtagg {
+            name,
+            tdo,
+            tdi,
+            clock,
+            run_test_idle,
+            shift,
+            update,
+            reset_n,
+            clock_enable,
+            extension_register_1,
+            extension_register_2,
+        } => (
+            name.clone(),
+            json_jtagg(
+                *tdo,
+                *tdi,
+                *clock,
+                *run_test_idle,
+                *shift,
+                *update,
+                *reset_n,
+                *clock_enable,
+                *extension_register_1,
+                *extension_register_2,
+            ),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn json_jtagg(
+    tdo: [Bit; 2],
+    tdi: u32,
+    clock: u32,
+    run_test_idle: [u32; 2],
+    shift: u32,
+    update: u32,
+    reset_n: u32,
+    clock_enable: [u32; 2],
+    extension_register_1: bool,
+    extension_register_2: bool,
+) -> JsonCell {
+    JsonCell {
+        hide_name: 0,
+        r#type: "JTAGG",
+        parameters: [
+            (
+                "ER1".into(),
+                if extension_register_1 {
+                    "ENABLED"
+                } else {
+                    "DISABLED"
+                }
+                .into(),
+            ),
+            (
+                "ER2".into(),
+                if extension_register_2 {
+                    "ENABLED"
+                } else {
+                    "DISABLED"
+                }
+                .into(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        attributes: BTreeMap::new(),
+        port_directions: [
+            ("JTDO1".into(), "input"),
+            ("JTDO2".into(), "input"),
+            ("JTDI".into(), "output"),
+            ("JTCK".into(), "output"),
+            ("JRTI1".into(), "output"),
+            ("JRTI2".into(), "output"),
+            ("JSHIFT".into(), "output"),
+            ("JUPDATE".into(), "output"),
+            ("JRSTN".into(), "output"),
+            ("JCE1".into(), "output"),
+            ("JCE2".into(), "output"),
+        ]
+        .into_iter()
+        .collect(),
+        connections: [
+            ("JTDO1".into(), vec![tdo[0]]),
+            ("JTDO2".into(), vec![tdo[1]]),
+            ("JTDI".into(), vec![Bit::Wire(tdi)]),
+            ("JTCK".into(), vec![Bit::Wire(clock)]),
+            ("JRTI1".into(), vec![Bit::Wire(run_test_idle[0])]),
+            ("JRTI2".into(), vec![Bit::Wire(run_test_idle[1])]),
+            ("JSHIFT".into(), vec![Bit::Wire(shift)]),
+            ("JUPDATE".into(), vec![Bit::Wire(update)]),
+            ("JRSTN".into(), vec![Bit::Wire(reset_n)]),
+            ("JCE1".into(), vec![Bit::Wire(clock_enable[0])]),
+            ("JCE2".into(), vec![Bit::Wire(clock_enable[1])]),
+        ]
+        .into_iter()
+        .collect(),
     }
 }
 
@@ -4932,12 +5352,12 @@ mod tests {
     };
 
     use super::{
-        ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, MappingOptions, NextpnrJsonError,
-        OpenDrainIo, PortDirection, backward_retime_ccu2c, backward_retime_lut,
+        ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, JtaggBinding, MappingOptions,
+        NextpnrJsonError, OpenDrainIo, PortDirection, backward_retime_ccu2c, backward_retime_lut,
         carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c, forward_retime_lut,
-        map_once, map_to_ecp5, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
-        mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
-        replicate_high_fanout_enable_luts, split_branched_carry_outs,
+        map_once, map_to_ecp5, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
+        map_to_ecp5_with_options, mapped_cell_name, mapped_wire_fanout,
+        merge_equivalent_flip_flops, replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
     use crate::PhysicalFeedback;
@@ -5552,7 +5972,8 @@ mod tests {
                     Ecp5Cell::FlipFlop { .. } => format!("X{index}/Y1/SLICEA.FF0"),
                     Ecp5Cell::Ccu2c { .. }
                     | Ecp5Cell::BlockRam { .. }
-                    | Ecp5Cell::TrellisIo { .. } => unreachable!(),
+                    | Ecp5Cell::TrellisIo { .. }
+                    | Ecp5Cell::Jtagg { .. } => unreachable!(),
                 };
                 format!(
                     r#""{}":{{"attributes":{{"NEXTPNR_BEL":"{bel}"}}}}"#,
@@ -6117,7 +6538,8 @@ mod tests {
                 Ecp5Cell::Ccu2c { .. }
                 | Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
-                | Ecp5Cell::TrellisIo { .. } => None,
+                | Ecp5Cell::TrellisIo { .. }
+                | Ecp5Cell::Jtagg { .. } => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(truth_tables, [0x8888, 0xeeee, 0x6666, 0x5555, 0xd8d8]);
@@ -6144,7 +6566,8 @@ mod tests {
                 Ecp5Cell::Ccu2c { .. }
                 | Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
-                | Ecp5Cell::TrellisIo { .. } => None,
+                | Ecp5Cell::TrellisIo { .. }
+                | Ecp5Cell::Jtagg { .. } => None,
             })
             .collect::<Vec<_>>();
 
@@ -6286,6 +6709,72 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn binds_scalar_top_ports_to_jtagg() {
+        let mut source = Netlist::new("debug_top");
+        for name in [
+            "jtag_tdi",
+            "jtag_tck",
+            "jtag_rti1",
+            "jtag_rti2",
+            "jtag_shift",
+            "jtag_update",
+            "jtag_rst_n",
+            "jtag_ce1",
+            "jtag_ce2",
+        ] {
+            source.add_input(name);
+        }
+        let zero = source.add_constant(false);
+        source.add_output("jtag_tdo1", zero);
+        source.add_output("jtag_tdo2", zero);
+        let mut binding = JtaggBinding::with_prefix("jtag");
+        binding.extension_register_2 = false;
+
+        let mapped = map_to_ecp5_with_jtagg(&source, &binding).unwrap();
+
+        assert!(mapped.ports().is_empty());
+        assert!(matches!(
+            mapped.cells(),
+            [Ecp5Cell::Jtagg {
+                tdo: [Bit::Zero, Bit::Zero],
+                extension_register_1: true,
+                extension_register_2: false,
+                ..
+            }]
+        ));
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let cell = &json["modules"]["debug_top"]["cells"]["jtagg"];
+        assert_eq!(cell["type"], "JTAGG");
+        assert_eq!(cell["parameters"]["ER1"], "ENABLED");
+        assert_eq!(cell["parameters"]["ER2"], "DISABLED");
+        assert_eq!(cell["connections"]["JTDO1"][0], "0");
+        assert_eq!(cell["port_directions"]["JTDO1"], "input");
+        assert_eq!(cell["port_directions"]["JTDI"], "output");
+        assert!(
+            json["modules"]["debug_top"]["ports"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn jtagg_binding_errors_leave_the_netlist_unchanged() {
+        let mut source = Netlist::new("incomplete_debug_top");
+        source.add_input("jtag_tdi");
+        let mut mapped = map_to_ecp5(&source).unwrap();
+        let original = mapped.clone();
+
+        assert!(
+            mapped
+                .bind_jtagg(&JtaggBinding::with_prefix("jtag"))
+                .is_err()
+        );
+        assert_eq!(mapped, original);
     }
 
     #[test]

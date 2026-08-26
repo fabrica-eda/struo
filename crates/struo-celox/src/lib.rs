@@ -20,7 +20,10 @@ use struo_target_ecp5::{Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection
 ///
 /// LUT truth tables are expanded as mux trees. `TRELLIS_FF` asynchronous resets
 /// map directly to the SDK register reset, while synchronous resets are folded
-/// into next-state logic with reset-over-enable priority.
+/// into next-state logic with reset-over-enable priority. A dedicated `JTAGG`
+/// has no package-pin interface in this artifact, so its fabric outputs use the
+/// inactive TAP state; exercise the ordinary top-level ports before target
+/// binding when simulating JTAG transactions.
 ///
 /// # Errors
 ///
@@ -163,6 +166,38 @@ fn reserve_cell_output(
         Ecp5Cell::TrellisIo {
             name, fabric_input, ..
         } => Some((*fabric_input, format!("__struo_io_{name}_{fabric_input}"))),
+        Ecp5Cell::Jtagg {
+            name,
+            tdi,
+            clock,
+            run_test_idle,
+            shift,
+            update,
+            reset_n,
+            clock_enable,
+            ..
+        } => {
+            for (label, wire) in [
+                ("tdi", *tdi),
+                ("tck", *clock),
+                ("rti1", run_test_idle[0]),
+                ("rti2", run_test_idle[1]),
+                ("shift", *shift),
+                ("update", *update),
+                ("rst_n", *reset_n),
+                ("ce1", clock_enable[0]),
+                ("ce2", clock_enable[1]),
+            ] {
+                reserve_scalar(
+                    builder,
+                    wires,
+                    wire,
+                    format!("__struo_jtagg_{name}_{label}_{wire}"),
+                    bit_type,
+                )?;
+            }
+            None
+        }
     };
     if let Some((wire, name)) = scalar {
         reserve_scalar(builder, wires, wire, name, bit_type)?;
@@ -268,7 +303,48 @@ fn emit_cell(
             builder.assign(target, resolved)?;
             Ok(())
         }
+        Ecp5Cell::Jtagg {
+            tdi,
+            clock,
+            run_test_idle,
+            shift,
+            update,
+            reset_n,
+            clock_enable,
+            ..
+        } => emit_idle_jtagg(
+            builder,
+            wires,
+            constants,
+            [
+                *tdi,
+                *clock,
+                run_test_idle[0],
+                run_test_idle[1],
+                *shift,
+                *update,
+                clock_enable[0],
+                clock_enable[1],
+            ],
+            *reset_n,
+        ),
     }
+}
+
+fn emit_idle_jtagg(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    inactive_outputs: [u32; 8],
+    reset_n: u32,
+) -> Result<(), CeloxAdapterError> {
+    for wire in inactive_outputs {
+        let target = builder.whole(wire_ref(wires, wire)?.signal)?;
+        builder.assign(target, constants.zero_expression)?;
+    }
+    let reset_target = builder.whole(wire_ref(wires, reset_n)?.signal)?;
+    builder.assign(reset_target, constants.one_expression)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -803,8 +879,8 @@ mod tests {
     };
     use struo_synth::synthesize;
     use struo_target_ecp5::{
-        ArithmeticMapping, MappingOptions, OpenDrainIo, map_to_ecp5,
-        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
+        ArithmeticMapping, JtaggBinding, MappingOptions, OpenDrainIo, map_to_ecp5,
+        map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
     };
 
     use super::{ecp5_frontend_artifact, ecp5_simulator};
@@ -1057,6 +1133,38 @@ mod tests {
             })
             .unwrap();
         assert_eq!(simulator.get(sampled), 0u8.into());
+    }
+
+    #[test]
+    fn models_bound_jtagg_in_its_inactive_state() {
+        let mut source = Netlist::new("debug_top");
+        let mut fabric_outputs = Vec::new();
+        for name in [
+            "jtag_tdi",
+            "jtag_tck",
+            "jtag_rti1",
+            "jtag_rti2",
+            "jtag_shift",
+            "jtag_update",
+            "jtag_rst_n",
+            "jtag_ce1",
+            "jtag_ce2",
+        ] {
+            fabric_outputs.push((name, source.add_input(name)));
+        }
+        let zero = source.add_constant(false);
+        source.add_output("jtag_tdo1", zero);
+        source.add_output("jtag_tdo2", zero);
+        source.add_output("observed_tdi", fabric_outputs[0].1);
+        source.add_output("observed_reset_n", fabric_outputs[6].1);
+        let mapped = map_to_ecp5_with_jtagg(&source, &JtaggBinding::with_prefix("jtag")).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        assert_eq!(simulator.get(simulator.signal("observed_tdi")), 0u8.into());
+        assert_eq!(
+            simulator.get(simulator.signal("observed_reset_n")),
+            1u8.into()
+        );
     }
 
     #[test]

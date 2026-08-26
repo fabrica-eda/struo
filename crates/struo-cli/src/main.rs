@@ -12,7 +12,7 @@ use struo::rtl::Design;
 use struo::target::ecp5 as struo_target_ecp5;
 use struo::target::ecp5::ECP5_QOR_TARGET_MHZ;
 use struo::{
-    MappingOptions, OpenDrainIo, analyze_project_and_lower, ecp5_simulator,
+    JtaggBinding, MappingOptions, OpenDrainIo, analyze_project_and_lower, ecp5_simulator,
     map_to_ecp5_with_options, synthesize,
 };
 
@@ -42,6 +42,10 @@ struct Cli {
         value_parser = parse_open_drain
     )]
     open_drain: Vec<OpenDrainIo>,
+
+    /// Bind `<PREFIX>_*` scalar ports to the dedicated ECP5 JTAG block.
+    #[arg(long, value_name = "PREFIX")]
+    jtagg_prefix: Option<String>,
 
     /// Raise diagnostic logging (-v info to stderr by default; -vv debug).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -85,6 +89,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         &cli.top,
         timing_goal_mhz,
         &cli.open_drain,
+        cli.jtagg_prefix.as_deref(),
         cli.output.as_deref(),
     )
 }
@@ -120,6 +125,7 @@ fn synthesize_and_map(
     label: &str,
     timing_goal_mhz: u32,
     open_drain: &[OpenDrainIo],
+    jtagg_prefix: Option<&str>,
     mapped_path: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let synthesized = synthesize(design)?;
@@ -134,6 +140,9 @@ fn synthesize_and_map(
         },
     )?;
     mapped.bind_open_drain_ios(open_drain)?;
+    if let Some(prefix) = jtagg_prefix {
+        mapped.bind_jtagg(&JtaggBinding::with_prefix(prefix))?;
+    }
     log_retiming_decision(&mapped);
     tracing::info!(
         "{label}: {} Boolean nodes, {} registers, {} ECP5 cells, goal {timing_goal_mhz} MHz",
@@ -209,6 +218,8 @@ mod tests {
             "sda:sda_i:sda_drive_low",
             "--open-drain",
             "scl:scl_i:scl_drive_low",
+            "--jtagg-prefix",
+            "jtag",
             "-vv",
         ])
         .unwrap();
@@ -224,11 +235,13 @@ mod tests {
             ]
         );
         assert_eq!(cli.verbose, 2);
+        assert_eq!(cli.jtagg_prefix.as_deref(), Some("jtag"));
 
         let defaults = Cli::try_parse_from(["struo", "Veryl.toml", "--top", "Top"]).unwrap();
         assert_eq!(defaults.output, None);
         assert_eq!(defaults.timing_goal_mhz, None);
         assert!(defaults.open_drain.is_empty());
+        assert_eq!(defaults.jtagg_prefix, None);
         assert_eq!(defaults.verbose, 0);
 
         let project =
