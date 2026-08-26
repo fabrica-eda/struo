@@ -95,7 +95,8 @@ block memories. Other unsupported constructs fail explicitly.
 The base pin constraints are in
 [`boards/lfe5um5g-85f-evn/base.lpf`](boards/lfe5um5g-85f-evn/base.lpf)
 and are based on the Project Trellis `ecp5_evn` example and the Lattice board
-manual.
+manual. The matching nextpnr pre-pack clock constraint is
+[`boards/lfe5um5g-85f-evn/clock-12.py`](boards/lfe5um5g-85f-evn/clock-12.py).
 
 The 12 MHz value describes the no-PLL board smoke-test clock, not an ECP5
 performance target. Struo targets 300 MHz for ECP5 implementation QoR; designs
@@ -314,12 +315,75 @@ partially connected primitive. Post-map Celox simulation holds the inaccessible
 physical TAP in its inactive state; simulate JTAG traffic before binding when
 the protocol itself is under test.
 
+`jtag_tck` is only the TAP transport clock; binding `JTAGG` does not create or
+replace a fabric system clock. The evaluation board's direct FTDI clock remains
+12 MHz. A user top or wrapper whose logic is intended to run at 250 MHz must
+provide a supported PLL path and constrain both its 12 MHz reference and the
+derived 250 MHz clock. That user-owned boundary is independent of
+`--jtagg-prefix` and of the JTAG programming transport.
+
+### User-configured ECP5 PLL
+
+The current Veryl analyzer IR does not retain enough named-port, parameter, and
+SV-attribute metadata for Struo to reproduce a vendor primitive instance.
+Until that upstream boundary is extended, declare the reference clock,
+generated clock, and lock signal as ordinary scalar inputs for RTL simulation,
+then apply `PllBinding` after synthesis. The binding owns no frequency policy:
+the user supplies the `EHXPLLL` parameters and attributes.
+
+For example, the Veryl top-level boundary for the supplied board configuration
+contains these ports; the core uses `clk_250`, while a testbench drives the
+logical generated clock and lock inputs before target binding:
+
+```veryl
+module Top (
+    clk:        input 'a clock,
+    clk_250:    input 'b clock,
+    pll_locked: input 'b logic,
+) {
+    // Core sequential logic uses clk_250.
+}
+```
+
+The compiler driver removes `clk_250` and `pll_locked` from the physical pin
+list and connects them to one `EHXPLLL` selected by the user-owned JSON:
+
+```sh
+struo . --top Top --output build/Top.json \
+  --pll-binding boards/lfe5um5g-85f-evn/pll-12-to-250.json
+```
+
+[`crates/struo-target-ecp5/examples/pll.rs`](crates/struo-target-ecp5/examples/pll.rs)
+contains a complete 12 MHz to 250 MHz high-resolution configuration generated
+with `ecppll -i 12 -o 250 --highres`. It retains physical port `clk`, replaces
+logical inputs `clk_250` and `pll_locked`, uses `CLKOS` for the fabric clock,
+and feeds `CLKOP` back to `CLKFB`. The same configuration is available as
+[`boards/lfe5um5g-85f-evn/pll-12-to-250.json`](boards/lfe5um5g-85f-evn/pll-12-to-250.json);
+replace that file with another valid device configuration to choose a different
+frequency or PLL topology.
+
+```sh
+cargo run -q -p struo-target-ecp5 --example pll > /tmp/struo-pll.json
+nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
+  --json /tmp/struo-pll.json --lpf-allow-unconstrained \
+  --pre-pack boards/lfe5um5g-85f-evn/clock-12.py \
+  --textcfg /tmp/struo-pll.config --freq 250
+```
+
+The pre-pack constraint names the physical `clk` net at 12 MHz. nextpnr then
+derives the generated constraint from the supplied PLL dividers; `--freq 250`
+is the default for otherwise unconstrained clocks and the implementation target.
+Use the normal complete LPF rather than `--lpf-allow-unconstrained` for a
+programmable board build.
+
 `carry-benchmark` emits two equivalent 32-bit registered counters as
 `carry.json` and `lut.json`. On nextpnr 0.6, LFE5UM5G-85F speed grade 8, seed 1,
 and a 250 MHz timing target, the routed carry version used 38 `TRELLIS_COMB`
 sites and reached 472.14 MHz; the LUT-ripple baseline used 65 sites and reached
 60.22 MHz. These figures are a reproducible comparison point, not a guaranteed
 device specification; rerun place-and-route for the installed nextpnr/chipdb.
+Here `--freq 250` is a timing constraint for the benchmark's logical clock, not
+a board clock configuration or a PLL implementation.
 
 ```sh
 for implementation in carry lut; do

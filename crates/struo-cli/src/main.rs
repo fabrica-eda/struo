@@ -12,8 +12,8 @@ use struo::rtl::Design;
 use struo::target::ecp5 as struo_target_ecp5;
 use struo::target::ecp5::ECP5_QOR_TARGET_MHZ;
 use struo::{
-    JtaggBinding, MappingOptions, OpenDrainIo, analyze_project_and_lower, ecp5_simulator,
-    map_to_ecp5_with_options, synthesize,
+    JtaggBinding, MappingOptions, OpenDrainIo, PllBinding, analyze_project_and_lower,
+    ecp5_simulator, map_to_ecp5_with_options, synthesize,
 };
 
 /// Synthesize a Veryl project to an ECP5 netlist.
@@ -43,9 +43,13 @@ struct Cli {
     )]
     open_drain: Vec<OpenDrainIo>,
 
-    /// Bind `<PREFIX>_*` scalar ports to the dedicated ECP5 JTAG block.
+    /// Bind `<PREFIX>_*` scalar ports to JTAGG (transport only; no system PLL).
     #[arg(long, value_name = "PREFIX")]
     jtagg_prefix: Option<String>,
+
+    /// Apply a user-owned EHXPLLL boundary binding from JSON (repeatable).
+    #[arg(long, value_name = "JSON")]
+    pll_binding: Vec<PathBuf>,
 
     /// Raise diagnostic logging (-v info to stderr by default; -vv debug).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -84,12 +88,25 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         return Err("timing goal must be greater than zero".into());
     }
     let design = load_design(&cli.project, &cli.top)?;
+    let pll_bindings = cli
+        .pll_binding
+        .iter()
+        .map(|path| {
+            let source = std::fs::read_to_string(path).map_err(|error| {
+                format!("failed to read PLL binding `{}`: {error}", path.display())
+            })?;
+            serde_json::from_str::<PllBinding>(&source).map_err(|error| {
+                format!("invalid PLL binding `{}`: {error}", path.display()).into()
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     synthesize_and_map(
         &design,
         &cli.top,
         timing_goal_mhz,
         &cli.open_drain,
         cli.jtagg_prefix.as_deref(),
+        &pll_bindings,
         cli.output.as_deref(),
     )
 }
@@ -126,6 +143,7 @@ fn synthesize_and_map(
     timing_goal_mhz: u32,
     open_drain: &[OpenDrainIo],
     jtagg_prefix: Option<&str>,
+    pll_bindings: &[PllBinding],
     mapped_path: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let synthesized = synthesize(design)?;
@@ -142,6 +160,9 @@ fn synthesize_and_map(
     mapped.bind_open_drain_ios(open_drain)?;
     if let Some(prefix) = jtagg_prefix {
         mapped.bind_jtagg(&JtaggBinding::with_prefix(prefix))?;
+    }
+    for binding in pll_bindings {
+        mapped.bind_pll(binding)?;
     }
     log_retiming_decision(&mapped);
     tracing::info!(
@@ -220,6 +241,8 @@ mod tests {
             "scl:scl_i:scl_drive_low",
             "--jtagg-prefix",
             "jtag",
+            "--pll-binding",
+            "pll.json",
             "-vv",
         ])
         .unwrap();
@@ -236,12 +259,14 @@ mod tests {
         );
         assert_eq!(cli.verbose, 2);
         assert_eq!(cli.jtagg_prefix.as_deref(), Some("jtag"));
+        assert_eq!(cli.pll_binding, [Path::new("pll.json")]);
 
         let defaults = Cli::try_parse_from(["struo", "Veryl.toml", "--top", "Top"]).unwrap();
         assert_eq!(defaults.output, None);
         assert_eq!(defaults.timing_goal_mhz, None);
         assert!(defaults.open_drain.is_empty());
         assert_eq!(defaults.jtagg_prefix, None);
+        assert!(defaults.pll_binding.is_empty());
         assert_eq!(defaults.verbose, 0);
 
         let project =
@@ -259,5 +284,21 @@ mod tests {
             Cli::try_parse_from(["struo", "project", "--top", "T", "--open-drain", "sda:x"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_the_bundled_pll_binding() {
+        let binding: struo::PllBinding = serde_json::from_str(include_str!(
+            "../../../boards/lfe5um5g-85f-evn/pll-12-to-250.json"
+        ))
+        .unwrap();
+
+        assert_eq!(binding.reference_clock_port, "clk");
+        assert_eq!(binding.output_clock_port, "clk_250");
+        assert_eq!(binding.locked_port, "pll_locked");
+        assert_eq!(binding.fabric_output, struo::PllOutput::Clkos);
+        assert_eq!(binding.feedback_output, struo::PllOutput::Clkop);
+        assert_eq!(binding.attributes["FREQUENCY_PIN_CLKI"], "12");
+        assert_eq!(binding.attributes["FREQUENCY_PIN_CLKOS"], "250");
     }
 }
