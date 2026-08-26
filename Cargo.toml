@@ -16,7 +16,7 @@ default-members = ["crates/struo-cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0" # x-release-please-version
+version = "0.1.1" # x-release-please-version
 edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
@@ -28,15 +28,15 @@ keywords = ["fpga", "hdl", "synthesis", "veryl", "ecp5"]
 categories = ["compilers", "development-tools"]
 
 [workspace.dependencies]
-struo = { version = "=0.1.0", path = "crates/struo" } # x-release-please-version
-struo-celox = { version = "=0.1.0", path = "crates/struo-celox" } # x-release-please-version
-struo-formal = { version = "=0.1.0", path = "crates/struo-formal" } # x-release-please-version
-struo-frontend-veryl = { version = "=0.1.0", path = "crates/struo-frontend-veryl" } # x-release-please-version
-struo-ir = { version = "=0.1.0", path = "crates/struo-ir" } # x-release-please-version
-struo-rtl = { version = "=0.1.0", path = "crates/struo-rtl" } # x-release-please-version
-struo-sim = { version = "=0.1.0", path = "crates/struo-sim" } # x-release-please-version
-struo-synth = { version = "=0.1.0", path = "crates/struo-synth" } # x-release-please-version
-struo-target-ecp5 = { version = "=0.1.0", path = "crates/struo-target-ecp5" } # x-release-please-version
+struo = { version = "=0.1.1", path = "crates/struo" } # x-release-please-version
+struo-celox = { version = "=0.1.1", path = "crates/struo-celox" } # x-release-please-version
+struo-formal = { version = "=0.1.1", path = "crates/struo-formal" } # x-release-please-version
+struo-frontend-veryl = { version = "=0.1.1", path = "crates/struo-frontend-veryl" } # x-release-please-version
+struo-ir = { version = "=0.1.1", path = "crates/struo-ir" } # x-release-please-version
+struo-rtl = { version = "=0.1.1", path = "crates/struo-rtl" } # x-release-please-version
+struo-sim = { version = "=0.1.1", path = "crates/struo-sim" } # x-release-please-version
+struo-synth = { version = "=0.1.1", path = "crates/struo-synth" } # x-release-please-version
+struo-target-ecp5 = { version = "=0.1.1", path = "crates/struo-target-ecp5" } # x-release-please-version
 
 [workspace.lints.rust]
 missing_docs = "warn"
