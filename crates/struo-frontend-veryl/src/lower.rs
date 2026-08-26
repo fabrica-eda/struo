@@ -6,9 +6,9 @@ use struo_rtl::{
     SignalSlice, StateDomain, UnaryOp, ValueType,
 };
 use veryl_analyzer::ir::{
-    AssignDestination, CasePattern, CaseStatement, Component, Declaration, Expression, Factor,
-    FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module, Op, Statement, Type, TypeKind,
-    ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
+    AssignDestination, CasePattern, CaseStatement, Component, Comptime, Declaration, Expression,
+    Factor, FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module, Op, Statement, Type,
+    TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
 };
 
 use crate::{ImportError, resolve_name};
@@ -67,9 +67,10 @@ struct PartialMemoryPattern {
 /// The current semantic boundary supports scalar packed variables, statically
 /// indexed unpacked arrays, recursively flattened module instances,
 /// analyzer-expanded interface/modport connections, combinational and
-/// sequential assignments, static packed selects, conditionals, case
-/// statements, concatenations, arithmetic, comparisons, shifts, and reset
-/// branches. Unsupported AIR is rejected rather than silently discarded.
+/// sequential assignments, compile-time constants, static packed selects,
+/// dynamic packed bit selects, conditionals, case statements, concatenations,
+/// arithmetic, comparisons, shifts, and reset branches. Unsupported AIR is
+/// rejected rather than silently discarded.
 ///
 /// # Errors
 ///
@@ -1153,12 +1154,29 @@ impl<'a> ModuleLowerer<'a> {
         match factor {
             Factor::Variable(id, index, select, comptime) => {
                 let key = self.key_from_index(*id, index)?;
-                let source = env.get(&key).copied().ok_or_else(|| {
-                    ImportError::UnsupportedBehavior(format!(
+                let Some(source) = env.get(&key).copied() else {
+                    if comptime.is_const {
+                        return self.lower_comptime(comptime, "constant variable");
+                    }
+                    return Err(ImportError::UnsupportedBehavior(format!(
                         "reference to non-runtime variable {}",
                         self.signal_name(&key)
-                    ))
-                })?;
+                    )));
+                };
+                if select.0.len() == 1
+                    && select.1.is_none()
+                    && evaluated_u64(&select.0[0]).is_none()
+                {
+                    let index = self.lower_expression(&select.0[0], env)?;
+                    let shifted =
+                        self.rtl
+                            .binary(BinaryOp::ShiftRightLogical, source.id, index.id)?;
+                    return Ok(LoweredExpr {
+                        id: self.rtl.expression_slice(shifted, 0, BitWidth::new(1)?)?,
+                        width: 1,
+                        signed: comptime.r#type.signed,
+                    });
+                }
                 let (lsb, width) = static_select(select, source.width)?;
                 if lsb == 0 && width == source.width {
                     Ok(source)
@@ -1173,22 +1191,7 @@ impl<'a> ModuleLowerer<'a> {
                 }
             }
             Factor::Value(comptime) | Factor::Anonymous(comptime) => {
-                let ValueVariant::Numeric(value) = &comptime.value else {
-                    return Err(ImportError::UnsupportedBehavior(
-                        "non-numeric compile-time value".into(),
-                    ));
-                };
-                let width = concrete_width(&comptime.r#type, "literal")?;
-                let value = value.to_u64().ok_or_else(|| {
-                    ImportError::UnsupportedBehavior("literal wider than 64 value bits".into())
-                })?;
-                Ok(LoweredExpr {
-                    id: self
-                        .rtl
-                        .constant(Constant::from_u64(BitWidth::new(width)?, value)),
-                    width,
-                    signed: comptime.r#type.signed,
-                })
+                self.lower_comptime(comptime, "literal")
             }
             Factor::Unknown(_) => Err(ImportError::UnsupportedBehavior(
                 "unknown or four-state X/Z literal".into(),
@@ -1200,6 +1203,29 @@ impl<'a> ModuleLowerer<'a> {
                 ImportError::UnsupportedBehavior("function call expression".into()),
             ),
         }
+    }
+
+    fn lower_comptime(
+        &mut self,
+        comptime: &Comptime,
+        context: &str,
+    ) -> Result<LoweredExpr, ImportError> {
+        let ValueVariant::Numeric(value) = &comptime.value else {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "non-numeric compile-time {context}"
+            )));
+        };
+        let width = concrete_width(&comptime.r#type, context)?;
+        let value = value.to_u64().ok_or_else(|| {
+            ImportError::UnsupportedBehavior(format!("{context} wider than 64 value bits"))
+        })?;
+        Ok(LoweredExpr {
+            id: self
+                .rtl
+                .constant(Constant::from_u64(BitWidth::new(width)?, value)),
+            width,
+            signed: comptime.r#type.signed,
+        })
     }
 
     fn assign_env(
@@ -1612,21 +1638,21 @@ fn concrete_width(r#type: &Type, name: &str) -> Result<u32, ImportError> {
 }
 
 fn constant_value(expression: &Expression) -> Result<u64, ImportError> {
-    expression
-        .comptime()
-        .get_value()
-        .ok()
-        .and_then(veryl_analyzer::value::Value::to_u64)
+    evaluated_u64(expression)
         .ok_or_else(|| ImportError::UnsupportedBehavior("non-constant replication count".into()))
 }
 
 fn static_array_index(expression: &Expression) -> Result<u64, ImportError> {
+    evaluated_u64(expression)
+        .ok_or_else(|| ImportError::UnsupportedBehavior("dynamic unpacked array index".into()))
+}
+
+fn evaluated_u64(expression: &Expression) -> Option<u64> {
     expression
         .comptime()
         .get_value()
         .ok()
         .and_then(veryl_analyzer::value::Value::to_u64)
-        .ok_or_else(|| ImportError::UnsupportedBehavior("dynamic unpacked array index".into()))
 }
 
 fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), ImportError> {
@@ -1638,11 +1664,15 @@ fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), Im
             "multi-dimensional packed select".into(),
         ));
     }
-    let first = u32::try_from(constant_value(&select.0[0])?)
-        .map_err(|_| ImportError::UnsupportedBehavior("packed select index overflow".into()))?;
+    let first = u32::try_from(evaluated_u64(&select.0[0]).ok_or_else(|| {
+        ImportError::UnsupportedBehavior("dynamic packed select is unsupported here".into())
+    })?)
+    .map_err(|_| ImportError::UnsupportedBehavior("packed select index overflow".into()))?;
     let (lsb, width) = if let Some((operation, end)) = &select.1 {
-        let end = u32::try_from(constant_value(end)?)
-            .map_err(|_| ImportError::UnsupportedBehavior("packed select bound overflow".into()))?;
+        let end = u32::try_from(evaluated_u64(end).ok_or_else(|| {
+            ImportError::UnsupportedBehavior("dynamic packed select width is unsupported".into())
+        })?)
+        .map_err(|_| ImportError::UnsupportedBehavior("packed select bound overflow".into()))?;
         match operation {
             VarSelectOp::Colon => (first.min(end), first.abs_diff(end) + 1),
             VarSelectOp::PlusColon => (first, end),
@@ -1888,6 +1918,26 @@ module MemoryTop (
 
     always_ff (clk) {
         read_data = words[read_address];
+    }
+}
+";
+
+    const I2C_EXPRESSION_SOURCE: &str = r"
+module I2cExpressionTop (
+    read_data: input  logic<8>,
+    bit_index: input  logic<3>,
+    state    : output logic<4>,
+    drive_low: output logic,
+) {
+    const STATE_IDLE: logic<4> = 4'h0;
+    const STATE_READ: logic<4> = 4'h7;
+
+    always_comb {
+        state = STATE_IDLE;
+        if read_data[bit_index] {
+            state = STATE_READ;
+        }
+        drive_low = !read_data[bit_index];
     }
 }
 ";
@@ -2209,6 +2259,27 @@ module NbaTop (
         set(&mut simulator, "read_address", 3);
         tick(&mut simulator);
         assert_value(&mut simulator, "read_data", 0x5a);
+    }
+
+    #[test]
+    fn lowers_module_constants_and_dynamic_packed_bit_selects() {
+        let design = analyze_and_lower(
+            I2C_EXPRESSION_SOURCE,
+            "i2c_expression_lowering",
+            "I2cExpressionTop",
+        )
+        .unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "read_data", 0b1010_0100);
+        for bit_index in 0..8 {
+            set(&mut simulator, "bit_index", bit_index);
+            let selected = (0b1010_0100 >> bit_index) & 1;
+            assert_value(&mut simulator, "state", if selected == 0 { 0 } else { 7 });
+            assert_value(&mut simulator, "drive_low", 1 - selected);
+        }
     }
 
     fn reset(simulator: &mut Simulator<NativeBackend>) {
