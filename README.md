@@ -229,6 +229,28 @@ hold muxes on timing-critical paths. Addition and subtraction remain
 word-level cells until technology mapping. ECP5 maps operations wider than
 four bits to `CCU2C` carry chains by default; explicit carry-chain and
 LUT-ripple modes are also available for regression tests and A/B measurements.
+For physical QoR experiments, pass `--no-infer-register-enables` to retain
+self-hold muxes or `--no-relax-qualified-register-enables` to retain qualified
+payload enables. Library callers can make the same choices with
+`SynthesisOptions` and `synthesize_with_options`; `synthesize` keeps both
+passes enabled for compatibility.
+Clock-enable replication is controlled independently at the mapped flip-flop
+level. Repeat `--register-enable-fanout 'CELL=LIMIT'` to select final ECP5 FF
+names with `*` and `?` patterns, for example:
+
+```sh
+struo project --top Top --output out.json \
+  --register-enable-fanout 'ff_core.operand_b_q[*]=16' \
+  --register-enable-fanout 'ff_core.logic_result_q[*]=8'
+```
+
+Only the selected CE sinks move onto replicated branches; other FFs sharing
+the logical enable stay on their original net. A LUT driver is duplicated
+without another logic level, while a non-LUT wire driver uses identity LUT
+branches. Zero limits, unmatched patterns, overlapping patterns, and selected
+FFs without a wire-driven CE are errors rather than silently ignored. Library
+callers can apply the same constraints with
+`Ecp5Netlist::apply_register_enable_fanout_constraints`.
 ECP5 technology mapping enumerates bounded four-input cuts and selects a cover
 using a 300 MHz required-time model. The estimate includes LUT, routing,
 carry-chain, BRAM, and setup arcs; fanout-weighted timing selection is enabled
