@@ -15,7 +15,9 @@ pub use struo_rtl as rtl;
 pub use struo_sim as sim;
 /// Synthesis pipeline and optimization passes.
 pub use struo_synth as synth;
-pub use struo_synth::{SynthesisError, SynthesisResult, synthesize};
+pub use struo_synth::{
+    SynthesisError, SynthesisOptions, SynthesisResult, synthesize, synthesize_with_options,
+};
 
 /// Veryl project analysis and lowering.
 #[cfg(feature = "veryl")]

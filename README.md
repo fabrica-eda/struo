@@ -229,6 +229,11 @@ hold muxes on timing-critical paths. Addition and subtraction remain
 word-level cells until technology mapping. ECP5 maps operations wider than
 four bits to `CCU2C` carry chains by default; explicit carry-chain and
 LUT-ripple modes are also available for regression tests and A/B measurements.
+For physical QoR experiments, pass `--no-infer-register-enables` to retain
+self-hold muxes or `--no-relax-qualified-register-enables` to retain qualified
+payload enables. Library callers can make the same choices with
+`SynthesisOptions` and `synthesize_with_options`; `synthesize` keeps both
+passes enabled for compatibility.
 ECP5 technology mapping enumerates bounded four-input cuts and selects a cover
 using a 300 MHz required-time model. The estimate includes LUT, routing,
 carry-chain, BRAM, and setup arcs; fanout-weighted timing selection is enabled

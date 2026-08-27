@@ -36,6 +36,28 @@ pub struct SynthesisResult {
     pub reports: Vec<PassReport>,
 }
 
+/// Target-independent synthesis pass controls.
+///
+/// The default preserves Struo's existing synthesis behavior. Individual
+/// transformations can be disabled for `QoR` experiments without requiring
+/// callers to reimplement RTL lowering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SynthesisOptions {
+    /// Replace direct register self-hold muxes with clock enables.
+    pub infer_register_enables: bool,
+    /// Remove enables from payload registers proven unobservable while invalid.
+    pub relax_qualified_register_enables: bool,
+}
+
+impl Default for SynthesisOptions {
+    fn default() -> Self {
+        Self {
+            infer_register_enables: true,
+            relax_qualified_register_enables: true,
+        }
+    }
+}
+
 /// Synthesizes the selected top module into a bit-level logic netlist.
 ///
 /// Construction performs constant folding and structural hashing. Word-level
@@ -48,6 +70,18 @@ pub struct SynthesisResult {
 /// Returns an error for invalid RTL, unsupported constructs, undriven bits,
 /// combinational loops, non-constant reset values, or an invalid netlist.
 pub fn synthesize(design: &Design) -> Result<SynthesisResult, SynthesisError> {
+    synthesize_with_options(design, SynthesisOptions::default())
+}
+
+/// Synthesizes the selected top module with explicit pass controls.
+///
+/// # Errors
+///
+/// Returns the same errors as [`synthesize`].
+pub fn synthesize_with_options(
+    design: &Design,
+    options: SynthesisOptions,
+) -> Result<SynthesisResult, SynthesisError> {
     validate_rtl(design)?;
     let module = design
         .top_module()
@@ -73,7 +107,7 @@ pub fn synthesize(design: &Design) -> Result<SynthesisResult, SynthesisError> {
             netlist.memories().len()
         ),
     }];
-    reports.extend(default_pipeline().run(&mut netlist)?);
+    reports.extend(pipeline_with_options(options).run(&mut netlist)?);
     Ok(SynthesisResult { netlist, reports })
 }
 
@@ -733,9 +767,19 @@ impl Pipeline {
 /// Returns the default development pipeline.
 #[must_use]
 pub fn default_pipeline() -> Pipeline {
+    pipeline_with_options(SynthesisOptions::default())
+}
+
+/// Returns the development pipeline selected by `options`.
+#[must_use]
+pub fn pipeline_with_options(options: SynthesisOptions) -> Pipeline {
     let mut pipeline = Pipeline::new();
-    pipeline.push(InferRegisterEnables);
-    pipeline.push(RelaxQualifiedRegisterEnables);
+    if options.infer_register_enables {
+        pipeline.push(InferRegisterEnables);
+    }
+    if options.relax_qualified_register_enables {
+        pipeline.push(RelaxQualifiedRegisterEnables);
+    }
     pipeline.push(ValidateNetlist);
     pipeline
 }
@@ -1202,7 +1246,7 @@ mod tests {
         PortDirection, Register, Reset, ResetMode, StateDomain, UnaryOp, ValueType,
     };
 
-    use super::{default_pipeline, synthesize};
+    use super::{SynthesisOptions, default_pipeline, pipeline_with_options, synthesize};
 
     fn bits(width: u32) -> ValueType {
         ValueType {
@@ -1832,6 +1876,41 @@ mod tests {
         assert_eq!(reports[0].pass, "infer-register-enables");
         assert_eq!(reports[1].pass, "relax-qualified-register-enables");
         assert_eq!(reports[2].pass, "validate");
+    }
+
+    #[test]
+    fn synthesis_options_can_disable_register_enable_passes() {
+        let mut design = Netlist::new("feedback_mux");
+        let clock = design.add_input("clock");
+        let update = design.add_input("update");
+        let data = design.add_input("data");
+        let state = design.add_register_output("state");
+        let next = design.add_mux(update, data, state);
+        design.add_register(RegisterCell::new(
+            "state",
+            state,
+            next,
+            clock,
+            IrClockEdge::Rising,
+            None,
+            None,
+        ));
+        design.add_output("state_out", state);
+
+        let reports = pipeline_with_options(SynthesisOptions {
+            infer_register_enables: false,
+            relax_qualified_register_enables: false,
+        })
+        .run(&mut design)
+        .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].pass, "validate");
+        assert_eq!(design.registers()[0].enable(), None);
+        assert!(matches!(
+            design.nodes()[design.registers()[0].data().index() as usize].kind(),
+            NodeKind::Mux
+        ));
     }
 
     #[test]

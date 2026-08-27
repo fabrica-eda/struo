@@ -13,8 +13,8 @@ use struo::target::ecp5 as struo_target_ecp5;
 use struo::target::ecp5::ECP5_QOR_TARGET_MHZ;
 use struo::{
     IoTimingConstraints, JtaggBinding, MappingOptions, OocTimingConstraints, OpenDrainIo,
-    PllBinding, analyze_project_and_lower, ecp5_simulator, map_to_ecp5_ooc,
-    map_to_ecp5_with_constraints, synthesize,
+    PllBinding, SynthesisOptions, analyze_project_and_lower, ecp5_simulator, map_to_ecp5_ooc,
+    map_to_ecp5_with_constraints, synthesize_with_options,
 };
 
 /// Synthesize a Veryl project to an ECP5 netlist.
@@ -69,6 +69,14 @@ struct Cli {
     /// Apply a user-owned EHXPLLL boundary binding from JSON (repeatable).
     #[arg(long, value_name = "JSON")]
     pll_binding: Vec<PathBuf>,
+
+    /// Keep register self-hold muxes instead of inferring clock enables.
+    #[arg(long)]
+    no_infer_register_enables: bool,
+
+    /// Keep qualified payload clock enables instead of relaxing them.
+    #[arg(long)]
+    no_relax_qualified_register_enables: bool,
 
     /// Raise diagnostic logging (-v info to stderr by default; -vv debug).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -171,6 +179,10 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         &cli.open_drain,
         cli.jtagg_prefix.as_deref(),
         &pll_bindings,
+        SynthesisOptions {
+            infer_register_enables: !cli.no_infer_register_enables,
+            relax_qualified_register_enables: !cli.no_relax_qualified_register_enables,
+        },
         cli.output.as_deref(),
     )
 }
@@ -211,9 +223,10 @@ fn synthesize_and_map(
     open_drain: &[OpenDrainIo],
     jtagg_prefix: Option<&str>,
     pll_bindings: &[PllBinding],
+    synthesis_options: SynthesisOptions,
     mapped_path: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
-    let synthesized = synthesize(design)?;
+    let synthesized = synthesize_with_options(design, synthesis_options)?;
     for report in &synthesized.reports {
         tracing::info!("{}: {}", report.pass, report.message);
     }
@@ -326,6 +339,8 @@ mod tests {
             "jtag",
             "--pll-binding",
             "pll.json",
+            "--no-infer-register-enables",
+            "--no-relax-qualified-register-enables",
             "-vv",
         ])
         .unwrap();
@@ -348,6 +363,8 @@ mod tests {
         assert_eq!(cli.verbose, 2);
         assert_eq!(cli.jtagg_prefix.as_deref(), Some("jtag"));
         assert_eq!(cli.pll_binding, [Path::new("pll.json")]);
+        assert!(cli.no_infer_register_enables);
+        assert!(cli.no_relax_qualified_register_enables);
 
         let defaults = Cli::try_parse_from(["struo", "Veryl.toml", "--top", "Top"]).unwrap();
         assert_eq!(defaults.output, None);
@@ -357,6 +374,8 @@ mod tests {
         assert!(defaults.open_drain.is_empty());
         assert_eq!(defaults.jtagg_prefix, None);
         assert!(defaults.pll_binding.is_empty());
+        assert!(!defaults.no_infer_register_enables);
+        assert!(!defaults.no_relax_qualified_register_enables);
         assert_eq!(defaults.verbose, 0);
 
         let project =
