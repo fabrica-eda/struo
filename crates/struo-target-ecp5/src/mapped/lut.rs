@@ -84,12 +84,13 @@ impl LutCover {
         cuts: &CutDatabase,
         mapping_roots: &[NetId],
         options: MappingOptions,
+        period_ps: u32,
         io_timing: &IoTimingConstraints,
     ) -> Self {
         let fanouts = structural_fanouts(netlist);
         let retained = RetainedTiming::new(netlist);
-        let critical_arrival_ps = timing_period_ps(options).saturating_mul(CRITICALITY_NUMERATOR)
-            / CRITICALITY_DENOMINATOR;
+        let critical_arrival_ps =
+            period_ps.saturating_mul(CRITICALITY_NUMERATOR) / CRITICALITY_DENOMINATOR;
         let (mut plans, mut arrivals) = select_initial_plans(
             netlist,
             cuts,
@@ -100,7 +101,7 @@ impl LutCover {
             io_timing,
         );
         let strict_required = required_times(
-            netlist, &plans, &arrivals, &fanouts, &retained, options, io_timing, false,
+            netlist, &plans, &arrivals, &fanouts, &retained, options, period_ps, io_timing, false,
         );
         if !timing_is_valid(&arrivals, &strict_required) {
             (plans, arrivals) =
@@ -110,13 +111,14 @@ impl LutCover {
         let original_plans = plans.clone();
         let original_arrivals = arrivals.clone();
         let strict_required = required_times(
-            netlist, &plans, &arrivals, &fanouts, &retained, options, io_timing, false,
+            netlist, &plans, &arrivals, &fanouts, &retained, options, period_ps, io_timing, false,
         );
         let mut required = if timing_is_valid(&arrivals, &strict_required) {
             strict_required
         } else {
             required_times(
-                netlist, &plans, &arrivals, &fanouts, &retained, options, io_timing, true,
+                netlist, &plans, &arrivals, &fanouts, &retained, options, period_ps, io_timing,
+                true,
             )
         };
         let original_required = required.clone();
@@ -481,10 +483,10 @@ fn required_times(
     fanouts: &[usize],
     retained: &RetainedTiming,
     options: MappingOptions,
+    period_ps: u32,
     io_timing: &IoTimingConstraints,
     preserve_initial: bool,
 ) -> Vec<u32> {
-    let period_ps = timing_period_ps(options);
     let mut required = vec![u32::MAX; netlist.nodes().len()];
     let mut constrain = |net: NetId, sink_delay: u32| {
         let index = net.index() as usize;
@@ -566,10 +568,6 @@ fn required_times(
         }
     }
     required
-}
-
-fn timing_period_ps(options: MappingOptions) -> u32 {
-    1_000_000u32 / options.timing_goal_mhz.max(1)
 }
 
 fn tighten_required(

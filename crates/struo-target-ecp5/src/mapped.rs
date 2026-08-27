@@ -13,7 +13,7 @@ use struo_formal::{
 };
 use struo_ir::{
     ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, ComparisonCell, MemoryCell, NetId,
-    Netlist, PortDirection as IrPortDirection, ValidationError,
+    Netlist, NodeKind, PortDirection as IrPortDirection, ValidationError,
 };
 
 use crate::physical::{PhysicalFeedback, PhysicalLocation};
@@ -363,6 +363,77 @@ impl IoTimingConstraints {
     pub fn with_output_delay_ps(mut self, port: impl Into<String>, delay_ps: u32) -> Self {
         self.output_delays_ps.insert(port.into(), delay_ps);
         self
+    }
+}
+
+/// One clock available at an out-of-context module boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OocClockConstraint {
+    /// Scalar input port carrying this clock.
+    pub port: String,
+    /// Nominal clock period in picoseconds.
+    pub period_ps: u32,
+    /// Setup uncertainty reserved from this clock period, in picoseconds.
+    #[serde(default)]
+    pub uncertainty_ps: u32,
+}
+
+/// Timing budget for one registered out-of-context data port.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OocPortConstraint {
+    /// Name of the reference clock in [`OocTimingConstraints::clocks`].
+    pub clock: String,
+    /// Maximum delay inside the OOC module between the port and its boundary
+    /// register, including the sequential endpoint arc, in picoseconds.
+    pub max_boundary_delay_ps: u32,
+}
+
+/// Strict timing context for compiling a registered module independently.
+///
+/// Every data port must appear in `inputs` or `outputs`. Clock ports and
+/// explicitly named asynchronous controls are exempt from the input map. The
+/// current ECP5 mapper uses one physical period, so all named clocks must have
+/// the same nominal period; uncertainty may differ by clock.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OocTimingConstraints {
+    /// Named clocks available at scalar input ports.
+    pub clocks: BTreeMap<String, OocClockConstraint>,
+    /// Registered input-boundary budgets by source-level port name.
+    pub inputs: BTreeMap<String, OocPortConstraint>,
+    /// Registered output-boundary budgets by source-level port name.
+    pub outputs: BTreeMap<String, OocPortConstraint>,
+    /// Input ports intentionally excluded from synchronous data timing, such
+    /// as asynchronous reset controls.
+    #[serde(default)]
+    pub asynchronous_controls: BTreeSet<String>,
+}
+
+impl OocTimingConstraints {
+    /// Returns the common nominal period when at least one valid clock exists.
+    #[must_use]
+    pub fn nominal_period_ps(&self) -> Option<u32> {
+        let mut clocks = self.clocks.values();
+        let period = clocks.next()?.period_ps;
+        clocks
+            .all(|clock| clock.period_ps == period)
+            .then_some(period)
+    }
+
+    /// Returns the nominal period after reserving the largest clock
+    /// uncertainty.
+    #[must_use]
+    pub fn effective_period_ps(&self) -> Option<u32> {
+        let period = self.nominal_period_ps()?;
+        period.checked_sub(
+            self.clocks
+                .values()
+                .map(|clock| clock.uncertainty_ps)
+                .max()
+                .unwrap_or(0),
+        )
     }
 }
 
@@ -1375,21 +1446,528 @@ pub fn map_to_ecp5_with_constraints(
     io_timing: &IoTimingConstraints,
 ) -> Result<Ecp5Netlist, MappingError> {
     validate_io_timing(netlist, io_timing)?;
-    let (mut selected, _) = map_once(netlist, options, io_timing)?;
+    let period_ps = 1_000_000u32 / options.timing_goal_mhz.max(1);
+    let retiming_target_period_ps = 1_000_000u32
+        .div_ceil(options.timing_goal_mhz.max(1))
+        .saturating_mul(RETIMING_PERIOD_MARGIN_NUMERATOR)
+        / RETIMING_PERIOD_MARGIN_DENOMINATOR;
+    map_to_ecp5_with_period(
+        netlist,
+        options,
+        io_timing,
+        period_ps,
+        retiming_target_period_ps,
+    )
+}
+
+/// Maps a registered core under a strict out-of-context timing environment.
+///
+/// The OOC file owns the nominal period. The mapper subtracts the largest
+/// named clock uncertainty from internal register-to-register timing and
+/// converts each direct boundary budget into the equivalent input/output
+/// arrival constraint. All named clocks currently need the same period.
+///
+/// # Errors
+///
+/// Returns an error when the source netlist is invalid, an OOC constraint is
+/// inconsistent or incomplete, or a data boundary is not registered on its
+/// declared clock.
+pub fn map_to_ecp5_ooc(
+    netlist: &Netlist,
+    constraints: &OocTimingConstraints,
+) -> Result<Ecp5Netlist, MappingError> {
+    netlist.validate()?;
+    let normalized = normalize_ooc_timing(netlist, constraints)?;
+    let options = MappingOptions {
+        timing_goal_mhz: 1_000_000u32.div_ceil(normalized.period_ps.max(1)),
+        ..MappingOptions::default()
+    };
+    let retiming_target_period_ps = normalized
+        .period_ps
+        .saturating_mul(RETIMING_PERIOD_MARGIN_NUMERATOR)
+        / RETIMING_PERIOD_MARGIN_DENOMINATOR;
+    map_to_ecp5_with_period(
+        netlist,
+        options,
+        &normalized.io_timing,
+        normalized.period_ps,
+        retiming_target_period_ps,
+    )
+}
+
+struct NormalizedOocTiming {
+    io_timing: IoTimingConstraints,
+    period_ps: u32,
+}
+
+#[allow(clippy::too_many_lines)]
+fn normalize_ooc_timing(
+    netlist: &Netlist,
+    constraints: &OocTimingConstraints,
+) -> Result<NormalizedOocTiming, MappingError> {
+    let invalid = |message: String| MappingError::InvalidOocConstraint(message);
+    let nominal_period_ps = constraints
+        .nominal_period_ps()
+        .ok_or_else(|| invalid("at least one clock with a common period is required".into()))?;
+    if nominal_period_ps == 0 {
+        return Err(invalid("clock period must be greater than zero".into()));
+    }
+
+    let mut clock_ports = BTreeSet::new();
+    let mut clock_nets = BTreeMap::new();
+    for (name, clock) in &constraints.clocks {
+        if name.trim().is_empty() {
+            return Err(invalid("clock names must not be empty".into()));
+        }
+        if clock.uncertainty_ps >= clock.period_ps {
+            return Err(invalid(format!(
+                "clock `{name}` uncertainty {} ps must be smaller than its {} ps period",
+                clock.uncertainty_ps, clock.period_ps
+            )));
+        }
+        let port = find_ooc_port(netlist, &clock.port, IrPortDirection::Input)?;
+        if port.bits().len() != 1 {
+            return Err(invalid(format!(
+                "clock `{name}` port `{}` has width {}, expected one bit",
+                clock.port,
+                port.bits().len()
+            )));
+        }
+        if !clock_ports.insert(clock.port.as_str()) {
+            return Err(invalid(format!(
+                "clock port `{}` is assigned to more than one named clock",
+                clock.port
+            )));
+        }
+        clock_nets.insert(name.as_str(), port.bits()[0]);
+    }
+
+    let effective_period_ps = constraints
+        .effective_period_ps()
+        .expect("clock periods and uncertainties were validated");
+    let mut asynchronous_ports = BTreeSet::new();
+    for name in &constraints.asynchronous_controls {
+        let port = find_ooc_port(netlist, name, IrPortDirection::Input)?;
+        if clock_ports.contains(name.as_str()) {
+            return Err(invalid(format!(
+                "input `{name}` cannot be both a clock and an asynchronous control"
+            )));
+        }
+        validate_ooc_asynchronous_control(netlist, port)?;
+        asynchronous_ports.insert(name.as_str());
+    }
+
+    for port in netlist.ports() {
+        match port.direction() {
+            IrPortDirection::Input
+                if !clock_ports.contains(port.name())
+                    && !asynchronous_ports.contains(port.name())
+                    && !constraints.inputs.contains_key(port.name()) =>
+            {
+                return Err(invalid(format!(
+                    "data input `{}` has no OOC boundary constraint",
+                    port.name()
+                )));
+            }
+            IrPortDirection::Output if !constraints.outputs.contains_key(port.name()) => {
+                return Err(invalid(format!(
+                    "data output `{}` has no OOC boundary constraint",
+                    port.name()
+                )));
+            }
+            IrPortDirection::Input | IrPortDirection::Output => {}
+        }
+    }
+
+    let mut io_timing = IoTimingConstraints::new();
+    for (port_name, boundary) in &constraints.inputs {
+        let port = find_ooc_port(netlist, port_name, IrPortDirection::Input)?;
+        if clock_ports.contains(port_name.as_str())
+            || asynchronous_ports.contains(port_name.as_str())
+        {
+            return Err(invalid(format!(
+                "clock or asynchronous-control input `{port_name}` cannot also be timed as data"
+            )));
+        }
+        let (clock, clock_net) =
+            resolve_ooc_boundary_clock(constraints, &clock_nets, port_name, boundary)?;
+        validate_ooc_input_boundary(netlist, port, clock_net, &boundary.clock)?;
+        let usable_budget = boundary
+            .max_boundary_delay_ps
+            .checked_sub(clock.uncertainty_ps)
+            .filter(|budget| *budget > 0)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "input `{port_name}` boundary budget {} ps must exceed clock `{}` uncertainty {} ps",
+                    boundary.max_boundary_delay_ps, boundary.clock, clock.uncertainty_ps
+                ))
+            })?;
+        if boundary.max_boundary_delay_ps > nominal_period_ps {
+            return Err(invalid(format!(
+                "input `{port_name}` boundary budget {} ps exceeds the {nominal_period_ps} ps clock period",
+                boundary.max_boundary_delay_ps
+            )));
+        }
+        io_timing.input_delays_ps.insert(
+            port_name.clone(),
+            effective_period_ps.saturating_sub(usable_budget),
+        );
+    }
+    for (port_name, boundary) in &constraints.outputs {
+        let port = find_ooc_port(netlist, port_name, IrPortDirection::Output)?;
+        let (clock, clock_net) =
+            resolve_ooc_boundary_clock(constraints, &clock_nets, port_name, boundary)?;
+        validate_ooc_output_boundary(netlist, port, clock_net, &boundary.clock)?;
+        let usable_budget = boundary
+            .max_boundary_delay_ps
+            .checked_sub(clock.uncertainty_ps)
+            .filter(|budget| *budget > 0)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "output `{port_name}` boundary budget {} ps must exceed clock `{}` uncertainty {} ps",
+                    boundary.max_boundary_delay_ps, boundary.clock, clock.uncertainty_ps
+                ))
+            })?;
+        if boundary.max_boundary_delay_ps > nominal_period_ps {
+            return Err(invalid(format!(
+                "output `{port_name}` boundary budget {} ps exceeds the {nominal_period_ps} ps clock period",
+                boundary.max_boundary_delay_ps
+            )));
+        }
+        io_timing.output_delays_ps.insert(
+            port_name.clone(),
+            effective_period_ps.saturating_sub(usable_budget),
+        );
+    }
+    validate_io_timing(netlist, &io_timing)?;
+    Ok(NormalizedOocTiming {
+        io_timing,
+        period_ps: effective_period_ps,
+    })
+}
+
+fn find_ooc_port<'a>(
+    netlist: &'a Netlist,
+    name: &str,
+    expected: IrPortDirection,
+) -> Result<&'a struo_ir::Port, MappingError> {
+    let port = netlist
+        .ports()
+        .iter()
+        .find(|port| port.name() == name)
+        .ok_or_else(|| {
+            MappingError::InvalidOocConstraint(format!("port `{name}` was not found"))
+        })?;
+    if port.direction() != expected {
+        return Err(MappingError::InvalidOocConstraint(format!(
+            "port `{name}` has direction {:?}, expected {expected:?}",
+            port.direction()
+        )));
+    }
+    Ok(port)
+}
+
+fn resolve_ooc_boundary_clock<'a>(
+    constraints: &'a OocTimingConstraints,
+    clock_nets: &BTreeMap<&str, NetId>,
+    port_name: &str,
+    boundary: &OocPortConstraint,
+) -> Result<(&'a OocClockConstraint, NetId), MappingError> {
+    let clock = constraints.clocks.get(&boundary.clock).ok_or_else(|| {
+        MappingError::InvalidOocConstraint(format!(
+            "port `{port_name}` references unknown clock `{}`",
+            boundary.clock
+        ))
+    })?;
+    let clock_net = clock_nets[boundary.clock.as_str()];
+    Ok((clock, clock_net))
+}
+
+fn validate_ooc_input_boundary(
+    netlist: &Netlist,
+    port: &struo_ir::Port,
+    expected_clock: NetId,
+    clock_name: &str,
+) -> Result<(), MappingError> {
+    let combinational_fanouts = ooc_combinational_fanouts(netlist);
+    let output_sources = netlist
+        .ports()
+        .iter()
+        .filter(|candidate| candidate.direction() == IrPortDirection::Output)
+        .flat_map(struo_ir::Port::bits)
+        .map(|output| node_for(netlist, *output).inputs()[0])
+        .collect::<HashSet<_>>();
+    let mut sequential_sinks = vec![Vec::new(); netlist.nodes().len()];
+    for register in netlist.registers() {
+        sequential_sinks[register.data().index() as usize].push(register.clock());
+        if let Some(enable) = register.enable() {
+            sequential_sinks[enable.signal.index() as usize].push(register.clock());
+        }
+    }
+    for memory in netlist.memories() {
+        for input in memory
+            .read_address()
+            .iter()
+            .chain(memory.write_address())
+            .chain(memory.write_data())
+            .copied()
+            .chain([memory.write_enable().signal])
+            .chain(memory.read_enable().map(|enable| enable.signal))
+        {
+            sequential_sinks[input.index() as usize].push(memory.clock());
+        }
+    }
+
+    for (bit_index, start) in port.bits().iter().copied().enumerate() {
+        let mut pending = vec![start];
+        let mut visited = HashSet::new();
+        let mut found_sequential = false;
+        while let Some(net) = pending.pop() {
+            if !visited.insert(net) {
+                continue;
+            }
+            if output_sources.contains(&net) {
+                return Err(MappingError::InvalidOocConstraint(format!(
+                    "input `{}[{bit_index}]` has a combinational path to an output; OOC boundaries must be registered",
+                    port.name()
+                )));
+            }
+            for actual_clock in &sequential_sinks[net.index() as usize] {
+                found_sequential = true;
+                if *actual_clock != expected_clock {
+                    return Err(MappingError::InvalidOocConstraint(format!(
+                        "input `{}[{bit_index}]` reaches state outside declared clock `{clock_name}`",
+                        port.name()
+                    )));
+                }
+            }
+            pending.extend(combinational_fanouts[net.index() as usize].iter().copied());
+        }
+        if !found_sequential {
+            return Err(MappingError::InvalidOocConstraint(format!(
+                "input `{}[{bit_index}]` does not reach a registered boundary",
+                port.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ooc_combinational_fanouts(netlist: &Netlist) -> Vec<Vec<NetId>> {
+    let mut combinational_fanouts = vec![Vec::new(); netlist.nodes().len()];
+    for node in netlist.nodes() {
+        if matches!(
+            node.kind(),
+            NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not | NodeKind::Mux
+        ) {
+            for input in node.inputs() {
+                combinational_fanouts[input.index() as usize].push(node.output());
+            }
+        }
+    }
+    for arithmetic in netlist.arithmetic() {
+        for input in arithmetic
+            .lhs()
+            .iter()
+            .chain(arithmetic.rhs())
+            .copied()
+            .chain(arithmetic.carry_in())
+        {
+            combinational_fanouts[input.index() as usize]
+                .extend(arithmetic.outputs().iter().copied());
+        }
+    }
+    for comparison in netlist.comparisons() {
+        for input in comparison.lhs().iter().chain(comparison.rhs()) {
+            combinational_fanouts[input.index() as usize].push(comparison.output());
+        }
+    }
+    combinational_fanouts
+}
+
+fn validate_ooc_asynchronous_control(
+    netlist: &Netlist,
+    port: &struo_ir::Port,
+) -> Result<(), MappingError> {
+    let invalid = |message: String| MappingError::InvalidOocConstraint(message);
+    if port.bits().len() != 1 {
+        return Err(invalid(format!(
+            "asynchronous control `{}` has width {}, expected one bit",
+            port.name(),
+            port.bits().len()
+        )));
+    }
+    let combinational_fanouts = ooc_combinational_fanouts(netlist);
+    let output_sources = netlist
+        .ports()
+        .iter()
+        .filter(|candidate| candidate.direction() == IrPortDirection::Output)
+        .flat_map(struo_ir::Port::bits)
+        .map(|output| node_for(netlist, *output).inputs()[0])
+        .collect::<HashSet<_>>();
+    let mut forbidden_sinks = vec![false; netlist.nodes().len()];
+    let mut asynchronous_reset_sinks = vec![false; netlist.nodes().len()];
+    for register in netlist.registers() {
+        forbidden_sinks[register.data().index() as usize] = true;
+        forbidden_sinks[register.clock().index() as usize] = true;
+        if let Some(enable) = register.enable() {
+            forbidden_sinks[enable.signal.index() as usize] = true;
+        }
+        if let Some(reset) = register.reset() {
+            if reset.asynchronous {
+                asynchronous_reset_sinks[reset.signal.index() as usize] = true;
+            } else {
+                forbidden_sinks[reset.signal.index() as usize] = true;
+            }
+        }
+    }
+    for memory in netlist.memories() {
+        for input in memory
+            .read_address()
+            .iter()
+            .chain(memory.write_address())
+            .chain(memory.write_data())
+            .copied()
+            .chain([memory.write_enable().signal])
+            .chain(memory.read_enable().map(|enable| enable.signal))
+            .chain([memory.clock()])
+        {
+            forbidden_sinks[input.index() as usize] = true;
+        }
+    }
+
+    let mut pending = port.bits().to_vec();
+    let mut visited = HashSet::new();
+    let mut found_asynchronous_reset = false;
+    while let Some(net) = pending.pop() {
+        if !visited.insert(net) {
+            continue;
+        }
+        if output_sources.contains(&net) || forbidden_sinks[net.index() as usize] {
+            return Err(invalid(format!(
+                "asynchronous control `{}` also reaches synchronous data, clock, or output logic",
+                port.name()
+            )));
+        }
+        found_asynchronous_reset |= asynchronous_reset_sinks[net.index() as usize];
+        pending.extend(combinational_fanouts[net.index() as usize].iter().copied());
+    }
+    if !found_asynchronous_reset {
+        return Err(invalid(format!(
+            "asynchronous control `{}` does not reach an asynchronous reset",
+            port.name()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ooc_output_boundary(
+    netlist: &Netlist,
+    port: &struo_ir::Port,
+    expected_clock: NetId,
+    clock_name: &str,
+) -> Result<(), MappingError> {
+    for (bit_index, output) in port.bits().iter().copied().enumerate() {
+        let mut pending = node_for(netlist, output).inputs().to_vec();
+        let mut visited = HashSet::new();
+        let mut found_sequential = false;
+        while let Some(net) = pending.pop() {
+            if !visited.insert(net) {
+                continue;
+            }
+            match node_for(netlist, net).kind() {
+                NodeKind::Input(_) => {
+                    return Err(MappingError::InvalidOocConstraint(format!(
+                        "output `{}[{bit_index}]` has a combinational path from an input; OOC boundaries must be registered",
+                        port.name()
+                    )));
+                }
+                NodeKind::Constant(_) => {}
+                NodeKind::RegisterOutput(_) => {
+                    let register = netlist
+                        .registers()
+                        .iter()
+                        .find(|register| register.output() == net)
+                        .expect("validated register outputs are connected");
+                    found_sequential = true;
+                    if register.clock() != expected_clock {
+                        return Err(MappingError::InvalidOocConstraint(format!(
+                            "output `{}[{bit_index}]` is sourced by state outside declared clock `{clock_name}`",
+                            port.name()
+                        )));
+                    }
+                }
+                NodeKind::MemoryOutput(_) => {
+                    let memory = netlist
+                        .memories()
+                        .iter()
+                        .find(|memory| memory.read_data().contains(&net))
+                        .expect("validated memory outputs are connected");
+                    found_sequential = true;
+                    if memory.clock() != expected_clock {
+                        return Err(MappingError::InvalidOocConstraint(format!(
+                            "output `{}[{bit_index}]` is sourced by memory outside declared clock `{clock_name}`",
+                            port.name()
+                        )));
+                    }
+                }
+                NodeKind::And
+                | NodeKind::Or
+                | NodeKind::Xor
+                | NodeKind::Not
+                | NodeKind::Mux
+                | NodeKind::Output(_) => {
+                    pending.extend(node_for(netlist, net).inputs());
+                }
+                NodeKind::ArithmeticOutput(_) => {
+                    let arithmetic = netlist
+                        .arithmetic()
+                        .iter()
+                        .find(|arithmetic| arithmetic.outputs().contains(&net))
+                        .expect("validated arithmetic outputs are connected");
+                    pending.extend(arithmetic.lhs());
+                    pending.extend(arithmetic.rhs());
+                    pending.extend(arithmetic.carry_in());
+                }
+                NodeKind::ComparisonOutput(_) => {
+                    let comparison = netlist
+                        .comparisons()
+                        .iter()
+                        .find(|comparison| comparison.output() == net)
+                        .expect("validated comparison outputs are connected");
+                    pending.extend(comparison.lhs());
+                    pending.extend(comparison.rhs());
+                }
+            }
+        }
+        if !found_sequential {
+            return Err(MappingError::InvalidOocConstraint(format!(
+                "output `{}[{bit_index}]` is not sourced from a registered boundary",
+                port.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn map_to_ecp5_with_period(
+    netlist: &Netlist,
+    options: MappingOptions,
+    io_timing: &IoTimingConstraints,
+    period_ps: u32,
+    retiming_target_period_ps: u32,
+) -> Result<Ecp5Netlist, MappingError> {
+    let (mut selected, _) = map_once_with_period(netlist, options, period_ps, io_timing)?;
     let original_cells = selected.cells.len();
     let original_registers = netlist.registers().len();
     let mut selected_registers = original_registers;
     let mut applied = false;
     let mapped_original_profile = mapped_lut_profile(&selected);
-    let target_period_ps = 1_000_000u32
-        .div_ceil(options.timing_goal_mhz.max(1))
-        .saturating_mul(RETIMING_PERIOD_MARGIN_NUMERATOR)
-        / RETIMING_PERIOD_MARGIN_DENOMINATOR;
     if let Some(retimed) = automatically_retime_mapped_luts(
         &selected,
         original_cells,
         original_registers,
-        target_period_ps,
+        retiming_target_period_ps,
     )
     .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
     {
@@ -4426,9 +5004,21 @@ fn resolve_io_timing(ports: &[MappedPort], constraints: &IoTimingConstraints) ->
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn map_once(
     netlist: &Netlist,
     options: MappingOptions,
+    io_timing: &IoTimingConstraints,
+) -> Result<(Ecp5Netlist, MappingQuality), MappingError> {
+    let period_ps = 1_000_000u32 / options.timing_goal_mhz.max(1);
+    map_once_with_period(netlist, options, period_ps, io_timing)
+}
+
+#[allow(clippy::too_many_lines)]
+fn map_once_with_period(
+    netlist: &Netlist,
+    options: MappingOptions,
+    period_ps: u32,
     io_timing: &IoTimingConstraints,
 ) -> Result<(Ecp5Netlist, MappingQuality), MappingError> {
     netlist.validate()?;
@@ -4441,7 +5031,7 @@ fn map_once(
     let constant_registers = constant_register_values(netlist);
     let demand = MappingDemand::collect(netlist, &constant_registers);
     let cuts = CutDatabase::analyze(netlist);
-    let cover = LutCover::select(netlist, &cuts, &demand.roots, options, io_timing);
+    let cover = LutCover::select(netlist, &cuts, &demand.roots, options, period_ps, io_timing);
     let (period_ps, _) = cover.estimated_register_period_ps(netlist);
     let quality = MappingQuality { period_ps };
     let mut emitter = LutEmitter::new(netlist, &cover);
@@ -4882,6 +5472,9 @@ fn physical_address(bits: &[Option<Bit>], address: &[NetId], width: u8) -> [Bit;
 pub enum MappingError {
     /// Source netlist is invalid.
     InvalidNetlist(ValidationError),
+    /// An out-of-context timing file is incomplete or inconsistent with the
+    /// synthesized boundary.
+    InvalidOocConstraint(String),
     /// A named I/O timing port does not exist.
     TimingPortNotFound(String),
     /// An I/O timing constraint was attached to a port of the wrong direction.
@@ -4984,6 +5577,9 @@ impl Display for MappingError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidNetlist(error) => write!(formatter, "invalid netlist: {error}"),
+            Self::InvalidOocConstraint(message) => {
+                write!(formatter, "invalid OOC timing constraint: {message}")
+            }
             Self::TimingPortNotFound(port) => {
                 write!(formatter, "I/O timing port `{port}` was not found")
             }
@@ -5092,6 +5688,7 @@ impl Error for MappingError {
         match self {
             Self::InvalidNetlist(error) => Some(error),
             Self::UnsupportedMemoryGeometry { .. }
+            | Self::InvalidOocConstraint(_)
             | Self::TimingPortNotFound(_)
             | Self::TimingPortDirection { .. }
             | Self::IoPortNotFound(_)
@@ -5834,12 +6431,13 @@ mod tests {
 
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
-        MappingOptions, NextpnrJsonError, OpenDrainIo, PllBinding, PllOutput, PortDirection,
-        backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names,
-        forward_retime_ccu2c, forward_retime_lut, map_once, map_to_ecp5,
-        map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
-        map_to_ecp5_with_options, map_to_ecp5_with_pll, mapped_cell_name, mapped_wire_fanout,
-        merge_equivalent_flip_flops, replicate_high_fanout_enable_luts, split_branched_carry_outs,
+        MappingOptions, NextpnrJsonError, OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput,
+        PortDirection, backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point,
+        ccu_chain_names, forward_retime_ccu2c, forward_retime_lut, map_once, map_to_ecp5,
+        map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
+        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
+        mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
+        replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
     use crate::PhysicalFeedback;
@@ -5862,6 +6460,149 @@ mod tests {
             .fold(inputs[0], |value, input| source.add_and(value, *input));
         source.add_output("result", result);
         source
+    }
+
+    fn registered_ooc_netlist(clock_name: &str) -> Netlist {
+        let mut source = Netlist::new("registered_ooc");
+        let clock = source.add_input(clock_name);
+        let input = source.add_input("request");
+        let registered = source.add_register_output("response_q");
+        source.add_register(RegisterCell::new(
+            "response_q",
+            registered,
+            input,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("response", registered);
+        source
+    }
+
+    fn ooc_constraints(clock_port: &str) -> OocTimingConstraints {
+        serde_json::from_value(serde_json::json!({
+            "clocks": {
+                "core": {
+                    "port": clock_port,
+                    "period_ps": 4_000,
+                    "uncertainty_ps": 100
+                }
+            },
+            "inputs": {
+                "request": {
+                    "clock": "core",
+                    "max_boundary_delay_ps": 600
+                }
+            },
+            "outputs": {
+                "response": {
+                    "clock": "core",
+                    "max_boundary_delay_ps": 700
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn maps_a_fully_constrained_registered_ooc_boundary() {
+        let source = registered_ooc_netlist("clock");
+        let constraints = ooc_constraints("clock");
+
+        assert_eq!(constraints.nominal_period_ps(), Some(4_000));
+        assert_eq!(constraints.effective_period_ps(), Some(3_900));
+        let mapped = map_to_ecp5_ooc(&source, &constraints).unwrap();
+
+        assert!(mapped.retiming().original_overall_period_ps > 3_200);
+    }
+
+    #[test]
+    fn accepts_an_explicit_asynchronous_reset_boundary() {
+        let mut source = Netlist::new("registered_ooc_reset");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset_n");
+        let input = source.add_input("request");
+        let registered = source.add_register_output("response_q");
+        source.add_register(RegisterCell::new(
+            "response_q",
+            registered,
+            input,
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::Low,
+                asynchronous: true,
+                value: false,
+            }),
+        ));
+        source.add_output("response", registered);
+        let mut constraints = ooc_constraints("clock");
+        constraints.asynchronous_controls.insert("reset_n".into());
+
+        map_to_ecp5_ooc(&source, &constraints).unwrap();
+    }
+
+    #[test]
+    fn rejects_an_unconstrained_ooc_data_port() {
+        let source = registered_ooc_netlist("clock");
+        let mut constraints = ooc_constraints("clock");
+        constraints.inputs.clear();
+
+        let error = map_to_ecp5_ooc(&source, &constraints).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("data input `request` has no OOC")
+        );
+    }
+
+    #[test]
+    fn rejects_an_ooc_combinational_feedthrough() {
+        let mut source = combinational_io_netlist();
+        source.add_input("clock");
+        let constraints: OocTimingConstraints = serde_json::from_value(serde_json::json!({
+            "clocks": {
+                "core": { "port": "clock", "period_ps": 4_000 }
+            },
+            "inputs": {
+                "inputs": { "clock": "core", "max_boundary_delay_ps": 600 }
+            },
+            "outputs": {
+                "result": { "clock": "core", "max_boundary_delay_ps": 600 }
+            }
+        }))
+        .unwrap();
+
+        let error = map_to_ecp5_ooc(&source, &constraints).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("combinational path to an output")
+        );
+    }
+
+    #[test]
+    fn rejects_an_ooc_boundary_on_the_wrong_clock() {
+        let mut source = registered_ooc_netlist("clock_b");
+        source.add_input("clock_a");
+        let mut constraints = ooc_constraints("clock_a");
+        constraints.clocks.insert(
+            "other".into(),
+            super::OocClockConstraint {
+                port: "clock_b".into(),
+                period_ps: 4_000,
+                uncertainty_ps: 100,
+            },
+        );
+
+        let error = map_to_ecp5_ooc(&source, &constraints).unwrap_err();
+
+        assert!(error.to_string().contains("outside declared clock `core`"));
     }
 
     #[test]

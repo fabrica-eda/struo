@@ -252,6 +252,61 @@ launching edge. An output delay reserves that much of the clock period beyond
 the boundary. Constraints apply to every bit of the named port; omitted ports
 remain unconstrained. Library callers can construct the same data with
 `IoTimingConstraints` and call `map_to_ecp5_with_constraints`.
+
+For a reusable registered module, use the stricter out-of-context mode instead:
+
+```sh
+struo bench/designs/counter32 --top counter32 \
+  --ooc-timing-constraints bench/designs/counter32/ooc-timing.json \
+  --output counter32.ooc.nextpnr.json
+```
+
+The OOC JSON owns the clock period, so `--ooc-timing-constraints` cannot be
+combined with `--timing-goal-mhz`, `--io-timing-constraints`, or physical
+boundary bindings such as `--open-drain`, `--jtagg-prefix`, and
+`--pll-binding`:
+
+```json
+{
+  "clocks": {
+    "core": {
+      "port": "clk",
+      "period_ps": 3333,
+      "uncertainty_ps": 100
+    }
+  },
+  "inputs": {
+    "request": {
+      "clock": "core",
+      "max_boundary_delay_ps": 600
+    }
+  },
+  "outputs": {
+    "response": {
+      "clock": "core",
+      "max_boundary_delay_ps": 700
+    }
+  },
+  "asynchronous_controls": ["reset_n"]
+}
+```
+
+`max_boundary_delay_ps` is the delay allocated *inside* the OOC module from an
+input port through its first sequential endpoint, or from the last sequential
+source through an output port. Clock uncertainty is deducted from that budget
+and from internal register-to-register timing. This direct boundary budget is
+intentionally different from `input_delays_ps` and `output_delays_ps`, which
+describe time consumed outside a top-level FPGA design.
+
+OOC validation requires every data port to have a constraint, every input path
+to terminate at state on its declared clock before reaching an output, and
+every output path to originate at state on its declared clock. Clock ports and
+named asynchronous controls are exempt from data-port coverage. Combinational
+feed-throughs, unused data inputs, constant-only outputs, and crossings to a
+different declared clock fail explicitly. Multiple named clocks are accepted
+when they share one nominal period; different periods remain unsupported by
+the mapper's current single-period timing model.
+
 Synchronous 1R1W memories map directly to ECP5 `DP16KD`
 primitives, including width tiling across multiple blocks. General four-state
 RTL `inout` ports remain rejected explicitly. Split open-drain interfaces can

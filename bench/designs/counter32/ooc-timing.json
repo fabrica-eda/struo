@@ -1,0 +1,16 @@
+{
+  "clocks": {
+    "core": {
+      "port": "clk",
+      "period_ps": 3333,
+      "uncertainty_ps": 100
+    }
+  },
+  "inputs": {},
+  "outputs": {
+    "count": {
+      "clock": "core",
+      "max_boundary_delay_ps": 700
+    }
+  }
+}
