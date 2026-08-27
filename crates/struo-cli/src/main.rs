@@ -12,8 +12,9 @@ use struo::rtl::Design;
 use struo::target::ecp5 as struo_target_ecp5;
 use struo::target::ecp5::ECP5_QOR_TARGET_MHZ;
 use struo::{
-    IoTimingConstraints, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
-    analyze_project_and_lower, ecp5_simulator, map_to_ecp5_with_constraints, synthesize,
+    IoTimingConstraints, JtaggBinding, MappingOptions, OocTimingConstraints, OpenDrainIo,
+    PllBinding, analyze_project_and_lower, ecp5_simulator, map_to_ecp5_ooc,
+    map_to_ecp5_with_constraints, synthesize,
 };
 
 /// Synthesize a Veryl project to an ECP5 netlist.
@@ -38,6 +39,20 @@ struct Cli {
     /// Read explicit top-level input/output delays from JSON.
     #[arg(long, value_name = "JSON")]
     io_timing_constraints: Option<PathBuf>,
+
+    /// Compile a fully constrained registered boundary from an OOC timing JSON file.
+    #[arg(
+        long,
+        value_name = "JSON",
+        conflicts_with_all = [
+            "io_timing_constraints",
+            "timing_goal_mhz",
+            "open_drain",
+            "jtagg_prefix",
+            "pll_binding"
+        ]
+    )]
+    ooc_timing_constraints: Option<PathBuf>,
 
     /// Bind `PIN:INPUT:DRIVE_LOW` as one physical open-drain pad (repeatable).
     #[arg(
@@ -114,6 +129,27 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         })
         .transpose()?
         .unwrap_or_default();
+    let ooc_timing = cli
+        .ooc_timing_constraints
+        .as_ref()
+        .map(|path| {
+            let source = std::fs::read_to_string(path).map_err(|error| {
+                format!(
+                    "failed to read OOC timing constraints `{}`: {error}",
+                    path.display()
+                )
+            })?;
+            serde_json::from_str::<OocTimingConstraints>(&source).map_err(
+                |error| -> Box<dyn Error> {
+                    format!(
+                        "invalid OOC timing constraints `{}`: {error}",
+                        path.display()
+                    )
+                    .into()
+                },
+            )
+        })
+        .transpose()?;
     let pll_bindings = cli
         .pll_binding
         .iter()
@@ -131,6 +167,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         &cli.top,
         timing_goal_mhz,
         &io_timing,
+        ooc_timing.as_ref(),
         &cli.open_drain,
         cli.jtagg_prefix.as_deref(),
         &pll_bindings,
@@ -170,6 +207,7 @@ fn synthesize_and_map(
     label: &str,
     timing_goal_mhz: u32,
     io_timing: &IoTimingConstraints,
+    ooc_timing: Option<&OocTimingConstraints>,
     open_drain: &[OpenDrainIo],
     jtagg_prefix: Option<&str>,
     pll_bindings: &[PllBinding],
@@ -179,14 +217,18 @@ fn synthesize_and_map(
     for report in &synthesized.reports {
         tracing::info!("{}: {}", report.pass, report.message);
     }
-    let mut mapped = map_to_ecp5_with_constraints(
-        &synthesized.netlist,
-        MappingOptions {
-            timing_goal_mhz,
-            ..MappingOptions::default()
-        },
-        io_timing,
-    )?;
+    let mut mapped = if let Some(ooc_timing) = ooc_timing {
+        map_to_ecp5_ooc(&synthesized.netlist, ooc_timing)?
+    } else {
+        map_to_ecp5_with_constraints(
+            &synthesized.netlist,
+            MappingOptions {
+                timing_goal_mhz,
+                ..MappingOptions::default()
+            },
+            io_timing,
+        )?
+    };
     mapped.bind_open_drain_ios(open_drain)?;
     if let Some(prefix) = jtagg_prefix {
         mapped.bind_jtagg(&JtaggBinding::with_prefix(prefix))?;
@@ -195,8 +237,17 @@ fn synthesize_and_map(
         mapped.bind_pll(binding)?;
     }
     log_retiming_decision(&mapped);
+    let timing_context = ooc_timing.map_or_else(
+        || format!("goal {timing_goal_mhz} MHz"),
+        |constraints| {
+            format!(
+                "OOC effective period {} ps",
+                constraints.effective_period_ps().unwrap_or_default()
+            )
+        },
+    );
     tracing::info!(
-        "{label}: {} Boolean nodes, {} registers, {} ECP5 cells, goal {timing_goal_mhz} MHz",
+        "{label}: {} Boolean nodes, {} registers, {} ECP5 cells, {timing_context}",
         synthesized.netlist.nodes().len(),
         synthesized.netlist.registers().len(),
         mapped.cells().len()
@@ -286,6 +337,7 @@ mod tests {
             cli.io_timing_constraints.as_deref(),
             Some(Path::new("io-timing.json"))
         );
+        assert_eq!(cli.ooc_timing_constraints, None);
         assert_eq!(
             cli.open_drain,
             [
@@ -301,6 +353,7 @@ mod tests {
         assert_eq!(defaults.output, None);
         assert_eq!(defaults.timing_goal_mhz, None);
         assert_eq!(defaults.io_timing_constraints, None);
+        assert_eq!(defaults.ooc_timing_constraints, None);
         assert!(defaults.open_drain.is_empty());
         assert_eq!(defaults.jtagg_prefix, None);
         assert!(defaults.pll_binding.is_empty());
@@ -324,6 +377,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_ooc_mode_and_rejects_conflicting_timing_options() {
+        let ooc = Cli::try_parse_from([
+            "struo",
+            "project",
+            "--top",
+            "T",
+            "--ooc-timing-constraints",
+            "ooc.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            ooc.ooc_timing_constraints.as_deref(),
+            Some(Path::new("ooc.json"))
+        );
+        for conflicting_option in ["--timing-goal-mhz", "--io-timing-constraints"] {
+            assert!(
+                Cli::try_parse_from([
+                    "struo",
+                    "project",
+                    "--top",
+                    "T",
+                    "--ooc-timing-constraints",
+                    "ooc.json",
+                    conflicting_option,
+                    "300"
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn parses_the_bundled_pll_binding() {
         let binding: struo::PllBinding =
             serde_json::from_str(include_str!("../tests/fixtures/pll-12-to-250.json")).unwrap();
@@ -335,5 +420,17 @@ mod tests {
         assert_eq!(binding.feedback_output, struo::PllOutput::Clkop);
         assert_eq!(binding.attributes["FREQUENCY_PIN_CLKI"], "12");
         assert_eq!(binding.attributes["FREQUENCY_PIN_CLKOS"], "250");
+    }
+
+    #[test]
+    fn parses_the_bundled_ooc_timing_constraints() {
+        let constraints: struo::OocTimingConstraints =
+            serde_json::from_str(include_str!("../tests/fixtures/ooc-timing.json")).unwrap();
+
+        assert_eq!(constraints.nominal_period_ps(), Some(3_333));
+        assert_eq!(constraints.effective_period_ps(), Some(3_233));
+        assert_eq!(constraints.clocks["core"].port, "clk");
+        assert_eq!(constraints.inputs["request"].max_boundary_delay_ps, 600);
+        assert!(constraints.asynchronous_controls.contains("reset_n"));
     }
 }

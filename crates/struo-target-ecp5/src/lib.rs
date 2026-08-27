@@ -5,8 +5,9 @@ mod physical;
 
 pub use mapped::{
     ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
-    MappedPort, MappingError, MappingOptions, NextpnrJsonError, OpenDrainIo, PllBinding, PllOutput,
-    PortDirection as MappedPortDirection, Reset, RetimingSelection, map_to_ecp5,
+    MappedPort, MappingError, MappingOptions, NextpnrJsonError, OocClockConstraint,
+    OocPortConstraint, OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput,
+    PortDirection as MappedPortDirection, Reset, RetimingSelection, map_to_ecp5, map_to_ecp5_ooc,
     map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
     map_to_ecp5_with_options, map_to_ecp5_with_pll,
 };

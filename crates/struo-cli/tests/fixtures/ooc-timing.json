@@ -1,0 +1,22 @@
+{
+  "clocks": {
+    "core": {
+      "port": "clk",
+      "period_ps": 3333,
+      "uncertainty_ps": 100
+    }
+  },
+  "inputs": {
+    "request": {
+      "clock": "core",
+      "max_boundary_delay_ps": 600
+    }
+  },
+  "outputs": {
+    "response": {
+      "clock": "core",
+      "max_boundary_delay_ps": 700
+    }
+  },
+  "asynchronous_controls": ["reset_n"]
+}
