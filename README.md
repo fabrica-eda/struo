@@ -423,6 +423,23 @@ initial contents, byte enables, asynchronous reads, multiple ports, and
 defined same-address read/write collision behavior remain unsupported and fail
 instead of being lowered to flip-flops silently.
 
+Inference intent can be attached to an unpacked array with Veryl's portable
+SystemVerilog-attribute escape. `preferred` is the default and preserves
+automatic inference, `required` makes a failed match an explicit diagnostic,
+and `forbidden` prevents the array from becoming a memory:
+
+```veryl
+#[sv("struo_memory = \"required\"")]
+var words: logic<32> [1024];
+```
+
+Veryl 0.20.3 rejects tool-defined attribute names, which is why this uses
+`sv(...)` instead of a Struo-specific attribute namespace. Struo consumes only
+the `struo_memory` key and ignores unrelated `sv` attributes. A required array
+that violates the contract reports the array name and the first unsupported
+port property. Physical geometry is checked later by the target mapper, which
+also fails rather than replacing an inferred memory with registers.
+
 ## Veryl AXI4 synthesis stress design
 
 [axi4_crossbar_2x2.veryl](examples/axi4-smartconnect/veryl/axi4_crossbar_2x2.veryl)
