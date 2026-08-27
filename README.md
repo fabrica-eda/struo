@@ -76,11 +76,12 @@ Crate responsibilities:
 declarations, including recursively flattened hierarchy, analyzer-expanded
 interface/modport connections, statically indexed unpacked and interface arrays
 across module boundaries, parameter-bounded generate-for instances, procedural
-conditionals, static packed selects, procedural case statements with value or
-range arms, arithmetic, comparisons, shifts, concatenations, and synchronous or
-asynchronous resets. One-dimensional dynamically indexed arrays with one
-conditional write port and one registered read port are inferred as synchronous
-block memories. Other unsupported constructs fail explicitly.
+conditionals, static packed selects, packed struct constructors and member
+accesses, procedural case statements with value or range arms, arithmetic,
+comparisons, shifts, concatenations, and synchronous or asynchronous resets.
+One-dimensional dynamically indexed arrays with one conditional write port and
+one registered read port are inferred as synchronous block memories. Other
+unsupported constructs fail explicitly.
 
 ## First hardware target
 
