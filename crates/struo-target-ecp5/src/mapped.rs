@@ -3487,6 +3487,24 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
             | Ecp5Cell::Pll { .. } => None,
         })?;
 
+    // A register cannot be introduced across an existing dedicated carry
+    // link. Doing so turns FCO -> FCI into FCO -> FF -> FCI; the two resulting
+    // carry fragments no longer share the adjacency required by the ECP5
+    // carry network. A CCU at a chain root remains eligible because its carry
+    // input already comes from fabric or a constant.
+    let uses_slice1 = output != CcuRetimeOutput::Sum0;
+    let uses_slice0 = !uses_slice1 || !inject[1];
+    let carry_in_is_chained = match carry_in {
+        Bit::Wire(wire) => netlist
+            .cells
+            .iter()
+            .any(|cell| matches!(cell, Ecp5Cell::Ccu2c { carry_out, .. } if *carry_out == wire)),
+        Bit::Zero | Bit::One => false,
+    };
+    if uses_slice0 && !inject[0] && carry_in_is_chained {
+        return None;
+    }
+
     let mut vertices = Vec::new();
     let mut edges = Vec::new();
     let mut boundaries = Vec::new();
@@ -3569,8 +3587,6 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
     let mut candidate = netlist.clone();
     candidate.equivalence_proof.certified_primitive_moves += 1;
     candidate.cells.remove(register_index);
-    let uses_slice1 = output != CcuRetimeOutput::Sum0;
-    let uses_slice0 = !uses_slice1 || !inject[1];
     let mut retimed_inputs = [[Bit::Zero; 4]; 2];
     if uses_slice0 {
         retimed_inputs[0] = inputs[0];
@@ -6613,7 +6629,7 @@ mod tests {
     }
 
     #[test]
-    fn backward_ccu_retiming_splits_a_carry_chain_with_a_certificate() {
+    fn backward_ccu_retiming_at_a_chain_root_has_a_certificate() {
         let mut source = Netlist::new("retimed_carry");
         let clock = source.add_input("clock");
         let reset = source.add_input("reset");
@@ -6626,7 +6642,7 @@ mod tests {
         source.add_register(RegisterCell::new(
             "result_q",
             output,
-            sum[7],
+            sum[1],
             clock,
             ClockEdge::Rising,
             None,
@@ -6672,7 +6688,7 @@ mod tests {
                 .iter()
                 .filter(|cell| matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name.starts_with("retime_ff_result_q_ccu_")))
                 .count()
-                >= 5
+                >= 4
         );
         let outputs = retimed
             .cells
@@ -6687,6 +6703,44 @@ mod tests {
             outputs.len(),
             outputs.iter().copied().collect::<HashSet<_>>().len()
         );
+    }
+
+    #[test]
+    fn backward_ccu_retiming_does_not_register_a_dedicated_carry_link() {
+        let mut source = Netlist::new("retimed_carry_middle");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let lhs = source.add_input_port("lhs", NonZeroU32::new(8).unwrap());
+        let rhs = source.add_input_port("rhs", NonZeroU32::new(8).unwrap());
+        let sum = source
+            .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
+            .unwrap();
+        let output = source.add_register_output("result_q");
+        source.add_register(RegisterCell::new(
+            "result_q",
+            output,
+            sum[7],
+            clock,
+            ClockEdge::Rising,
+            None,
+            Some(ResetControl {
+                signal: reset,
+                active: ActiveLevel::High,
+                asynchronous: true,
+                value: false,
+            }),
+        ));
+        source.add_output("result", output);
+        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let register = mapped
+            .cells
+            .iter()
+            .position(
+                |cell| matches!(cell, Ecp5Cell::FlipFlop { name, .. } if name == "ff_result_q"),
+            )
+            .unwrap();
+
+        assert!(backward_retime_ccu2c(&mapped, register).is_none());
     }
 
     #[test]
