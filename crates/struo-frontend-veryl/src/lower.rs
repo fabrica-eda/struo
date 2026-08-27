@@ -10,8 +10,9 @@ use veryl_analyzer::ir::{
     Factor, FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module, Op, Statement, Type,
     TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
 };
+use veryl_analyzer::{attribute::Attribute as VerylAttribute, attribute_table};
 
-use crate::{ImportError, resolve_name};
+use crate::{ImportError, MemoryInferencePolicy, resolve_name};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct SignalKey {
@@ -36,6 +37,7 @@ struct ModuleLowerer<'a> {
     widths: HashMap<SignalKey, u32>,
     signed: HashMap<SignalKey, bool>,
     inferred_memories: HashSet<VarId>,
+    memory_policies: HashMap<VarId, MemoryInferencePolicy>,
 }
 
 #[derive(Clone)]
@@ -103,7 +105,8 @@ impl<'a> ModuleLowerer<'a> {
         let mut signal_order = Vec::new();
         let mut widths = HashMap::new();
         let mut signed = HashMap::new();
-        let inferred_memories = memory_candidates(source);
+        let memory_policies = memory_inference_policies(source)?;
+        let inferred_memories = memory_candidates(source, &memory_policies);
 
         let mut ports = source.ports.iter().collect::<Vec<_>>();
         ports.sort_by_key(|(path, _)| path.to_string());
@@ -166,25 +169,44 @@ impl<'a> ModuleLowerer<'a> {
             widths,
             signed,
             inferred_memories,
+            memory_policies,
         })
     }
 
     fn infer_memories(&mut self) -> Result<(), ImportError> {
-        let candidates = self.inferred_memories.clone();
+        let mut candidates = self.inferred_memories.iter().copied().collect::<Vec<_>>();
         if candidates.is_empty() {
             return Ok(());
         }
+        candidates.sort_by_key(|memory| self.variable_name(*memory));
 
-        let mut patterns = self.collect_memory_patterns(&candidates)?;
+        let mut patterns = self.collect_memory_patterns(&self.inferred_memories)?;
         for memory_id in candidates {
             let pattern = patterns.remove(&memory_id).unwrap_or_default();
-            let (Some(write), Some(read)) = (pattern.write, pattern.read) else {
-                return Err(ImportError::UnsupportedBehavior(format!(
-                    "unpacked array {} is not a synchronous 1R1W memory",
-                    self.variable_name(memory_id)
-                )));
+            let (write, read) = match (pattern.write, pattern.read) {
+                (Some(write), Some(read)) => (write, read),
+                (None, Some(_)) => {
+                    return Err(self.memory_inference_failure(
+                        memory_id,
+                        "no supported synchronous write port was found",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(self.memory_inference_failure(
+                        memory_id,
+                        "no supported synchronous read port was found",
+                    ));
+                }
+                (None, None) => {
+                    return Err(self.memory_inference_failure(
+                        memory_id,
+                        "no supported synchronous read or write port was found",
+                    ));
+                }
             };
-            self.lower_inferred_memory(memory_id, write, read)?;
+            if let Err(error) = self.lower_inferred_memory(memory_id, write, read) {
+                return Err(self.requirement_failure(memory_id, error));
+            }
         }
         Ok(())
     }
@@ -212,10 +234,10 @@ impl<'a> ModuleLowerer<'a> {
                     } => {
                         let slot = &mut patterns.entry(memory).or_default().write;
                         if slot.is_some() {
-                            return Err(ImportError::UnsupportedBehavior(format!(
-                                "memory {} has multiple write ports",
-                                self.variable_name(memory)
-                            )));
+                            return Err(self.memory_inference_failure(
+                                memory,
+                                "multiple write ports are not supported",
+                            ));
                         }
                         *slot = Some(MemoryWritePattern {
                             clock: clock.clone(),
@@ -233,10 +255,10 @@ impl<'a> ModuleLowerer<'a> {
                     } => {
                         let slot = &mut patterns.entry(memory).or_default().read;
                         if slot.is_some() {
-                            return Err(ImportError::UnsupportedBehavior(format!(
-                                "memory {} has multiple read ports",
-                                self.variable_name(memory)
-                            )));
+                            return Err(self.memory_inference_failure(
+                                memory,
+                                "multiple read ports are not supported",
+                            ));
                         }
                         *slot = Some(MemoryReadPattern {
                             clock: clock.clone(),
@@ -259,17 +281,17 @@ impl<'a> ModuleLowerer<'a> {
         read: MemoryReadPattern,
     ) -> Result<(), ImportError> {
         if write.clock != read.clock || write.edge != read.edge {
-            return Err(ImportError::UnsupportedBehavior(format!(
-                "memory {} read and write ports use different clocks",
-                self.variable_name(memory_id)
-            )));
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "read and write ports use different clocks or clock edges",
+            ));
         }
         let variable = &self.source.variables[&memory_id];
         if variable.r#type.array.dims() != 1 {
-            return Err(ImportError::UnsupportedBehavior(format!(
-                "memory {} must have exactly one unpacked dimension",
-                self.variable_name(memory_id)
-            )));
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "the array must have exactly one unpacked dimension",
+            ));
         }
         let depth = variable
             .r#type
@@ -278,10 +300,7 @@ impl<'a> ModuleLowerer<'a> {
         let depth = u32::try_from(depth)
             .map_err(|_| ImportError::WidthTooLarge(self.variable_name(memory_id)))?;
         if depth == 0 {
-            return Err(ImportError::UnsupportedBehavior(format!(
-                "memory {} has zero depth",
-                self.variable_name(memory_id)
-            )));
+            return Err(self.memory_inference_failure(memory_id, "the array has zero depth"));
         }
         let word = value_type(&variable.r#type, &self.variable_name(memory_id))?;
         let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1);
@@ -328,6 +347,41 @@ impl<'a> ModuleLowerer<'a> {
             edge: write.edge,
         });
         Ok(())
+    }
+
+    fn memory_policy(&self, memory: VarId) -> MemoryInferencePolicy {
+        self.memory_policies
+            .get(&memory)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn memory_inference_failure(&self, memory: VarId, reason: impl Into<String>) -> ImportError {
+        let memory_name = self.variable_name(memory);
+        let reason = reason.into();
+        if self.memory_policy(memory) == MemoryInferencePolicy::Required {
+            ImportError::RequiredMemoryInferenceFailed {
+                memory: memory_name,
+                reason,
+            }
+        } else {
+            ImportError::UnsupportedBehavior(format!(
+                "unpacked array {memory_name} cannot be inferred as a block memory: {reason}"
+            ))
+        }
+    }
+
+    fn requirement_failure(&self, memory: VarId, error: ImportError) -> ImportError {
+        if self.memory_policy(memory) != MemoryInferencePolicy::Required
+            || matches!(error, ImportError::RequiredMemoryInferenceFailed { .. })
+        {
+            error
+        } else {
+            ImportError::RequiredMemoryInferenceFailed {
+                memory: self.variable_name(memory),
+                reason: error.to_string(),
+            }
+        }
     }
 
     fn lower_memory_enable(
@@ -1420,7 +1474,17 @@ impl<'a> ModuleLowerer<'a> {
             .0
             .iter()
             .map(|value| {
-                usize::try_from(static_array_index(value)?).map_err(|_| {
+                let index = static_array_index(value).map_err(|error| {
+                    if self.memory_policy(id) == MemoryInferencePolicy::Forbidden {
+                        ImportError::UnsupportedBehavior(format!(
+                            "dynamic access to unpacked array {} cannot be lowered because block-memory inference is forbidden",
+                            self.variable_name(id)
+                        ))
+                    } else {
+                        error
+                    }
+                })?;
+                usize::try_from(index).map_err(|_| {
                     ImportError::UnsupportedBehavior("unpacked array index overflow".into())
                 })
             })
@@ -1469,14 +1533,20 @@ impl<'a> ModuleLowerer<'a> {
     }
 }
 
-fn memory_candidates(source: &Module) -> HashSet<VarId> {
+fn memory_candidates(
+    source: &Module,
+    policies: &HashMap<VarId, MemoryInferencePolicy>,
+) -> HashSet<VarId> {
     let arrays = source
         .variables
         .values()
         .filter(|variable| variable.kind == VarKind::Variable && !variable.r#type.array.is_empty())
         .map(|variable| variable.id)
         .collect::<HashSet<_>>();
-    let mut candidates = HashSet::new();
+    let mut candidates = policies
+        .iter()
+        .filter_map(|(id, policy)| (*policy == MemoryInferencePolicy::Required).then_some(*id))
+        .collect::<HashSet<_>>();
     for declaration in &source.declarations {
         let Declaration::Ff(ff) = declaration else {
             continue;
@@ -1493,12 +1563,78 @@ fn memory_candidates(source: &Module) -> HashSet<VarId> {
                     memory, address, ..
                 } => (*memory, address),
             };
-            if static_array_index(address).is_err() {
+            if static_array_index(address).is_err()
+                && policies.get(&memory).copied().unwrap_or_default()
+                    != MemoryInferencePolicy::Forbidden
+            {
                 candidates.insert(memory);
             }
         }
     }
     candidates
+}
+
+fn memory_inference_policies(
+    source: &Module,
+) -> Result<HashMap<VarId, MemoryInferencePolicy>, ImportError> {
+    let mut policies = HashMap::new();
+    for variable in source
+        .variables
+        .values()
+        .filter(|variable| variable.kind == VarKind::Variable)
+    {
+        for attribute in attribute_table::get(&variable.token.beg) {
+            let VerylAttribute::Sv(value) = attribute else {
+                continue;
+            };
+            let raw = veryl_parser::resource_table::get_str_value(value)
+                .ok_or(ImportError::MissingResourceString)?;
+            let text = veryl_analyzer::value::unescape_string_literal_to_string(&raw);
+            let Some(value) = memory_policy_value(&text) else {
+                continue;
+            };
+            let policy = match value {
+                "preferred" => MemoryInferencePolicy::Preferred,
+                "required" => MemoryInferencePolicy::Required,
+                "forbidden" => MemoryInferencePolicy::Forbidden,
+                _ => {
+                    return Err(ImportError::InvalidMemoryInferencePolicy {
+                        memory: variable.path.to_string(),
+                        value: value.into(),
+                    });
+                }
+            };
+            if variable.r#type.array.is_empty() {
+                return Err(ImportError::UnsupportedBehavior(format!(
+                    "`struo_memory` policy on non-array variable {}",
+                    variable.path
+                )));
+            }
+            if let Some(previous) = policies.insert(variable.id, policy)
+                && previous != policy
+            {
+                return Err(ImportError::ConflictingMemoryInferencePolicies(
+                    variable.path.to_string(),
+                ));
+            }
+        }
+    }
+    Ok(policies)
+}
+
+fn memory_policy_value(text: &str) -> Option<&str> {
+    let (key, value) = text.split_once('=')?;
+    if key.trim() != "struo_memory" {
+        return None;
+    }
+    let value = value.trim();
+    Some(
+        value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value)
+            .trim(),
+    )
 }
 
 enum MemoryStatementPattern {
@@ -1712,7 +1848,7 @@ mod tests {
     use struo_synth::synthesize;
     use struo_target_ecp5::{JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg};
 
-    use crate::analyze_and_lower;
+    use crate::{ImportError, analyze_and_lower};
 
     const SOURCE: &str = r"
 module Top (
@@ -1934,6 +2070,51 @@ module MemoryTop (
     }
 }
 ";
+
+    const REQUIRED_ASYNC_MEMORY_SOURCE: &str = r#"
+module RequiredAsyncMemoryTop (
+    clk          : input  clock_posedge,
+    write_enable : input  logic,
+    read_address : input  logic<4>,
+    write_address: input  logic<4>,
+    write_data   : input  logic<8>,
+    read_data    : output logic<8>,
+) {
+    #[sv("struo_memory = \"required\"")]
+    var words: logic<8> [16];
+
+    always_ff (clk) {
+        if write_enable {
+            words[write_address] = write_data;
+        }
+    }
+
+    always_comb {
+        read_data = words[read_address];
+    }
+}
+"#;
+
+    const FORBIDDEN_MEMORY_SOURCE: &str = r#"
+module ForbiddenMemoryTop (
+    clk          : input  clock_posedge,
+    write_enable : input  logic,
+    read_address : input  logic<4>,
+    write_address: input  logic<4>,
+    write_data   : input  logic<8>,
+    read_data    : output logic<8>,
+) {
+    #[sv("struo_memory = \"forbidden\"")]
+    var words: logic<8> [16];
+
+    always_ff (clk) {
+        if write_enable {
+            words[write_address] = write_data;
+        }
+        read_data = words[read_address];
+    }
+}
+"#;
 
     const I2C_EXPRESSION_SOURCE: &str = r"
 module I2cExpressionTop (
@@ -2286,6 +2467,60 @@ module NbaTop (
         set(&mut simulator, "read_address", 3);
         tick(&mut simulator);
         assert_value(&mut simulator, "read_data", 0x5a);
+    }
+
+    #[test]
+    fn required_memory_policy_accepts_a_supported_memory() {
+        let source = MEMORY_SOURCE.replace(
+            "    var words: logic<8> [16];",
+            "    #[sv(\"struo_memory = \\\"required\\\"\")]\n    var words: logic<8> [16];",
+        );
+        let design = analyze_and_lower(&source, "required_memory", "MemoryTop").unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+
+        assert_eq!(design.top_module().unwrap().memories().len(), 1);
+        assert!(
+            mapped
+                .to_nextpnr_json()
+                .unwrap()
+                .contains("\"type\": \"DP16KD\"")
+        );
+    }
+
+    #[test]
+    fn required_memory_policy_reports_why_inference_failed() {
+        let error = analyze_and_lower(
+            REQUIRED_ASYNC_MEMORY_SOURCE,
+            "required_async_memory",
+            "RequiredAsyncMemoryTop",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            ImportError::RequiredMemoryInferenceFailed { memory, reason }
+                if memory == "words"
+                    && reason.contains("no supported synchronous read port")
+        ));
+        assert_eq!(
+            error.to_string(),
+            "block-memory inference was required for `words`, but failed: no supported synchronous read port was found"
+        );
+    }
+
+    #[test]
+    fn forbidden_memory_policy_disables_inference() {
+        let error = analyze_and_lower(
+            FORBIDDEN_MEMORY_SOURCE,
+            "forbidden_memory",
+            "ForbiddenMemoryTop",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(
+            "dynamic access to unpacked array words cannot be lowered because block-memory inference is forbidden"
+        ));
     }
 
     #[test]

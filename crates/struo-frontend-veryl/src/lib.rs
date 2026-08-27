@@ -136,6 +136,23 @@ fn analyze_parsed_and_lower(
 /// Exact Veryl analyzer release supported by this adapter.
 pub const SUPPORTED_VERYL_VERSION: &str = "0.20.3";
 
+/// Requested treatment of an unpacked Veryl array during memory inference.
+///
+/// Veryl 0.20.3 does not accept tool-defined attribute names, so source code
+/// selects this policy through its portable `SystemVerilog` attribute escape:
+/// `#[sv("struo_memory = \"required\"")]`. The other accepted values are
+/// `preferred` and `forbidden`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MemoryInferencePolicy {
+    /// Infer a memory when the access pattern is recognized.
+    #[default]
+    Preferred,
+    /// Reject the design unless the array is inferred as a memory.
+    Required,
+    /// Keep the array in ordinary logic and never infer a memory.
+    Forbidden,
+}
+
 /// Counts source constructs whose semantic lowering must be implemented.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LoweringInventory {
@@ -293,6 +310,22 @@ pub enum ImportError {
     InvalidRtl(RtlError),
     /// The analyzed construct is not implemented by the semantic lowerer.
     UnsupportedBehavior(String),
+    /// A source directive used an unknown memory-inference policy.
+    InvalidMemoryInferencePolicy {
+        /// Array carrying the directive.
+        memory: String,
+        /// Unsupported directive value.
+        value: String,
+    },
+    /// An array carried incompatible memory-inference directives.
+    ConflictingMemoryInferencePolicies(String),
+    /// A required array did not match the supported memory contract.
+    RequiredMemoryInferenceFailed {
+        /// Array that was required to become a memory.
+        memory: String,
+        /// First unsupported part of its access pattern.
+        reason: String,
+    },
     /// The requested top module was not present in the analyzer IR.
     MissingTop(String),
     /// Veryl parsing, analysis, or metadata setup failed.
@@ -326,6 +359,18 @@ impl Display for ImportError {
             Self::UnsupportedBehavior(description) => {
                 write!(formatter, "unsupported Veryl behavior: {description}")
             }
+            Self::InvalidMemoryInferencePolicy { memory, value } => write!(
+                formatter,
+                "memory `{memory}` has invalid `struo_memory` policy `{value}`; expected `preferred`, `required`, or `forbidden`"
+            ),
+            Self::ConflictingMemoryInferencePolicies(memory) => write!(
+                formatter,
+                "memory `{memory}` has conflicting `struo_memory` policies"
+            ),
+            Self::RequiredMemoryInferenceFailed { memory, reason } => write!(
+                formatter,
+                "block-memory inference was required for `{memory}`, but failed: {reason}"
+            ),
             Self::MissingTop(top) => write!(formatter, "Veryl top module `{top}` was not found"),
             Self::AnalysisFailed(diagnostic) => {
                 write!(formatter, "Veryl analysis failed: {diagnostic}")
