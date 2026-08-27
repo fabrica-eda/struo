@@ -1745,6 +1745,19 @@ module Top (
 }
 ";
 
+    const ADD_WITH_CARRY_SOURCE: &str = r"
+module AddWithCarry (
+    a    : input  logic<8>,
+    b    : input  logic<8>,
+    carry: input  logic,
+    sum  : output logic<8>,
+) {
+    always_comb {
+        sum = a + b + carry;
+    }
+}
+";
+
     const HIERARCHY_SOURCE: &str = r"
 interface ByteBus {
     var request : logic<8>;
@@ -2020,6 +2033,20 @@ module NbaTop (
         tick(&mut simulator);
         assert_value(&mut simulator, "q", 56);
         assert_value(&mut simulator, "flag", 0);
+    }
+
+    #[test]
+    fn retains_add_with_carry_as_one_arithmetic_cell() {
+        let design = analyze_and_lower(
+            ADD_WITH_CARRY_SOURCE,
+            "add_with_carry_lowering",
+            "AddWithCarry",
+        )
+        .unwrap();
+        let synthesized = synthesize(&design).unwrap();
+
+        assert_eq!(synthesized.netlist.arithmetic().len(), 1);
+        assert!(synthesized.netlist.arithmetic()[0].carry_in().is_some());
     }
 
     #[test]

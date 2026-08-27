@@ -237,7 +237,13 @@ impl Model {
                     .iter()
                     .find(|cell| cell.outputs().contains(&net))
                 {
-                    work.extend(cell.lhs().iter().chain(cell.rhs()).copied());
+                    work.extend(
+                        cell.lhs()
+                            .iter()
+                            .chain(cell.rhs())
+                            .copied()
+                            .chain(cell.carry_in()),
+                    );
                 }
             } else if matches!(node.kind(), NodeKind::ComparisonOutput(_))
                 && let Some(cell) = design
@@ -308,8 +314,15 @@ impl Model {
                         .arithmetic()
                         .iter()
                         .find(|cell| cell.outputs().contains(&node.output()))?;
-                    for (input, net) in cell.lhs().iter().chain(cell.rhs()).enumerate() {
-                        push_edge(&mut edges, &vertex_for_net, *net, target, input, 0);
+                    for (input, net) in cell
+                        .lhs()
+                        .iter()
+                        .chain(cell.rhs())
+                        .copied()
+                        .chain(cell.carry_in())
+                        .enumerate()
+                    {
+                        push_edge(&mut edges, &vertex_for_net, net, target, input, 0);
                     }
                 }
                 NodeKind::ComparisonOutput(_) => {
@@ -719,7 +732,11 @@ impl Model {
                             let rhs = (width..width * 2)
                                 .map(&input)
                                 .collect::<Result<Vec<_>, _>>()?;
-                            let outputs = new.add_arithmetic(cell.operation(), &lhs, &rhs)?;
+                            let outputs = if cell.carry_in().is_some() {
+                                new.add_arithmetic_with_carry(&lhs, &rhs, input(width * 2)?)?
+                            } else {
+                                new.add_arithmetic(cell.operation(), &lhs, &rhs)?
+                            };
                             for (old_output, output) in cell.outputs().iter().zip(outputs) {
                                 vertex_net[self.vertex_for_net[old_output]] = Some(output);
                             }

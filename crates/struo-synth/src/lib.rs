@@ -345,9 +345,15 @@ impl<'a> Lowering<'a> {
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let lhs = self.lower_expression(lhs)?;
-                let rhs = self.lower_expression(rhs)?;
-                self.lower_binary(op, &lhs, &rhs)
+                if op == BinaryOp::Add
+                    && let Some(bits) = self.lower_add_with_carry(lhs, rhs)?
+                {
+                    bits
+                } else {
+                    let lhs = self.lower_expression(lhs)?;
+                    let rhs = self.lower_expression(rhs)?;
+                    self.lower_binary(op, &lhs, &rhs)
+                }
             }
             ExprKind::Mux {
                 condition,
@@ -376,6 +382,75 @@ impl<'a> Lowering<'a> {
         };
         self.expression_bits[index] = Some(bits.clone());
         Ok(bits)
+    }
+
+    fn lower_add_with_carry(
+        &mut self,
+        lhs: ExprId,
+        rhs: ExprId,
+    ) -> Result<Option<Vec<NetId>>, SynthesisError> {
+        let Some((add_lhs, add_rhs, carry)) = self
+            .add_operands(lhs)
+            .and_then(|(add_lhs, add_rhs)| {
+                self.carry_lsb(rhs).map(|carry| (add_lhs, add_rhs, carry))
+            })
+            .or_else(|| {
+                self.add_operands(rhs).and_then(|(add_lhs, add_rhs)| {
+                    self.carry_lsb(lhs).map(|carry| (add_lhs, add_rhs, carry))
+                })
+            })
+        else {
+            return Ok(None);
+        };
+        let lhs = self.lower_expression(add_lhs)?;
+        let rhs = self.lower_expression(add_rhs)?;
+        let carry = self.lower_expression(carry)?[0];
+        Ok(Some(
+            self.netlist
+                .add_arithmetic_with_carry(&lhs, &rhs, carry)
+                .expect("validated RTL carry addition has equal, non-zero widths"),
+        ))
+    }
+
+    fn add_operands(&self, id: ExprId) -> Option<(ExprId, ExprId)> {
+        match self.module.expressions()[id.index() as usize].kind() {
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                lhs,
+                rhs,
+            } => Some((*lhs, *rhs)),
+            _ => None,
+        }
+    }
+
+    fn carry_lsb(&self, id: ExprId) -> Option<ExprId> {
+        let expression = &self.module.expressions()[id.index() as usize];
+        if expression.r#type().width.get() == 1 {
+            return Some(id);
+        }
+        match expression.kind() {
+            ExprKind::Constant(value) if (1..value.width().get()).all(|bit| !value.bit(bit)) => {
+                Some(id)
+            }
+            ExprKind::Concat(parts) => {
+                let (&least_significant, upper) = parts.split_last()?;
+                let lsb_width = self.module.expressions()[least_significant.index() as usize]
+                    .r#type()
+                    .width
+                    .get();
+                (lsb_width == 1 && upper.iter().all(|part| self.is_zero_expression(*part)))
+                    .then_some(least_significant)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_zero_expression(&self, id: ExprId) -> bool {
+        match self.module.expressions()[id.index() as usize].kind() {
+            ExprKind::Constant(value) => (0..value.width().get()).all(|bit| !value.bit(bit)),
+            ExprKind::Concat(parts) => parts.iter().all(|part| self.is_zero_expression(*part)),
+            _ => false,
+        }
     }
 
     fn lower_expression_range(
@@ -895,6 +970,7 @@ fn influence_with_qualifier_low(
             .iter()
             .chain(cell.rhs())
             .copied()
+            .chain(cell.carry_in())
             .collect::<Vec<NetId>>();
         for output in cell.outputs() {
             cell_inputs.insert(*output, inputs.clone());
@@ -1162,6 +1238,41 @@ mod tests {
         design
     }
 
+    fn add_with_carry_design(width: u32) -> Design {
+        let mut module = Module::new("AddWithCarry");
+        let lhs = module.add_port(Port {
+            name: "lhs".into(),
+            direction: PortDirection::Input,
+            r#type: bits(width),
+        });
+        let rhs = module.add_port(Port {
+            name: "rhs".into(),
+            direction: PortDirection::Input,
+            r#type: bits(width),
+        });
+        let carry = module.add_port(Port {
+            name: "carry".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let output = module.add_port(Port {
+            name: "sum".into(),
+            direction: PortDirection::Output,
+            r#type: bits(width),
+        });
+        let lhs = module.read(lhs).unwrap();
+        let rhs = module.read(rhs).unwrap();
+        let carry = module.read(carry).unwrap();
+        let zeros = module.constant(Constant::from_u64(BitWidth::new(width - 1).unwrap(), 0));
+        let carry = module.concat(vec![zeros, carry]).unwrap();
+        let operands = module.binary(BinaryOp::Add, lhs, rhs).unwrap();
+        let sum = module.binary(BinaryOp::Add, operands, carry).unwrap();
+        module.assign(module.whole(output).unwrap(), sum).unwrap();
+        let mut design = Design::new("AddWithCarry");
+        design.add_module(module);
+        design
+    }
+
     #[test]
     fn retains_synchronous_memory_for_block_ram_mapping() {
         let mut module = Module::new("Scratchpad");
@@ -1255,6 +1366,27 @@ mod tests {
                     .collect();
                 let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
                 assert_eq!(output_word(&outputs, "sum", 4), (lhs + rhs) & 0xf);
+            }
+        }
+    }
+
+    #[test]
+    fn folds_zero_extended_carry_into_one_adder() {
+        let synthesized = synthesize(&add_with_carry_design(4)).unwrap();
+        assert_eq!(synthesized.netlist.arithmetic().len(), 1);
+        assert!(synthesized.netlist.arithmetic()[0].carry_in().is_some());
+
+        for lhs in 0..16 {
+            for rhs in 0..16 {
+                for carry in 0..2 {
+                    let inputs = input_word("lhs", 4, lhs)
+                        .into_iter()
+                        .chain(input_word("rhs", 4, rhs))
+                        .chain([("carry".into(), carry != 0)])
+                        .collect();
+                    let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+                    assert_eq!(output_word(&outputs, "sum", 4), (lhs + rhs + carry) & 0xf);
+                }
             }
         }
     }
@@ -1910,7 +2042,10 @@ mod tests {
                         });
                     let mask = u128::MAX >> (u128::BITS as usize - width);
                     let result = match cell.operation() {
-                        ArithmeticOp::Add => lhs.wrapping_add(rhs),
+                        ArithmeticOp::Add => lhs.wrapping_add(rhs).wrapping_add(u128::from(
+                            cell.carry_in()
+                                .is_some_and(|carry| values[carry.index() as usize]),
+                        )),
                         ArithmeticOp::Subtract => lhs.wrapping_sub(rhs),
                     } & mask;
                     result & (1 << bit) != 0
@@ -1966,7 +2101,13 @@ mod tests {
                         .iter()
                         .find(|cell| cell.outputs().contains(&node.output()))
                         .into_iter()
-                        .flat_map(|cell| cell.lhs().iter().chain(cell.rhs()))
+                        .flat_map(|cell| {
+                            cell.lhs()
+                                .iter()
+                                .chain(cell.rhs())
+                                .copied()
+                                .chain(cell.carry_in())
+                        })
                         .map(|input| depths[input.index() as usize])
                         .max()
                         .unwrap_or(0)

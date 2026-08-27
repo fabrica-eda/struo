@@ -326,6 +326,10 @@ impl RetainedTiming {
                         tighten_required(input, required_output, arc, fanouts, required);
                     }
                 }
+                if let Some(carry_in) = arithmetic.carry_in() {
+                    let arc = arithmetic_carry_arc_ps(arithmetic, bit, arithmetic_mapping);
+                    tighten_required(carry_in, required_output, arc, fanouts, required);
+                }
             }
             RetainedOutput::Comparison { cell } => {
                 let comparison = &netlist.comparisons()[cell];
@@ -375,8 +379,14 @@ fn structural_fanouts(netlist: &Netlist) -> Vec<usize> {
         }
     }
     for arithmetic in netlist.arithmetic() {
-        for input in arithmetic.lhs().iter().chain(arithmetic.rhs()) {
-            add(*input);
+        for input in arithmetic
+            .lhs()
+            .iter()
+            .chain(arithmetic.rhs())
+            .copied()
+            .chain(arithmetic.carry_in())
+        {
+            add(input);
         }
     }
     for comparison in netlist.comparisons() {
@@ -415,6 +425,18 @@ fn arithmetic_arc_ps(
     }
 }
 
+fn arithmetic_carry_arc_ps(
+    arithmetic: &ArithmeticCell,
+    output_bit: usize,
+    mapping: ArithmeticMapping,
+) -> u32 {
+    if arithmetic_uses_carry(arithmetic, mapping) {
+        CCU_CARRY_PS * u32::try_from(output_bit).unwrap() + CCU_SUM_PS
+    } else {
+        LUT_DELAY_PS * u32::try_from(output_bit + 1).unwrap()
+    }
+}
+
 fn arithmetic_arrival(
     arithmetic: &ArithmeticCell,
     output_bit: usize,
@@ -422,7 +444,7 @@ fn arithmetic_arrival(
     fanouts: &[usize],
     mapping: ArithmeticMapping,
 ) -> Option<u32> {
-    (0..=output_bit)
+    let operand_arrival = (0..=output_bit)
         .flat_map(|input_bit| {
             let arc = arithmetic_arc_ps(arithmetic, output_bit, input_bit, mapping);
             [arithmetic.lhs()[input_bit], arithmetic.rhs()[input_bit]]
@@ -433,7 +455,15 @@ fn arithmetic_arrival(
                     })
                 })
         })
-        .max()
+        .max();
+    let carry_arrival = arithmetic.carry_in().and_then(|carry_in| {
+        arrivals[carry_in.index() as usize].map(|arrival| {
+            arrival
+                + wire_delay_ps(fanouts[carry_in.index() as usize])
+                + arithmetic_carry_arc_ps(arithmetic, output_bit, mapping)
+        })
+    });
+    operand_arrival.into_iter().chain(carry_arrival).max()
 }
 
 fn comparison_arc_ps(width: usize, input_bit: usize, signed: bool) -> u32 {
