@@ -11,6 +11,7 @@ use veryl_analyzer::ir::{
     TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
 };
 use veryl_analyzer::{attribute::Attribute as VerylAttribute, attribute_table};
+use veryl_parser::resource_table::StrId;
 
 use crate::{ImportError, MemoryInferencePolicy, resolve_name};
 
@@ -70,9 +71,10 @@ struct PartialMemoryPattern {
 /// indexed unpacked arrays, recursively flattened module instances,
 /// analyzer-expanded interface/modport connections, combinational and
 /// sequential assignments, compile-time constants, static packed selects,
-/// dynamic packed bit selects, conditionals, case statements, concatenations,
-/// arithmetic, comparisons, shifts, and reset branches. Unsupported AIR is
-/// rejected rather than silently discarded.
+/// dynamic packed bit selects, packed struct constructors and member accesses,
+/// conditionals, case statements, concatenations, arithmetic, comparisons,
+/// shifts, and reset branches. Unsupported AIR is rejected rather than
+/// silently discarded.
 ///
 /// # Errors
 ///
@@ -1124,10 +1126,46 @@ impl<'a> ModuleLowerer<'a> {
                     signed: false,
                 })
             }
-            Expression::ArrayLiteral(_, _) | Expression::StructConstructor(_, _, _) => Err(
-                ImportError::UnsupportedBehavior("aggregate expressions".into()),
-            ),
+            Expression::StructConstructor(r#type, fields, _) => {
+                self.lower_struct_constructor(r#type, fields, env)
+            }
+            Expression::ArrayLiteral(_, _) => Err(ImportError::UnsupportedBehavior(
+                "array literal expression".into(),
+            )),
         }
+    }
+
+    fn lower_struct_constructor(
+        &mut self,
+        r#type: &Type,
+        fields: &[(StrId, Expression)],
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let TypeKind::Struct(definition) = &r#type.kind else {
+            return Err(ImportError::UnsupportedBehavior(
+                "non-struct aggregate constructor".into(),
+            ));
+        };
+        let mut lowered = Vec::with_capacity(definition.members.len());
+        for member in &definition.members {
+            let field = fields
+                .iter()
+                .find_map(|(name, expression)| (*name == member.name).then_some(expression))
+                .ok_or_else(|| {
+                    ImportError::UnsupportedBehavior(format!(
+                        "struct constructor is missing field `{}`",
+                        member.name
+                    ))
+                })?;
+            let value = self.lower_expression(field, env)?;
+            let width = concrete_width(&member.r#type, "struct member")?;
+            lowered.push(self.resize(value, width, member.r#type.signed)?.id);
+        }
+        Ok(LoweredExpr {
+            id: self.rtl.concat(lowered)?,
+            width: concrete_width(r#type, "struct constructor")?,
+            signed: r#type.signed,
+        })
     }
 
     fn lower_binary(
@@ -2196,6 +2234,90 @@ module NbaTop (
 }
 ";
 
+    const STRUCT_SOURCE: &str = r"
+module StructTop (
+    header          : input  logic<3>,
+    nibble          : input  logic<4>,
+    flag            : input  logic,
+    data            : input  logic<8>,
+    override_nibble : input  logic,
+    replacement     : input  logic<4>,
+    packed_value    : output logic<16>,
+    selected_nibble : output logic<4>,
+    selected_flag   : output logic,
+) {
+    struct Inner {
+        nibble: logic<4>,
+        flag  : logic,
+    }
+
+    struct Payload {
+        header: logic<3>,
+        inner : Inner,
+        data  : logic<8>,
+    }
+
+    var payload: Payload;
+
+    always_comb {
+        payload = Payload'{
+            header: header,
+            inner : Inner'{
+                nibble: nibble,
+                flag  : flag,
+            },
+            data: data,
+        };
+        if override_nibble {
+            payload.inner.nibble = replacement;
+        }
+        packed_value    = payload;
+        selected_nibble = payload.inner.nibble;
+        selected_flag   = payload.inner.flag;
+    }
+}
+";
+
+    const STRUCT_INSTANCE_SOURCE: &str = r"
+package StructTypes {
+    struct Payload {
+        upper: logic<4>,
+        lower: logic<8>,
+    }
+}
+
+module StructPass (
+    value : input  StructTypes::Payload,
+    result: output StructTypes::Payload,
+) {
+    always_comb {
+        result = value;
+    }
+}
+
+module StructInstanceTop (
+    upper_in : input  logic<4>,
+    lower_in : input  logic<8>,
+    upper_out: output logic<4>,
+    lower_out: output logic<8>,
+) {
+    var result: StructTypes::Payload;
+
+    inst pass: StructPass (
+        value: StructTypes::Payload'{
+            upper: upper_in,
+            lower: lower_in,
+        },
+        result: result,
+    );
+
+    always_comb {
+        upper_out = result.upper;
+        lower_out = result.lower;
+    }
+}
+";
+
     #[test]
     fn lowers_analyzed_comb_and_ff_through_ecp5_and_celox() {
         let design = analyze_and_lower(SOURCE, "air_lowering", "Top").unwrap();
@@ -2303,6 +2425,49 @@ module NbaTop (
         set(&mut simulator, "alt", 0b11);
         tick(&mut simulator);
         assert_value(&mut simulator, "flags", 0b11);
+    }
+
+    #[test]
+    fn lowers_nested_struct_constructors_and_member_accesses() {
+        let design = analyze_and_lower(STRUCT_SOURCE, "struct_lowering", "StructTop").unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "header", 0b101);
+        set(&mut simulator, "nibble", 0b1010);
+        set(&mut simulator, "flag", 1);
+        set(&mut simulator, "data", 0xc3);
+        set(&mut simulator, "override_nibble", 0);
+        assert_value(&mut simulator, "packed_value", 0xb5c3);
+        assert_value(&mut simulator, "selected_nibble", 0b1010);
+        assert_value(&mut simulator, "selected_flag", 1);
+
+        set(&mut simulator, "replacement", 0b0011);
+        set(&mut simulator, "override_nibble", 1);
+        assert_value(&mut simulator, "packed_value", 0xa7c3);
+        assert_value(&mut simulator, "selected_nibble", 0b0011);
+        assert_value(&mut simulator, "selected_flag", 1);
+    }
+
+    #[test]
+    fn lowers_struct_ports_across_flattened_instances() {
+        let design = analyze_and_lower(
+            STRUCT_INSTANCE_SOURCE,
+            "struct_instance_lowering",
+            "StructInstanceTop",
+        )
+        .unwrap();
+        assert!(design.top_module().unwrap().instances().is_empty());
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "upper_in", 0xa);
+        set(&mut simulator, "lower_in", 0x5c);
+        assert_value(&mut simulator, "upper_out", 0xa);
+        assert_value(&mut simulator, "lower_out", 0x5c);
     }
 
     #[test]
