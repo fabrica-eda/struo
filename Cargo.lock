@@ -3156,7 +3156,6 @@ version = "0.1.1"
 name = "struo-synth"
 version = "0.1.1"
 dependencies = [
- "struo-formal",
  "struo-ir",
  "struo-rtl",
 ]

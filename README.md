@@ -136,11 +136,6 @@ known reset-derived state, and no retained memory. A separate linear-time
 certificate checker validates boundary-preserving retiming over truth-table
 vertices. It derives reset values in both directions: forward moves evaluate
 the crossed function, while backward moves solve a reset preimage.
-`struo-synth::TimingDrivenRetiming` builds that register-weighted graph, searches
-forward and backward placements, checks the selected labels, and rebuilds the
-netlist. Clock enables are exposed as feedback muxes during the move and
-inferred again afterwards; unrelated clock/reset domains and their fan-in are
-fixed boundaries.
 
 ECP5 mapping also performs automatic, certificate-checked retiming on the final
 LUT4 and CCU2C network, where physical depth, carry hops, and duplicated inputs

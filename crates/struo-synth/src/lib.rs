@@ -1,7 +1,5 @@
 //! Technology-independent synthesis for Struo.
 
-mod retiming;
-
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -15,8 +13,6 @@ use struo_rtl::{
     BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, Polarity, PortDirection, ResetMode,
     RtlError, SignalId, UnaryOp,
 };
-
-pub use retiming::TimingDrivenRetiming;
 
 /// Verifies hardware-semantic RTL before any information-losing lowering.
 ///
