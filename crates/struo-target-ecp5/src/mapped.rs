@@ -325,6 +325,53 @@ impl Default for MappingOptions {
     }
 }
 
+/// Explicit timing delays for top-level ports in the mapper's single-period
+/// timing model.
+///
+/// Ports absent from these maps are unconstrained. An input delay is the
+/// arrival time at the FPGA boundary after the launching clock edge; an output
+/// delay is the portion of the period reserved beyond the FPGA boundary.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IoTimingConstraints {
+    /// Maximum input arrival delay by source-level port name, in picoseconds.
+    #[serde(default)]
+    pub input_delays_ps: BTreeMap<String, u32>,
+    /// Maximum external output delay by source-level port name, in picoseconds.
+    #[serde(default)]
+    pub output_delays_ps: BTreeMap<String, u32>,
+}
+
+impl IoTimingConstraints {
+    /// Creates an empty set in which every top-level I/O path is unconstrained.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            input_delays_ps: BTreeMap::new(),
+            output_delays_ps: BTreeMap::new(),
+        }
+    }
+
+    /// Adds or replaces a maximum input delay in picoseconds.
+    #[must_use]
+    pub fn with_input_delay_ps(mut self, port: impl Into<String>, delay_ps: u32) -> Self {
+        self.input_delays_ps.insert(port.into(), delay_ps);
+        self
+    }
+
+    /// Adds or replaces a maximum external output delay in picoseconds.
+    #[must_use]
+    pub fn with_output_delay_ps(mut self, port: impl Into<String>, delay_ps: u32) -> Self {
+        self.output_delays_ps.insert(port.into(), delay_ps);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ResolvedIoTiming {
+    input_arrivals_ps: BTreeMap<u32, u32>,
+    output_delays_ps: Vec<(Bit, u32)>,
+}
+
 #[derive(Debug)]
 struct MappingDemand {
     roots: Vec<NetId>,
@@ -524,6 +571,7 @@ pub struct Ecp5Netlist {
     retiming: RetimingSelection,
     equivalence_proof: MappedEquivalenceProof,
     placement_hints: BTreeMap<String, String>,
+    io_timing: ResolvedIoTiming,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -553,9 +601,9 @@ pub struct RetimingSelection {
     pub original_period_ps: u32,
     /// Estimated register-to-register period selected for mapping.
     pub selected_period_ps: u32,
-    /// Estimated worst data, control, or output period before retiming.
+    /// Estimated worst synchronous or explicitly constrained I/O period before retiming.
     pub original_overall_period_ps: u32,
-    /// Estimated worst data, control, or output period after retiming.
+    /// Estimated worst synchronous or explicitly constrained I/O period after retiming.
     pub selected_overall_period_ps: u32,
     /// Mapped flip-flops before candidate selection.
     pub original_registers: usize,
@@ -1304,7 +1352,27 @@ pub fn map_to_ecp5_with_options(
     netlist: &Netlist,
     options: MappingOptions,
 ) -> Result<Ecp5Netlist, MappingError> {
-    let (mut selected, _) = map_once(netlist, options)?;
+    map_to_ecp5_with_constraints(netlist, options, &IoTimingConstraints::new())
+}
+
+/// Maps a target-independent netlist with explicit implementation and I/O
+/// timing constraints.
+///
+/// Top-level ports omitted from `io_timing` remain unconstrained. The global
+/// frequency applies to synchronous paths and to only those I/O paths named by
+/// these constraints.
+///
+/// # Errors
+///
+/// Returns an error if the source netlist or an I/O timing constraint is
+/// invalid.
+pub fn map_to_ecp5_with_constraints(
+    netlist: &Netlist,
+    options: MappingOptions,
+    io_timing: &IoTimingConstraints,
+) -> Result<Ecp5Netlist, MappingError> {
+    validate_io_timing(netlist, io_timing)?;
+    let (mut selected, _) = map_once(netlist, options, io_timing)?;
     let original_cells = selected.cells.len();
     let original_registers = netlist.registers().len();
     let mut selected_registers = original_registers;
@@ -2307,22 +2375,17 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
                 .map_or(0, |control| bit_lut_depth(control.signal, &depths))
                 .max(bit_lut_depth(write_enable.signal, &depths)),
         ),
-        Ecp5Cell::TrellisIo {
-            fabric_output,
-            tristate,
-            ..
-        } => Some(bit_lut_depth(*fabric_output, &depths).max(bit_lut_depth(*tristate, &depths))),
         Ecp5Cell::Lut4 { .. }
         | Ecp5Cell::Ccu2c { .. }
+        | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
         | Ecp5Cell::Pll { .. } => None,
     });
     let output_depths = netlist
-        .ports
+        .io_timing
+        .output_delays_ps
         .iter()
-        .filter(|port| port.direction == PortDirection::Output)
-        .flat_map(|port| &port.bits)
-        .map(|bit| bit_lut_depth(*bit, &depths));
+        .map(|(bit, _)| bit_lut_depth(*bit, &depths));
     let overall_depth = [data_depth]
         .into_iter()
         .chain(control_depths)
@@ -2341,7 +2404,7 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         .enumerate()
         .filter_map(|(index, cell)| match cell {
             Ecp5Cell::FlipFlop { data, .. } => {
-                Some((index, mapped_setup_period(*data, &arrivals, &fanouts)))
+                mapped_setup_period(*data, &arrivals, &fanouts).map(|period| (index, period))
             }
             _ => None,
         })
@@ -2357,42 +2420,35 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         .collect();
     let control_periods = netlist.cells.iter().filter_map(|cell| match cell {
         Ecp5Cell::FlipFlop { enable, .. } => {
-            enable.map(|control| mapped_setup_period(control.signal, &arrivals, &fanouts))
+            enable.and_then(|control| mapped_setup_period(control.signal, &arrivals, &fanouts))
         }
         Ecp5Cell::BlockRam {
             write_enable,
             read_enable,
             ..
-        } => Some(
-            read_enable
-                .map_or(0, |control| {
-                    mapped_setup_period(control.signal, &arrivals, &fanouts)
-                })
-                .max(mapped_setup_period(
-                    write_enable.signal,
-                    &arrivals,
-                    &fanouts,
-                )),
-        ),
-        Ecp5Cell::TrellisIo {
-            fabric_output,
-            tristate,
-            ..
-        } => Some(
-            mapped_setup_period(*fabric_output, &arrivals, &fanouts)
-                .max(mapped_setup_period(*tristate, &arrivals, &fanouts)),
-        ),
+        } => read_enable
+            .and_then(|control| mapped_setup_period(control.signal, &arrivals, &fanouts))
+            .into_iter()
+            .chain(mapped_setup_period(
+                write_enable.signal,
+                &arrivals,
+                &fanouts,
+            ))
+            .max(),
         Ecp5Cell::Lut4 { .. }
         | Ecp5Cell::Ccu2c { .. }
+        | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
         | Ecp5Cell::Pll { .. } => None,
     });
     let output_periods = netlist
-        .ports
+        .io_timing
+        .output_delays_ps
         .iter()
-        .filter(|port| port.direction == PortDirection::Output)
-        .flat_map(|port| &port.bits)
-        .map(|bit| mapped_output_period(*bit, &arrivals, &fanouts));
+        .filter_map(|(bit, delay_ps)| {
+            mapped_output_period(*bit, &arrivals, &fanouts)
+                .map(|period| period.saturating_add(*delay_ps))
+        });
     let overall_period_ps = [data_period_ps]
         .into_iter()
         .chain(control_periods)
@@ -2413,15 +2469,13 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
 fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
     let mut depths = WireMap::default();
     depths.reserve(netlist.cells.len());
-    for port in &netlist.ports {
-        if port.direction == PortDirection::Input {
-            for bit in &port.bits {
-                if let Bit::Wire(wire) = bit {
-                    depths.entry(*wire).or_insert(0);
-                }
-            }
-        }
-    }
+    depths.extend(
+        netlist
+            .io_timing
+            .input_arrivals_ps
+            .keys()
+            .map(|wire| (*wire, 0)),
+    );
     for cell in &netlist.cells {
         match cell {
             Ecp5Cell::FlipFlop { output, .. } => {
@@ -2432,45 +2486,11 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
                     depths.insert(*output, 0);
                 }
             }
-            Ecp5Cell::Ccu2c {
-                sums, carry_out, ..
-            } => {
-                for output in sums.iter().chain([carry_out]) {
-                    depths.entry(*output).or_insert(0);
-                }
-            }
-            Ecp5Cell::TrellisIo { fabric_input, .. } => {
-                depths.insert(*fabric_input, 0);
-            }
-            Ecp5Cell::Jtagg {
-                tdi,
-                clock,
-                run_test_idle,
-                shift,
-                update,
-                reset_n,
-                clock_enable,
-                ..
-            } => {
-                for output in [*tdi, *clock, *shift, *update, *reset_n]
-                    .into_iter()
-                    .chain(*run_test_idle)
-                    .chain(*clock_enable)
-                {
-                    depths.insert(output, 0);
-                }
-            }
-            Ecp5Cell::Pll {
-                feedback_clock,
-                output_clock,
-                locked,
-                ..
-            } => {
-                for output in [*feedback_clock, *output_clock, *locked] {
-                    depths.insert(output, 0);
-                }
-            }
-            Ecp5Cell::Lut4 { .. } => {}
+            Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::Ccu2c { .. }
+            | Ecp5Cell::TrellisIo { .. }
+            | Ecp5Cell::Jtagg { .. }
+            | Ecp5Cell::Pll { .. } => {}
         }
     }
     // Retimed cells need not remain in producer-before-consumer order. Iterate
@@ -2478,21 +2498,51 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
     for _ in 0..netlist.cells.len() {
         let mut progress = false;
         for cell in &netlist.cells {
-            let Ecp5Cell::Lut4 { inputs, output, .. } = cell else {
-                continue;
-            };
-            let input_depths = inputs
-                .iter()
-                .map(|input| match input {
-                    Bit::Wire(wire) => depths.get(wire).copied(),
-                    Bit::Zero | Bit::One => Some(0),
-                })
-                .collect::<Option<Vec<_>>>();
-            if let Some(input_depths) = input_depths {
-                let depth = 1 + input_depths.into_iter().max().unwrap_or(0);
-                if depths.insert(*output, depth) != Some(depth) {
-                    progress = true;
+            match cell {
+                Ecp5Cell::Lut4 { inputs, output, .. } => {
+                    let depth = inputs
+                        .iter()
+                        .filter_map(|input| match input {
+                            Bit::Wire(wire) => depths.get(wire).copied(),
+                            Bit::Zero | Bit::One => None,
+                        })
+                        .max()
+                        .map(|depth| depth + 1);
+                    if let Some(depth) = depth
+                        && depths.insert(*output, depth) != Some(depth)
+                    {
+                        progress = true;
+                    }
                 }
+                Ecp5Cell::Ccu2c {
+                    inputs,
+                    carry_in,
+                    sums,
+                    carry_out,
+                    ..
+                } => {
+                    let depth = inputs
+                        .iter()
+                        .flatten()
+                        .chain([carry_in])
+                        .filter_map(|input| match input {
+                            Bit::Wire(wire) => depths.get(wire).copied(),
+                            Bit::Zero | Bit::One => None,
+                        })
+                        .max();
+                    if let Some(depth) = depth {
+                        for output in sums.iter().chain([carry_out]) {
+                            if depths.insert(*output, depth) != Some(depth) {
+                                progress = true;
+                            }
+                        }
+                    }
+                }
+                Ecp5Cell::FlipFlop { .. }
+                | Ecp5Cell::BlockRam { .. }
+                | Ecp5Cell::TrellisIo { .. }
+                | Ecp5Cell::Jtagg { .. }
+                | Ecp5Cell::Pll { .. } => {}
             }
         }
         if !progress {
@@ -2522,15 +2572,13 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
         .collect::<HashSet<_>>();
     let mut arrivals = WireMap::default();
     arrivals.reserve(netlist.cells.len());
-    for port in &netlist.ports {
-        if port.direction == PortDirection::Input {
-            for bit in &port.bits {
-                if let Bit::Wire(wire) = bit {
-                    arrivals.entry(*wire).or_insert(0);
-                }
-            }
-        }
-    }
+    arrivals.extend(
+        netlist
+            .io_timing
+            .input_arrivals_ps
+            .iter()
+            .map(|(wire, delay_ps)| (*wire, *delay_ps)),
+    );
     for cell in &netlist.cells {
         match cell {
             Ecp5Cell::FlipFlop { output, .. } => {
@@ -2541,38 +2589,11 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                     arrivals.insert(*output, BRAM_CLOCK_TO_OUTPUT_PS);
                 }
             }
-            Ecp5Cell::TrellisIo { fabric_input, .. } => {
-                arrivals.insert(*fabric_input, 0);
-            }
-            Ecp5Cell::Jtagg {
-                tdi,
-                clock,
-                run_test_idle,
-                shift,
-                update,
-                reset_n,
-                clock_enable,
-                ..
-            } => {
-                for output in [*tdi, *clock, *shift, *update, *reset_n]
-                    .into_iter()
-                    .chain(*run_test_idle)
-                    .chain(*clock_enable)
-                {
-                    arrivals.insert(output, 0);
-                }
-            }
-            Ecp5Cell::Pll {
-                feedback_clock,
-                output_clock,
-                locked,
-                ..
-            } => {
-                for output in [*feedback_clock, *output_clock, *locked] {
-                    arrivals.insert(output, 0);
-                }
-            }
-            Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. } => {}
+            Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::Ccu2c { .. }
+            | Ecp5Cell::TrellisIo { .. }
+            | Ecp5Cell::Jtagg { .. }
+            | Ecp5Cell::Pll { .. } => {}
         }
     }
     for _ in 0..netlist.cells.len() {
@@ -2580,16 +2601,12 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
         for cell in &netlist.cells {
             match cell {
                 Ecp5Cell::Lut4 { inputs, output, .. } => {
-                    let input_arrivals = inputs
+                    let arrival = inputs
                         .iter()
-                        .map(|input| mapped_routed_arrival(*input, &arrivals, &fanouts))
-                        .collect::<Option<Vec<_>>>();
-                    if let Some(input_arrivals) = input_arrivals {
-                        let arrival = input_arrivals
-                            .into_iter()
-                            .max()
-                            .unwrap_or(0)
-                            .saturating_add(LUT_DELAY_PS);
+                        .filter_map(|input| mapped_routed_arrival(*input, &arrivals, &fanouts))
+                        .max()
+                        .map(|arrival| arrival.saturating_add(LUT_DELAY_PS));
+                    if let Some(arrival) = arrival {
                         progress |= arrivals.insert(*output, arrival) != Some(arrival);
                     }
                 }
@@ -2600,35 +2617,30 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                     carry_out,
                     ..
                 } => {
-                    let Some(first_inputs) = mapped_ccu_inputs(inputs[0], &arrivals, &fanouts)
-                    else {
-                        continue;
-                    };
-                    let Some(second_inputs) = mapped_ccu_inputs(inputs[1], &arrivals, &fanouts)
-                    else {
-                        continue;
-                    };
+                    let first_inputs = mapped_ccu_inputs(inputs[0], &arrivals, &fanouts);
+                    let second_inputs = mapped_ccu_inputs(inputs[1], &arrivals, &fanouts);
                     let carry = match carry_in {
-                        Bit::Zero | Bit::One => Some(CCU_CARRY_PS),
+                        Bit::Zero | Bit::One => None,
                         Bit::Wire(wire) if carry_outputs.contains(wire) => arrivals
                             .get(wire)
                             .map(|arrival| arrival.saturating_add(CCU_CARRY_PS)),
                         bit @ Bit::Wire(_) => mapped_routed_arrival(*bit, &arrivals, &fanouts)
                             .map(|arrival| arrival.saturating_add(CCU_INPUT_PS)),
                     };
-                    let Some(carry) = carry else {
-                        continue;
-                    };
-                    let first = first_inputs.max(carry);
-                    let sum0 = first.saturating_add(CCU_SUM_PS);
-                    let internal_carry = first.saturating_add(CCU_CARRY_PS);
-                    let second = second_inputs.max(internal_carry);
-                    let sum1 = second.saturating_add(CCU_SUM_PS);
-                    let carry_out_arrival = second.saturating_add(CCU_CARRY_PS);
-                    progress |= arrivals.insert(sums[0], sum0) != Some(sum0);
-                    progress |= arrivals.insert(sums[1], sum1) != Some(sum1);
-                    progress |=
-                        arrivals.insert(*carry_out, carry_out_arrival) != Some(carry_out_arrival);
+                    let first = first_inputs.into_iter().chain(carry).max();
+                    let internal_carry = first.map(|arrival| arrival.saturating_add(CCU_CARRY_PS));
+                    if let Some(first) = first {
+                        let sum0 = first.saturating_add(CCU_SUM_PS);
+                        progress |= arrivals.insert(sums[0], sum0) != Some(sum0);
+                    }
+                    let second = second_inputs.into_iter().chain(internal_carry).max();
+                    if let Some(second) = second {
+                        let sum1 = second.saturating_add(CCU_SUM_PS);
+                        let carry_out_arrival = second.saturating_add(CCU_CARRY_PS);
+                        progress |= arrivals.insert(sums[1], sum1) != Some(sum1);
+                        progress |= arrivals.insert(*carry_out, carry_out_arrival)
+                            != Some(carry_out_arrival);
+                    }
                 }
                 Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
@@ -2651,15 +2663,9 @@ fn mapped_ccu_inputs(
 ) -> Option<u32> {
     inputs
         .into_iter()
-        .map(|input| mapped_routed_arrival(input, arrivals, fanouts))
-        .collect::<Option<Vec<_>>>()
-        .map(|arrivals| {
-            arrivals
-                .into_iter()
-                .max()
-                .unwrap_or(0)
-                .saturating_add(CCU_INPUT_PS)
-        })
+        .filter_map(|input| mapped_routed_arrival(input, arrivals, fanouts))
+        .max()
+        .map(|arrival| arrival.saturating_add(CCU_INPUT_PS))
 }
 
 fn mapped_routed_arrival(
@@ -2668,7 +2674,7 @@ fn mapped_routed_arrival(
     fanouts: &WireMap<usize>,
 ) -> Option<u32> {
     match bit {
-        Bit::Zero | Bit::One => Some(0),
+        Bit::Zero | Bit::One => None,
         Bit::Wire(wire) => arrivals.get(&wire).map(|arrival| {
             arrival
                 .saturating_add(wire_delay_ps(fanouts.get(&wire).copied().unwrap_or(1)))
@@ -2677,14 +2683,17 @@ fn mapped_routed_arrival(
     }
 }
 
-fn mapped_setup_period(bit: Bit, arrivals: &WireMap<u32>, fanouts: &WireMap<usize>) -> u32 {
+fn mapped_setup_period(bit: Bit, arrivals: &WireMap<u32>, fanouts: &WireMap<usize>) -> Option<u32> {
     mapped_routed_arrival(bit, arrivals, fanouts)
-        .unwrap_or(0)
-        .saturating_add(FLIP_FLOP_SETUP_PS)
+        .map(|arrival| arrival.saturating_add(FLIP_FLOP_SETUP_PS))
 }
 
-fn mapped_output_period(bit: Bit, arrivals: &WireMap<u32>, fanouts: &WireMap<usize>) -> u32 {
-    mapped_routed_arrival(bit, arrivals, fanouts).unwrap_or(0)
+fn mapped_output_period(
+    bit: Bit,
+    arrivals: &WireMap<u32>,
+    fanouts: &WireMap<usize>,
+) -> Option<u32> {
+    mapped_routed_arrival(bit, arrivals, fanouts)
 }
 
 /// Structural wiring burden: the sum of per-net fanout-weighted route
@@ -4354,9 +4363,70 @@ fn split_branched_carry_outs_once(netlist: &mut Ecp5Netlist) -> usize {
     replicas
 }
 
+fn validate_io_timing(
+    netlist: &Netlist,
+    constraints: &IoTimingConstraints,
+) -> Result<(), MappingError> {
+    let validate = |name: &str, expected: IrPortDirection| {
+        let port = netlist
+            .ports()
+            .iter()
+            .find(|port| port.name() == name)
+            .ok_or_else(|| MappingError::TimingPortNotFound(name.to_owned()))?;
+        if port.direction() != expected {
+            return Err(MappingError::TimingPortDirection {
+                port: name.to_owned(),
+                expected: match expected {
+                    IrPortDirection::Input => PortDirection::Input,
+                    IrPortDirection::Output => PortDirection::Output,
+                },
+                actual: match port.direction() {
+                    IrPortDirection::Input => PortDirection::Input,
+                    IrPortDirection::Output => PortDirection::Output,
+                },
+            });
+        }
+        Ok(())
+    };
+    for name in constraints.input_delays_ps.keys() {
+        validate(name, IrPortDirection::Input)?;
+    }
+    for name in constraints.output_delays_ps.keys() {
+        validate(name, IrPortDirection::Output)?;
+    }
+    Ok(())
+}
+
+fn resolve_io_timing(ports: &[MappedPort], constraints: &IoTimingConstraints) -> ResolvedIoTiming {
+    let mut resolved = ResolvedIoTiming::default();
+    for (name, delay_ps) in &constraints.input_delays_ps {
+        let port = ports
+            .iter()
+            .find(|port| port.name == *name)
+            .expect("I/O timing constraints were validated");
+        for bit in &port.bits {
+            if let Bit::Wire(wire) = bit {
+                resolved.input_arrivals_ps.insert(*wire, *delay_ps);
+            }
+        }
+    }
+    for (name, delay_ps) in &constraints.output_delays_ps {
+        let port = ports
+            .iter()
+            .find(|port| port.name == *name)
+            .expect("I/O timing constraints were validated");
+        resolved
+            .output_delays_ps
+            .extend(port.bits.iter().map(|bit| (*bit, *delay_ps)));
+    }
+    resolved
+}
+
+#[allow(clippy::too_many_lines)]
 fn map_once(
     netlist: &Netlist,
     options: MappingOptions,
+    io_timing: &IoTimingConstraints,
 ) -> Result<(Ecp5Netlist, MappingQuality), MappingError> {
     netlist.validate()?;
     // ECP5 loads every flip-flop through GSR at configuration and REGSET
@@ -4368,7 +4438,7 @@ fn map_once(
     let constant_registers = constant_register_values(netlist);
     let demand = MappingDemand::collect(netlist, &constant_registers);
     let cuts = CutDatabase::analyze(netlist);
-    let cover = LutCover::select(netlist, &cuts, &demand.roots, options);
+    let cover = LutCover::select(netlist, &cuts, &demand.roots, options, io_timing);
     let (period_ps, _) = cover.estimated_register_period_ps(netlist);
     let quality = MappingQuality { period_ps };
     let mut emitter = LutEmitter::new(netlist, &cover);
@@ -4441,7 +4511,8 @@ fn map_once(
                 .map(|net| mapped_bit(&bits, *net))
                 .collect(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let io_timing = resolve_io_timing(&ports, io_timing);
 
     Ok((
         Ecp5Netlist {
@@ -4472,6 +4543,7 @@ fn map_once(
                 ..MappedEquivalenceProof::default()
             },
             placement_hints: BTreeMap::new(),
+            io_timing,
         },
         quality,
     ))
@@ -4803,6 +4875,17 @@ fn physical_address(bits: &[Option<Bit>], address: &[NetId], width: u8) -> [Bit;
 pub enum MappingError {
     /// Source netlist is invalid.
     InvalidNetlist(ValidationError),
+    /// A named I/O timing port does not exist.
+    TimingPortNotFound(String),
+    /// An I/O timing constraint was attached to a port of the wrong direction.
+    TimingPortDirection {
+        /// Port name.
+        port: String,
+        /// Direction required by the constraint.
+        expected: PortDirection,
+        /// Actual port direction.
+        actual: PortDirection,
+    },
     /// A logical memory cannot be width-tiled into DP16KD primitives.
     UnsupportedMemoryGeometry {
         /// Memory name.
@@ -4890,9 +4973,21 @@ pub enum MappingError {
 }
 
 impl Display for MappingError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidNetlist(error) => write!(formatter, "invalid netlist: {error}"),
+            Self::TimingPortNotFound(port) => {
+                write!(formatter, "I/O timing port `{port}` was not found")
+            }
+            Self::TimingPortDirection {
+                port,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "I/O timing port `{port}` has direction {actual:?}, expected {expected:?}"
+            ),
             Self::UnsupportedMemoryGeometry {
                 memory,
                 depth,
@@ -4990,6 +5085,8 @@ impl Error for MappingError {
         match self {
             Self::InvalidNetlist(error) => Some(error),
             Self::UnsupportedMemoryGeometry { .. }
+            | Self::TimingPortNotFound(_)
+            | Self::TimingPortDirection { .. }
             | Self::IoPortNotFound(_)
             | Self::IoPortAlreadyExists(_)
             | Self::IoPortsMustDiffer { .. }
@@ -5729,13 +5826,13 @@ mod tests {
     };
 
     use super::{
-        ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, JtaggBinding, MappingOptions,
-        NextpnrJsonError, OpenDrainIo, PllBinding, PllOutput, PortDirection, backward_retime_ccu2c,
-        backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c,
-        forward_retime_lut, map_once, map_to_ecp5, map_to_ecp5_with_jtagg,
-        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
-        mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
-        replicate_high_fanout_enable_luts, split_branched_carry_outs,
+        ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
+        MappingOptions, NextpnrJsonError, OpenDrainIo, PllBinding, PllOutput, PortDirection,
+        backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names,
+        forward_retime_ccu2c, forward_retime_lut, map_once, map_to_ecp5,
+        map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
+        map_to_ecp5_with_options, map_to_ecp5_with_pll, mapped_cell_name, mapped_wire_fanout,
+        merge_equivalent_flip_flops, replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
     use crate::PhysicalFeedback;
@@ -5748,6 +5845,118 @@ mod tests {
         let result = source.add_arithmetic(operation, &lhs, &rhs).unwrap();
         source.add_output_port("result", &result).unwrap();
         source
+    }
+
+    fn combinational_io_netlist() -> Netlist {
+        let mut source = Netlist::new("combinational_io");
+        let inputs = source.add_input_port("inputs", NonZeroU32::new(12).unwrap());
+        let result = inputs[1..]
+            .iter()
+            .fold(inputs[0], |value, input| source.add_and(value, *input));
+        source.add_output("result", result);
+        source
+    }
+
+    #[test]
+    fn unconstrained_io_paths_are_not_scored_against_the_frequency_goal() {
+        let source = combinational_io_netlist();
+        let slow = map_to_ecp5_with_options(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 100,
+                ..MappingOptions::default()
+            },
+        )
+        .unwrap();
+        let fast = map_to_ecp5_with_options(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 1_000,
+                ..MappingOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(slow.cells(), fast.cells());
+        assert_eq!(slow.retiming().original_overall_period_ps, 0);
+        assert_eq!(fast.retiming().original_overall_period_ps, 0);
+    }
+
+    #[test]
+    fn explicit_io_delays_constrain_the_named_paths() {
+        let source = combinational_io_netlist();
+        let constraints = IoTimingConstraints::new()
+            .with_input_delay_ps("inputs", 500)
+            .with_output_delay_ps("result", 750);
+
+        let mapped = map_to_ecp5_with_constraints(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 250,
+                ..MappingOptions::default()
+            },
+            &constraints,
+        )
+        .unwrap();
+
+        assert!(mapped.retiming().original_overall_period_ps > 1_250);
+    }
+
+    #[test]
+    fn input_to_register_and_register_to_output_paths_require_io_delays() {
+        let mut source = Netlist::new("sequential_io");
+        let clock = source.add_input("clock");
+        let input = source.add_input("input");
+        let auxiliary = source.add_input("auxiliary");
+        let data = source.add_and(input, auxiliary);
+        let registered = source.add_register_output("registered");
+        source.add_register(RegisterCell::new(
+            "registered",
+            registered,
+            data,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        let result = source.add_xor(registered, auxiliary);
+        source.add_output("result", result);
+
+        let unconstrained = map_to_ecp5(&source).unwrap();
+        assert_eq!(unconstrained.retiming().original_period_ps, 0);
+        assert_eq!(unconstrained.retiming().original_overall_period_ps, 0);
+
+        let constrained_inputs = IoTimingConstraints::new()
+            .with_input_delay_ps("input", 400)
+            .with_input_delay_ps("auxiliary", 400);
+        let input_timed =
+            map_to_ecp5_with_constraints(&source, MappingOptions::default(), &constrained_inputs)
+                .unwrap();
+        assert!(input_timed.retiming().original_period_ps > 400);
+
+        let constrained_output = IoTimingConstraints::new().with_output_delay_ps("result", 600);
+        let output_timed =
+            map_to_ecp5_with_constraints(&source, MappingOptions::default(), &constrained_output)
+                .unwrap();
+        assert!(output_timed.retiming().original_overall_period_ps > 600);
+    }
+
+    #[test]
+    fn rejects_an_io_delay_on_a_port_of_the_wrong_direction() {
+        let source = combinational_io_netlist();
+        let constraints = IoTimingConstraints::new().with_input_delay_ps("result", 500);
+
+        let error = map_to_ecp5_with_constraints(&source, MappingOptions::default(), &constraints)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::MappingError::TimingPortDirection {
+                expected: PortDirection::Input,
+                actual: PortDirection::Output,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5879,7 +6088,12 @@ mod tests {
         ));
         source.add_output("mismatched_reset", mismatched_reset_q);
 
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         let flip_flops = mapped
             .cells
             .iter()
@@ -5907,6 +6121,7 @@ mod tests {
         let (base, _) = map_once(
             &arithmetic_netlist(8, ArithmeticOp::Add),
             MappingOptions::default(),
+            &IoTimingConstraints::new(),
         )
         .unwrap();
         let mut netlist = base;
@@ -6037,7 +6252,12 @@ mod tests {
     #[test]
     fn mapped_equivalence_signoff_rejects_an_invalid_final_netlist() {
         let source = arithmetic_netlist(8, ArithmeticOp::Add);
-        let (mut mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mut mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         assert!(verify_mapped_equivalence_proof(&mapped, false));
 
         let duplicate = mapped.cells[0].clone();
@@ -6077,7 +6297,12 @@ mod tests {
             ));
             source.add_output(format!("output{index}"), output);
         }
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
 
         let replicated = replicate_high_fanout_enable_luts(&mapped, 5);
 
@@ -6122,7 +6347,12 @@ mod tests {
             ));
             source.add_output(format!("output{index}"), output);
         }
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         let (driver, output) = mapped
             .cells
             .iter()
@@ -6227,7 +6457,10 @@ mod tests {
             }),
         ));
         source.add_output("output", result);
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let io_timing = IoTimingConstraints::new()
+            .with_input_delay_ps("lhs", 0)
+            .with_input_delay_ps("rhs", 0);
+        let (mapped, _) = map_once(&source, MappingOptions::default(), &io_timing).unwrap();
         let driver = mapped
             .cells
             .iter()
@@ -6323,7 +6556,12 @@ mod tests {
             Some(reset_control),
         ));
         source.add_output("result", result_q);
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         let lut = mapped
             .cells
             .iter()
@@ -6424,7 +6662,12 @@ mod tests {
         ));
         let result = source.add_and(lhs_q, rhs_q);
         source.add_output("result", result);
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         let lut = mapped
             .cells
             .iter()
@@ -6471,7 +6714,12 @@ mod tests {
             }),
         ));
         source.add_output("result", output);
-        let (mut mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mut mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         mapped.cells.push(Ecp5Cell::Lut4 {
             name: "retime_dead_lut".into(),
             inputs: [Bit::Zero; 4],
@@ -6549,7 +6797,12 @@ mod tests {
             ));
             source.add_output(name, output);
         }
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         let register = |netlist: &Ecp5Netlist, name: &str| {
             netlist
                 .cells
@@ -6598,7 +6851,12 @@ mod tests {
             None,
         ));
         source.add_output("result", output_net);
-        let (mut mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mut mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         let mut duplicate = mapped.cells[0].clone();
         if let Ecp5Cell::FlipFlop { name, output, .. } = &mut duplicate {
             *name = mapped_cell_name(&mapped.cells[0]).to_owned();
@@ -6638,7 +6896,12 @@ mod tests {
             }),
         ));
         source.add_output("result", output);
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         let register = mapped
             .cells
             .iter()
@@ -6725,7 +6988,12 @@ mod tests {
             .add_arithmetic(ArithmeticOp::Add, &registered[..8], &registered[8..])
             .unwrap();
         source.add_output_port("sum", &sum).unwrap();
-        let (mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
 
         let mut retimed = mapped.clone();
         for name in &ccu_chain_names(&mapped)[0] {
@@ -6783,7 +7051,12 @@ mod tests {
             ));
             source.add_output(format!("output{index}"), output);
         }
-        let (mut mapped, _) = map_once(&source, MappingOptions::default()).unwrap();
+        let (mut mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
         for cell in &mut mapped.cells {
             if let Ecp5Cell::FlipFlop { name, .. } = cell {
                 *name = format!("retime_{name}");

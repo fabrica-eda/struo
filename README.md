@@ -235,6 +235,23 @@ carry-chain, BRAM, and setup arcs; fanout-weighted timing selection is enabled
 for cones that consume about half the available period before exact
 referenced-area recovery. Unreachable Boolean logic is omitted and the
 selected cover maps to `LUT4`; registers map to `TRELLIS_FF`.
+The frequency goal applies to synchronous paths. Top-level I/O paths are
+unconstrained unless their delays are named explicitly, so a combinational or
+I/O-to-register path is not silently treated as a 300 MHz path. Pass a JSON
+file with `--io-timing-constraints`, for example:
+
+```json
+{
+  "input_delays_ps": { "request": 500 },
+  "output_delays_ps": { "response": 750 }
+}
+```
+
+An input delay is the maximum arrival time at the FPGA boundary after the
+launching edge. An output delay reserves that much of the clock period beyond
+the boundary. Constraints apply to every bit of the named port; omitted ports
+remain unconstrained. Library callers can construct the same data with
+`IoTimingConstraints` and call `map_to_ecp5_with_constraints`.
 Synchronous 1R1W memories map directly to ECP5 `DP16KD`
 primitives, including width tiling across multiple blocks. General four-state
 RTL `inout` ports remain rejected explicitly. Split open-drain interfaces can
