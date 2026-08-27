@@ -202,6 +202,7 @@ pub struct ArithmeticCell {
     operation: ArithmeticOp,
     lhs: Vec<NetId>,
     rhs: Vec<NetId>,
+    carry_in: Option<NetId>,
     outputs: Vec<NetId>,
 }
 
@@ -297,6 +298,12 @@ impl ArithmeticCell {
     #[must_use]
     pub fn rhs(&self) -> &[NetId] {
         &self.rhs
+    }
+
+    /// Returns the optional one-bit carry input for addition.
+    #[must_use]
+    pub const fn carry_in(&self) -> Option<NetId> {
+        self.carry_in
     }
 
     /// Returns result bits least-significant first.
@@ -661,6 +668,33 @@ impl Netlist {
         lhs: &[NetId],
         rhs: &[NetId],
     ) -> Result<Vec<NetId>, ValidationError> {
+        self.add_arithmetic_inner(operation, lhs, rhs, None)
+    }
+
+    /// Adds a wrapping word-level addition with a one-bit carry input.
+    ///
+    /// Operands and result bits are stored least-significant first and must
+    /// have the same non-zero width.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, mismatched, or unrepresentable widths.
+    pub fn add_arithmetic_with_carry(
+        &mut self,
+        lhs: &[NetId],
+        rhs: &[NetId],
+        carry_in: NetId,
+    ) -> Result<Vec<NetId>, ValidationError> {
+        self.add_arithmetic_inner(ArithmeticOp::Add, lhs, rhs, Some(carry_in))
+    }
+
+    fn add_arithmetic_inner(
+        &mut self,
+        operation: ArithmeticOp,
+        lhs: &[NetId],
+        rhs: &[NetId],
+        carry_in: Option<NetId>,
+    ) -> Result<Vec<NetId>, ValidationError> {
         let name = format!("arith{}", self.arithmetic.len());
         if lhs.is_empty() || lhs.len() != rhs.len() {
             return Err(ValidationError::ArithmeticWidth(name));
@@ -680,6 +714,7 @@ impl Netlist {
             operation,
             lhs: lhs.to_vec(),
             rhs: rhs.to_vec(),
+            carry_in,
             outputs: outputs.clone(),
         });
         Ok(outputs)
@@ -1063,7 +1098,12 @@ impl Netlist {
             {
                 return Err(ValidationError::ArithmeticWidth(arithmetic.name.clone()));
             }
-            for input in arithmetic.lhs.iter().chain(&arithmetic.rhs) {
+            for input in arithmetic
+                .lhs
+                .iter()
+                .chain(&arithmetic.rhs)
+                .chain(&arithmetic.carry_in)
+            {
                 if !defined_nets.contains(input) {
                     return Err(ValidationError::UndefinedNet(*input));
                 }

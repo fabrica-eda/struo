@@ -193,7 +193,11 @@ impl TransitionSystem {
                         .iter()
                         .map(|net| net_literal(&nets, *net))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let result = lower_arithmetic(&mut aig, cell.operation(), &lhs, &rhs);
+                    let carry_in = cell
+                        .carry_in()
+                        .map(|net| net_literal(&nets, net))
+                        .transpose()?;
+                    let result = lower_arithmetic(&mut aig, cell.operation(), &lhs, &rhs, carry_in);
                     for (output, literal) in cell.outputs().iter().zip(result) {
                         nets[output.index() as usize] = Some(literal);
                     }
@@ -313,11 +317,12 @@ fn lower_arithmetic(
     operation: ArithmeticOp,
     lhs: &[Literal],
     rhs: &[Literal],
+    carry_in: Option<Literal>,
 ) -> Vec<Literal> {
     let mut carry = if operation == ArithmeticOp::Subtract {
         Literal::TRUE
     } else {
-        Literal::FALSE
+        carry_in.unwrap_or(Literal::FALSE)
     };
     lhs.iter()
         .zip(rhs)
@@ -433,9 +438,11 @@ mod tests {
         let mut design = Netlist::new("word_operations");
         let lhs = design.add_input_port("lhs", NonZeroU32::new(4).unwrap());
         let rhs = design.add_input_port("rhs", NonZeroU32::new(4).unwrap());
+        let carry = design.add_input("carry");
         let sum = design
             .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
             .unwrap();
+        let sum_with_carry = design.add_arithmetic_with_carry(&lhs, &rhs, carry).unwrap();
         let difference = design
             .add_arithmetic(ArithmeticOp::Subtract, &lhs, &rhs)
             .unwrap();
@@ -446,6 +453,9 @@ mod tests {
             .add_comparison(ComparisonOp::LessThanSigned, &lhs, &rhs)
             .unwrap();
         design.add_output_port("sum", &sum).unwrap();
+        design
+            .add_output_port("sum_with_carry", &sum_with_carry)
+            .unwrap();
         design.add_output_port("difference", &difference).unwrap();
         design.add_output("unsigned_less", unsigned_less);
         design.add_output("signed_less", signed_less);
@@ -453,46 +463,57 @@ mod tests {
 
         for lhs in 0_u8..16 {
             for rhs in 0_u8..16 {
-                let expected = [
-                    ("sum", lhs.wrapping_add(rhs) & 0xf),
-                    ("difference", lhs.wrapping_sub(rhs) & 0xf),
-                ];
-                let mut mismatch = Literal::FALSE;
-                let mut aig = system.aig.clone();
-                for (port, value) in expected {
-                    for bit in 0..4 {
-                        let name = format!("{port}[{bit}]");
-                        let actual = system.outputs[&name];
-                        let expected = value & (1 << bit) != 0;
+                for carry in 0_u8..2 {
+                    let expected = [
+                        ("sum", lhs.wrapping_add(rhs) & 0xf),
+                        (
+                            "sum_with_carry",
+                            lhs.wrapping_add(rhs).wrapping_add(carry) & 0xf,
+                        ),
+                        ("difference", lhs.wrapping_sub(rhs) & 0xf),
+                    ];
+                    let mut mismatch = Literal::FALSE;
+                    let mut aig = system.aig.clone();
+                    for (port, value) in expected {
+                        for bit in 0..4 {
+                            let name = format!("{port}[{bit}]");
+                            let actual = system.outputs[&name];
+                            let expected = value & (1 << bit) != 0;
+                            let differs = if expected { actual.negate() } else { actual };
+                            mismatch = aig.or(mismatch, differs);
+                        }
+                    }
+                    for (name, expected) in [
+                        ("unsigned_less", lhs < rhs),
+                        ("signed_less", signed_nibble(lhs) < signed_nibble(rhs)),
+                    ] {
+                        let actual = system.outputs[name];
                         let differs = if expected { actual.negate() } else { actual };
                         mismatch = aig.or(mismatch, differs);
                     }
-                }
-                for (name, expected) in [
-                    ("unsigned_less", lhs < rhs),
-                    ("signed_less", signed_nibble(lhs) < signed_nibble(rhs)),
-                ] {
-                    let actual = system.outputs[name];
-                    let differs = if expected { actual.negate() } else { actual };
-                    mismatch = aig.or(mismatch, differs);
-                }
-                let mut assumptions = Vec::with_capacity(9);
-                for (port, value) in [("lhs", lhs), ("rhs", rhs)] {
-                    assumptions.extend((0..4).map(|bit| {
-                        let literal = system.inputs[&format!("{port}[{bit}]")];
-                        if value & (1 << bit) != 0 {
-                            literal
-                        } else {
-                            literal.negate()
-                        }
-                    }));
-                }
-                assumptions.push(mismatch);
+                    let mut assumptions = Vec::with_capacity(10);
+                    for (port, value) in [("lhs", lhs), ("rhs", rhs)] {
+                        assumptions.extend((0..4).map(|bit| {
+                            let literal = system.inputs[&format!("{port}[{bit}]")];
+                            if value & (1 << bit) != 0 {
+                                literal
+                            } else {
+                                literal.negate()
+                            }
+                        }));
+                    }
+                    assumptions.push(if carry != 0 {
+                        system.inputs["carry"]
+                    } else {
+                        system.inputs["carry"].negate()
+                    });
+                    assumptions.push(mismatch);
 
-                assert!(
-                    solve(&aig, &assumptions).is_none(),
-                    "word lowering mismatch for lhs={lhs}, rhs={rhs}"
-                );
+                    assert!(
+                        solve(&aig, &assumptions).is_none(),
+                        "word lowering mismatch for lhs={lhs}, rhs={rhs}, carry={carry}"
+                    );
+                }
             }
         }
     }

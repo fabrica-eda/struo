@@ -405,10 +405,13 @@ impl MappingDemand {
                 .chain([memory.clock(), memory.write_enable().signal])
                 .chain(memory.read_enable().map(|enable| enable.signal))
         });
-        let arithmetic_roots = netlist
-            .arithmetic()
-            .iter()
-            .flat_map(|cell| cell.lhs().iter().chain(cell.rhs()).copied());
+        let arithmetic_roots = netlist.arithmetic().iter().flat_map(|cell| {
+            cell.lhs()
+                .iter()
+                .chain(cell.rhs())
+                .copied()
+                .chain(cell.carry_in())
+        });
         let comparison_roots = netlist
             .comparisons()
             .iter()
@@ -4595,7 +4598,9 @@ impl RetainedCell<'_> {
 
 fn map_arithmetic_carry(arithmetic: &ArithmeticCell, emitter: &mut LutEmitter<'_>) {
     let subtract = arithmetic.operation() == ArithmeticOp::Subtract;
-    let mut carry = Bit::from(subtract);
+    let mut carry = arithmetic
+        .carry_in()
+        .map_or(Bit::from(subtract), |carry| emitter.map_net(carry));
     for (pair, bit) in (0..arithmetic.outputs().len()).step_by(2).enumerate() {
         let mut inputs = [[Bit::Zero; 4]; 2];
         let mut sums = [0; 2];
@@ -4702,7 +4707,9 @@ fn signed_comparison_truth_table() -> u16 {
 
 fn map_arithmetic_luts(arithmetic: &ArithmeticCell, emitter: &mut LutEmitter<'_>) {
     let subtract = arithmetic.operation() == ArithmeticOp::Subtract;
-    let mut carry = Bit::from(subtract);
+    let mut carry = arithmetic
+        .carry_in()
+        .map_or(Bit::from(subtract), |carry| emitter.map_net(carry));
     for bit in 0..arithmetic.outputs().len() {
         let lhs = emitter.map_net(arithmetic.lhs()[bit]);
         let rhs = emitter.map_net(arithmetic.rhs()[bit]);
@@ -7109,6 +7116,35 @@ mod tests {
             cell["parameters"]["INIT0"] == "1001011010101010"
                 && cell["parameters"]["INJECT1_0"] == "NO"
         }));
+    }
+
+    #[test]
+    fn maps_addition_carry_in_to_the_first_ccu2c() {
+        let mut source = Netlist::new("add_with_carry");
+        let width = NonZeroU32::new(8).unwrap();
+        let lhs = source.add_input_port("lhs", width);
+        let rhs = source.add_input_port("rhs", width);
+        let carry = source.add_input("carry");
+        let result = source.add_arithmetic_with_carry(&lhs, &rhs, carry).unwrap();
+        source.add_output_port("result", &result).unwrap();
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        let carry_bit = mapped
+            .ports()
+            .iter()
+            .find(|port| port.name == "carry")
+            .unwrap()
+            .bits[0];
+        let ccus = mapped
+            .cells()
+            .iter()
+            .filter_map(|cell| match cell {
+                Ecp5Cell::Ccu2c { carry_in, .. } => Some(*carry_in),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ccus.len(), 4);
+        assert_eq!(ccus[0], carry_bit);
     }
 
     #[test]
