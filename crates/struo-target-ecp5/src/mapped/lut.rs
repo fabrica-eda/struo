@@ -4,7 +4,10 @@ use std::collections::BTreeSet;
 
 use struo_ir::{ArithmeticCell, NetId, Netlist, NodeKind};
 
-use super::{ArithmeticMapping, Bit, Ecp5Cell, MappingOptions, node_for, wire_for, wire_number};
+use super::{
+    ArithmeticMapping, Bit, Ecp5Cell, IoTimingConstraints, MappingOptions, node_for, wire_for,
+    wire_number,
+};
 
 const LUT_INPUTS: usize = 4;
 const CUT_LIMIT: usize = 64;
@@ -64,14 +67,14 @@ impl CutDatabase {
 struct LutPlan {
     leaves: Vec<NetId>,
     depth: usize,
-    arrival_ps: u32,
+    arrival_ps: Option<u32>,
     area: usize,
 }
 
 /// Required-time-aware cover selected from a feasible-cut database.
 pub(super) struct LutCover {
     plans: Vec<Option<LutPlan>>,
-    arrivals: Vec<u32>,
+    arrivals: Vec<Option<u32>>,
     fanouts: Vec<usize>,
 }
 
@@ -81,6 +84,7 @@ impl LutCover {
         cuts: &CutDatabase,
         mapping_roots: &[NetId],
         options: MappingOptions,
+        io_timing: &IoTimingConstraints,
     ) -> Self {
         let fanouts = structural_fanouts(netlist);
         let retained = RetainedTiming::new(netlist);
@@ -93,25 +97,26 @@ impl LutCover {
             &retained,
             options,
             critical_arrival_ps,
+            io_timing,
         );
         let strict_required = required_times(
-            netlist, &plans, &arrivals, &fanouts, &retained, options, false,
+            netlist, &plans, &arrivals, &fanouts, &retained, options, io_timing, false,
         );
         if !timing_is_valid(&arrivals, &strict_required) {
             (plans, arrivals) =
-                select_initial_plans(netlist, cuts, &fanouts, &retained, options, 0);
+                select_initial_plans(netlist, cuts, &fanouts, &retained, options, 0, io_timing);
         }
 
         let original_plans = plans.clone();
         let original_arrivals = arrivals.clone();
         let strict_required = required_times(
-            netlist, &plans, &arrivals, &fanouts, &retained, options, false,
+            netlist, &plans, &arrivals, &fanouts, &retained, options, io_timing, false,
         );
         let mut required = if timing_is_valid(&arrivals, &strict_required) {
             strict_required
         } else {
             required_times(
-                netlist, &plans, &arrivals, &fanouts, &retained, options, true,
+                netlist, &plans, &arrivals, &fanouts, &retained, options, io_timing, true,
             )
         };
         let original_required = required.clone();
@@ -152,14 +157,16 @@ impl LutCover {
                     .into_iter()
                     .chain(register.enable().map(|enable| enable.signal))
             })
-            .map(|net| {
+            .filter_map(|net| {
                 let index = net.index() as usize;
-                (
-                    net,
-                    self.arrivals[index]
-                        .saturating_add(wire_delay_ps(self.fanouts[index]))
-                        .saturating_add(FLIP_FLOP_SETUP_PS),
-                )
+                self.arrivals[index].map(|arrival| {
+                    (
+                        net,
+                        arrival
+                            .saturating_add(wire_delay_ps(self.fanouts[index]))
+                            .saturating_add(FLIP_FLOP_SETUP_PS),
+                    )
+                })
             })
             .collect::<Vec<_>>();
         let maximum = endpoints
@@ -184,9 +191,20 @@ fn select_initial_plans(
     retained: &RetainedTiming,
     options: MappingOptions,
     critical_arrival_ps: u32,
-) -> (Vec<Option<LutPlan>>, Vec<u32>) {
+    io_timing: &IoTimingConstraints,
+) -> (Vec<Option<LutPlan>>, Vec<Option<u32>>) {
     let mut plans = vec![None; netlist.nodes().len()];
-    let mut arrivals = vec![0; netlist.nodes().len()];
+    let mut arrivals = vec![None; netlist.nodes().len()];
+    for (name, delay_ps) in &io_timing.input_delays_ps {
+        let port = netlist
+            .ports()
+            .iter()
+            .find(|port| port.name() == name)
+            .expect("I/O timing constraints were validated");
+        for bit in port.bits() {
+            arrivals[bit.index() as usize] = Some(*delay_ps);
+        }
+    }
     for node in netlist.nodes() {
         let index = node.output().index() as usize;
         match node.kind() {
@@ -201,7 +219,7 @@ fn select_initial_plans(
                 arrivals[index] = plan.arrival_ps;
                 plans[index] = Some(plan);
             }
-            NodeKind::MemoryOutput(_) => arrivals[index] = BRAM_CLOCK_TO_OUTPUT_PS,
+            NodeKind::MemoryOutput(_) => arrivals[index] = Some(BRAM_CLOCK_TO_OUTPUT_PS),
             NodeKind::ArithmeticOutput(_) | NodeKind::ComparisonOutput(_) => {
                 arrivals[index] = retained.output_arrival(
                     netlist,
@@ -212,7 +230,9 @@ fn select_initial_plans(
                 );
             }
             NodeKind::Output(_) => arrivals[index] = arrivals[node.inputs()[0].index() as usize],
-            NodeKind::RegisterOutput(_) => arrivals[index] = FLIP_FLOP_CLOCK_TO_OUTPUT_PS,
+            NodeKind::RegisterOutput(_) => {
+                arrivals[index] = Some(FLIP_FLOP_CLOCK_TO_OUTPUT_PS);
+            }
             NodeKind::Input(_) | NodeKind::Constant(_) => {}
         }
     }
@@ -248,10 +268,10 @@ impl RetainedTiming {
         &self,
         netlist: &Netlist,
         output: NetId,
-        arrivals: &[u32],
+        arrivals: &[Option<u32>],
         fanouts: &[usize],
         arithmetic_mapping: ArithmeticMapping,
-    ) -> u32 {
+    ) -> Option<u32> {
         match self.outputs[output.index() as usize]
             .expect("a retained output belongs to a retained cell")
         {
@@ -275,14 +295,13 @@ impl RetainedTiming {
                             bit,
                             comparison.operation().is_signed(),
                         );
-                        [*lhs, *rhs].map(|input| {
-                            arrivals[input.index() as usize]
-                                + wire_delay_ps(fanouts[input.index() as usize])
-                                + arc
+                        [*lhs, *rhs].into_iter().filter_map(move |input| {
+                            arrivals[input.index() as usize].map(|arrival| {
+                                arrival + wire_delay_ps(fanouts[input.index() as usize]) + arc
+                            })
                         })
                     })
                     .max()
-                    .unwrap_or(0)
             }
         }
     }
@@ -399,21 +418,22 @@ fn arithmetic_arc_ps(
 fn arithmetic_arrival(
     arithmetic: &ArithmeticCell,
     output_bit: usize,
-    arrivals: &[u32],
+    arrivals: &[Option<u32>],
     fanouts: &[usize],
     mapping: ArithmeticMapping,
-) -> u32 {
+) -> Option<u32> {
     (0..=output_bit)
         .flat_map(|input_bit| {
             let arc = arithmetic_arc_ps(arithmetic, output_bit, input_bit, mapping);
-            [arithmetic.lhs()[input_bit], arithmetic.rhs()[input_bit]].map(|input| {
-                arrivals[input.index() as usize]
-                    + wire_delay_ps(fanouts[input.index() as usize])
-                    + arc
-            })
+            [arithmetic.lhs()[input_bit], arithmetic.rhs()[input_bit]]
+                .into_iter()
+                .filter_map(move |input| {
+                    arrivals[input.index() as usize].map(|arrival| {
+                        arrival + wire_delay_ps(fanouts[input.index() as usize]) + arc
+                    })
+                })
         })
         .max()
-        .unwrap_or(0)
 }
 
 fn comparison_arc_ps(width: usize, input_bit: usize, signed: bool) -> u32 {
@@ -423,40 +443,46 @@ fn comparison_arc_ps(width: usize, input_bit: usize, signed: bool) -> u32 {
         + if signed { LUT_DELAY_PS } else { 0 }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn required_times(
     netlist: &Netlist,
     plans: &[Option<LutPlan>],
-    arrivals: &[u32],
+    arrivals: &[Option<u32>],
     fanouts: &[usize],
     retained: &RetainedTiming,
     options: MappingOptions,
+    io_timing: &IoTimingConstraints,
     preserve_initial: bool,
 ) -> Vec<u32> {
     let period_ps = timing_period_ps(options);
     let mut required = vec![u32::MAX; netlist.nodes().len()];
     let mut constrain = |net: NetId, sink_delay: u32| {
         let index = net.index() as usize;
+        let Some(arrival) = arrivals[index] else {
+            return;
+        };
         let deadline = period_ps.saturating_sub(sink_delay);
         let deadline = if preserve_initial {
-            deadline.max(arrivals[index])
+            deadline.max(arrival)
         } else {
             deadline
         };
         required[index] = required[index].min(deadline);
     };
 
-    for port in netlist
-        .ports()
-        .iter()
-        .filter(|port| port.direction() == struo_ir::PortDirection::Output)
-    {
+    for (name, output_delay_ps) in &io_timing.output_delays_ps {
+        let port = netlist
+            .ports()
+            .iter()
+            .find(|port| port.name() == name)
+            .expect("I/O timing constraints were validated");
         for output in port.bits() {
-            constrain(node_for(netlist, *output).inputs()[0], 0);
+            constrain(node_for(netlist, *output).inputs()[0], *output_delay_ps);
         }
     }
+
     for register in netlist.registers() {
         constrain(register.data(), FLIP_FLOP_SETUP_PS);
-        constrain(register.clock(), 0);
         if let Some(enable) = register.enable() {
             constrain(enable.signal, FLIP_FLOP_SETUP_PS);
         }
@@ -476,17 +502,6 @@ fn required_times(
         {
             constrain(input, BRAM_SETUP_PS);
         }
-        constrain(memory.clock(), 0);
-    }
-    // Retained cells are always emitted today, even when an output is not
-    // otherwise observed, so their inputs remain real timing endpoints.
-    for arithmetic in netlist.arithmetic() {
-        for output in arithmetic.outputs() {
-            constrain(*output, 0);
-        }
-    }
-    for comparison in netlist.comparisons() {
-        constrain(comparison.output(), 0);
     }
 
     for index in (0..netlist.nodes().len()).rev() {
@@ -539,11 +554,10 @@ fn tighten_required(
     required[index] = required[index].min(deadline);
 }
 
-fn timing_is_valid(arrivals: &[u32], required: &[u32]) -> bool {
-    arrivals
-        .iter()
-        .zip(required)
-        .all(|(arrival, required)| *required == u32::MAX || arrival <= required)
+fn timing_is_valid(arrivals: &[Option<u32>], required: &[u32]) -> bool {
+    arrivals.iter().zip(required).all(|(arrival, required)| {
+        arrival.is_none_or(|arrival| *required == u32::MAX || arrival <= *required)
+    })
 }
 
 struct RecoveryContext<'a> {
@@ -559,7 +573,7 @@ impl RecoveryContext<'_> {
     fn recover_area(
         &self,
         plans: &mut [Option<LutPlan>],
-        arrivals: &mut [u32],
+        arrivals: &mut [Option<u32>],
         required: &mut [u32],
     ) {
         let mut references = vec![0usize; plans.len()];
@@ -578,7 +592,10 @@ impl RecoveryContext<'_> {
                 let replacement = self.cuts.cuts[index]
                     .iter()
                     .map(|cut| plan_for_cut(plans, arrivals, self.fanouts, cut))
-                    .filter(|plan| plan.arrival_ps <= required[index])
+                    .filter(|plan| {
+                        plan.arrival_ps
+                            .is_none_or(|arrival| arrival <= required[index])
+                    })
                     .map(|plan| {
                         let area = reference_leaves(&plan.leaves, plans, &mut references);
                         let removed = dereference_leaves(&plan.leaves, plans, &mut references);
@@ -625,7 +642,7 @@ impl RecoveryContext<'_> {
 fn refresh_arrivals(
     netlist: &Netlist,
     plans: &mut [Option<LutPlan>],
-    arrivals: &mut [u32],
+    arrivals: &mut [Option<u32>],
     fanouts: &[usize],
     retained: &RetainedTiming,
     arithmetic_mapping: ArithmeticMapping,
@@ -643,7 +660,7 @@ fn refresh_arrivals(
                 arrivals[index] = plan.arrival_ps;
                 plans[index] = Some(plan);
             }
-            NodeKind::MemoryOutput(_) => arrivals[index] = BRAM_CLOCK_TO_OUTPUT_PS,
+            NodeKind::MemoryOutput(_) => arrivals[index] = Some(BRAM_CLOCK_TO_OUTPUT_PS),
             NodeKind::ArithmeticOutput(_) | NodeKind::ComparisonOutput(_) => {
                 arrivals[index] = retained.output_arrival(
                     netlist,
@@ -654,7 +671,9 @@ fn refresh_arrivals(
                 );
             }
             NodeKind::Output(_) => arrivals[index] = arrivals[node.inputs()[0].index() as usize],
-            NodeKind::RegisterOutput(_) => arrivals[index] = FLIP_FLOP_CLOCK_TO_OUTPUT_PS,
+            NodeKind::RegisterOutput(_) => {
+                arrivals[index] = Some(FLIP_FLOP_CLOCK_TO_OUTPUT_PS);
+            }
             NodeKind::Input(_) | NodeKind::Constant(_) => {}
         }
     }
@@ -803,7 +822,7 @@ impl<'a> LutEmitter<'a> {
 
 fn best_plan(
     plans: &[Option<LutPlan>],
-    arrivals: &[u32],
+    arrivals: &[Option<u32>],
     fanouts: &[usize],
     cuts: &[Cut],
     critical_arrival_ps: u32,
@@ -820,10 +839,10 @@ fn best_plan(
     let minimum_depth_arrival = candidates
         .iter()
         .filter(|plan| plan.depth == minimum_depth)
-        .map(|plan| plan.arrival_ps)
+        .filter_map(|plan| plan.arrival_ps)
         .min()
-        .expect("the minimum-depth set is non-empty");
-    if minimum_depth_arrival >= critical_arrival_ps {
+        .unwrap_or(0);
+    if candidates[0].arrival_ps.is_some() && minimum_depth_arrival >= critical_arrival_ps {
         candidates
             .into_iter()
             .min_by_key(|plan| {
@@ -847,7 +866,7 @@ fn best_plan(
 
 fn plan_for_cut(
     plans: &[Option<LutPlan>],
-    arrivals: &[u32],
+    arrivals: &[Option<u32>],
     fanouts: &[usize],
     cut: &Cut,
 ) -> LutPlan {
@@ -857,16 +876,15 @@ fn plan_for_cut(
         .filter_map(|leaf| plans[leaf.index() as usize].as_ref())
         .map(|plan| plan.area)
         .sum::<usize>();
-    let arrival_ps = LUT_DELAY_PS
-        + cut
-            .leaves
-            .iter()
-            .map(|leaf| {
-                let index = leaf.index() as usize;
-                arrivals[index] + wire_delay_ps(fanouts[index])
-            })
-            .max()
-            .unwrap_or(0);
+    let arrival_ps = cut
+        .leaves
+        .iter()
+        .filter_map(|leaf| {
+            let index = leaf.index() as usize;
+            arrivals[index].map(|arrival| arrival + wire_delay_ps(fanouts[index]))
+        })
+        .max()
+        .map(|arrival| arrival + LUT_DELAY_PS);
     let depth = 1 + cut
         .leaves
         .iter()
@@ -1011,7 +1029,7 @@ mod tests {
             .add_arithmetic(ArithmeticOp::Add, &lhs, &rhs)
             .unwrap();
         let retained = RetainedTiming::new(&netlist);
-        let arrivals = vec![0; netlist.nodes().len()];
+        let arrivals = vec![Some(0); netlist.nodes().len()];
         let fanouts = structural_fanouts(&netlist);
 
         let least_significant = retained.output_arrival(
@@ -1029,7 +1047,7 @@ mod tests {
             ArithmeticMapping::CarryChain,
         );
 
-        assert!(most_significant > least_significant);
+        assert!(most_significant.unwrap() > least_significant.unwrap());
     }
 
     #[test]
@@ -1039,7 +1057,7 @@ mod tests {
         let crowded = netlist.add_input("crowded");
         let local = netlist.add_input("local");
         let plans = vec![None; netlist.nodes().len()];
-        let arrivals = vec![0; netlist.nodes().len()];
+        let arrivals = vec![Some(0); netlist.nodes().len()];
         let mut fanouts = vec![1; netlist.nodes().len()];
         fanouts[crowded.index() as usize] = 16;
         let cuts = [
@@ -1066,12 +1084,12 @@ mod tests {
         plans[internal.index() as usize] = Some(super::LutPlan {
             leaves: vec![fast_source],
             depth: 1,
-            arrival_ps: 500,
+            arrival_ps: Some(500),
             area: 1,
         });
-        let mut arrivals = vec![0; netlist.nodes().len()];
-        arrivals[slow_source.index() as usize] = 1_500;
-        arrivals[internal.index() as usize] = 500;
+        let mut arrivals = vec![Some(0); netlist.nodes().len()];
+        arrivals[slow_source.index() as usize] = Some(1_500);
+        arrivals[internal.index() as usize] = Some(500);
         let fanouts = vec![1; netlist.nodes().len()];
         let cuts = [
             Cut {

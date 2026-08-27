@@ -12,8 +12,8 @@ use struo::rtl::Design;
 use struo::target::ecp5 as struo_target_ecp5;
 use struo::target::ecp5::ECP5_QOR_TARGET_MHZ;
 use struo::{
-    JtaggBinding, MappingOptions, OpenDrainIo, PllBinding, analyze_project_and_lower,
-    ecp5_simulator, map_to_ecp5_with_options, synthesize,
+    IoTimingConstraints, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
+    analyze_project_and_lower, ecp5_simulator, map_to_ecp5_with_constraints, synthesize,
 };
 
 /// Synthesize a Veryl project to an ECP5 netlist.
@@ -34,6 +34,10 @@ struct Cli {
     /// Timing goal in MHz (default: 300).
     #[arg(long)]
     timing_goal_mhz: Option<u32>,
+
+    /// Read explicit top-level input/output delays from JSON.
+    #[arg(long, value_name = "JSON")]
+    io_timing_constraints: Option<PathBuf>,
 
     /// Bind `PIN:INPUT:DRIVE_LOW` as one physical open-drain pad (repeatable).
     #[arg(
@@ -88,6 +92,28 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         return Err("timing goal must be greater than zero".into());
     }
     let design = load_design(&cli.project, &cli.top)?;
+    let io_timing = cli
+        .io_timing_constraints
+        .as_ref()
+        .map(|path| {
+            let source = std::fs::read_to_string(path).map_err(|error| {
+                format!(
+                    "failed to read I/O timing constraints `{}`: {error}",
+                    path.display()
+                )
+            })?;
+            serde_json::from_str::<IoTimingConstraints>(&source).map_err(
+                |error| -> Box<dyn Error> {
+                    format!(
+                        "invalid I/O timing constraints `{}`: {error}",
+                        path.display()
+                    )
+                    .into()
+                },
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
     let pll_bindings = cli
         .pll_binding
         .iter()
@@ -104,6 +130,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         &design,
         &cli.top,
         timing_goal_mhz,
+        &io_timing,
         &cli.open_drain,
         cli.jtagg_prefix.as_deref(),
         &pll_bindings,
@@ -137,10 +164,12 @@ fn load_design(input: &Path, top: &str) -> Result<Design, Box<dyn Error>> {
     .into())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synthesize_and_map(
     design: &Design,
     label: &str,
     timing_goal_mhz: u32,
+    io_timing: &IoTimingConstraints,
     open_drain: &[OpenDrainIo],
     jtagg_prefix: Option<&str>,
     pll_bindings: &[PllBinding],
@@ -150,12 +179,13 @@ fn synthesize_and_map(
     for report in &synthesized.reports {
         tracing::info!("{}: {}", report.pass, report.message);
     }
-    let mut mapped = map_to_ecp5_with_options(
+    let mut mapped = map_to_ecp5_with_constraints(
         &synthesized.netlist,
         MappingOptions {
             timing_goal_mhz,
             ..MappingOptions::default()
         },
+        io_timing,
     )?;
     mapped.bind_open_drain_ios(open_drain)?;
     if let Some(prefix) = jtagg_prefix {
@@ -235,6 +265,8 @@ mod tests {
             "out.json",
             "--timing-goal-mhz",
             "310",
+            "--io-timing-constraints",
+            "io-timing.json",
             "--open-drain",
             "sda:sda_i:sda_drive_low",
             "--open-drain",
@@ -251,6 +283,10 @@ mod tests {
         assert_eq!(cli.output.as_deref(), Some(Path::new("out.json")));
         assert_eq!(cli.timing_goal_mhz, Some(310));
         assert_eq!(
+            cli.io_timing_constraints.as_deref(),
+            Some(Path::new("io-timing.json"))
+        );
+        assert_eq!(
             cli.open_drain,
             [
                 struo::OpenDrainIo::new("sda", "sda_i", "sda_drive_low"),
@@ -264,6 +300,7 @@ mod tests {
         let defaults = Cli::try_parse_from(["struo", "Veryl.toml", "--top", "Top"]).unwrap();
         assert_eq!(defaults.output, None);
         assert_eq!(defaults.timing_goal_mhz, None);
+        assert_eq!(defaults.io_timing_constraints, None);
         assert!(defaults.open_drain.is_empty());
         assert_eq!(defaults.jtagg_prefix, None);
         assert!(defaults.pll_binding.is_empty());
