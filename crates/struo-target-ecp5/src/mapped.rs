@@ -316,6 +316,38 @@ pub struct MappingOptions {
     pub timing_goal_mhz: u32,
 }
 
+/// Per-register control of the physical fanout seen at the ECP5 clock-enable
+/// pin. Patterns match final mapped flip-flop names and accept `*` and `?`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RegisterEnableFanoutConstraint {
+    /// Mapped flip-flop name or glob pattern.
+    pub cell: String,
+    /// Maximum number of constrained flip-flop CE pins on each generated branch.
+    pub max_fanout: usize,
+}
+
+impl RegisterEnableFanoutConstraint {
+    /// Creates one mapped-register clock-enable constraint.
+    #[must_use]
+    pub fn new(cell: impl Into<String>, max_fanout: usize) -> Self {
+        Self {
+            cell: cell.into(),
+            max_fanout,
+        }
+    }
+}
+
+/// Observable result of applying per-register clock-enable constraints.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegisterEnableFanoutReport {
+    /// Flip-flops matched by the supplied patterns.
+    pub matched_registers: usize,
+    /// Flip-flop CE pins moved onto generated branches.
+    pub rewired_registers: usize,
+    /// Equivalent LUT branches inserted or replicated.
+    pub inserted_branches: usize,
+}
+
 impl Default for MappingOptions {
     fn default() -> Self {
         Self {
@@ -714,6 +746,47 @@ impl Ecp5Netlist {
     #[must_use]
     pub fn cells(&self) -> &[Ecp5Cell] {
         &self.cells
+    }
+
+    /// Applies clock-enable fanout limits to selected mapped flip-flops.
+    ///
+    /// Each constrained sink is moved to an equivalent, dedicated LUT branch;
+    /// unconstrained sinks on the same logical enable remain untouched. A LUT
+    /// enable driver is duplicated without adding a logic level. Other wire
+    /// drivers are fanned out through identity LUTs.
+    ///
+    /// This operation is atomic. Patterns match final mapped cell names using
+    /// `*` for any sequence and `?` for one character.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero limit, unmatched or overlapping patterns,
+    /// a matched flip-flop without a wire-driven enable, or wire exhaustion.
+    pub fn apply_register_enable_fanout_constraints(
+        &mut self,
+        constraints: &[RegisterEnableFanoutConstraint],
+    ) -> Result<RegisterEnableFanoutReport, RegisterEnableFanoutError> {
+        if constraints.is_empty() {
+            return Ok(RegisterEnableFanoutReport::default());
+        }
+        let (branches, matched_registers) =
+            resolve_register_enable_fanout_constraints(self, constraints)?;
+        let mut candidate = self.clone();
+        let (rewired_registers, inserted_branches) =
+            insert_register_enable_fanout_branches(&mut candidate, branches)?;
+
+        candidate.equivalence_proof.equivalent_logic_replications += inserted_branches;
+        candidate.retiming.equivalent_logic_replications += inserted_branches;
+        candidate.retiming.equivalence_signed_off = verify_mapped_equivalence_proof(
+            &candidate,
+            candidate.retiming.applied || inserted_branches != 0,
+        );
+        *self = candidate;
+        Ok(RegisterEnableFanoutReport {
+            matched_registers,
+            rewired_registers,
+            inserted_branches,
+        })
     }
 
     /// Replaces logical clock/lock inputs with a user-configured `EHXPLLL`.
@@ -4583,6 +4656,164 @@ fn mapped_cell_name(cell: &Ecp5Cell) -> &str {
     }
 }
 
+type EnableFanoutBranches = BTreeMap<(u32, usize), Vec<usize>>;
+
+fn resolve_register_enable_fanout_constraints(
+    netlist: &Ecp5Netlist,
+    constraints: &[RegisterEnableFanoutConstraint],
+) -> Result<(EnableFanoutBranches, usize), RegisterEnableFanoutError> {
+    let mut assignments = vec![None::<usize>; netlist.cells.len()];
+    let mut matched_registers = 0usize;
+    for (constraint_index, constraint) in constraints.iter().enumerate() {
+        if constraint.max_fanout == 0 {
+            return Err(RegisterEnableFanoutError::ZeroFanout {
+                pattern: constraint.cell.clone(),
+            });
+        }
+        let matches = netlist
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| match cell {
+                Ecp5Cell::FlipFlop { name, .. }
+                    if mapped_cell_glob_matches(&constraint.cell, name) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(RegisterEnableFanoutError::UnmatchedPattern {
+                pattern: constraint.cell.clone(),
+            });
+        }
+        matched_registers += matches.len();
+        for cell_index in matches {
+            if let Some(previous) = assignments[cell_index] {
+                return Err(RegisterEnableFanoutError::OverlappingPatterns {
+                    cell: mapped_cell_name(&netlist.cells[cell_index]).to_owned(),
+                    first: constraints[previous].cell.clone(),
+                    second: constraint.cell.clone(),
+                });
+            }
+            assignments[cell_index] = Some(constraint_index);
+        }
+    }
+
+    let mut branches = EnableFanoutBranches::new();
+    for (cell_index, constraint_index) in assignments.into_iter().enumerate() {
+        let Some(constraint_index) = constraint_index else {
+            continue;
+        };
+        let Ecp5Cell::FlipFlop { name, enable, .. } = &netlist.cells[cell_index] else {
+            unreachable!("only flip-flops receive CE assignments");
+        };
+        let Some(enable) = enable else {
+            return Err(RegisterEnableFanoutError::RegisterHasNoEnable { cell: name.clone() });
+        };
+        let Bit::Wire(wire) = enable.signal else {
+            return Err(RegisterEnableFanoutError::RegisterEnableIsConstant { cell: name.clone() });
+        };
+        branches
+            .entry((wire, constraints[constraint_index].max_fanout))
+            .or_default()
+            .push(cell_index);
+    }
+    Ok((branches, matched_registers))
+}
+
+fn insert_register_enable_fanout_branches(
+    candidate: &mut Ecp5Netlist,
+    branches: EnableFanoutBranches,
+) -> Result<(usize, usize), RegisterEnableFanoutError> {
+    let original_cells = candidate.cells.clone();
+    let mut next_wire = maximum_mapped_wire(candidate)
+        .and_then(|wire| wire.checked_add(1))
+        .unwrap_or(1);
+    let mut inserted = 0usize;
+    let mut rewired = 0usize;
+    for ((wire, max_fanout), sinks) in branches {
+        let duplicated_lut = original_cells.iter().find_map(|cell| match cell {
+            Ecp5Cell::Lut4 {
+                name,
+                inputs,
+                output,
+                init,
+            } if *output == wire => Some((name.clone(), *inputs, *init)),
+            _ => None,
+        });
+        for chunk in sinks.chunks(max_fanout) {
+            let output = next_wire;
+            next_wire = next_wire
+                .checked_add(1)
+                .ok_or(RegisterEnableFanoutError::MappedWireOverflow)?;
+            for &sink in chunk {
+                let Ecp5Cell::FlipFlop {
+                    enable: Some(enable),
+                    ..
+                } = &mut candidate.cells[sink]
+                else {
+                    unreachable!("validated constrained CE sink");
+                };
+                enable.signal = Bit::Wire(output);
+                rewired += 1;
+            }
+            let (base_name, inputs, init) = duplicated_lut.clone().unwrap_or_else(|| {
+                (
+                    format!("wire_{wire}"),
+                    [Bit::Wire(wire), Bit::Zero, Bit::Zero, Bit::Zero],
+                    0xaaaa,
+                )
+            });
+            let name = unique_cell_name(
+                &format!("constrain_enable_{base_name}_{max_fanout}"),
+                &candidate.cells,
+                None,
+            );
+            candidate.cells.push(Ecp5Cell::Lut4 {
+                name,
+                inputs,
+                output,
+                init,
+            });
+            inserted += 1;
+        }
+    }
+    Ok((rewired, inserted))
+}
+
+fn mapped_cell_glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let name = name.as_bytes();
+    let (mut pattern_index, mut name_index) = (0usize, 0usize);
+    let mut star = None;
+    let mut retry_name = 0usize;
+
+    while name_index < name.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == name[name_index])
+        {
+            pattern_index += 1;
+            name_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            retry_name = name_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            retry_name += 1;
+            name_index = retry_name;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
 fn unique_cell_name(base: &str, cells: &[Ecp5Cell], skip: Option<usize>) -> String {
     let mut name = base.to_owned();
     let mut suffix = 2usize;
@@ -5466,6 +5697,77 @@ fn physical_address(bits: &[Option<Bit>], address: &[NetId], width: u8) -> [Bit;
     }
     physical
 }
+
+/// Failure while applying mapped-register clock-enable fanout constraints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegisterEnableFanoutError {
+    /// A fanout ceiling must be at least one.
+    ZeroFanout {
+        /// Pattern carrying the invalid ceiling.
+        pattern: String,
+    },
+    /// A pattern selected no mapped flip-flop.
+    UnmatchedPattern {
+        /// Unmatched mapped-cell pattern.
+        pattern: String,
+    },
+    /// Two constraints selected the same mapped flip-flop.
+    OverlappingPatterns {
+        /// Ambiguous mapped flip-flop.
+        cell: String,
+        /// Earlier pattern.
+        first: String,
+        /// Later pattern.
+        second: String,
+    },
+    /// A selected mapped flip-flop has no clock enable.
+    RegisterHasNoEnable {
+        /// Selected mapped flip-flop.
+        cell: String,
+    },
+    /// A selected mapped flip-flop has a constant clock enable.
+    RegisterEnableIsConstant {
+        /// Selected mapped flip-flop.
+        cell: String,
+    },
+    /// No mapped wire number remains for a generated branch.
+    MappedWireOverflow,
+}
+
+impl Display for RegisterEnableFanoutError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroFanout { pattern } => write!(
+                formatter,
+                "register-enable pattern `{pattern}` has a zero fanout limit"
+            ),
+            Self::UnmatchedPattern { pattern } => write!(
+                formatter,
+                "register-enable pattern `{pattern}` matched no mapped flip-flop"
+            ),
+            Self::OverlappingPatterns {
+                cell,
+                first,
+                second,
+            } => write!(
+                formatter,
+                "mapped flip-flop `{cell}` matches both register-enable patterns `{first}` and `{second}`"
+            ),
+            Self::RegisterHasNoEnable { cell } => write!(
+                formatter,
+                "mapped flip-flop `{cell}` has no clock-enable pin to constrain"
+            ),
+            Self::RegisterEnableIsConstant { cell } => write!(
+                formatter,
+                "mapped flip-flop `{cell}` has a constant clock enable"
+            ),
+            Self::MappedWireOverflow => formatter
+                .write_str("mapped wire number overflow while inserting a register-enable branch"),
+        }
+    }
+}
+
+impl Error for RegisterEnableFanoutError {}
 
 /// ECP5 technology-mapping failure.
 #[derive(Debug)]
@@ -6432,11 +6734,12 @@ mod tests {
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
         MappingOptions, NextpnrJsonError, OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput,
-        PortDirection, backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point,
-        ccu_chain_names, forward_retime_ccu2c, forward_retime_lut, map_once, map_to_ecp5,
-        map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
-        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
-        mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
+        PortDirection, RegisterEnableFanoutConstraint, RegisterEnableFanoutError,
+        RegisterEnableFanoutReport, backward_retime_ccu2c, backward_retime_lut,
+        carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c, forward_retime_lut,
+        map_once, map_to_ecp5, map_to_ecp5_ooc, map_to_ecp5_with_constraints,
+        map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
+        map_to_ecp5_with_pll, mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
         replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
@@ -7072,6 +7375,174 @@ mod tests {
             };
             mapped_wire_fanout(&replicated, wire) <= 5
         }));
+    }
+
+    #[test]
+    fn constrains_enable_fanout_per_mapped_register_pattern() {
+        let mut source = Netlist::new("constrained_enable");
+        let clock = source.add_input("clock");
+        let enable_lhs = source.add_input("enable_lhs");
+        let enable_rhs = source.add_input("enable_rhs");
+        let enable = source.add_and(enable_lhs, enable_rhs);
+        let data = source.add_input("data");
+        for index in 0..50 {
+            let name = format!("value[{index}]");
+            let output = source.add_register_output(&name);
+            source.add_register(RegisterCell::new(
+                name.clone(),
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                Some(EnableControl {
+                    signal: enable,
+                    active: ActiveLevel::High,
+                }),
+                None,
+            ));
+            source.add_output(format!("output{index}"), output);
+        }
+        let (mut mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+
+        let report = mapped
+            .apply_register_enable_fanout_constraints(&[RegisterEnableFanoutConstraint::new(
+                "ff_value[*]",
+                5,
+            )])
+            .unwrap();
+
+        assert_eq!(
+            report,
+            RegisterEnableFanoutReport {
+                matched_registers: 50,
+                rewired_registers: 50,
+                inserted_branches: 10,
+            }
+        );
+        assert!(mapped.retiming.equivalence_signed_off);
+        assert!(mapped.cells.iter().all(|cell| {
+            let Ecp5Cell::FlipFlop {
+                name,
+                enable: Some(enable),
+                ..
+            } = cell
+            else {
+                return true;
+            };
+            if !name.starts_with("ff_value[") {
+                return true;
+            }
+            let Bit::Wire(wire) = enable.signal else {
+                return false;
+            };
+            mapped_wire_fanout(&mapped, wire) <= 5
+        }));
+    }
+
+    #[test]
+    fn rejects_unmatched_register_enable_pattern_without_mutating() {
+        let source = arithmetic_netlist(8, ArithmeticOp::Add);
+        let (mut mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+        let original = mapped.clone();
+
+        let error = mapped
+            .apply_register_enable_fanout_constraints(&[RegisterEnableFanoutConstraint::new(
+                "ff_missing*",
+                8,
+            )])
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            RegisterEnableFanoutError::UnmatchedPattern {
+                pattern: "ff_missing*".into(),
+            }
+        );
+        assert_eq!(mapped, original);
+    }
+
+    #[test]
+    fn constrains_register_driven_enable_with_identity_lut_branches() {
+        let mut source = Netlist::new("registered_enable");
+        let clock = source.add_input("clock");
+        let enable_data = source.add_input("enable_data");
+        let enable = source.add_register_output("enable_q");
+        source.add_register(RegisterCell::new(
+            "enable_q",
+            enable,
+            enable_data,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        let data = source.add_input("data");
+        for index in 0..10 {
+            let name = format!("value[{index}]");
+            let output = source.add_register_output(&name);
+            source.add_register(RegisterCell::new(
+                name.clone(),
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                Some(EnableControl {
+                    signal: enable,
+                    active: ActiveLevel::High,
+                }),
+                None,
+            ));
+            source.add_output(format!("output{index}"), output);
+        }
+        let (mut mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+        let enable_wire = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::FlipFlop { name, output, .. } if name == "ff_enable_q" => Some(*output),
+                _ => None,
+            })
+            .unwrap();
+
+        let report = mapped
+            .apply_register_enable_fanout_constraints(&[RegisterEnableFanoutConstraint::new(
+                "ff_value[*]",
+                3,
+            )])
+            .unwrap();
+
+        assert_eq!(report.inserted_branches, 4);
+        assert_eq!(mapped_wire_fanout(&mapped, enable_wire), 4);
+        assert_eq!(
+            mapped
+                .cells
+                .iter()
+                .filter(|cell| matches!(
+                    cell,
+                    Ecp5Cell::Lut4 {
+                        inputs: [Bit::Wire(input), Bit::Zero, Bit::Zero, Bit::Zero],
+                        init: 0xaaaa,
+                        ..
+                    } if *input == enable_wire
+                ))
+                .count(),
+            4
+        );
     }
 
     #[test]

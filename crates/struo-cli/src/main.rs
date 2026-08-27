@@ -13,8 +13,8 @@ use struo::target::ecp5 as struo_target_ecp5;
 use struo::target::ecp5::ECP5_QOR_TARGET_MHZ;
 use struo::{
     IoTimingConstraints, JtaggBinding, MappingOptions, OocTimingConstraints, OpenDrainIo,
-    PllBinding, SynthesisOptions, analyze_project_and_lower, ecp5_simulator, map_to_ecp5_ooc,
-    map_to_ecp5_with_constraints, synthesize_with_options,
+    PllBinding, RegisterEnableFanoutConstraint, SynthesisOptions, analyze_project_and_lower,
+    ecp5_simulator, map_to_ecp5_ooc, map_to_ecp5_with_constraints, synthesize_with_options,
 };
 
 /// Synthesize a Veryl project to an ECP5 netlist.
@@ -77,6 +77,14 @@ struct Cli {
     /// Keep qualified payload clock enables instead of relaxing them.
     #[arg(long)]
     no_relax_qualified_register_enables: bool,
+
+    /// Limit CE fanout for mapped FF cells matching CELL (`*`/`?`; repeatable).
+    #[arg(
+        long,
+        value_name = "CELL=LIMIT",
+        value_parser = parse_register_enable_fanout
+    )]
+    register_enable_fanout: Vec<RegisterEnableFanoutConstraint>,
 
     /// Raise diagnostic logging (-v info to stderr by default; -vv debug).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -183,6 +191,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
             infer_register_enables: !cli.no_infer_register_enables,
             relax_qualified_register_enables: !cli.no_relax_qualified_register_enables,
         },
+        &cli.register_enable_fanout,
         cli.output.as_deref(),
     )
 }
@@ -196,6 +205,22 @@ fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
         return Err("expected PIN:INPUT:DRIVE_LOW with three non-empty port names".into());
     }
     Ok(OpenDrainIo::new(pin, input, drive_low))
+}
+
+fn parse_register_enable_fanout(value: &str) -> Result<RegisterEnableFanoutConstraint, String> {
+    let (cell, limit) = value
+        .rsplit_once('=')
+        .ok_or_else(|| "expected CELL=LIMIT".to_owned())?;
+    if cell.is_empty() {
+        return Err("mapped FF cell pattern must not be empty".into());
+    }
+    let max_fanout = limit
+        .parse::<usize>()
+        .map_err(|_| "register-enable fanout limit must be a positive integer".to_owned())?;
+    if max_fanout == 0 {
+        return Err("register-enable fanout limit must be greater than zero".into());
+    }
+    Ok(RegisterEnableFanoutConstraint::new(cell, max_fanout))
 }
 
 fn load_design(input: &Path, top: &str) -> Result<Design, Box<dyn Error>> {
@@ -224,6 +249,7 @@ fn synthesize_and_map(
     jtagg_prefix: Option<&str>,
     pll_bindings: &[PllBinding],
     synthesis_options: SynthesisOptions,
+    register_enable_fanout: &[RegisterEnableFanoutConstraint],
     mapped_path: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let synthesized = synthesize_with_options(design, synthesis_options)?;
@@ -242,6 +268,14 @@ fn synthesize_and_map(
             io_timing,
         )?
     };
+    let enable_report = mapped.apply_register_enable_fanout_constraints(register_enable_fanout)?;
+    if enable_report.matched_registers != 0 {
+        tracing::info!(
+            "register-enable fanout constraints: {} mapped FFs rewired onto {} branches",
+            enable_report.rewired_registers,
+            enable_report.inserted_branches
+        );
+    }
     mapped.bind_open_drain_ios(open_drain)?;
     if let Some(prefix) = jtagg_prefix {
         mapped.bind_jtagg(&JtaggBinding::with_prefix(prefix))?;
@@ -341,6 +375,10 @@ mod tests {
             "pll.json",
             "--no-infer-register-enables",
             "--no-relax-qualified-register-enables",
+            "--register-enable-fanout",
+            "ff_core.operand_b_q[*]=16",
+            "--register-enable-fanout",
+            "ff_core.logic_result_q[*]=8",
             "-vv",
         ])
         .unwrap();
@@ -365,6 +403,13 @@ mod tests {
         assert_eq!(cli.pll_binding, [Path::new("pll.json")]);
         assert!(cli.no_infer_register_enables);
         assert!(cli.no_relax_qualified_register_enables);
+        assert_eq!(
+            cli.register_enable_fanout,
+            [
+                struo::RegisterEnableFanoutConstraint::new("ff_core.operand_b_q[*]", 16),
+                struo::RegisterEnableFanoutConstraint::new("ff_core.logic_result_q[*]", 8),
+            ]
+        );
 
         let defaults = Cli::try_parse_from(["struo", "Veryl.toml", "--top", "Top"]).unwrap();
         assert_eq!(defaults.output, None);
@@ -376,6 +421,7 @@ mod tests {
         assert!(defaults.pll_binding.is_empty());
         assert!(!defaults.no_infer_register_enables);
         assert!(!defaults.no_relax_qualified_register_enables);
+        assert!(defaults.register_enable_fanout.is_empty());
         assert_eq!(defaults.verbose, 0);
 
         let project =
@@ -392,6 +438,17 @@ mod tests {
         assert!(
             Cli::try_parse_from(["struo", "project", "--top", "T", "--open-drain", "sda:x"])
                 .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "struo",
+                "project",
+                "--top",
+                "T",
+                "--register-enable-fanout",
+                "ff_*=0"
+            ])
+            .is_err()
         );
     }
 

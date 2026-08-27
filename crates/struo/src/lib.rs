@@ -35,8 +35,10 @@ pub mod target {
 pub use struo_target_ecp5::{
     Ecp5Netlist, IoTimingConstraints, JtaggBinding, MappingError, MappingOptions,
     OocClockConstraint, OocPortConstraint, OocTimingConstraints, OpenDrainIo, PllBinding,
-    PllOutput, map_to_ecp5, map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
-    map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
+    PllOutput, RegisterEnableFanoutConstraint, RegisterEnableFanoutError,
+    RegisterEnableFanoutReport, map_to_ecp5, map_to_ecp5_ooc, map_to_ecp5_with_constraints,
+    map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
+    map_to_ecp5_with_pll,
 };
 
 /// Celox adapter for post-synthesis simulation.
