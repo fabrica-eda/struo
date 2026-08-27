@@ -14,7 +14,6 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-struo-formal.workspace = true
 struo-ir.workspace = true
 struo-rtl.workspace = true
 
