@@ -34,11 +34,6 @@ const RETIMING_PERIOD_MARGIN_DENOMINATOR: u32 = 10;
 // 100 ps more than that model, while dedicated carry hops bypass this charge.
 const MAPPED_ROUTE_GUARD_PS: u32 = 100;
 const MAX_ENABLE_FANOUT_PER_REPLICA: usize = 16;
-// Physical fanout repair remains useful outside the final two percent: a
-// single long branch on an otherwise closed design can readily consume more
-// than that. Keep the guard only to avoid rewriting fundamentally unready
-// netlists.
-const PHYSICAL_REWRITE_MIN_GOAL_PERCENT: u32 = 95;
 const PHYSICAL_RETIME_MIN_GOAL_PERCENT: u32 = 95;
 const PHYSICAL_RETIME_MODEL_BRIDGE_PS: u32 = 400;
 // PFUMX and L6MUX21 data inputs use dedicated intra-PFU/inter-slice wiring.
@@ -1161,15 +1156,12 @@ impl Ecp5Netlist {
         if feedback.meets_timing_goal() || !physical_feedback_matches_netlist(&refined, feedback) {
             return refined;
         }
-        let (replicas, critical_rewires, cluster_rewires) =
-            if feedback.is_near_timing_closure(PHYSICAL_REWRITE_MIN_GOAL_PERCENT) {
-                let (replicas, critical_rewires) =
-                    replicate_physically_critical_cells(&mut refined, feedback);
-                let cluster_rewires = recluster_replicated_enable_sinks(&mut refined, feedback);
-                (replicas, critical_rewires, cluster_rewires)
-            } else {
-                (0, 0, 0)
-            };
+        // Branch replication is bounded and equivalence-checked below. Do not
+        // suppress it based on aggregate Fmax: one isolated high-fanout branch
+        // can account for an arbitrarily large fraction of the miss.
+        let (replicas, critical_rewires) =
+            replicate_physically_critical_cells(&mut refined, feedback);
+        let cluster_rewires = recluster_replicated_enable_sinks(&mut refined, feedback);
         let rewires = critical_rewires + cluster_rewires;
         let physical_retiming_moves =
             if rewires == 0 && feedback.is_near_timing_closure(PHYSICAL_RETIME_MIN_GOAL_PERCENT) {
@@ -8213,12 +8205,7 @@ mod tests {
         let far_from_closure =
             PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "300.0"), &placed)
                 .unwrap();
-        assert_eq!(mapped.apply_physical_feedback(&far_from_closure), mapped);
-
-        let repairable =
-            PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "307.2"), &placed)
-                .unwrap();
-        assert_ne!(mapped.apply_physical_feedback(&repairable), mapped);
+        assert_ne!(mapped.apply_physical_feedback(&far_from_closure), mapped);
 
         let incompatible = PhysicalFeedback::from_nextpnr_json(
             &report,
