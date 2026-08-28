@@ -3155,7 +3155,7 @@ fn replicate_physically_critical_luts(
     feedback: &PhysicalFeedback,
 ) -> (usize, usize) {
     const MAX_PHYSICAL_REPLICAS: usize = 16;
-    const MAX_REPLICATED_NET_FANOUT: usize = 16;
+    const MAX_REPLICATED_BRANCH_FANOUT: usize = 16;
 
     let mut next_wire = maximum_mapped_wire(netlist)
         .and_then(|wire| wire.checked_add(1))
@@ -3183,7 +3183,7 @@ fn replicate_physically_critical_luts(
             .collect::<HashSet<_>>();
         if violating_sinks.is_empty()
             || violating_sinks.len() >= eligible_sinks.len()
-            || eligible_sinks.len() > MAX_REPLICATED_NET_FANOUT
+            || violating_sinks.len() > MAX_REPLICATED_BRANCH_FANOUT
         {
             continue;
         }
@@ -7301,7 +7301,7 @@ fn block_ram_parameters(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::num::NonZeroU32;
 
     use struo_ir::{
@@ -7322,7 +7322,7 @@ mod tests {
         replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
-    use crate::PhysicalFeedback;
+    use crate::{PhysicalFeedback, PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint};
 
     fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
         let mut source = Netlist::new("arithmetic");
@@ -8210,6 +8210,111 @@ mod tests {
             PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "321.0"), &placed)
                 .unwrap();
         assert_eq!(mapped.apply_physical_feedback(&passing), mapped);
+    }
+
+    #[test]
+    fn physical_feedback_replicates_a_small_violating_branch_of_a_high_fanout_lut() {
+        let mut source = Netlist::new("physical_high_fanout");
+        let clock = source.add_input("clock");
+        let lhs = source.add_input("lhs");
+        let rhs = source.add_input("rhs");
+        let data = source.add_and(lhs, rhs);
+        for index in 0..20 {
+            let name = format!("value{index}");
+            let output = source.add_register_output(&name);
+            source.add_register(RegisterCell::new(
+                name.clone(),
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                None,
+                None,
+            ));
+            source.add_output(format!("output{index}"), output);
+        }
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+        let (driver, output) = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::Lut4 { name, output, .. }
+                    if mapped_wire_fanout(&mapped, *output) == 20 =>
+                {
+                    Some((name.clone(), *output))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let sinks = mapped
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                Ecp5Cell::FlipFlop {
+                    name,
+                    data: Bit::Wire(wire),
+                    ..
+                } if *wire == output => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let placements = mapped
+            .cells
+            .iter()
+            .filter(|cell| !matches!(cell, Ecp5Cell::Ccu2c { .. }))
+            .map(|cell| {
+                (
+                    mapped_cell_name(cell).to_owned(),
+                    PhysicalLocation { x: 1, y: 1 },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let bels = mapped
+            .cells
+            .iter()
+            .filter_map(|cell| {
+                let bel = match cell {
+                    Ecp5Cell::Lut4 { .. } => "X1/Y1/SLICEA.K0",
+                    Ecp5Cell::FlipFlop { .. } => "X1/Y1/SLICEA.FF0",
+                    Ecp5Cell::TrellisIo { .. } => "X1/Y1/PIOA",
+                    Ecp5Cell::Ccu2c { .. } => return None,
+                    _ => unreachable!("fixture maps only LUTs, FFs, and IOs"),
+                };
+                Some((mapped_cell_name(cell).to_owned(), bel.to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let endpoints = sinks
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| PhysicalTimingEndpoint {
+                cell: cell.clone(),
+                port: "DI".into(),
+                delay_ps: if index == 0 { 4_000 } else { 2_000 },
+                budget_ps: 3_000,
+            })
+            .collect();
+        let feedback = PhysicalFeedback::from_observations(
+            placements,
+            bels,
+            vec![PhysicalNetTiming {
+                driver,
+                net: "critical".into(),
+                endpoints,
+            }],
+            Vec::new(),
+            BTreeMap::from([("clock".into(), (319_000, 320_000))]),
+        );
+
+        let refined = mapped.apply_physical_feedback(&feedback);
+
+        assert_eq!(refined.cells.len(), mapped.cells.len() + 1);
+        assert_eq!(refined.retiming.equivalent_physical_rewires, 1);
+        assert!(refined.retiming.equivalence_signed_off);
     }
 
     #[test]
