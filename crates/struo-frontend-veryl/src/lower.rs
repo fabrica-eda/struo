@@ -2268,6 +2268,33 @@ module NbaTop (
 }
 ";
 
+    const PARTIAL_MUX_SOURCE: &str = r"
+module PartialMuxTop (
+    clk    : input  clock_posedge,
+    reverse: input  logic,
+    value  : input  logic<8>,
+    result : output logic<8>,
+) {
+    var mem_shift_result_q: logic<8>;
+    var mem_shift_result  : logic<8>;
+
+    always_comb {
+        for i in 0..8 {
+            if reverse {
+                mem_shift_result[i] = mem_shift_result_q[7 - i];
+            } else {
+                mem_shift_result[i] = mem_shift_result_q[i];
+            }
+        }
+        result = mem_shift_result;
+    }
+
+    always_ff (clk) {
+        mem_shift_result_q = value;
+    }
+}
+";
+
     const STRUCT_SOURCE: &str = r"
 module StructTop (
     header          : input  logic<3>,
@@ -2484,6 +2511,22 @@ module StructInstanceTop (
         set(&mut simulator, "alt", 0b11);
         tick(&mut simulator);
         assert_value(&mut simulator, "flags", 0b11);
+    }
+
+    #[test]
+    fn lowers_exhaustive_partial_mux_assignments_without_a_false_loop() {
+        let design =
+            analyze_and_lower(PARTIAL_MUX_SOURCE, "partial_mux_lowering", "PartialMuxTop").unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "value", 0b1101_0010);
+        tick(&mut simulator);
+        set(&mut simulator, "reverse", 0);
+        assert_value(&mut simulator, "result", 0b1101_0010);
+        set(&mut simulator, "reverse", 1);
+        assert_value(&mut simulator, "result", 0b0100_1011);
     }
 
     #[test]

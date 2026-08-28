@@ -489,14 +489,56 @@ impl<'a> Lowering<'a> {
         lsb: usize,
         width: usize,
     ) -> Result<Vec<NetId>, SynthesisError> {
+        if let Some(bits) = &self.expression_bits[id.index() as usize] {
+            return Ok(bits[lsb..lsb + width].to_vec());
+        }
         let expression = &self.module.expressions()[id.index() as usize];
         debug_assert!(lsb + width <= expression.r#type().width.get() as usize);
+        // Keep bitwise expressions lazy across slices. Procedural partial
+        // assignments can leave self-references in bits that a later write
+        // discards; lowering the whole vector would report those dead edges
+        // as combinational feedback.
         match expression.kind().clone() {
             ExprKind::Signal(slice) => (0..width)
                 .map(|offset| {
                     self.resolve_signal_bit(slice.signal, slice.lsb as usize + lsb + offset)
                 })
                 .collect(),
+            ExprKind::Constant(value) => Ok((lsb..lsb + width)
+                .map(|bit| {
+                    let bit = u32::try_from(bit).expect("RTL expression bit indices fit in u32");
+                    self.netlist.add_constant(value.bit(bit))
+                })
+                .collect()),
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                input,
+            } => Ok(self
+                .lower_expression_range(input, lsb, width)?
+                .into_iter()
+                .map(|net| self.netlist.add_not(net))
+                .collect()),
+            ExprKind::Binary { op, lhs, rhs }
+                if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor) =>
+            {
+                let lhs = self.lower_expression_range(lhs, lsb, width)?;
+                let rhs = self.lower_expression_range(rhs, lsb, width)?;
+                Ok(self.lower_binary(op, &lhs, &rhs))
+            }
+            ExprKind::Mux {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                let condition = self.lower_expression(condition)?[0];
+                let then_bits = self.lower_expression_range(then_expr, lsb, width)?;
+                let else_bits = self.lower_expression_range(else_expr, lsb, width)?;
+                Ok(then_bits
+                    .into_iter()
+                    .zip(else_bits)
+                    .map(|(then_net, else_net)| self.netlist.add_mux(condition, then_net, else_net))
+                    .collect())
+            }
             ExprKind::Slice {
                 input,
                 lsb: inner_lsb,
@@ -1494,6 +1536,69 @@ mod tests {
             .collect();
         let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
         assert_eq!(output_word(&outputs, "output", 16), 0xbbaa);
+    }
+
+    #[test]
+    fn ignores_discarded_self_references_beneath_vector_muxes() {
+        let mut module = Module::new("FullyAssignedMuxSlices");
+        let select = module.add_port(Port {
+            name: "select".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let low_true = module.add_port(Port {
+            name: "low_true".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let low_false = module.add_port(Port {
+            name: "low_false".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let high = module.add_port(Port {
+            name: "high".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let output = module.add_port(Port {
+            name: "output".into(),
+            direction: PortDirection::Output,
+            r#type: bits(2),
+        });
+
+        let previous = module.read(output).unwrap();
+        let previous_high = module
+            .expression_slice(previous, 1, BitWidth::new(1).unwrap())
+            .unwrap();
+        let low_true = module.read(low_true).unwrap();
+        let true_partial = module.concat(vec![previous_high, low_true]).unwrap();
+        let low_false = module.read(low_false).unwrap();
+        let false_partial = module.concat(vec![previous_high, low_false]).unwrap();
+        let select = module.read(select).unwrap();
+        let partial_mux = module.mux(select, true_partial, false_partial).unwrap();
+        let assigned_low = module
+            .expression_slice(partial_mux, 0, BitWidth::new(1).unwrap())
+            .unwrap();
+        let high = module.read(high).unwrap();
+        let fully_assigned = module.concat(vec![high, assigned_low]).unwrap();
+        module
+            .assign(module.whole(output).unwrap(), fully_assigned)
+            .unwrap();
+        let mut design = Design::new("FullyAssignedMuxSlices");
+        design.add_module(module);
+
+        let synthesized = synthesize(&design).unwrap();
+        for (select, expected) in [(false, 0b10), (true, 0b11)] {
+            let inputs = HashMap::from([
+                ("select".into(), select),
+                ("low_true".into(), true),
+                ("low_false".into(), false),
+                ("high".into(), true),
+            ]);
+            let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+            assert_eq!(output_word(&outputs, "output", 2), expected);
+        }
     }
 
     #[test]
