@@ -1445,7 +1445,14 @@ fn physical_feedback_matches_netlist(netlist: &Ecp5Netlist, feedback: &PhysicalF
     let mut expected = 0usize;
     let mut missing = 0usize;
     for cell in &netlist.cells {
-        if matches!(cell, Ecp5Cell::Ccu2c { .. }) {
+        // These logical cascade primitives are absorbed into their LUT
+        // packing groups and therefore have no independent placed BEL in a
+        // native physical report. Their member LUTs still provide the stable
+        // placement correspondence needed by physical feedback.
+        if matches!(
+            cell,
+            Ecp5Cell::PfuMux { .. } | Ecp5Cell::L6Mux21 { .. } | Ecp5Cell::Ccu2c { .. }
+        ) {
             continue;
         }
         expected += 1;
@@ -7319,8 +7326,8 @@ mod tests {
         map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
         map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
         mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
-        replicate_high_fanout_enable_luts, split_branched_carry_outs,
-        verify_mapped_equivalence_proof,
+        physical_feedback_matches_netlist, replicate_high_fanout_enable_luts,
+        split_branched_carry_outs, verify_mapped_equivalence_proof,
     };
     use crate::{PhysicalFeedback, PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint};
 
@@ -8213,6 +8220,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn physical_feedback_replicates_a_small_violating_branch_of_a_high_fanout_lut() {
         let mut source = Netlist::new("physical_high_fanout");
         let clock = source.add_input("clock");
@@ -8309,6 +8317,18 @@ mod tests {
             Vec::new(),
             BTreeMap::from([("clock".into(), (319_000, 320_000))]),
         );
+        let mut mapped_with_absorbed_mux = mapped.clone();
+        mapped_with_absorbed_mux.cells.push(Ecp5Cell::PfuMux {
+            name: "absorbed_mux".into(),
+            lut_true: Bit::Zero,
+            lut_false: Bit::Zero,
+            select: Bit::Zero,
+            output: u32::MAX,
+        });
+        assert!(physical_feedback_matches_netlist(
+            &mapped_with_absorbed_mux,
+            &feedback
+        ));
 
         let refined = mapped.apply_physical_feedback(&feedback);
 
