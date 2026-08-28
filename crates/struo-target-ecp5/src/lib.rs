@@ -5,12 +5,13 @@ mod physical;
 
 pub use mapped::{
     ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
-    MappedPort, MappingError, MappingOptions, NextpnrJsonError, OocClockConstraint,
-    OocPortConstraint, OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput,
-    PortDirection as MappedPortDirection, RegisterEnableFanoutConstraint,
-    RegisterEnableFanoutError, RegisterEnableFanoutReport, Reset, RetimingSelection, map_to_ecp5,
-    map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
-    map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
+    MappedPort, MappingError, MappingOptions, MulticyclePathConstraint, NextpnrJsonError,
+    OocClockConstraint, OocPortConstraint, OocTimingConstraints, OpenDrainIo, PllBinding,
+    PllOutput, PortDirection as MappedPortDirection, RegisterEnableFanoutConstraint,
+    RegisterEnableFanoutError, RegisterEnableFanoutReport, Reset, RetimingSelection,
+    TimingClockConstraint, TimingConstraints, TimingPathConstraint, map_to_ecp5, map_to_ecp5_ooc,
+    map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
+    map_to_ecp5_with_options, map_to_ecp5_with_pll, map_to_ecp5_with_timing_constraints,
 };
 pub use physical::{
     PhysicalCriticalPath, PhysicalFeedback, PhysicalLocation, PhysicalNetTiming,
@@ -96,6 +97,8 @@ pub struct FlowArtifacts {
     pub svf: String,
     /// Board LPF copied into the artifact directory.
     pub constraints: String,
+    /// Generated nextpnr pre-pack timing constraints.
+    pub timing_constraints: String,
 }
 
 impl FlowArtifacts {
@@ -116,6 +119,7 @@ impl FlowArtifacts {
             bitstream: format!("{root}/design.bit"),
             svf: format!("{root}/design.svf"),
             constraints: format!("{root}/board.lpf"),
+            timing_constraints: format!("{root}/design.timing.py"),
         }
     }
 }
@@ -131,6 +135,7 @@ pub struct Ecp5Flow {
     pub timing_goal_mhz: u32,
     /// Files produced during the flow.
     pub artifacts: FlowArtifacts,
+    timing_constraints: Option<String>,
 }
 
 impl Ecp5Flow {
@@ -142,7 +147,52 @@ impl Ecp5Flow {
             board: LFE5UM5G_85F_EVN,
             timing_goal_mhz: ECP5_QOR_TARGET_MHZ,
             artifacts: FlowArtifacts::under(artifact_root),
+            timing_constraints: None,
         }
+    }
+
+    /// Creates an evaluation-board flow using the exact timing context stored
+    /// in a mapped netlist.
+    ///
+    /// This keeps mapper timing and every draft, candidate, and final nextpnr
+    /// invocation on one source of truth.
+    #[must_use]
+    pub fn evaluation_board_for_netlist(netlist: &Ecp5Netlist, artifact_root: &str) -> Self {
+        let timing_constraints = netlist.nextpnr_pre_pack_timing_constraints();
+        Self {
+            top: netlist.name().into(),
+            board: LFE5UM5G_85F_EVN,
+            timing_goal_mhz: netlist.nextpnr_default_frequency_mhz(),
+            artifacts: FlowArtifacts::under(artifact_root),
+            timing_constraints: (!timing_constraints.is_empty()).then_some(timing_constraints),
+        }
+    }
+
+    /// Returns the generated pre-pack source and its conventional path.
+    #[must_use]
+    pub fn timing_constraints_artifact(&self) -> Option<(&str, &str)> {
+        self.timing_constraints
+            .as_deref()
+            .map(|source| (self.artifacts.timing_constraints.as_str(), source))
+    }
+
+    /// Writes the generated nextpnr pre-pack timing file when named clocks are
+    /// present and returns its path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the artifact directory or file cannot be
+    /// created.
+    pub fn write_timing_constraints_artifact(&self) -> std::io::Result<Option<&str>> {
+        let Some(source) = self.timing_constraints.as_deref() else {
+            return Ok(None);
+        };
+        let path = std::path::Path::new(&self.artifacts.timing_constraints);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, source)?;
+        Ok(Some(self.artifacts.timing_constraints.as_str()))
     }
 
     /// Deterministic routed draft used only to return physical observations to
@@ -263,29 +313,38 @@ impl Ecp5Flow {
     }
 
     fn place_and_route_command_for(&self, json: &str, config: &str) -> ToolCommand {
+        let mut args = vec![
+            self.board.nextpnr_device.into(),
+            "--package".into(),
+            self.board.nextpnr_package.into(),
+            "--speed".into(),
+            self.board.speed_grade.to_string(),
+            "--json".into(),
+            json.into(),
+            "--lpf".into(),
+            self.artifacts.constraints.clone(),
+        ];
+        if self.timing_constraints.is_some() {
+            args.extend([
+                "--pre-pack".into(),
+                self.artifacts.timing_constraints.clone(),
+            ]);
+        }
+        args.extend([
+            "--textcfg".into(),
+            config.into(),
+            "--freq".into(),
+            self.timing_goal_mhz.to_string(),
+            "--placer-budgets".into(),
+            "--placer-heap-timingweight".into(),
+            "30".into(),
+            "--tmg-ripup".into(),
+            "--seed".into(),
+            "1".into(),
+        ]);
         ToolCommand {
             program: "nextpnr-ecp5",
-            args: vec![
-                self.board.nextpnr_device.into(),
-                "--package".into(),
-                self.board.nextpnr_package.into(),
-                "--speed".into(),
-                self.board.speed_grade.to_string(),
-                "--json".into(),
-                json.into(),
-                "--lpf".into(),
-                self.artifacts.constraints.clone(),
-                "--textcfg".into(),
-                config.into(),
-                "--freq".into(),
-                self.timing_goal_mhz.to_string(),
-                "--placer-budgets".into(),
-                "--placer-heap-timingweight".into(),
-                "30".into(),
-                "--tmg-ripup".into(),
-                "--seed".into(),
-                "1".into(),
-            ],
+            args,
             evidence: Some(VerificationStage::PlaceAndRoute),
         }
     }
@@ -357,9 +416,13 @@ impl Ecp5Flow {
 
 #[cfg(test)]
 mod tests {
+    use struo_ir::{ClockEdge, Netlist, RegisterCell};
     use struo_sim::{VerificationPolicy, VerificationReport};
 
-    use super::{ECP5_QOR_TARGET_MHZ, Ecp5Flow, LFE5UM5G_85F_EVN};
+    use super::{
+        ECP5_QOR_TARGET_MHZ, Ecp5Flow, LFE5UM5G_85F_EVN, MappingOptions, TimingClockConstraint,
+        TimingConstraints, map_to_ecp5_with_timing_constraints,
+    };
 
     #[test]
     fn board_profile_selects_the_exact_fpga() {
@@ -396,6 +459,60 @@ mod tests {
                 .any(|args| args == ["--placer-heap-timingweight", "30"])
         );
         assert_eq!(ECP5_QOR_TARGET_MHZ, 300);
+    }
+
+    #[test]
+    fn mapped_timing_is_passed_to_every_physical_run() {
+        let mut source = Netlist::new("timed");
+        let clock = source.add_input("clock");
+        let data = source.add_input("data");
+        let output = source.add_register_output("output_q");
+        source.add_register(RegisterCell::new(
+            "output_q",
+            output,
+            data,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("output", output);
+        let constraints = TimingConstraints::new().with_clock(
+            "core",
+            TimingClockConstraint {
+                port: "clock".into(),
+                period_ps: 10_000,
+                uncertainty_ps: 100,
+            },
+        );
+        let mapped =
+            map_to_ecp5_with_timing_constraints(&source, MappingOptions::default(), &constraints)
+                .unwrap();
+        let flow = Ecp5Flow::evaluation_board_for_netlist(&mapped, "build/timed");
+
+        let (path, source) = flow.timing_constraints_artifact().unwrap();
+        assert_eq!(path, "build/timed/design.timing.py");
+        assert!(source.contains("ctx.addClock(\"clock\", 1000000.0 / 9900)"));
+        let commands = [
+            flow.place_and_route_command(),
+            flow.draft_place_and_route_command(),
+            flow.refined_place_and_route_command(),
+            flow.physical_candidate_place_and_route_commands(2)[1].clone(),
+        ];
+        for command in commands {
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|args| { args == ["--pre-pack", "build/timed/design.timing.py"] })
+            );
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--freq", "102"])
+            );
+        }
     }
 
     #[test]
