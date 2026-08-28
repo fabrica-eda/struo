@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory,
-    Module as RtlModule, Polarity, Port, PortDirection, Register, Reset, ResetMode, SignalId,
-    SignalSlice, StateDomain, UnaryOp, ValueType,
+    Module as RtlModule, PlacementRegion, Polarity, Port, PortDirection, Register, Reset,
+    ResetMode, SignalId, SignalSlice, StateDomain, UnaryOp, ValueType,
 };
 use veryl_analyzer::ir::{
     AssignDestination, CasePattern, CaseStatement, Component, Comptime, Declaration, Expression,
@@ -508,7 +508,8 @@ impl<'a> ModuleLowerer<'a> {
             .chain(std::iter::once(resolve_name(instance.name)?))
             .collect::<Vec<_>>()
             .join(".");
-        let inline_signals = self.inline_module(&child.rtl, &prefix)?;
+        let region = placement_region(instance)?;
+        let inline_signals = self.inline_module(&child.rtl, &prefix, region)?;
         let parent_env = self.read_env()?;
         self.lower_instance_inputs(instance, &child, &inline_signals, &parent_env)?;
         self.lower_instance_outputs(instance, &child, &inline_signals)?;
@@ -647,6 +648,7 @@ impl<'a> ModuleLowerer<'a> {
         &mut self,
         child: &RtlModule,
         prefix: &str,
+        enclosing_region: Option<PlacementRegion>,
     ) -> Result<HashMap<SignalId, SignalId>, ImportError> {
         if !child.instances().is_empty() {
             return Err(ImportError::UnsupportedBehavior(
@@ -693,6 +695,12 @@ impl<'a> ModuleLowerer<'a> {
                     expression.r#type().width,
                 )?,
             };
+            if let Some(region) = child
+                .expression_placement(expression.id())
+                .or(enclosing_region)
+            {
+                self.rtl.set_expression_placement(mapped, region)?;
+            }
             expressions.insert(expression.id(), mapped);
         }
 
@@ -706,9 +714,23 @@ impl<'a> ModuleLowerer<'a> {
                 expressions[&assignment.value],
             )?;
         }
+        self.inline_registers(child, prefix, &signals, &expressions, enclosing_region)?;
+        self.inline_memories(child, prefix, &signals, &expressions, enclosing_region)?;
+        Ok(signals)
+    }
+
+    fn inline_registers(
+        &mut self,
+        child: &RtlModule,
+        prefix: &str,
+        signals: &HashMap<SignalId, SignalId>,
+        expressions: &HashMap<ExprId, ExprId>,
+        enclosing_region: Option<PlacementRegion>,
+    ) -> Result<(), ImportError> {
         for register in child.registers() {
+            let name = format!("{prefix}.{}", register.name);
             self.rtl.add_register(Register {
-                name: format!("{prefix}.{}", register.name),
+                name: name.clone(),
                 target: signals[&register.target],
                 next: expressions[&register.next],
                 clock: signals[&register.clock],
@@ -724,10 +746,28 @@ impl<'a> ModuleLowerer<'a> {
                     value: expressions[&reset.value],
                 }),
             })?;
+            if let Some(region) = child
+                .register_placement(&register.name)
+                .or(enclosing_region)
+            {
+                self.rtl.set_register_placement(&name, region)?;
+            }
         }
+        Ok(())
+    }
+
+    fn inline_memories(
+        &mut self,
+        child: &RtlModule,
+        prefix: &str,
+        signals: &HashMap<SignalId, SignalId>,
+        expressions: &HashMap<ExprId, ExprId>,
+        enclosing_region: Option<PlacementRegion>,
+    ) -> Result<(), ImportError> {
         for memory in child.memories() {
+            let name = format!("{prefix}.{}", memory.name);
             self.rtl.add_memory(Memory {
-                name: format!("{prefix}.{}", memory.name),
+                name: name.clone(),
                 word: memory.word,
                 depth: memory.depth,
                 read_latency: memory.read_latency,
@@ -746,8 +786,11 @@ impl<'a> ModuleLowerer<'a> {
                 clock: signals[&memory.clock],
                 edge: memory.edge,
             });
+            if let Some(region) = child.memory_placement(&memory.name).or(enclosing_region) {
+                self.rtl.set_memory_placement(&name, region)?;
+            }
         }
-        Ok(signals)
+        Ok(())
     }
 
     fn destination_slice(
@@ -1675,6 +1718,76 @@ fn memory_policy_value(text: &str) -> Option<&str> {
     )
 }
 
+fn placement_region(instance: &InstDeclaration) -> Result<Option<PlacementRegion>, ImportError> {
+    let mut region = None;
+    for attribute in attribute_table::get(&instance.token.beg) {
+        let VerylAttribute::Sv(value) = attribute else {
+            continue;
+        };
+        let raw = veryl_parser::resource_table::get_str_value(value)
+            .ok_or(ImportError::MissingResourceString)?;
+        let text = veryl_analyzer::value::unescape_string_literal_to_string(&raw);
+        let Some(value) = placement_region_value(&text) else {
+            continue;
+        };
+        let parsed = parse_placement_region(value).map_err(|reason| {
+            ImportError::InvalidPlacementRegion {
+                instance: resolve_name(instance.name).unwrap_or_else(|_| instance.name.to_string()),
+                value: value.to_owned(),
+                reason,
+            }
+        })?;
+        if let Some(previous) = region
+            && previous != parsed
+        {
+            return Err(ImportError::ConflictingPlacementRegions(
+                resolve_name(instance.name).unwrap_or_else(|_| instance.name.to_string()),
+            ));
+        }
+        region = Some(parsed);
+    }
+    Ok(region)
+}
+
+fn placement_region_value(text: &str) -> Option<&str> {
+    let (key, value) = text.split_once('=')?;
+    if key.trim() != "struo_region" {
+        return None;
+    }
+    let value = value.trim();
+    Some(
+        value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value)
+            .trim(),
+    )
+}
+
+fn parse_placement_region(value: &str) -> Result<PlacementRegion, String> {
+    let (lower, upper) = value
+        .split_once(':')
+        .ok_or_else(|| "expected `x_min,y_min:x_max,y_max`".to_owned())?;
+    let parse_point = |point: &str| {
+        let (x, y) = point
+            .split_once(',')
+            .ok_or_else(|| "expected each point as `x,y`".to_owned())?;
+        if y.contains(',') {
+            return Err("expected exactly two coordinates per point".to_owned());
+        }
+        let parse_coordinate = |coordinate: &str| {
+            coordinate
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "coordinates must be non-negative integers".to_owned())
+        };
+        Ok((parse_coordinate(x)?, parse_coordinate(y)?))
+    };
+    let (x_min, y_min) = parse_point(lower)?;
+    let (x_max, y_max) = parse_point(upper)?;
+    PlacementRegion::new(x_min, y_min, x_max, y_max).map_err(|error| error.to_string())
+}
+
 enum MemoryStatementPattern {
     Write {
         memory: VarId,
@@ -1886,6 +1999,7 @@ mod tests {
     use struo_synth::synthesize;
     use struo_target_ecp5::{JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg};
 
+    use super::parse_placement_region;
     use crate::{ImportError, analyze_and_lower};
 
     const SOURCE: &str = r"
@@ -1931,6 +2045,37 @@ module AddWithCarry (
     }
 }
 ";
+
+    const PLACEMENT_REGION_SOURCE: &str = r#"
+module RegionChild (
+    clk   : input  clock_posedge,
+    value : input  logic<4>,
+    result: output logic<4>,
+) {
+    var state: logic<4>;
+
+    always_ff (clk) {
+        state = value ^ 4'ha;
+    }
+
+    always_comb {
+        result = state;
+    }
+}
+
+module RegionTop (
+    clk   : input  clock_posedge,
+    value : input  logic<4>,
+    result: output logic<4>,
+) {
+    #[sv("struo_region = \"10,5:30,20\"")]
+    inst placed: RegionChild (
+        clk   : clk   ,
+        value : value ,
+        result: result,
+    );
+}
+"#;
 
     const HIERARCHY_SOURCE: &str = r"
 interface ByteBus {
@@ -2350,6 +2495,46 @@ module StructInstanceTop (
 
         assert_eq!(synthesized.netlist.arithmetic().len(), 1);
         assert!(synthesized.netlist.arithmetic()[0].carry_in().is_some());
+    }
+
+    #[test]
+    fn carries_instance_placement_regions_through_ecp5_mapping() {
+        let design = analyze_and_lower(
+            PLACEMENT_REGION_SOURCE,
+            "placement_region_lowering",
+            "RegionTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+        let region = struo_rtl::PlacementRegion::new(10, 5, 30, 20).unwrap();
+        assert_eq!(top.register_placement("placed.state"), Some(region));
+
+        let synthesized = synthesize(&design).unwrap();
+        assert!(synthesized.netlist.has_placement_constraints());
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        assert!(!mapped.placement_regions().is_empty());
+        assert_eq!(mapped.placement_regions().len(), mapped.cells().len());
+        assert!(
+            mapped
+                .placement_regions()
+                .values()
+                .all(|placement| placement.x_min == 10
+                    && placement.y_min == 5
+                    && placement.x_max == 30
+                    && placement.y_max == 20)
+        );
+        assert!(mapped.to_nextpnr_json().unwrap().contains("STRUO_REGION"));
+        assert!(mapped.nextpnr_region_script().is_some());
+    }
+
+    #[test]
+    fn validates_placement_region_coordinates() {
+        let region = parse_placement_region(" 1, 2 : 30, 40 ").unwrap();
+        assert_eq!((region.x_min, region.y_min), (1, 2));
+        assert_eq!((region.x_max, region.y_max), (30, 40));
+        assert!(parse_placement_region("30,2:1,40").is_err());
+        assert!(parse_placement_region("-1,2:3,4").is_err());
+        assert!(parse_placement_region("1,2,3:4,5").is_err());
     }
 
     #[test]

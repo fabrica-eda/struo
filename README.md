@@ -489,6 +489,42 @@ done
 Module instances are flattened before synthesis; the implemented path consumes
 analyzer AIR directly and does not depend on generated Verilog.
 
+### Placement regions from Veryl
+
+Attach an inclusive nextpnr tile rectangle to a module instance with the
+portable SystemVerilog-attribute escape:
+
+```veryl
+#[sv("struo_region = \"10,5:30,20\"")]
+inst core: ProcessingCore (
+    clk   : clk,
+    input : request,
+    output: response,
+);
+```
+
+The value is `x_min,y_min:x_max,y_max`; all coordinates are non-negative and
+the lower bounds must not exceed the upper bounds. Struo carries the region
+through hierarchy flattening, RTL synthesis, and ECP5 mapping to the LUT, FF,
+carry, and block-RAM cells owned by the instance. A region on a nested instance
+overrides its containing instance. Invalid or conflicting attributes are hard
+errors. Automatic mapped-cell retiming and physical-feedback rewrites are not
+applied to a floorplanned design because those transforms change physical
+ownership boundaries.
+
+When `--output build/design.json` contains placement regions, the CLI also
+writes `build/design.regions.py`. Pass it to nextpnr after packing:
+
+```sh
+nextpnr-ecp5 --um5g-85k --package CABGA381 --speed 8 \
+  --json build/design.json --pre-place build/design.regions.py \
+  --lpf board.lpf --textcfg build/design.config --freq 300
+```
+
+The mapped JSON retains each rectangle as a `STRUO_REGION` cell attribute, and
+the generated pre-place script converts equal rectangles into native nextpnr
+regions before placement.
+
 The BRAM inference contract is intentionally explicit: read and write ports
 share one clock edge, reads have one-cycle latency, writes cover the whole word,
 and arrays have one unpacked dimension with at most 16,384 words. Memory reset,

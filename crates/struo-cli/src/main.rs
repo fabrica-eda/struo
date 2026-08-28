@@ -28,7 +28,7 @@ struct Cli {
     #[arg(short, long)]
     top: String,
 
-    /// Write the mapped nextpnr JSON here.
+    /// Write mapped JSON here and, when needed, a sibling `.regions.py` file.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -306,6 +306,11 @@ fn synthesize_and_map(
         }
         std::fs::write(path, mapped.to_nextpnr_json()?)?;
         println!("{}", path.display());
+        if let Some(script) = mapped.nextpnr_region_script() {
+            let script_path = path.with_extension("regions.py");
+            std::fs::write(&script_path, script)?;
+            println!("{}", script_path.display());
+        }
     }
     Ok(())
 }

@@ -7,11 +7,12 @@ use std::num::NonZeroU32;
 
 use struo_ir::{
     ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, ComparisonOp, EnableControl, MemoryCell,
-    NetId, Netlist, NodeKind, RegisterCell, ResetControl, ValidationError,
+    NetId, Netlist, NodeKind, PlacementRegion as IrPlacementRegion, RegisterCell, ResetControl,
+    ValidationError,
 };
 use struo_rtl::{
-    BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, Polarity, PortDirection, ResetMode,
-    RtlError, SignalId, UnaryOp,
+    BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, PlacementRegion as RtlPlacementRegion,
+    Polarity, PortDirection, ResetMode, RtlError, SignalId, UnaryOp,
 };
 
 /// Verifies hardware-semantic RTL before any information-losing lowering.
@@ -128,13 +129,21 @@ fn reject_unsupported(module: &Module) -> Result<(), SynthesisError> {
 
 type Driver = (ExprId, usize);
 
+#[derive(Clone, Copy)]
+enum LogicOperation {
+    And,
+    Or,
+    Xor,
+}
+
 struct Lowering<'a> {
     module: &'a Module,
     netlist: Netlist,
     signal_bits: Vec<Vec<Option<NetId>>>,
     drivers: Vec<Vec<Option<Driver>>>,
-    expression_bits: Vec<Option<Vec<NetId>>>,
+    expression_bits: HashMap<(ExprId, Option<IrPlacementRegion>), Vec<NetId>>,
     resolving: HashSet<(SignalId, usize)>,
+    current_placement: Option<IrPlacementRegion>,
 }
 
 impl<'a> Lowering<'a> {
@@ -154,8 +163,9 @@ impl<'a> Lowering<'a> {
             netlist: Netlist::new(module.name()),
             signal_bits,
             drivers,
-            expression_bits: vec![None; module.expressions().len()],
+            expression_bits: HashMap::new(),
             resolving: HashSet::new(),
+            current_placement: None,
         }
     }
 
@@ -172,23 +182,29 @@ impl<'a> Lowering<'a> {
         }
         for register in self.module.registers() {
             let target = &self.module.signals()[register.target.index() as usize];
+            let placement = self
+                .module
+                .register_placement(&register.name)
+                .map(lower_placement);
             for bit in 0..target.r#type().width.get() as usize {
-                let net = self.netlist.add_register_output(bit_name(
-                    &register.name,
-                    target.r#type().width.get(),
-                    bit,
-                ));
+                let net = self.netlist.add_register_output_with_placement(
+                    bit_name(&register.name, target.r#type().width.get(), bit),
+                    placement,
+                );
                 self.signal_bits[register.target.index() as usize][bit] = Some(net);
             }
         }
         for memory in self.module.memories() {
             let target = &self.module.signals()[memory.read_data.index() as usize];
+            let placement = self
+                .module
+                .memory_placement(&memory.name)
+                .map(lower_placement);
             for bit in 0..target.r#type().width.get() as usize {
-                let net = self.netlist.add_memory_output(bit_name(
-                    &memory.name,
-                    target.r#type().width.get(),
-                    bit,
-                ));
+                let net = self.netlist.add_memory_output_with_placement(
+                    bit_name(&memory.name, target.r#type().width.get(), bit),
+                    placement,
+                );
                 self.signal_bits[memory.read_data.index() as usize][bit] = Some(net);
             }
         }
@@ -345,15 +361,35 @@ impl<'a> Lowering<'a> {
     }
 
     fn lower_expression(&mut self, id: ExprId) -> Result<Vec<NetId>, SynthesisError> {
-        let index = id.index() as usize;
-        if let Some(bits) = &self.expression_bits[index] {
+        let inherited_placement = self.current_placement;
+        let placement = self
+            .module
+            .expression_placement(id)
+            .map(lower_placement)
+            .or(inherited_placement);
+        if let Some(bits) = self.expression_bits.get(&(id, placement)) {
             return Ok(bits.clone());
         }
+        self.current_placement = placement;
+        let result = self.lower_expression_uncached(id);
+        self.current_placement = inherited_placement;
+        let bits = result?;
+        self.expression_bits.insert((id, placement), bits.clone());
+        Ok(bits)
+    }
+
+    fn lower_expression_uncached(&mut self, id: ExprId) -> Result<Vec<NetId>, SynthesisError> {
+        let index = id.index() as usize;
         let expression = &self.module.expressions()[index];
         let width = expression.r#type().width.get() as usize;
         let bits = match expression.kind().clone() {
             ExprKind::Signal(slice) => (0..slice.width.get() as usize)
-                .map(|offset| self.resolve_signal_bit(slice.signal, slice.lsb as usize + offset))
+                .map(|offset| {
+                    self.resolve_signal_bit_without_inheritance(
+                        slice.signal,
+                        slice.lsb as usize + offset,
+                    )
+                })
                 .collect::<Result<_, _>>()?,
             ExprKind::Constant(value) => (0..value.width().get())
                 .map(|bit| self.netlist.add_constant(value.bit(bit)))
@@ -361,13 +397,10 @@ impl<'a> Lowering<'a> {
             ExprKind::Unary { op, input } => {
                 let input = self.lower_expression(input)?;
                 match op {
-                    UnaryOp::BitNot => input
-                        .into_iter()
-                        .map(|net| self.netlist.add_not(net))
-                        .collect(),
+                    UnaryOp::BitNot => input.into_iter().map(|net| self.add_not(net)).collect(),
                     UnaryOp::LogicNot => {
                         let reduced = self.reduce_or(&input);
-                        vec![self.netlist.add_not(reduced)]
+                        vec![self.add_not(reduced)]
                     }
                     UnaryOp::ReduceOr => vec![self.reduce_or(&input)],
                     UnaryOp::ReduceAnd => vec![self.reduce_and(&input)],
@@ -396,7 +429,7 @@ impl<'a> Lowering<'a> {
                 then_bits
                     .into_iter()
                     .zip(else_bits)
-                    .map(|(then_net, else_net)| self.netlist.add_mux(condition, then_net, else_net))
+                    .map(|(then_net, else_net)| self.add_mux(condition, then_net, else_net))
                     .collect()
             }
             ExprKind::Concat(parts) => {
@@ -410,8 +443,18 @@ impl<'a> Lowering<'a> {
                 self.lower_expression_range(input, lsb as usize, width)?
             }
         };
-        self.expression_bits[index] = Some(bits.clone());
         Ok(bits)
+    }
+
+    fn resolve_signal_bit_without_inheritance(
+        &mut self,
+        signal: SignalId,
+        bit: usize,
+    ) -> Result<NetId, SynthesisError> {
+        let placement = self.current_placement.take();
+        let result = self.resolve_signal_bit(signal, bit);
+        self.current_placement = placement;
+        result
     }
 
     fn lower_add_with_carry(
@@ -437,7 +480,7 @@ impl<'a> Lowering<'a> {
         let carry = self.lower_expression(carry)?[0];
         Ok(Some(
             self.netlist
-                .add_arithmetic_with_carry(&lhs, &rhs, carry)
+                .add_arithmetic_with_carry_and_placement(&lhs, &rhs, carry, self.current_placement)
                 .expect("validated RTL carry addition has equal, non-zero widths"),
         ))
     }
@@ -536,21 +579,26 @@ impl<'a> Lowering<'a> {
 
     fn lower_binary(&mut self, op: BinaryOp, lhs: &[NetId], rhs: &[NetId]) -> Vec<NetId> {
         match op {
-            BinaryOp::And => self.bitwise(lhs, rhs, Netlist::add_and),
-            BinaryOp::Or => self.bitwise(lhs, rhs, Netlist::add_or),
-            BinaryOp::Xor => self.bitwise(lhs, rhs, Netlist::add_xor),
+            BinaryOp::And => self.bitwise(lhs, rhs, LogicOperation::And),
+            BinaryOp::Or => self.bitwise(lhs, rhs, LogicOperation::Or),
+            BinaryOp::Xor => self.bitwise(lhs, rhs, LogicOperation::Xor),
             BinaryOp::Add => self
                 .netlist
-                .add_arithmetic(ArithmeticOp::Add, lhs, rhs)
+                .add_arithmetic_with_placement(ArithmeticOp::Add, lhs, rhs, self.current_placement)
                 .expect("validated RTL arithmetic has equal, non-zero widths"),
             BinaryOp::Sub => self
                 .netlist
-                .add_arithmetic(ArithmeticOp::Subtract, lhs, rhs)
+                .add_arithmetic_with_placement(
+                    ArithmeticOp::Subtract,
+                    lhs,
+                    rhs,
+                    self.current_placement,
+                )
                 .expect("validated RTL arithmetic has equal, non-zero widths"),
             BinaryOp::Equal => vec![self.equal_words(lhs, rhs)],
             BinaryOp::NotEqual => {
                 let equal = self.equal_words(lhs, rhs);
-                vec![self.netlist.add_not(equal)]
+                vec![self.add_not(equal)]
             }
             BinaryOp::LessThanUnsigned => self.compare(ComparisonOp::LessThanUnsigned, lhs, rhs),
             BinaryOp::LessThanSigned => self.compare(ComparisonOp::LessThanSigned, lhs, rhs),
@@ -577,27 +625,22 @@ impl<'a> Lowering<'a> {
             .iter()
             .zip(rhs)
             .map(|(&lhs, &rhs)| {
-                let different = self.netlist.add_xor(lhs, rhs);
-                self.netlist.add_not(different)
+                let different = self.add_logic(LogicOperation::Xor, lhs, rhs);
+                self.add_not(different)
             })
             .collect::<Vec<_>>();
-        self.reduce_tree(&same, true, Netlist::add_and)
+        self.reduce_tree(&same, true, LogicOperation::And)
     }
 
     fn compare(&mut self, operation: ComparisonOp, lhs: &[NetId], rhs: &[NetId]) -> Vec<NetId> {
         vec![
             self.netlist
-                .add_comparison(operation, lhs, rhs)
+                .add_comparison_with_placement(operation, lhs, rhs, self.current_placement)
                 .expect("validated RTL comparisons have equal, non-zero widths"),
         ]
     }
 
-    fn reduce_tree(
-        &mut self,
-        bits: &[NetId],
-        identity: bool,
-        operation: fn(&mut Netlist, NetId, NetId) -> NetId,
-    ) -> NetId {
+    fn reduce_tree(&mut self, bits: &[NetId], identity: bool, operation: LogicOperation) -> NetId {
         if bits.is_empty() {
             return self.netlist.add_constant(identity);
         }
@@ -606,7 +649,7 @@ impl<'a> Lowering<'a> {
             let mut next = Vec::with_capacity(level.len().div_ceil(2));
             for pair in level.chunks(2) {
                 if let [lhs, rhs] = pair {
-                    next.push(operation(&mut self.netlist, *lhs, *rhs));
+                    next.push(self.add_logic(operation, *lhs, *rhs));
                 } else {
                     next.push(pair[0]);
                 }
@@ -630,7 +673,7 @@ impl<'a> Lowering<'a> {
             result = shifted
                 .into_iter()
                 .zip(result)
-                .map(|(shifted, original)| self.netlist.add_mux(select, shifted, original))
+                .map(|(shifted, original)| self.add_mux(select, shifted, original))
                 .collect();
         }
         result
@@ -656,34 +699,56 @@ impl<'a> Lowering<'a> {
             result = shifted
                 .into_iter()
                 .zip(result)
-                .map(|(shifted, original)| self.netlist.add_mux(select, shifted, original))
+                .map(|(shifted, original)| self.add_mux(select, shifted, original))
                 .collect();
         }
         result
     }
 
-    fn bitwise(
-        &mut self,
-        lhs: &[NetId],
-        rhs: &[NetId],
-        operation: fn(&mut Netlist, NetId, NetId) -> NetId,
-    ) -> Vec<NetId> {
+    fn bitwise(&mut self, lhs: &[NetId], rhs: &[NetId], operation: LogicOperation) -> Vec<NetId> {
         lhs.iter()
             .zip(rhs)
-            .map(|(&lhs, &rhs)| operation(&mut self.netlist, lhs, rhs))
+            .map(|(&lhs, &rhs)| self.add_logic(operation, lhs, rhs))
             .collect()
     }
 
+    fn add_logic(&mut self, operation: LogicOperation, lhs: NetId, rhs: NetId) -> NetId {
+        match operation {
+            LogicOperation::And => {
+                self.netlist
+                    .add_and_with_placement(lhs, rhs, self.current_placement)
+            }
+            LogicOperation::Or => {
+                self.netlist
+                    .add_or_with_placement(lhs, rhs, self.current_placement)
+            }
+            LogicOperation::Xor => {
+                self.netlist
+                    .add_xor_with_placement(lhs, rhs, self.current_placement)
+            }
+        }
+    }
+
+    fn add_not(&mut self, input: NetId) -> NetId {
+        self.netlist
+            .add_not_with_placement(input, self.current_placement)
+    }
+
+    fn add_mux(&mut self, condition: NetId, then_net: NetId, else_net: NetId) -> NetId {
+        self.netlist
+            .add_mux_with_placement(condition, then_net, else_net, self.current_placement)
+    }
+
     fn reduce_or(&mut self, bits: &[NetId]) -> NetId {
-        self.reduce_tree(bits, false, Netlist::add_or)
+        self.reduce_tree(bits, false, LogicOperation::Or)
     }
 
     fn reduce_and(&mut self, bits: &[NetId]) -> NetId {
-        self.reduce_tree(bits, true, Netlist::add_and)
+        self.reduce_tree(bits, true, LogicOperation::And)
     }
 
     fn reduce_xor(&mut self, bits: &[NetId]) -> NetId {
-        self.reduce_tree(bits, false, Netlist::add_xor)
+        self.reduce_tree(bits, false, LogicOperation::Xor)
     }
 }
 
@@ -699,6 +764,15 @@ fn lower_polarity(polarity: Polarity) -> ActiveLevel {
     match polarity {
         Polarity::ActiveHigh => ActiveLevel::High,
         Polarity::ActiveLow => ActiveLevel::Low,
+    }
+}
+
+const fn lower_placement(region: RtlPlacementRegion) -> IrPlacementRegion {
+    IrPlacementRegion {
+        x_min: region.x_min,
+        y_min: region.y_min,
+        x_max: region.x_max,
+        y_max: region.y_max,
     }
 }
 
