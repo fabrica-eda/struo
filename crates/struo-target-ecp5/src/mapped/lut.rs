@@ -1,15 +1,16 @@
-//! Four-input cut analysis, cover selection, and LUT emission.
+//! ECP5 LUT4/wide-LUT cut analysis, cover selection, and emission.
 
 use std::collections::BTreeSet;
 
 use struo_ir::{ArithmeticCell, NetId, Netlist, NodeKind};
 
 use super::{
-    ArithmeticMapping, Bit, Ecp5Cell, IoTimingConstraints, MappingOptions, node_for, wire_for,
-    wire_number,
+    ArithmeticMapping, Bit, Ecp5Cell, IoTimingConstraints, L6_MUX_DELAY_PS, MappingOptions,
+    PFU_MUX_DELAY_PS, node_for, wire_for, wire_number,
 };
 
 const LUT_INPUTS: usize = 4;
+pub(super) const WIDE_LUT_INPUTS: usize = 6;
 const CUT_LIMIT: usize = 64;
 const MAX_AREA_RECOVERY_PASSES: usize = 8;
 const CRITICALITY_NUMERATOR: u32 = 15;
@@ -40,13 +41,14 @@ pub(super) struct CutDatabase {
 }
 
 impl CutDatabase {
-    pub(super) fn analyze(netlist: &Netlist) -> Self {
+    pub(super) fn analyze(netlist: &Netlist, max_inputs: usize) -> Self {
+        debug_assert!((LUT_INPUTS..=WIDE_LUT_INPUTS).contains(&max_inputs));
         let cuts = netlist
             .nodes()
             .iter()
             .map(|node| {
                 if is_boolean(node.kind()) {
-                    enumerate_cuts(netlist, node.output())
+                    enumerate_cuts(netlist, node.output(), max_inputs)
                         .into_iter()
                         .map(|leaves| Cut { leaves })
                         .collect()
@@ -69,6 +71,7 @@ struct LutPlan {
     depth: usize,
     arrival_ps: Option<u32>,
     area: usize,
+    root_area: usize,
 }
 
 /// Required-time-aware cover selected from a feasible-cut database.
@@ -546,8 +549,14 @@ fn required_times(
                 let plan = plans[index]
                     .as_ref()
                     .expect("a Boolean node has a LUT plan");
-                for leaf in &plan.leaves {
-                    tighten_required(*leaf, required[index], LUT_DELAY_PS, fanouts, &mut required);
+                for (leaf_index, leaf) in plan.leaves.iter().enumerate() {
+                    tighten_required(
+                        *leaf,
+                        required[index],
+                        wide_lut_input_delay_ps(plan.leaves.len(), leaf_index),
+                        fanouts,
+                        &mut required,
+                    );
                 }
             }
             NodeKind::ArithmeticOutput(_) | NodeKind::ComparisonOutput(_) => {
@@ -625,10 +634,10 @@ impl RecoveryContext<'_> {
                             .is_none_or(|arrival| arrival <= required[index])
                     })
                     .map(|plan| {
-                        let area = reference_leaves(&plan.leaves, plans, &mut references);
+                        let leaf_area = reference_leaves(&plan.leaves, plans, &mut references);
                         let removed = dereference_leaves(&plan.leaves, plans, &mut references);
-                        debug_assert_eq!(area, removed);
-                        (area, plan)
+                        debug_assert_eq!(leaf_area, removed);
+                        (plan.root_area + leaf_area, plan)
                     })
                     .min_by_key(|(area, plan)| {
                         (
@@ -642,11 +651,13 @@ impl RecoveryContext<'_> {
                 changed |=
                     replacement.leaves != plans[index].as_ref().expect("checked above").leaves;
                 reference_leaves(&replacement.leaves, plans, &mut references);
-                for leaf in &replacement.leaves {
+                for (position, leaf) in replacement.leaves.iter().enumerate() {
                     let leaf_index = leaf.index() as usize;
                     if plans[leaf_index].is_some() {
-                        let required_leaf = required[index]
-                            .saturating_sub(LUT_DELAY_PS + wire_delay_ps(self.fanouts[leaf_index]));
+                        let required_leaf = required[index].saturating_sub(
+                            wide_lut_input_delay_ps(replacement.leaves.len(), position)
+                                + wire_delay_ps(self.fanouts[leaf_index]),
+                        );
                         required[leaf_index] = required[leaf_index].min(required_leaf);
                     }
                 }
@@ -727,7 +738,7 @@ fn reference_node(net: NetId, plans: &[Option<LutPlan>], references: &mut [usize
     if references[index] > 1 {
         return 0;
     }
-    1 + reference_leaves(&plan.leaves, plans, references)
+    plan.root_area + reference_leaves(&plan.leaves, plans, references)
 }
 
 fn dereference_leaves(
@@ -751,7 +762,7 @@ fn dereference_node(net: NetId, plans: &[Option<LutPlan>], references: &mut [usi
     if references[index] > 0 {
         return 0;
     }
-    1 + dereference_leaves(&plan.leaves, plans, references)
+    plan.root_area + dereference_leaves(&plan.leaves, plans, references)
 }
 
 /// Materializes only the selected LUT cover reachable from requested roots.
@@ -805,21 +816,103 @@ impl<'a> LutEmitter<'a> {
             .plan(net)
             .cloned()
             .expect("only Boolean logic requires a LUT plan");
-        let mut inputs = [Bit::Zero; LUT_INPUTS];
-        for (target, leaf) in inputs.iter_mut().zip(&plan.leaves) {
-            *target = self.map_net(*leaf);
-        }
-
         let output = wire_number(net);
-        self.cells.push(Ecp5Cell::Lut4 {
-            name: format!("lut{}", net.index()),
-            inputs,
-            output,
-            init: cut_truth_table(self.netlist, net, &plan.leaves),
-        });
+        let inputs = plan
+            .leaves
+            .iter()
+            .map(|leaf| self.map_net(*leaf))
+            .collect::<Vec<_>>();
+        let truth = cut_truth_table(self.netlist, net, &plan.leaves);
+        self.emit_lut_plan(net, &inputs, output, truth);
         let bit = Bit::Wire(output);
         self.bits[net.index() as usize] = Some(bit);
         bit
+    }
+
+    fn emit_lut_plan(&mut self, net: NetId, inputs: &[Bit], output: u32, truth: u64) {
+        match inputs.len() {
+            0..=LUT_INPUTS => self.emit_lut4(
+                format!("lut{}", net.index()),
+                inputs,
+                output,
+                lut4_init(truth, inputs.len()),
+            ),
+            5 => self.emit_lut5(net, inputs, output, truth),
+            6 => self.emit_lut6(net, inputs, output, truth),
+            _ => unreachable!("the cut database limits ECP5 LUTs to six inputs"),
+        }
+    }
+
+    fn emit_lut4(&mut self, name: String, inputs: &[Bit], output: u32, init: u16) {
+        let mut padded = [Bit::Zero; LUT_INPUTS];
+        padded[..inputs.len()].copy_from_slice(inputs);
+        self.cells.push(Ecp5Cell::Lut4 {
+            name,
+            inputs: padded,
+            output,
+            init,
+        });
+    }
+
+    fn emit_lut5(&mut self, net: NetId, inputs: &[Bit], output: u32, truth: u64) {
+        let data_zero = self.fresh_wire();
+        let data_one = self.fresh_wire();
+        self.emit_lut4(
+            format!("lut{}_wide0", net.index()),
+            &inputs[..4],
+            data_zero,
+            low_lut4_init(truth),
+        );
+        self.emit_lut4(
+            format!("lut{}_wide1", net.index()),
+            &inputs[..4],
+            data_one,
+            low_lut4_init(truth >> 16),
+        );
+        self.cells.push(Ecp5Cell::PfuMux {
+            name: format!("lut{}", net.index()),
+            lut_true: Bit::Wire(data_one),
+            lut_false: Bit::Wire(data_zero),
+            select: inputs[4],
+            output,
+        });
+    }
+
+    fn emit_lut6(&mut self, net: NetId, inputs: &[Bit], output: u32, truth: u64) {
+        let mut cofactors = [0u32; 4];
+        for (cofactor, chunk) in cofactors.iter_mut().enumerate() {
+            *chunk = self.fresh_wire();
+            self.emit_lut4(
+                format!("lut{}_wide{cofactor}", net.index()),
+                &inputs[..4],
+                *chunk,
+                low_lut4_init(truth >> (cofactor * 16)),
+            );
+        }
+        let data_zero = self.fresh_wire();
+        let data_one = self.fresh_wire();
+        for (index, (lut_false, lut_true, mux_output)) in [
+            (cofactors[0], cofactors[1], data_zero),
+            (cofactors[2], cofactors[3], data_one),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.cells.push(Ecp5Cell::PfuMux {
+                name: format!("lut{}_pfumx{index}", net.index()),
+                lut_true: Bit::Wire(lut_true),
+                lut_false: Bit::Wire(lut_false),
+                select: inputs[4],
+                output: mux_output,
+            });
+        }
+        self.cells.push(Ecp5Cell::L6Mux21 {
+            name: format!("lut{}", net.index()),
+            data_zero: Bit::Wire(data_zero),
+            data_one: Bit::Wire(data_one),
+            select: inputs[5],
+            output,
+        });
     }
 
     pub(super) fn alias_net(&mut self, net: NetId, bit: Bit) {
@@ -846,6 +939,18 @@ impl<'a> LutEmitter<'a> {
     pub(super) fn finish(self) -> (Vec<Option<Bit>>, Vec<Ecp5Cell>) {
         (self.bits, self.cells)
     }
+}
+
+fn lut4_init(truth: u64, inputs: usize) -> u16 {
+    let assignments = 1usize << inputs;
+    (0..16).fold(0, |init, assignment| {
+        let value = (truth >> (assignment % assignments)) & 1;
+        init | (u16::try_from(value).unwrap() << assignment)
+    })
+}
+
+fn low_lut4_init(truth: u64) -> u16 {
+    u16::try_from(truth & u64::from(u16::MAX)).unwrap()
 }
 
 fn best_plan(
@@ -898,37 +1003,72 @@ fn plan_for_cut(
     fanouts: &[usize],
     cut: &Cut,
 ) -> LutPlan {
-    let area = 1 + cut
-        .leaves
-        .iter()
-        .filter_map(|leaf| plans[leaf.index() as usize].as_ref())
-        .map(|plan| plan.area)
-        .sum::<usize>();
-    let arrival_ps = cut
-        .leaves
-        .iter()
-        .filter_map(|leaf| {
+    let mut leaves = cut.leaves.clone();
+    if leaves.len() > LUT_INPUTS {
+        leaves.sort_unstable_by_key(|leaf| {
             let index = leaf.index() as usize;
-            arrivals[index].map(|arrival| arrival + wire_delay_ps(fanouts[index]))
+            (
+                arrivals[index].unwrap_or(0) + wire_delay_ps(fanouts[index]),
+                *leaf,
+            )
+        });
+    }
+    let root_area = wide_lut_area(leaves.len());
+    let area = root_area
+        + leaves
+            .iter()
+            .filter_map(|leaf| plans[leaf.index() as usize].as_ref())
+            .map(|plan| plan.area)
+            .sum::<usize>();
+    let arrival_ps = leaves
+        .iter()
+        .enumerate()
+        .filter_map(|(position, leaf)| {
+            let index = leaf.index() as usize;
+            arrivals[index].map(|arrival| {
+                arrival
+                    + wire_delay_ps(fanouts[index])
+                    + wide_lut_input_delay_ps(leaves.len(), position)
+            })
         })
-        .max()
-        .map(|arrival| arrival + LUT_DELAY_PS);
-    let depth = 1 + cut
-        .leaves
+        .max();
+    let depth = 1 + leaves
         .iter()
         .filter_map(|leaf| plans[leaf.index() as usize].as_ref())
         .map(|plan| plan.depth)
         .max()
         .unwrap_or(0);
     LutPlan {
-        leaves: cut.leaves.clone(),
+        leaves,
         depth,
         arrival_ps,
         area,
+        root_area,
     }
 }
 
-fn enumerate_cuts(netlist: &Netlist, root: NetId) -> Vec<Vec<NetId>> {
+fn wide_lut_area(inputs: usize) -> usize {
+    match inputs {
+        0..=4 => 1,
+        5 => 2,
+        6 => 4,
+        _ => unreachable!("ECP5 wide LUTs support at most six inputs here"),
+    }
+}
+
+fn wide_lut_input_delay_ps(inputs: usize, position: usize) -> u32 {
+    match inputs {
+        0..=4 => LUT_DELAY_PS,
+        5 if position == 4 => PFU_MUX_DELAY_PS,
+        5 => LUT_DELAY_PS + PFU_MUX_DELAY_PS,
+        6 if position == 5 => L6_MUX_DELAY_PS,
+        6 if position == 4 => PFU_MUX_DELAY_PS + L6_MUX_DELAY_PS,
+        6 => LUT_DELAY_PS + PFU_MUX_DELAY_PS + L6_MUX_DELAY_PS,
+        _ => unreachable!("ECP5 wide LUTs support at most six inputs here"),
+    }
+}
+
+fn enumerate_cuts(netlist: &Netlist, root: NetId, max_inputs: usize) -> Vec<Vec<NetId>> {
     let mut first = node_for(netlist, root)
         .inputs()
         .iter()
@@ -964,7 +1104,7 @@ fn enumerate_cuts(netlist: &Netlist, root: NetId) -> Vec<Vec<NetId>> {
                 .collect::<Vec<_>>();
             expanded.sort_unstable();
             expanded.dedup();
-            if expanded.len() <= LUT_INPUTS && seen.insert(expanded.clone()) {
+            if expanded.len() <= max_inputs && seen.insert(expanded.clone()) {
                 cuts.push(expanded);
                 if cuts.len() == CUT_LIMIT {
                     break;
@@ -975,11 +1115,11 @@ fn enumerate_cuts(netlist: &Netlist, root: NetId) -> Vec<Vec<NetId>> {
     cuts
 }
 
-fn cut_truth_table(netlist: &Netlist, root: NetId, leaves: &[NetId]) -> u16 {
-    (0..16).fold(0, |table, assignment| {
+fn cut_truth_table(netlist: &Netlist, root: NetId, leaves: &[NetId]) -> u64 {
+    (0..(1u64 << leaves.len())).fold(0, |table, assignment| {
         let mut values = vec![None; netlist.nodes().len()];
         let value = evaluate_cut(netlist, root, leaves, assignment, &mut values);
-        table | (u16::from(value) << assignment)
+        table | (u64::from(value) << assignment)
     })
 }
 
@@ -987,7 +1127,7 @@ fn evaluate_cut(
     netlist: &Netlist,
     net: NetId,
     leaves: &[NetId],
-    assignment: u16,
+    assignment: u64,
     values: &mut [Option<bool>],
 ) -> bool {
     if let Some(index) = leaves.iter().position(|leaf| *leaf == net) {
@@ -1045,7 +1185,9 @@ mod tests {
 
     use struo_ir::{ArithmeticOp, Netlist};
 
-    use super::{ArithmeticMapping, Cut, RetainedTiming, best_plan, structural_fanouts};
+    use super::{
+        ArithmeticMapping, Cut, RetainedTiming, best_plan, plan_for_cut, structural_fanouts,
+    };
 
     #[test]
     fn carry_source_arrival_grows_toward_the_most_significant_bit() {
@@ -1103,6 +1245,32 @@ mod tests {
     }
 
     #[test]
+    fn wide_cut_places_the_latest_input_on_the_top_mux_select() {
+        let mut netlist = Netlist::new("wide_pin_order");
+        let inputs = (0..6)
+            .map(|index| netlist.add_input(format!("input{index}")))
+            .collect::<Vec<_>>();
+        let plans = vec![None; netlist.nodes().len()];
+        let mut arrivals = vec![Some(0); netlist.nodes().len()];
+        arrivals[inputs[0].index() as usize] = Some(1_000);
+        arrivals[inputs[1].index() as usize] = Some(500);
+        let fanouts = vec![1; netlist.nodes().len()];
+
+        let plan = plan_for_cut(
+            &plans,
+            &arrivals,
+            &fanouts,
+            &Cut {
+                leaves: inputs.clone(),
+            },
+        );
+
+        assert_eq!(plan.leaves[4], inputs[1]);
+        assert_eq!(plan.leaves[5], inputs[0]);
+        assert_eq!(plan.root_area, 4);
+    }
+
+    #[test]
     fn critical_timing_can_choose_a_faster_deeper_cut() {
         let mut netlist = Netlist::new("critical_cut");
         let slow_source = netlist.add_input("slow_source");
@@ -1114,6 +1282,7 @@ mod tests {
             depth: 1,
             arrival_ps: Some(500),
             area: 1,
+            root_area: 1,
         });
         let mut arrivals = vec![Some(0); netlist.nodes().len()];
         arrivals[slow_source.index() as usize] = Some(1_500);
