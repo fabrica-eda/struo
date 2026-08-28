@@ -2061,7 +2061,7 @@ fn map_to_ecp5_with_period(
     period_ps: u32,
     retiming_target_period_ps: u32,
 ) -> Result<Ecp5Netlist, MappingError> {
-    // A self-contained wide cut can implement arbitrary LUT5/LUT6 functions,
+    // A self-contained wide cut can implement arbitrary LUT5/LUT6/LUT7 functions,
     // while the conservative cover can reuse already mapped LUT outputs and
     // is often smaller for mux-heavy logic. Keep both candidates: the mapped
     // timing/area model, rather than syntax alone, decides which survives.
@@ -9095,6 +9095,57 @@ mod tests {
                 .filter(|cell| matches!(cell, Ecp5Cell::L6Mux21 { .. }))
                 .count(),
             1
+        );
+        assert!(verify_mapped_equivalence_proof(&mapped, false));
+    }
+
+    #[test]
+    fn maps_an_arbitrary_seven_input_function_to_a_lut7_cluster() {
+        let mut source = Netlist::new("seven_input_parity");
+        let inputs = source.add_input_port("inputs", NonZeroU32::new(7).unwrap());
+        let parity = inputs[1..]
+            .iter()
+            .fold(inputs[0], |value, input| source.add_xor(value, *input));
+        source.add_output("result", parity);
+        let constraints = IoTimingConstraints::new()
+            .with_input_delay_ps("inputs", 0)
+            .with_output_delay_ps("result", 0);
+
+        let mapped = map_to_ecp5_with_constraints(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 1_500,
+                ..MappingOptions::default()
+            },
+            &constraints,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+                .count(),
+            8,
+            "{:?}",
+            mapped.retiming()
+        );
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::PfuMux { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::L6Mux21 { .. }))
+                .count(),
+            3
         );
         assert!(verify_mapped_equivalence_proof(&mapped, false));
     }

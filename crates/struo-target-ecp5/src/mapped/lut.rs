@@ -10,7 +10,7 @@ use super::{
 };
 
 const LUT_INPUTS: usize = 4;
-pub(super) const WIDE_LUT_INPUTS: usize = 6;
+pub(super) const WIDE_LUT_INPUTS: usize = 7;
 const CUT_LIMIT: usize = 64;
 const MAX_AREA_RECOVERY_PASSES: usize = 8;
 const CRITICALITY_NUMERATOR: u32 = 15;
@@ -829,18 +829,8 @@ impl<'a> LutEmitter<'a> {
         bit
     }
 
-    fn emit_lut_plan(&mut self, net: NetId, inputs: &[Bit], output: u32, truth: u64) {
-        match inputs.len() {
-            0..=LUT_INPUTS => self.emit_lut4(
-                format!("lut{}", net.index()),
-                inputs,
-                output,
-                lut4_init(truth, inputs.len()),
-            ),
-            5 => self.emit_lut5(net, inputs, output, truth),
-            6 => self.emit_lut6(net, inputs, output, truth),
-            _ => unreachable!("the cut database limits ECP5 LUTs to six inputs"),
-        }
+    fn emit_lut_plan(&mut self, net: NetId, inputs: &[Bit], output: u32, truth: u128) {
+        self.emit_wide_lut(&format!("lut{}", net.index()), inputs, output, truth);
     }
 
     fn emit_lut4(&mut self, name: String, inputs: &[Bit], output: u32, init: u16) {
@@ -854,65 +844,51 @@ impl<'a> LutEmitter<'a> {
         });
     }
 
-    fn emit_lut5(&mut self, net: NetId, inputs: &[Bit], output: u32, truth: u64) {
-        let data_zero = self.fresh_wire();
-        let data_one = self.fresh_wire();
-        self.emit_lut4(
-            format!("lut{}_wide0", net.index()),
-            &inputs[..4],
-            data_zero,
-            low_lut4_init(truth),
-        );
-        self.emit_lut4(
-            format!("lut{}_wide1", net.index()),
-            &inputs[..4],
-            data_one,
-            low_lut4_init(truth >> 16),
-        );
-        self.cells.push(Ecp5Cell::PfuMux {
-            name: format!("lut{}", net.index()),
-            lut_true: Bit::Wire(data_one),
-            lut_false: Bit::Wire(data_zero),
-            select: inputs[4],
-            output,
-        });
-    }
-
-    fn emit_lut6(&mut self, net: NetId, inputs: &[Bit], output: u32, truth: u64) {
-        let mut cofactors = [0u32; 4];
-        for (cofactor, chunk) in cofactors.iter_mut().enumerate() {
-            *chunk = self.fresh_wire();
+    fn emit_wide_lut(&mut self, name: &str, inputs: &[Bit], output: u32, truth: u128) {
+        if inputs.len() <= LUT_INPUTS {
             self.emit_lut4(
-                format!("lut{}_wide{cofactor}", net.index()),
-                &inputs[..4],
-                *chunk,
-                low_lut4_init(truth >> (cofactor * 16)),
+                name.to_owned(),
+                inputs,
+                output,
+                lut4_init(truth, inputs.len()),
             );
+            return;
         }
+
+        debug_assert!(inputs.len() <= WIDE_LUT_INPUTS);
+        let cofactor_bits = 1usize << (inputs.len() - 1);
+        let cofactor_mask = (1u128 << cofactor_bits) - 1;
         let data_zero = self.fresh_wire();
         let data_one = self.fresh_wire();
-        for (index, (lut_false, lut_true, mux_output)) in [
-            (cofactors[0], cofactors[1], data_zero),
-            (cofactors[2], cofactors[3], data_one),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        self.emit_wide_lut(
+            &format!("{name}_wide0"),
+            &inputs[..inputs.len() - 1],
+            data_zero,
+            truth & cofactor_mask,
+        );
+        self.emit_wide_lut(
+            &format!("{name}_wide1"),
+            &inputs[..inputs.len() - 1],
+            data_one,
+            truth >> cofactor_bits,
+        );
+        if inputs.len() == 5 {
             self.cells.push(Ecp5Cell::PfuMux {
-                name: format!("lut{}_pfumx{index}", net.index()),
-                lut_true: Bit::Wire(lut_true),
-                lut_false: Bit::Wire(lut_false),
+                name: name.to_owned(),
+                lut_true: Bit::Wire(data_one),
+                lut_false: Bit::Wire(data_zero),
                 select: inputs[4],
-                output: mux_output,
+                output,
+            });
+        } else {
+            self.cells.push(Ecp5Cell::L6Mux21 {
+                name: name.to_owned(),
+                data_zero: Bit::Wire(data_zero),
+                data_one: Bit::Wire(data_one),
+                select: inputs[inputs.len() - 1],
+                output,
             });
         }
-        self.cells.push(Ecp5Cell::L6Mux21 {
-            name: format!("lut{}", net.index()),
-            data_zero: Bit::Wire(data_zero),
-            data_one: Bit::Wire(data_one),
-            select: inputs[5],
-            output,
-        });
     }
 
     pub(super) fn alias_net(&mut self, net: NetId, bit: Bit) {
@@ -941,16 +917,12 @@ impl<'a> LutEmitter<'a> {
     }
 }
 
-fn lut4_init(truth: u64, inputs: usize) -> u16 {
+fn lut4_init(truth: u128, inputs: usize) -> u16 {
     let assignments = 1usize << inputs;
     (0..16).fold(0, |init, assignment| {
         let value = (truth >> (assignment % assignments)) & 1;
         init | (u16::try_from(value).unwrap() << assignment)
     })
-}
-
-fn low_lut4_init(truth: u64) -> u16 {
-    u16::try_from(truth & u64::from(u16::MAX)).unwrap()
 }
 
 fn best_plan(
@@ -1052,19 +1024,22 @@ fn wide_lut_area(inputs: usize) -> usize {
         0..=4 => 1,
         5 => 2,
         6 => 4,
-        _ => unreachable!("ECP5 wide LUTs support at most six inputs here"),
+        7 => 8,
+        _ => unreachable!("ECP5 wide LUTs support at most seven inputs here"),
     }
 }
 
 fn wide_lut_input_delay_ps(inputs: usize, position: usize) -> u32 {
-    match inputs {
-        0..=4 => LUT_DELAY_PS,
-        5 if position == 4 => PFU_MUX_DELAY_PS,
-        5 => LUT_DELAY_PS + PFU_MUX_DELAY_PS,
-        6 if position == 5 => L6_MUX_DELAY_PS,
-        6 if position == 4 => PFU_MUX_DELAY_PS + L6_MUX_DELAY_PS,
-        6 => LUT_DELAY_PS + PFU_MUX_DELAY_PS + L6_MUX_DELAY_PS,
-        _ => unreachable!("ECP5 wide LUTs support at most six inputs here"),
+    if inputs <= LUT_INPUTS {
+        return LUT_DELAY_PS;
+    }
+    debug_assert!(inputs <= WIDE_LUT_INPUTS);
+    debug_assert!(position < inputs);
+    let l6_muxes = u32::try_from(inputs - position.max(5)).unwrap();
+    match position {
+        0..=3 => LUT_DELAY_PS + PFU_MUX_DELAY_PS + l6_muxes * L6_MUX_DELAY_PS,
+        4 => PFU_MUX_DELAY_PS + l6_muxes * L6_MUX_DELAY_PS,
+        _ => l6_muxes * L6_MUX_DELAY_PS,
     }
 }
 
@@ -1115,11 +1090,11 @@ fn enumerate_cuts(netlist: &Netlist, root: NetId, max_inputs: usize) -> Vec<Vec<
     cuts
 }
 
-fn cut_truth_table(netlist: &Netlist, root: NetId, leaves: &[NetId]) -> u64 {
-    (0..(1u64 << leaves.len())).fold(0, |table, assignment| {
+fn cut_truth_table(netlist: &Netlist, root: NetId, leaves: &[NetId]) -> u128 {
+    (0..(1u128 << leaves.len())).fold(0, |table, assignment| {
         let mut values = vec![None; netlist.nodes().len()];
         let value = evaluate_cut(netlist, root, leaves, assignment, &mut values);
-        table | (u64::from(value) << assignment)
+        table | (u128::from(value) << assignment)
     })
 }
 
@@ -1127,7 +1102,7 @@ fn evaluate_cut(
     netlist: &Netlist,
     net: NetId,
     leaves: &[NetId],
-    assignment: u64,
+    assignment: u128,
     values: &mut [Option<bool>],
 ) -> bool {
     if let Some(index) = leaves.iter().position(|leaf| *leaf == net) {
@@ -1247,13 +1222,14 @@ mod tests {
     #[test]
     fn wide_cut_places_the_latest_input_on_the_top_mux_select() {
         let mut netlist = Netlist::new("wide_pin_order");
-        let inputs = (0..6)
+        let inputs = (0..7)
             .map(|index| netlist.add_input(format!("input{index}")))
             .collect::<Vec<_>>();
         let plans = vec![None; netlist.nodes().len()];
         let mut arrivals = vec![Some(0); netlist.nodes().len()];
         arrivals[inputs[0].index() as usize] = Some(1_000);
         arrivals[inputs[1].index() as usize] = Some(500);
+        arrivals[inputs[2].index() as usize] = Some(250);
         let fanouts = vec![1; netlist.nodes().len()];
 
         let plan = plan_for_cut(
@@ -1265,9 +1241,10 @@ mod tests {
             },
         );
 
-        assert_eq!(plan.leaves[4], inputs[1]);
-        assert_eq!(plan.leaves[5], inputs[0]);
-        assert_eq!(plan.root_area, 4);
+        assert_eq!(plan.leaves[4], inputs[2]);
+        assert_eq!(plan.leaves[5], inputs[1]);
+        assert_eq!(plan.leaves[6], inputs[0]);
+        assert_eq!(plan.root_area, 8);
     }
 
     #[test]
