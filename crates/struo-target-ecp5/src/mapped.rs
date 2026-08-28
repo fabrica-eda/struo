@@ -1469,7 +1469,7 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
     match cell {
         Ecp5Cell::Lut4 { .. } => bel.contains(".K"),
         Ecp5Cell::FlipFlop { .. } => bel.contains(".FF"),
-        Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD"),
+        Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD") || bel.contains("/EBR"),
         Ecp5Cell::TrellisIo { .. } => bel.contains("PIO"),
         Ecp5Cell::Jtagg { .. } => bel.contains("JTAGG"),
         Ecp5Cell::Pll { .. } => bel.contains("PLL"),
@@ -7326,8 +7326,9 @@ mod tests {
         map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
         map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
         mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
-        physical_feedback_matches_netlist, replicate_high_fanout_enable_luts,
-        split_branched_carry_outs, verify_mapped_equivalence_proof,
+        physical_bel_is_compatible, physical_feedback_matches_netlist,
+        replicate_high_fanout_enable_luts, split_branched_carry_outs,
+        verify_mapped_equivalence_proof,
     };
     use crate::{PhysicalFeedback, PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint};
 
@@ -9851,15 +9852,23 @@ mod tests {
         source.add_output_port("read_data", &read_data).unwrap();
 
         let mapped = map_to_ecp5(&source).unwrap();
-        assert!(mapped.cells().iter().any(|cell| matches!(
-            cell,
-            Ecp5Cell::BlockRam {
-                physical_width: 9,
-                depth: 256,
-                word_width: 8,
-                ..
-            }
-        )));
+        let block_ram = mapped
+            .cells()
+            .iter()
+            .find(|cell| {
+                matches!(
+                    cell,
+                    Ecp5Cell::BlockRam {
+                        physical_width: 9,
+                        depth: 256,
+                        word_width: 8,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(physical_bel_is_compatible(block_ram, "X1/Y1/DP16KD"));
+        assert!(physical_bel_is_compatible(block_ram, "R46C58/EBR0"));
 
         let json: serde_json::Value =
             serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
