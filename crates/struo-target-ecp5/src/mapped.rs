@@ -2139,9 +2139,10 @@ fn mapping_profile_key(netlist: &Ecp5Netlist, profile: &MappedLutProfile) -> (u3
 
 /// Replace LUT4s which are exactly 2:1 muxes with the ECP5 hard wide-LUT
 /// muxes.  A PFUMX requires both data inputs to be LUT4 outputs in the same
-/// slice.  When a source LUT is already owned by another PFUMX, duplicate it;
-/// the removed mux LUT pays for at most one duplicate so the LUT4 count never
-/// increases.  nextpnr then owns the slice/PFU clustering and placement.
+/// slice.  When a source LUT is already owned by another PFUMX or still has an
+/// ordinary-routing consumer, duplicate it.  The removed mux LUT pays for at
+/// most one duplicate so the LUT4 count never increases.  nextpnr then owns
+/// the slice/PFU clustering and placement.
 fn map_dedicated_wide_muxes(netlist: &mut Ecp5Netlist) {
     let original_len = netlist.cells.len();
     let depths = mapped_lut_depths(netlist);
@@ -2177,14 +2178,28 @@ fn map_dedicated_wide_muxes(netlist: &mut Ecp5Netlist) {
         {
             continue;
         }
-        let needed_clones = usize::from(claimed_sources.contains(&true_driver))
-            + usize::from(claimed_sources.contains(&false_driver));
+        let (Bit::Wire(true_wire), Bit::Wire(false_wire)) = (lut_true, lut_false) else {
+            unreachable!("wide-mux sources were validated as LUT4 outputs")
+        };
+        // A LUT packed as a PFUMX input cannot expose its F output to ordinary
+        // routing at the same time: both uses claim the same physical F wire.
+        // Fanout greater than one means that replacing `root` would leave at
+        // least one such consumer, so give the PFUMX a private clone.
+        let true_requires_clone =
+            claimed_sources.contains(&true_driver) || mapped_wire_fanout(netlist, true_wire) > 1;
+        let false_requires_clone =
+            claimed_sources.contains(&false_driver) || mapped_wire_fanout(netlist, false_wire) > 1;
+        let needed_clones = usize::from(true_requires_clone) + usize::from(false_requires_clone);
         if clones + needed_clones > transformed + 1 {
             continue;
         }
 
-        for (driver, input) in [(true_driver, &mut lut_true), (false_driver, &mut lut_false)] {
-            if claimed_sources.insert(driver) {
+        for (driver, requires_clone, input) in [
+            (true_driver, true_requires_clone, &mut lut_true),
+            (false_driver, false_requires_clone, &mut lut_false),
+        ] {
+            claimed_sources.insert(driver);
+            if !requires_clone {
                 continue;
             }
             let Ecp5Cell::Lut4 {
@@ -9250,6 +9265,85 @@ mod tests {
         let cells = json["modules"]["wide_mux"]["cells"].as_object().unwrap();
         assert_eq!(cells["low"]["type"], "PFUMX");
         assert_eq!(cells["root"]["type"], "L6MUX21");
+    }
+
+    #[test]
+    fn clones_a_pfumx_source_with_an_ordinary_consumer() {
+        let (mut mapped, _) = map_once(
+            &arithmetic_netlist(2, ArithmeticOp::Add),
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+        mapped.name = "shared_wide_mux_source".into();
+        mapped.cells = vec![
+            Ecp5Cell::Lut4 {
+                name: "shared".into(),
+                inputs: [Bit::Wire(2), Bit::Zero, Bit::Zero, Bit::Zero],
+                output: 10,
+                init: 0xaaaa,
+            },
+            Ecp5Cell::Lut4 {
+                name: "other".into(),
+                inputs: [Bit::Wire(3), Bit::Zero, Bit::Zero, Bit::Zero],
+                output: 11,
+                init: 0xaaaa,
+            },
+            Ecp5Cell::Lut4 {
+                name: "mux".into(),
+                inputs: [Bit::Wire(10), Bit::Wire(11), Bit::Wire(4), Bit::Zero],
+                output: 12,
+                init: 0xacac,
+            },
+            Ecp5Cell::Lut4 {
+                name: "ordinary_consumer".into(),
+                inputs: [Bit::Wire(10), Bit::Wire(5), Bit::Zero, Bit::Zero],
+                output: 13,
+                init: 0x8888,
+            },
+        ];
+        mapped.ports = (2..=5)
+            .map(|wire| MappedPort {
+                name: format!("i{wire}"),
+                direction: PortDirection::Input,
+                bits: vec![Bit::Wire(wire)],
+            })
+            .chain((12..=13).map(|wire| MappedPort {
+                name: format!("o{wire}"),
+                direction: PortDirection::Output,
+                bits: vec![Bit::Wire(wire)],
+            }))
+            .collect();
+        mapped.io_timing = ResolvedIoTiming::default();
+
+        map_dedicated_wide_muxes(&mut mapped);
+
+        let clone_output = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::Lut4 { name, output, .. }
+                    if name.starts_with("shared_wide_mux_clone") =>
+                {
+                    Some(*output)
+                }
+                _ => None,
+            })
+            .expect("the shared PFUMX source must be cloned");
+        let Ecp5Cell::PfuMux {
+            lut_true,
+            lut_false,
+            ..
+        } = &mapped.cells[2]
+        else {
+            panic!("the mux root must map to PFUMX")
+        };
+        assert!([*lut_true, *lut_false].contains(&Bit::Wire(clone_output)));
+        let Ecp5Cell::Lut4 { inputs, .. } = &mapped.cells[3] else {
+            panic!("the ordinary consumer must remain a LUT4")
+        };
+        assert_eq!(inputs[0], Bit::Wire(10));
+        assert!(verify_mapped_equivalence_proof(&mapped, false));
     }
 
     #[test]
