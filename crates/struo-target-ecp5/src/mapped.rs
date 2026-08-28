@@ -188,6 +188,9 @@ impl JtaggBinding {
 /// One clock output of an ECP5 `EHXPLLL` primitive.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum PllOutput {
+    /// Dedicated internal feedback output (`CLKINTFB`).
+    #[serde(rename = "CLKINTFB")]
+    Clkintfb,
     /// Primary output (`CLKOP`).
     #[serde(rename = "CLKOP")]
     Clkop,
@@ -205,6 +208,7 @@ pub enum PllOutput {
 impl PllOutput {
     fn port(self) -> &'static str {
         match self {
+            Self::Clkintfb => "CLKINTFB",
             Self::Clkop => "CLKOP",
             Self::Clkos => "CLKOS",
             Self::Clkos2 => "CLKOS2",
@@ -230,7 +234,8 @@ pub struct PllBinding {
     pub locked_port: String,
     /// PLL output routed into the core.
     pub fabric_output: PllOutput,
-    /// PLL output looped back to `CLKFB`.
+    /// PLL output looped back to `CLKFB`, normally `CLKINTFB` for
+    /// `FEEDBK_PATH=INT_OP` as emitted by `ecppll`.
     pub feedback_output: PllOutput,
     /// Raw `EHXPLLL` parameters written to nextpnr JSON.
     #[serde(default)]
@@ -9844,6 +9849,21 @@ mod tests {
             &shared_output_mapped,
             shared_output_mapped.retiming.applied
         ));
+
+        let internal_feedback = PllBinding::new(
+            "clk",
+            "clk_250",
+            "pll_locked",
+            PllOutput::Clkop,
+            PllOutput::Clkintfb,
+        );
+        let internal_feedback_mapped = map_to_ecp5_with_pll(&source, &internal_feedback).unwrap();
+        let internal_json: serde_json::Value =
+            serde_json::from_str(&internal_feedback_mapped.to_nextpnr_json().unwrap()).unwrap();
+        let pll = &internal_json["modules"]["pll_top"]["cells"]["pll"];
+        assert_eq!(pll["connections"]["CLKFB"], pll["connections"]["CLKINTFB"]);
+        assert_ne!(pll["connections"]["CLKOP"], pll["connections"]["CLKINTFB"]);
+        assert_eq!(pll["port_directions"]["CLKINTFB"], "output");
     }
 
     #[test]
