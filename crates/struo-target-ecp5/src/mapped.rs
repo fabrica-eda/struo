@@ -23,7 +23,7 @@ mod lut;
 use lut::{
     BRAM_CLOCK_TO_OUTPUT_PS, CCU_CARRY_PS, CCU_INPUT_PS, CCU_SUM_PS, CutDatabase,
     FLIP_FLOP_CLOCK_TO_OUTPUT_PS, FLIP_FLOP_SETUP_PS, LUT_DELAY_PS, LutCover, LutEmitter,
-    wire_delay_ps,
+    WIDE_LUT_INPUTS, wire_delay_ps,
 };
 
 const RETIMING_PERIOD_MARGIN_NUMERATOR: u32 = 9;
@@ -37,6 +37,11 @@ const MAX_ENABLE_FANOUT_PER_REPLICA: usize = 16;
 const PHYSICAL_REWRITE_MIN_GOAL_PERCENT: u32 = 98;
 const PHYSICAL_RETIME_MIN_GOAL_PERCENT: u32 = 95;
 const PHYSICAL_RETIME_MODEL_BRIDGE_PS: u32 = 400;
+// PFUMX and L6MUX21 data inputs use dedicated intra-PFU/inter-slice wiring.
+// Select inputs still arrive through ordinary routing; these values model only
+// the hard mux itself and intentionally leave sign-off to nextpnr.
+const PFU_MUX_DELAY_PS: u32 = 100;
+const L6_MUX_DELAY_PS: u32 = 100;
 
 // These maps only contain trusted internal u32 wire IDs. Avoid the randomized
 // string-oriented hashing cost in the timing model's repeated fixed-point scans.
@@ -545,6 +550,32 @@ pub enum Ecp5Cell {
         output: u32,
         /// Complete LUT truth table.
         init: u16,
+    },
+    /// Dedicated mux combining the outputs of two LUT4s into a LUT5-class path.
+    PfuMux {
+        /// Stable cell name.
+        name: String,
+        /// Value selected when `select` is one.
+        lut_true: Bit,
+        /// Value selected when `select` is zero.
+        lut_false: Bit,
+        /// Routed select input.
+        select: Bit,
+        /// Dedicated mux output wire.
+        output: u32,
+    },
+    /// Dedicated mux combining two PFUMX outputs into a LUT6-class path.
+    L6Mux21 {
+        /// Stable cell name.
+        name: String,
+        /// Value selected when `select` is zero.
+        data_zero: Bit,
+        /// Value selected when `select` is one.
+        data_one: Bit,
+        /// Routed select input.
+        select: Bit,
+        /// Dedicated mux output wire.
+        output: u32,
     },
     /// Two ECP5 LUT/carry slices connected through the dedicated carry path.
     Ccu2c {
@@ -1435,7 +1466,7 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
         Ecp5Cell::TrellisIo { .. } => bel.contains("PIO"),
         Ecp5Cell::Jtagg { .. } => bel.contains("JTAGG"),
         Ecp5Cell::Pll { .. } => bel.contains("PLL"),
-        Ecp5Cell::Ccu2c { .. } => false,
+        Ecp5Cell::PfuMux { .. } | Ecp5Cell::L6Mux21 { .. } | Ecp5Cell::Ccu2c { .. } => false,
     }
 }
 
@@ -2030,25 +2061,50 @@ fn map_to_ecp5_with_period(
     period_ps: u32,
     retiming_target_period_ps: u32,
 ) -> Result<Ecp5Netlist, MappingError> {
-    let (mut selected, _) = map_once_with_period(netlist, options, period_ps, io_timing)?;
-    let original_cells = selected.cells.len();
+    // A self-contained wide cut can implement arbitrary LUT5/LUT6 functions,
+    // while the conservative cover can reuse already mapped LUT outputs and
+    // is often smaller for mux-heavy logic. Keep both candidates: the mapped
+    // timing/area model, rather than syntax alone, decides which survives.
+    let (mut wide, _) = map_once_with_period(netlist, options, period_ps, io_timing)?;
+    split_branched_carry_outs(&mut wide);
+    let (narrow, _) =
+        map_once_with_period_and_lut_inputs(netlist, options, period_ps, io_timing, 4)?;
+    let original_cells = narrow.cells.len();
+    let mut conservative = narrow.clone();
+    split_branched_carry_outs(&mut conservative);
+    map_dedicated_wide_muxes(&mut conservative);
+    let wide_profile = mapped_lut_profile(&wide);
+    let conservative_profile = mapped_lut_profile(&conservative);
+    let (mut selected, mapped_original_profile) =
+        if mapping_profile_key(&conservative, &conservative_profile)
+            < mapping_profile_key(&wide, &wide_profile)
+        {
+            (conservative, conservative_profile)
+        } else {
+            (wide, wide_profile)
+        };
     let original_registers = netlist.registers().len();
     let mut selected_registers = original_registers;
     let mut applied = false;
-    let mapped_original_profile = mapped_lut_profile(&selected);
-    if let Some(retimed) = automatically_retime_mapped_luts(
-        &selected,
+    if let Some(mut retimed) = automatically_retime_mapped_luts(
+        &narrow,
         original_cells,
         original_registers,
         retiming_target_period_ps,
     )
     .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
     {
-        selected = retimed;
-        selected_registers = mapped_register_count(&selected);
-        applied = true;
+        split_branched_carry_outs(&mut retimed);
+        map_dedicated_wide_muxes(&mut retimed);
+        let retimed_profile = mapped_lut_profile(&retimed);
+        if mapping_profile_key(&retimed, &retimed_profile)
+            < mapping_profile_key(&selected, &mapped_original_profile)
+        {
+            selected_registers = mapped_register_count(&retimed);
+            selected = retimed;
+            applied = true;
+        }
     }
-    split_branched_carry_outs(&mut selected);
     let mapped_selected_profile = mapped_lut_profile(&selected);
     let equivalence_signed_off = verify_mapped_equivalence_proof(&selected, applied);
     selected.retiming = RetimingSelection {
@@ -2071,6 +2127,271 @@ fn map_to_ecp5_with_period(
         equivalence_signed_off,
     };
     Ok(selected)
+}
+
+fn mapping_profile_key(netlist: &Ecp5Netlist, profile: &MappedLutProfile) -> (u32, u32, usize) {
+    (
+        profile.overall_period_ps,
+        profile.data_period_ps,
+        mapped_comb_count(netlist),
+    )
+}
+
+/// Replace LUT4s which are exactly 2:1 muxes with the ECP5 hard wide-LUT
+/// muxes.  A PFUMX requires both data inputs to be LUT4 outputs in the same
+/// slice.  When a source LUT is already owned by another PFUMX, duplicate it;
+/// the removed mux LUT pays for at most one duplicate so the LUT4 count never
+/// increases.  nextpnr then owns the slice/PFU clustering and placement.
+fn map_dedicated_wide_muxes(netlist: &mut Ecp5Netlist) {
+    let original_len = netlist.cells.len();
+    let depths = mapped_lut_depths(netlist);
+    let lut_drivers = netlist
+        .cells
+        .iter()
+        .take(original_len)
+        .enumerate()
+        .filter_map(|(index, cell)| match cell {
+            Ecp5Cell::Lut4 { output, .. } => Some((*output, index)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut candidates = wide_mux_candidates(netlist, original_len, &depths, &lut_drivers);
+    candidates.sort_unstable_by_key(|candidate| (candidate.0, candidate.1));
+
+    let mut claimed_sources = HashSet::<usize>::new();
+    let mut transformed_roots = HashSet::<usize>::new();
+    let mut transformed = 0usize;
+    let mut clones = 0usize;
+    let mut next_wire = maximum_mapped_wire(netlist)
+        .and_then(|wire| wire.checked_add(1))
+        .unwrap_or(2);
+
+    for (_, root, true_driver, false_driver, mut lut_true, mut lut_false, select, output) in
+        candidates
+    {
+        // A PFUMX source must remain a LUT4, and a LUT4 replaced by a PFUMX
+        // cannot itself feed another PFUMX through the LUT F port.
+        if claimed_sources.contains(&root)
+            || transformed_roots.contains(&true_driver)
+            || transformed_roots.contains(&false_driver)
+        {
+            continue;
+        }
+        let needed_clones = usize::from(claimed_sources.contains(&true_driver))
+            + usize::from(claimed_sources.contains(&false_driver));
+        if clones + needed_clones > transformed + 1 {
+            continue;
+        }
+
+        for (driver, input) in [(true_driver, &mut lut_true), (false_driver, &mut lut_false)] {
+            if claimed_sources.insert(driver) {
+                continue;
+            }
+            let Ecp5Cell::Lut4 {
+                name, inputs, init, ..
+            } = &netlist.cells[driver]
+            else {
+                unreachable!("wide-mux source was validated as LUT4")
+            };
+            let clone_output = next_wire;
+            next_wire = next_wire
+                .checked_add(1)
+                .expect("mapped netlist exceeds the Yosys JSON range");
+            let clone_name =
+                unique_cell_name(&format!("{name}_wide_mux_clone"), &netlist.cells, None);
+            netlist.cells.push(Ecp5Cell::Lut4 {
+                name: clone_name,
+                inputs: *inputs,
+                output: clone_output,
+                init: *init,
+            });
+            *input = Bit::Wire(clone_output);
+            clones += 1;
+        }
+
+        let name = mapped_cell_name(&netlist.cells[root]).to_owned();
+        netlist.cells[root] = Ecp5Cell::PfuMux {
+            name,
+            lut_true,
+            lut_false,
+            select,
+            output,
+        };
+        transformed_roots.insert(root);
+        transformed += 1;
+    }
+
+    map_l6_muxes(netlist);
+}
+
+type WideMuxCandidate = (usize, usize, usize, usize, Bit, Bit, Bit, u32);
+
+fn wide_mux_candidates(
+    netlist: &Ecp5Netlist,
+    original_len: usize,
+    depths: &WireMap<usize>,
+    lut_drivers: &HashMap<u32, usize>,
+) -> Vec<WideMuxCandidate> {
+    netlist
+        .cells
+        .iter()
+        .take(original_len)
+        .enumerate()
+        .filter_map(|(index, cell)| {
+            let Ecp5Cell::Lut4 {
+                inputs,
+                output,
+                init,
+                ..
+            } = cell
+            else {
+                return None;
+            };
+            let (lut_true, lut_false, select) = lut_mux_decomposition(*inputs, *init)?;
+            let Bit::Wire(true_wire) = lut_true else {
+                return None;
+            };
+            let Bit::Wire(false_wire) = lut_false else {
+                return None;
+            };
+            let true_driver = *lut_drivers.get(&true_wire)?;
+            let false_driver = *lut_drivers.get(&false_wire)?;
+            (true_driver != false_driver).then_some((
+                bit_lut_depth(Bit::Wire(*output), depths),
+                index,
+                true_driver,
+                false_driver,
+                lut_true,
+                lut_false,
+                select,
+                *output,
+            ))
+        })
+        .collect()
+}
+
+fn map_l6_muxes(netlist: &mut Ecp5Netlist) {
+    let mut pfu_drivers = HashMap::<u32, usize>::new();
+    let mut lut_outputs_used_by_pfu = HashSet::<u32>::new();
+    for (index, cell) in netlist.cells.iter().enumerate() {
+        match cell {
+            Ecp5Cell::PfuMux {
+                lut_true,
+                lut_false,
+                output,
+                ..
+            } => {
+                pfu_drivers.insert(*output, index);
+                for input in [lut_true, lut_false] {
+                    if let Bit::Wire(wire) = input {
+                        lut_outputs_used_by_pfu.insert(*wire);
+                    }
+                }
+            }
+            Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::L6Mux21 { .. }
+            | Ecp5Cell::Ccu2c { .. }
+            | Ecp5Cell::FlipFlop { .. }
+            | Ecp5Cell::BlockRam { .. }
+            | Ecp5Cell::TrellisIo { .. }
+            | Ecp5Cell::Jtagg { .. }
+            | Ecp5Cell::Pll { .. } => {}
+        }
+    }
+    let depths = mapped_lut_depths(netlist);
+    let mut candidates = netlist
+        .cells
+        .iter()
+        .enumerate()
+        .filter_map(|(root, cell)| {
+            let Ecp5Cell::Lut4 {
+                inputs,
+                output,
+                init,
+                ..
+            } = cell
+            else {
+                return None;
+            };
+            if lut_outputs_used_by_pfu.contains(output) {
+                return None;
+            }
+            let (data_one, data_zero, select) = lut_mux_decomposition(*inputs, *init)?;
+            let Bit::Wire(one_wire) = data_one else {
+                return None;
+            };
+            let Bit::Wire(zero_wire) = data_zero else {
+                return None;
+            };
+            let one_driver = *pfu_drivers.get(&one_wire)?;
+            let zero_driver = *pfu_drivers.get(&zero_wire)?;
+            // Once OFX feeds L6MUX21 it cannot also escape through ordinary
+            // routing. Barrel-shifter stages commonly have fanout two, so
+            // leave those as PFUMX outputs instead of creating an unroutable
+            // overlapping LUT6 cluster.
+            if mapped_wire_fanout(netlist, one_wire) != 1
+                || mapped_wire_fanout(netlist, zero_wire) != 1
+            {
+                return None;
+            }
+            (one_driver != zero_driver).then_some((
+                bit_lut_depth(Bit::Wire(*output), &depths),
+                root,
+                zero_driver,
+                one_driver,
+                data_zero,
+                data_one,
+                select,
+                *output,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|candidate| (candidate.0, candidate.1));
+
+    let mut claimed = HashSet::<usize>::new();
+    for (_, root, zero_driver, one_driver, data_zero, data_one, select, output) in candidates {
+        if !claimed.insert(zero_driver) {
+            continue;
+        }
+        if !claimed.insert(one_driver) {
+            claimed.remove(&zero_driver);
+            continue;
+        }
+        let name = mapped_cell_name(&netlist.cells[root]).to_owned();
+        netlist.cells[root] = Ecp5Cell::L6Mux21 {
+            name,
+            data_zero,
+            data_one,
+            select,
+            output,
+        };
+    }
+}
+
+fn lut_mux_decomposition(inputs: [Bit; 4], init: u16) -> Option<(Bit, Bit, Bit)> {
+    for select in 0..4 {
+        for data_true in 0..4 {
+            if data_true == select {
+                continue;
+            }
+            for data_false in 0..4 {
+                if data_false == select || data_false == data_true {
+                    continue;
+                }
+                let is_mux = (0..16).all(|assignment| {
+                    let actual = init & (1 << assignment) != 0;
+                    let selected = assignment & (1 << select) != 0;
+                    let expected_pin = if selected { data_true } else { data_false };
+                    let expected = assignment & (1 << expected_pin) != 0;
+                    actual == expected
+                });
+                if is_mux {
+                    return Some((inputs[data_true], inputs[data_false], inputs[select]));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2622,6 +2943,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
         .filter_map(|cell| match cell {
             Ecp5Cell::Lut4 { output, .. } => Some(*output),
             Ecp5Cell::Ccu2c { .. }
+            | Ecp5Cell::PfuMux { .. }
+            | Ecp5Cell::L6Mux21 { .. }
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
@@ -2644,6 +2967,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
                 Bit::Wire(_) | Bit::Zero | Bit::One => None,
             },
             Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::PfuMux { .. }
+            | Ecp5Cell::L6Mux21 { .. }
             | Ecp5Cell::Ccu2c { .. }
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
@@ -2901,6 +3226,26 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
                 replace(input);
             }
         }
+        Ecp5Cell::PfuMux {
+            lut_true,
+            lut_false,
+            select,
+            ..
+        } => {
+            replace(lut_true);
+            replace(lut_false);
+            replace(select);
+        }
+        Ecp5Cell::L6Mux21 {
+            data_zero,
+            data_one,
+            select,
+            ..
+        } => {
+            replace(data_zero);
+            replace(data_one);
+            replace(select);
+        }
         Ecp5Cell::Ccu2c {
             inputs, carry_in, ..
         } => {
@@ -3030,6 +3375,8 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
                 .max(bit_lut_depth(write_enable.signal, &depths)),
         ),
         Ecp5Cell::Lut4 { .. }
+        | Ecp5Cell::PfuMux { .. }
+        | Ecp5Cell::L6Mux21 { .. }
         | Ecp5Cell::Ccu2c { .. }
         | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
@@ -3090,6 +3437,8 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
             ))
             .max(),
         Ecp5Cell::Lut4 { .. }
+        | Ecp5Cell::PfuMux { .. }
+        | Ecp5Cell::L6Mux21 { .. }
         | Ecp5Cell::Ccu2c { .. }
         | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
@@ -3141,6 +3490,8 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
                 }
             }
             Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::PfuMux { .. }
+            | Ecp5Cell::L6Mux21 { .. }
             | Ecp5Cell::Ccu2c { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
@@ -3152,58 +3503,76 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
     for _ in 0..netlist.cells.len() {
         let mut progress = false;
         for cell in &netlist.cells {
-            match cell {
-                Ecp5Cell::Lut4 { inputs, output, .. } => {
-                    let depth = inputs
-                        .iter()
-                        .filter_map(|input| match input {
-                            Bit::Wire(wire) => depths.get(wire).copied(),
-                            Bit::Zero | Bit::One => None,
-                        })
-                        .max()
-                        .map(|depth| depth + 1);
-                    if let Some(depth) = depth
-                        && depths.insert(*output, depth) != Some(depth)
-                    {
-                        progress = true;
-                    }
-                }
-                Ecp5Cell::Ccu2c {
-                    inputs,
-                    carry_in,
-                    sums,
-                    carry_out,
-                    ..
-                } => {
-                    let depth = inputs
-                        .iter()
-                        .flatten()
-                        .chain([carry_in])
-                        .filter_map(|input| match input {
-                            Bit::Wire(wire) => depths.get(wire).copied(),
-                            Bit::Zero | Bit::One => None,
-                        })
-                        .max();
-                    if let Some(depth) = depth {
-                        for output in sums.iter().chain([carry_out]) {
-                            if depths.insert(*output, depth) != Some(depth) {
-                                progress = true;
-                            }
-                        }
-                    }
-                }
-                Ecp5Cell::FlipFlop { .. }
-                | Ecp5Cell::BlockRam { .. }
-                | Ecp5Cell::TrellisIo { .. }
-                | Ecp5Cell::Jtagg { .. }
-                | Ecp5Cell::Pll { .. } => {}
-            }
+            progress = update_mapped_cell_depth(cell, &mut depths) || progress;
         }
         if !progress {
             break;
         }
     }
     depths
+}
+
+fn update_mapped_cell_depth(cell: &Ecp5Cell, depths: &mut WireMap<usize>) -> bool {
+    let update = |inputs: &[&Bit], output: u32, depths: &mut WireMap<usize>| {
+        let depth = inputs
+            .iter()
+            .filter_map(|input| match input {
+                Bit::Wire(wire) => depths.get(wire).copied(),
+                Bit::Zero | Bit::One => None,
+            })
+            .max()
+            .map(|depth| depth + 1);
+        depth.is_some_and(|depth| depths.insert(output, depth) != Some(depth))
+    };
+    match cell {
+        Ecp5Cell::Lut4 { inputs, output, .. } => {
+            update(&inputs.iter().collect::<Vec<_>>(), *output, depths)
+        }
+        Ecp5Cell::PfuMux {
+            lut_true,
+            lut_false,
+            select,
+            output,
+            ..
+        } => update(&[lut_true, lut_false, select], *output, depths),
+        Ecp5Cell::L6Mux21 {
+            data_zero,
+            data_one,
+            select,
+            output,
+            ..
+        } => update(&[data_zero, data_one, select], *output, depths),
+        Ecp5Cell::Ccu2c {
+            inputs,
+            carry_in,
+            sums,
+            carry_out,
+            ..
+        } => {
+            let depth = inputs
+                .iter()
+                .flatten()
+                .chain([carry_in])
+                .filter_map(|input| match input {
+                    Bit::Wire(wire) => depths.get(wire).copied(),
+                    Bit::Zero | Bit::One => None,
+                })
+                .max();
+            let Some(depth) = depth else {
+                return false;
+            };
+            let mut progress = false;
+            for output in sums.iter().chain([carry_out]) {
+                progress = depths.insert(*output, depth) != Some(depth) || progress;
+            }
+            progress
+        }
+        Ecp5Cell::FlipFlop { .. }
+        | Ecp5Cell::BlockRam { .. }
+        | Ecp5Cell::TrellisIo { .. }
+        | Ecp5Cell::Jtagg { .. }
+        | Ecp5Cell::Pll { .. } => false,
+    }
 }
 
 fn bit_lut_depth(bit: Bit, depths: &WireMap<usize>) -> usize {
@@ -3244,6 +3613,8 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                 }
             }
             Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::PfuMux { .. }
+            | Ecp5Cell::L6Mux21 { .. }
             | Ecp5Cell::Ccu2c { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
@@ -3261,6 +3632,48 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                         .max()
                         .map(|arrival| arrival.saturating_add(LUT_DELAY_PS));
                     if let Some(arrival) = arrival {
+                        progress |= arrivals.insert(*output, arrival) != Some(arrival);
+                    }
+                }
+                Ecp5Cell::PfuMux {
+                    lut_true,
+                    lut_false,
+                    select,
+                    output,
+                    ..
+                } => {
+                    let data = [lut_true, lut_false]
+                        .into_iter()
+                        .filter_map(|input| mapped_dedicated_arrival(*input, &arrivals))
+                        .max();
+                    let select = mapped_routed_arrival(*select, &arrivals, &fanouts);
+                    if let Some(arrival) = data
+                        .into_iter()
+                        .chain(select)
+                        .max()
+                        .map(|arrival| arrival.saturating_add(PFU_MUX_DELAY_PS))
+                    {
+                        progress |= arrivals.insert(*output, arrival) != Some(arrival);
+                    }
+                }
+                Ecp5Cell::L6Mux21 {
+                    data_zero,
+                    data_one,
+                    select,
+                    output,
+                    ..
+                } => {
+                    let data = [data_zero, data_one]
+                        .into_iter()
+                        .filter_map(|input| mapped_dedicated_arrival(*input, &arrivals))
+                        .max();
+                    let select = mapped_routed_arrival(*select, &arrivals, &fanouts);
+                    if let Some(arrival) = data
+                        .into_iter()
+                        .chain(select)
+                        .max()
+                        .map(|arrival| arrival.saturating_add(L6_MUX_DELAY_PS))
+                    {
                         progress |= arrivals.insert(*output, arrival) != Some(arrival);
                     }
                 }
@@ -3334,6 +3747,13 @@ fn mapped_routed_arrival(
                 .saturating_add(wire_delay_ps(fanouts.get(&wire).copied().unwrap_or(1)))
                 .saturating_add(MAPPED_ROUTE_GUARD_PS)
         }),
+    }
+}
+
+fn mapped_dedicated_arrival(bit: Bit, arrivals: &WireMap<u32>) -> Option<u32> {
+    match bit {
+        Bit::Zero | Bit::One => None,
+        Bit::Wire(wire) => arrivals.get(&wire).copied(),
     }
 }
 
@@ -3780,6 +4200,8 @@ fn ccu_chain_names(netlist: &Ecp5Netlist) -> Vec<Vec<String>> {
                 ..
             } => Some((name.clone(), *carry_in, *carry_out)),
             Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::PfuMux { .. }
+            | Ecp5Cell::L6Mux21 { .. }
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
@@ -3902,6 +4324,8 @@ fn forward_retime_ccu2c(netlist: &Ecp5Netlist, ccu_index: usize) -> Option<Ecp5N
                         ..
                     } if *output == wire => Some((index, *data, *clock, *edge, *enable, *reset)),
                     Ecp5Cell::Lut4 { .. }
+                    | Ecp5Cell::PfuMux { .. }
+                    | Ecp5Cell::L6Mux21 { .. }
                     | Ecp5Cell::Ccu2c { .. }
                     | Ecp5Cell::FlipFlop { .. }
                     | Ecp5Cell::BlockRam { .. }
@@ -4143,6 +4567,8 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
                 ))
             }
             Ecp5Cell::Lut4 { .. }
+            | Ecp5Cell::PfuMux { .. }
+            | Ecp5Cell::L6Mux21 { .. }
             | Ecp5Cell::FlipFlop { .. }
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
@@ -4555,75 +4981,104 @@ fn replace_mapped_wire_uses(netlist: &mut Ecp5Netlist, from: u32, to: u32) {
         }
     }
     for cell in &mut netlist.cells {
-        match cell {
-            Ecp5Cell::Lut4 { inputs, .. } => {
-                for bit in inputs {
-                    replace(bit);
-                }
-            }
-            Ecp5Cell::Ccu2c {
-                inputs, carry_in, ..
-            } => {
-                for bit in inputs.iter_mut().flatten() {
-                    replace(bit);
-                }
-                replace(carry_in);
-            }
-            Ecp5Cell::FlipFlop {
-                data,
-                clock,
-                enable,
-                reset,
-                ..
-            } => {
-                replace(data);
-                replace(clock);
-                if let Some(control) = enable {
-                    replace(&mut control.signal);
-                }
-                if let Some(control) = reset {
-                    replace(&mut control.signal);
-                }
-            }
-            Ecp5Cell::BlockRam {
-                write_address,
-                write_data,
-                write_enable,
-                read_address,
-                read_enable,
-                clock,
-                ..
-            } => {
-                for bit in write_address
-                    .iter_mut()
-                    .chain(write_data)
-                    .chain(read_address.iter_mut())
-                {
-                    replace(bit);
-                }
-                replace(&mut write_enable.signal);
-                if let Some(control) = read_enable {
-                    replace(&mut control.signal);
-                }
-                replace(clock);
-            }
-            Ecp5Cell::TrellisIo {
-                fabric_output,
-                tristate,
-                ..
-            } => {
-                replace(fabric_output);
-                replace(tristate);
-            }
-            Ecp5Cell::Jtagg { tdo, .. } => {
-                for bit in tdo {
-                    replace(bit);
-                }
-            }
-            Ecp5Cell::Pll {
-                reference_clock, ..
-            } => replace(reference_clock),
+        replace_mapped_cell_wire_uses(cell, from, to);
+    }
+}
+
+fn replace_mapped_cell_wire_uses(cell: &mut Ecp5Cell, from: u32, to: u32) {
+    let replace = |bit: &mut Bit| {
+        if *bit == Bit::Wire(from) {
+            *bit = Bit::Wire(to);
         }
+    };
+    match cell {
+        Ecp5Cell::Lut4 { inputs, .. } => {
+            for bit in inputs {
+                replace(bit);
+            }
+        }
+        Ecp5Cell::PfuMux {
+            lut_true,
+            lut_false,
+            select,
+            ..
+        } => {
+            replace(lut_true);
+            replace(lut_false);
+            replace(select);
+        }
+        Ecp5Cell::L6Mux21 {
+            data_zero,
+            data_one,
+            select,
+            ..
+        } => {
+            replace(data_zero);
+            replace(data_one);
+            replace(select);
+        }
+        Ecp5Cell::Ccu2c {
+            inputs, carry_in, ..
+        } => {
+            for bit in inputs.iter_mut().flatten() {
+                replace(bit);
+            }
+            replace(carry_in);
+        }
+        Ecp5Cell::FlipFlop {
+            data,
+            clock,
+            enable,
+            reset,
+            ..
+        } => {
+            replace(data);
+            replace(clock);
+            if let Some(control) = enable {
+                replace(&mut control.signal);
+            }
+            if let Some(control) = reset {
+                replace(&mut control.signal);
+            }
+        }
+        Ecp5Cell::BlockRam {
+            write_address,
+            write_data,
+            write_enable,
+            read_address,
+            read_enable,
+            clock,
+            ..
+        } => {
+            for bit in write_address
+                .iter_mut()
+                .chain(write_data)
+                .chain(read_address.iter_mut())
+            {
+                replace(bit);
+            }
+            replace(&mut write_enable.signal);
+            if let Some(control) = read_enable {
+                replace(&mut control.signal);
+            }
+            replace(clock);
+        }
+        Ecp5Cell::TrellisIo {
+            fabric_output,
+            tristate,
+            ..
+        } => {
+            replace(fabric_output);
+            replace(tristate);
+        }
+        Ecp5Cell::Jtagg { tdo, .. } => {
+            for bit in tdo {
+                replace(bit);
+            }
+        }
+        Ecp5Cell::Pll {
+            reference_clock, ..
+        } => replace(reference_clock),
     }
 }
 
@@ -4647,6 +5102,8 @@ fn prune_unobservable_retiming_cells(netlist: &mut Ecp5Netlist) {
 fn mapped_cell_name(cell: &Ecp5Cell) -> &str {
     match cell {
         Ecp5Cell::Lut4 { name, .. }
+        | Ecp5Cell::PfuMux { name, .. }
+        | Ecp5Cell::L6Mux21 { name, .. }
         | Ecp5Cell::Ccu2c { name, .. }
         | Ecp5Cell::FlipFlop { name, .. }
         | Ecp5Cell::BlockRam { name, .. }
@@ -4836,6 +5293,8 @@ fn mapped_wire_is_clock_or_reset(netlist: &Ecp5Netlist, wire: u32) -> bool {
         }
         Ecp5Cell::BlockRam { clock, .. } => *clock == Bit::Wire(wire),
         Ecp5Cell::Lut4 { .. }
+        | Ecp5Cell::PfuMux { .. }
+        | Ecp5Cell::L6Mux21 { .. }
         | Ecp5Cell::Ccu2c { .. }
         | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
@@ -4916,6 +5375,26 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
                 visit(*bit);
             }
         }
+        Ecp5Cell::PfuMux {
+            lut_true,
+            lut_false,
+            select,
+            ..
+        } => {
+            visit(*lut_true);
+            visit(*lut_false);
+            visit(*select);
+        }
+        Ecp5Cell::L6Mux21 {
+            data_zero,
+            data_one,
+            select,
+            ..
+        } => {
+            visit(*data_zero);
+            visit(*data_one);
+            visit(*select);
+        }
         Ecp5Cell::Ccu2c {
             inputs, carry_in, ..
         } => {
@@ -4988,7 +5467,10 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
 
 fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
     match cell {
-        Ecp5Cell::Lut4 { output, .. } | Ecp5Cell::FlipFlop { output, .. } => {
+        Ecp5Cell::Lut4 { output, .. }
+        | Ecp5Cell::PfuMux { output, .. }
+        | Ecp5Cell::L6Mux21 { output, .. }
+        | Ecp5Cell::FlipFlop { output, .. } => {
             vec![Bit::Wire(*output)]
         }
         Ecp5Cell::Ccu2c {
@@ -5252,6 +5734,17 @@ fn map_once_with_period(
     period_ps: u32,
     io_timing: &IoTimingConstraints,
 ) -> Result<(Ecp5Netlist, MappingQuality), MappingError> {
+    map_once_with_period_and_lut_inputs(netlist, options, period_ps, io_timing, WIDE_LUT_INPUTS)
+}
+
+#[allow(clippy::too_many_lines)]
+fn map_once_with_period_and_lut_inputs(
+    netlist: &Netlist,
+    options: MappingOptions,
+    period_ps: u32,
+    io_timing: &IoTimingConstraints,
+    max_lut_inputs: usize,
+) -> Result<(Ecp5Netlist, MappingQuality), MappingError> {
     netlist.validate()?;
     // ECP5 loads every flip-flop through GSR at configuration and REGSET
     // selects the loaded value, so a flip-flop whose data is a constant and
@@ -5261,7 +5754,7 @@ fn map_once_with_period(
     // that state after the first clock edge, so it must stay a flip-flop.
     let constant_registers = constant_register_values(netlist);
     let demand = MappingDemand::collect(netlist, &constant_registers);
-    let cuts = CutDatabase::analyze(netlist);
+    let cuts = CutDatabase::analyze(netlist, max_lut_inputs);
     let cover = LutCover::select(netlist, &cuts, &demand.roots, options, period_ps, io_timing);
     let (period_ps, _) = cover.estimated_register_period_ps(netlist);
     let quality = MappingQuality { period_ps };
@@ -6164,6 +6657,26 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
             output,
             init,
         } => (name.clone(), json_lut(*inputs, *output, *init)),
+        Ecp5Cell::PfuMux {
+            name,
+            lut_true,
+            lut_false,
+            select,
+            output,
+        } => (
+            name.clone(),
+            json_pfu_mux(*lut_true, *lut_false, *select, *output),
+        ),
+        Ecp5Cell::L6Mux21 {
+            name,
+            data_zero,
+            data_one,
+            select,
+            output,
+        } => (
+            name.clone(),
+            json_l6_mux(*data_zero, *data_one, *select, *output),
+        ),
         Ecp5Cell::Ccu2c {
             name,
             inputs,
@@ -6457,6 +6970,56 @@ fn json_lut(inputs: [Bit; 4], output: u32, init: u16) -> JsonCell {
     }
 }
 
+fn json_pfu_mux(lut_true: Bit, lut_false: Bit, select: Bit, output: u32) -> JsonCell {
+    JsonCell {
+        hide_name: 0,
+        r#type: "PFUMX",
+        parameters: BTreeMap::new(),
+        attributes: BTreeMap::new(),
+        port_directions: [
+            ("ALUT".into(), "input"),
+            ("BLUT".into(), "input"),
+            ("C0".into(), "input"),
+            ("Z".into(), "output"),
+        ]
+        .into_iter()
+        .collect(),
+        connections: [
+            ("ALUT".into(), vec![lut_true]),
+            ("BLUT".into(), vec![lut_false]),
+            ("C0".into(), vec![select]),
+            ("Z".into(), vec![Bit::Wire(output)]),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+fn json_l6_mux(data_zero: Bit, data_one: Bit, select: Bit, output: u32) -> JsonCell {
+    JsonCell {
+        hide_name: 0,
+        r#type: "L6MUX21",
+        parameters: BTreeMap::new(),
+        attributes: BTreeMap::new(),
+        port_directions: [
+            ("D0".into(), "input"),
+            ("D1".into(), "input"),
+            ("SD".into(), "input"),
+            ("Z".into(), "output"),
+        ]
+        .into_iter()
+        .collect(),
+        connections: [
+            ("D0".into(), vec![data_zero]),
+            ("D1".into(), vec![data_one]),
+            ("SD".into(), vec![select]),
+            ("Z".into(), vec![Bit::Wire(output)]),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
 fn json_ccu2c(
     inputs: [[Bit; 4]; 2],
     carry_in: Bit,
@@ -6733,13 +7296,14 @@ mod tests {
 
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
-        MappingOptions, NextpnrJsonError, OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput,
-        PortDirection, RegisterEnableFanoutConstraint, RegisterEnableFanoutError,
-        RegisterEnableFanoutReport, backward_retime_ccu2c, backward_retime_lut,
-        carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c, forward_retime_lut,
-        map_once, map_to_ecp5, map_to_ecp5_ooc, map_to_ecp5_with_constraints,
-        map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options,
-        map_to_ecp5_with_pll, mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
+        MappedPort, MappingOptions, NextpnrJsonError, OocTimingConstraints, OpenDrainIo,
+        PllBinding, PllOutput, PortDirection, RegisterEnableFanoutConstraint,
+        RegisterEnableFanoutError, RegisterEnableFanoutReport, ResolvedIoTiming,
+        backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names,
+        forward_retime_ccu2c, forward_retime_lut, map_dedicated_wide_muxes, map_once, map_to_ecp5,
+        map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
+        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
+        mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
         replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
@@ -7011,7 +7575,7 @@ mod tests {
     }
 
     #[test]
-    fn automatically_selects_retiming_only_when_lut_timing_improves() {
+    fn wide_lut_cover_can_make_retiming_unnecessary() {
         let mut source = Netlist::new("retimed_lut_chain");
         let clock = source.add_input("clock");
         let reset = source.add_input("reset");
@@ -7059,14 +7623,10 @@ mod tests {
 
         let mapped = map_to_ecp5(&source).unwrap();
 
-        assert!(mapped.retiming().applied, "{:?}", mapped.retiming());
+        assert!(!mapped.retiming().applied, "{:?}", mapped.retiming());
         assert!(mapped.retiming().equivalence_signed_off);
-        assert!(mapped.retiming().certified_primitive_moves > 0);
-        assert!(
-            mapped.retiming().selected_lut_depth < mapped.retiming().original_lut_depth,
-            "{:?}",
-            mapped.retiming()
-        );
+        assert_eq!(mapped.retiming().original_lut_depth, 2);
+        assert_eq!(mapped.retiming().selected_lut_depth, 2);
     }
 
     #[test]
@@ -7805,7 +8365,9 @@ mod tests {
                 let bel = match cell {
                     Ecp5Cell::Lut4 { .. } => format!("X{index}/Y1/SLICEA.K0"),
                     Ecp5Cell::FlipFlop { .. } => format!("X{index}/Y1/SLICEA.FF0"),
-                    Ecp5Cell::Ccu2c { .. }
+                    Ecp5Cell::PfuMux { .. }
+                    | Ecp5Cell::L6Mux21 { .. }
+                    | Ecp5Cell::Ccu2c { .. }
                     | Ecp5Cell::BlockRam { .. }
                     | Ecp5Cell::TrellisIo { .. }
                     | Ecp5Cell::Jtagg { .. }
@@ -8435,7 +8997,9 @@ mod tests {
             .iter()
             .filter_map(|cell| match cell {
                 Ecp5Cell::Lut4 { init, .. } => Some(*init),
-                Ecp5Cell::Ccu2c { .. }
+                Ecp5Cell::PfuMux { .. }
+                | Ecp5Cell::L6Mux21 { .. }
+                | Ecp5Cell::Ccu2c { .. }
                 | Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
                 | Ecp5Cell::TrellisIo { .. }
@@ -8464,7 +9028,9 @@ mod tests {
             .iter()
             .filter_map(|cell| match cell {
                 Ecp5Cell::Lut4 { inputs, init, .. } => Some((*inputs, *init)),
-                Ecp5Cell::Ccu2c { .. }
+                Ecp5Cell::PfuMux { .. }
+                | Ecp5Cell::L6Mux21 { .. }
+                | Ecp5Cell::Ccu2c { .. }
                 | Ecp5Cell::FlipFlop { .. }
                 | Ecp5Cell::BlockRam { .. }
                 | Ecp5Cell::TrellisIo { .. }
@@ -8480,6 +9046,159 @@ mod tests {
                 0xf888
             )]
         );
+    }
+
+    #[test]
+    fn maps_an_arbitrary_six_input_function_to_a_lut6_cluster() {
+        let mut source = Netlist::new("six_input_parity");
+        let inputs = source.add_input_port("inputs", NonZeroU32::new(6).unwrap());
+        let parity = inputs[1..]
+            .iter()
+            .fold(inputs[0], |value, input| source.add_xor(value, *input));
+        source.add_output("result", parity);
+        let constraints = IoTimingConstraints::new()
+            .with_input_delay_ps("inputs", 0)
+            .with_output_delay_ps("result", 0);
+
+        let mapped = map_to_ecp5_with_constraints(
+            &source,
+            MappingOptions {
+                timing_goal_mhz: 1_500,
+                ..MappingOptions::default()
+            },
+            &constraints,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+                .count(),
+            4,
+            "{:?}",
+            mapped.retiming()
+        );
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::PfuMux { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::L6Mux21 { .. }))
+                .count(),
+            1
+        );
+        assert!(verify_mapped_equivalence_proof(&mapped, false));
+    }
+
+    #[test]
+    fn maps_an_unshared_mux_tree_to_pfumx_and_l6mux21() {
+        let (mut mapped, _) = map_once(
+            &arithmetic_netlist(2, ArithmeticOp::Add),
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+        mapped.name = "wide_mux".into();
+        mapped.cells = vec![
+            Ecp5Cell::Lut4 {
+                name: "a".into(),
+                inputs: [Bit::Wire(2), Bit::Zero, Bit::Zero, Bit::Zero],
+                output: 10,
+                init: 0xaaaa,
+            },
+            Ecp5Cell::Lut4 {
+                name: "b".into(),
+                inputs: [Bit::Wire(3), Bit::Zero, Bit::Zero, Bit::Zero],
+                output: 11,
+                init: 0xaaaa,
+            },
+            Ecp5Cell::Lut4 {
+                name: "c".into(),
+                inputs: [Bit::Wire(4), Bit::Zero, Bit::Zero, Bit::Zero],
+                output: 12,
+                init: 0xaaaa,
+            },
+            Ecp5Cell::Lut4 {
+                name: "d".into(),
+                inputs: [Bit::Wire(5), Bit::Zero, Bit::Zero, Bit::Zero],
+                output: 13,
+                init: 0xaaaa,
+            },
+            Ecp5Cell::Lut4 {
+                name: "low".into(),
+                inputs: [Bit::Wire(10), Bit::Wire(11), Bit::Wire(6), Bit::Zero],
+                output: 14,
+                init: 0xacac,
+            },
+            Ecp5Cell::Lut4 {
+                name: "high".into(),
+                inputs: [Bit::Wire(12), Bit::Wire(13), Bit::Wire(6), Bit::Zero],
+                output: 15,
+                init: 0xacac,
+            },
+            Ecp5Cell::Lut4 {
+                name: "root".into(),
+                inputs: [Bit::Wire(14), Bit::Wire(15), Bit::Wire(7), Bit::Zero],
+                output: 16,
+                init: 0xacac,
+            },
+        ];
+        mapped.ports = (2..=7)
+            .map(|wire| MappedPort {
+                name: format!("i{wire}"),
+                direction: PortDirection::Input,
+                bits: vec![Bit::Wire(wire)],
+            })
+            .chain([MappedPort {
+                name: "y".into(),
+                direction: PortDirection::Output,
+                bits: vec![Bit::Wire(16)],
+            }])
+            .collect();
+        mapped.io_timing = ResolvedIoTiming::default();
+
+        map_dedicated_wide_muxes(&mut mapped);
+
+        assert_eq!(
+            mapped
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            mapped
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::PfuMux { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            mapped
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, Ecp5Cell::L6Mux21 { .. }))
+                .count(),
+            1
+        );
+        assert!(verify_mapped_equivalence_proof(&mapped, false));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let cells = json["modules"]["wide_mux"]["cells"].as_object().unwrap();
+        assert_eq!(cells["low"]["type"], "PFUMX");
+        assert_eq!(cells["root"]["type"], "L6MUX21");
     }
 
     #[test]

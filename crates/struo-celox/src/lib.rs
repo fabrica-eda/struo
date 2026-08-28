@@ -129,6 +129,12 @@ fn reserve_cell_output(
         Ecp5Cell::Lut4 { name, output, .. } => {
             Some((*output, format!("__struo_lut_{name}_{output}")))
         }
+        Ecp5Cell::PfuMux { name, output, .. } => {
+            Some((*output, format!("__struo_pfumx_{name}_{output}")))
+        }
+        Ecp5Cell::L6Mux21 { name, output, .. } => {
+            Some((*output, format!("__struo_l6mux_{name}_{output}")))
+        }
         Ecp5Cell::FlipFlop { .. } => None,
         Ecp5Cell::Ccu2c {
             name,
@@ -271,6 +277,36 @@ fn emit_cell(
                 .map(|bit| bit_expression(builder, wires, constants, *bit))
                 .collect::<Result<Vec<_>, _>>()?;
             let value = lut_expression(builder, &input_expressions, *init, 0, 0, constants)?;
+            let target = builder.whole(wire_ref(wires, *output)?.signal)?;
+            builder.assign(target, value)?;
+            Ok(())
+        }
+        Ecp5Cell::PfuMux {
+            lut_true,
+            lut_false,
+            select,
+            output,
+            ..
+        } => {
+            let select = bit_expression(builder, wires, constants, *select)?;
+            let lut_true = bit_expression(builder, wires, constants, *lut_true)?;
+            let lut_false = bit_expression(builder, wires, constants, *lut_false)?;
+            let value = builder.mux(select, lut_true, lut_false)?;
+            let target = builder.whole(wire_ref(wires, *output)?.signal)?;
+            builder.assign(target, value)?;
+            Ok(())
+        }
+        Ecp5Cell::L6Mux21 {
+            data_zero,
+            data_one,
+            select,
+            output,
+            ..
+        } => {
+            let select = bit_expression(builder, wires, constants, *select)?;
+            let data_zero = bit_expression(builder, wires, constants, *data_zero)?;
+            let data_one = bit_expression(builder, wires, constants, *data_one)?;
+            let value = builder.mux(select, data_one, data_zero)?;
             let target = builder.whole(wire_ref(wires, *output)?.signal)?;
             builder.assign(target, value)?;
             Ok(())
