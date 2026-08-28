@@ -5525,10 +5525,13 @@ fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
             output_clock,
             locked,
             ..
-        } => [*feedback_clock, *output_clock, *locked]
-            .into_iter()
-            .map(Bit::Wire)
-            .collect(),
+        } => {
+            let mut outputs = vec![Bit::Wire(*output_clock), Bit::Wire(*locked)];
+            if feedback_clock != output_clock {
+                outputs.push(Bit::Wire(*feedback_clock));
+            }
+            outputs
+        }
     }
 }
 
@@ -9723,6 +9726,19 @@ mod tests {
         assert_eq!(cell["connections"]["CLKFB"], cell["connections"]["CLKOP"]);
         assert_ne!(cell["connections"]["CLKOP"], cell["connections"]["CLKOS"]);
         assert_eq!(cell["port_directions"]["CLKOS"], "output");
+
+        let shared_output = PllBinding::new(
+            "clk",
+            "clk_250",
+            "pll_locked",
+            PllOutput::Clkop,
+            PllOutput::Clkop,
+        );
+        let shared_output_mapped = map_to_ecp5_with_pll(&source, &shared_output).unwrap();
+        assert!(verify_mapped_equivalence_proof(
+            &shared_output_mapped,
+            shared_output_mapped.retiming.applied
+        ));
     }
 
     #[test]
