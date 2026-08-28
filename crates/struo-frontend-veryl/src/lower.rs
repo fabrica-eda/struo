@@ -1088,7 +1088,7 @@ impl<'a> ModuleLowerer<'a> {
                 }
                 let lhs = self.lower_expression(lhs, env)?;
                 let rhs = self.lower_expression(rhs, env)?;
-                let result_width = concrete_width(&comptime.r#type, "binary expression")?;
+                let result_width = binary_width(*op, comptime)?;
                 self.lower_binary(*op, lhs, rhs, result_width, comptime.r#type.signed)
             }
             Expression::Ternary(condition, then_expr, else_expr, comptime) => {
@@ -1811,6 +1811,23 @@ fn concrete_width(r#type: &Type, name: &str) -> Result<u32, ImportError> {
     u32::try_from(width).map_err(|_| ImportError::WidthTooLarge(name.into()))
 }
 
+// Shift result types retain the left operand's intrinsic width in AIR, while
+// the assignment or parent expression width is carried separately as context.
+fn binary_width(op: Op, comptime: &Comptime) -> Result<u32, ImportError> {
+    if !matches!(
+        op,
+        Op::LogicShiftL | Op::ArithShiftL | Op::LogicShiftR | Op::ArithShiftR
+    ) {
+        return concrete_width(&comptime.r#type, "binary expression");
+    }
+    let width = comptime
+        .r#type
+        .total_width()
+        .ok_or_else(|| ImportError::NonConcreteWidth("shift expression".into()))?
+        .max(comptime.expr_context.width);
+    u32::try_from(width).map_err(|_| ImportError::WidthTooLarge("shift expression".into()))
+}
+
 fn constant_value(expression: &Expression) -> Result<u64, ImportError> {
     evaluated_u64(expression)
         .ok_or_else(|| ImportError::UnsupportedBehavior("non-constant replication count".into()))
@@ -1928,6 +1945,23 @@ module AddWithCarry (
 ) {
     always_comb {
         sum = a + b + carry;
+    }
+}
+";
+
+    const SHIFT_CONTEXT_SOURCE: &str = r"
+module ShiftContext (
+    value           : input  logic<8>,
+    signed_value    : input  signed logic<8>,
+    amount          : input  logic<4>,
+    left            : output logic<16>,
+    logical_right   : output signed logic<16>,
+    arithmetic_right: output signed logic<16>,
+) {
+    always_comb {
+        left             = value << amount;
+        logical_right    = signed_value >> amount;
+        arithmetic_right = signed_value >>> amount;
     }
 }
 ";
@@ -2350,6 +2384,31 @@ module StructInstanceTop (
 
         assert_eq!(synthesized.netlist.arithmetic().len(), 1);
         assert!(synthesized.netlist.arithmetic()[0].carry_in().is_some());
+    }
+
+    #[test]
+    fn shifts_at_the_assignment_context_width() {
+        let design = analyze_and_lower(
+            SHIFT_CONTEXT_SOURCE,
+            "shift_context_lowering",
+            "ShiftContext",
+        )
+        .unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "value", 1);
+        set(&mut simulator, "signed_value", 0x80);
+        set(&mut simulator, "amount", 8);
+        assert_value(&mut simulator, "left", 0x0100);
+        assert_value(&mut simulator, "logical_right", 0x00ff);
+        assert_value(&mut simulator, "arithmetic_right", 0xffff);
+
+        set(&mut simulator, "amount", 1);
+        assert_value(&mut simulator, "left", 0x0002);
+        assert_value(&mut simulator, "logical_right", 0x7fc0);
+        assert_value(&mut simulator, "arithmetic_right", 0xffc0);
     }
 
     #[test]
