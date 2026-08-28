@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_OPT_LEVEL: 1
       RUST_BACKTRACE: 1
 
     steps:
@@ -39,8 +40,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-validate-dev-opt1-v1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '**/Cargo.toml') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-validate-dev-opt1-v1-
+            cargo-${{ runner.os }}-${{ runner.arch }}-validate-
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Veryl
@@ -77,7 +80,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run Rust tests
-        run: cargo test --locked --workspace --all-targets
+        # Match the following cargo run so dependencies are code-generated once.
+        run: cargo test --locked --workspace --all-targets --profile dev
 
       - name: Check Veryl source
         working-directory: examples/axi4-smartconnect
@@ -216,8 +220,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-qor-release-v1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '**/Cargo.toml') }}
           restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-qor-release-v1-
+            cargo-${{ runner.os }}-${{ runner.arch }}-qor-release-
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Veryl
