@@ -34,7 +34,11 @@ const RETIMING_PERIOD_MARGIN_DENOMINATOR: u32 = 10;
 // 100 ps more than that model, while dedicated carry hops bypass this charge.
 const MAPPED_ROUTE_GUARD_PS: u32 = 100;
 const MAX_ENABLE_FANOUT_PER_REPLICA: usize = 16;
-const PHYSICAL_REWRITE_MIN_GOAL_PERCENT: u32 = 98;
+// Physical fanout repair remains useful outside the final two percent: a
+// single long branch on an otherwise closed design can readily consume more
+// than that. Keep the guard only to avoid rewriting fundamentally unready
+// netlists.
+const PHYSICAL_REWRITE_MIN_GOAL_PERCENT: u32 = 95;
 const PHYSICAL_RETIME_MIN_GOAL_PERCENT: u32 = 95;
 const PHYSICAL_RETIME_MODEL_BRIDGE_PS: u32 = 400;
 // PFUMX and L6MUX21 data inputs use dedicated intra-PFU/inter-slice wiring.
@@ -8210,6 +8214,11 @@ mod tests {
             PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "300.0"), &placed)
                 .unwrap();
         assert_eq!(mapped.apply_physical_feedback(&far_from_closure), mapped);
+
+        let repairable =
+            PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "307.2"), &placed)
+                .unwrap();
+        assert_ne!(mapped.apply_physical_feedback(&repairable), mapped);
 
         let incompatible = PhysicalFeedback::from_nextpnr_json(
             &report,
