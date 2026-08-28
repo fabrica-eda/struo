@@ -17,6 +17,19 @@ impl NetId {
     }
 }
 
+/// Inclusive rectangular placement region in target tile coordinates.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PlacementRegion {
+    /// Leftmost permitted tile column.
+    pub x_min: u32,
+    /// Smallest permitted tile row.
+    pub y_min: u32,
+    /// Rightmost permitted tile column.
+    pub x_max: u32,
+    /// Largest permitted tile row.
+    pub y_max: u32,
+}
+
 impl Display for NetId {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(formatter, "n{}", self.0)
@@ -524,6 +537,8 @@ pub struct Netlist {
     next_net: u32,
     constants: [Option<NetId>; 2],
     logic_cache: HashMap<LogicKey, NetId>,
+    placed_logic_cache: HashMap<(LogicKey, PlacementRegion), NetId>,
+    placements: HashMap<NetId, PlacementRegion>,
 }
 
 impl Netlist {
@@ -541,6 +556,8 @@ impl Netlist {
             next_net: 0,
             constants: [None, None],
             logic_cache: HashMap::new(),
+            placed_logic_cache: HashMap::new(),
+            placements: HashMap::new(),
         }
     }
 
@@ -592,6 +609,18 @@ impl Netlist {
         &self.comparisons
     }
 
+    /// Returns the physical region attached to the cell driving `net`.
+    #[must_use]
+    pub fn placement(&self, net: NetId) -> Option<PlacementRegion> {
+        self.placements.get(&net).copied()
+    }
+
+    /// Returns whether this netlist carries any placement intent.
+    #[must_use]
+    pub fn has_placement_constraints(&self) -> bool {
+        !self.placements.is_empty()
+    }
+
     /// Adds a primary input and returns its net.
     pub fn add_input(&mut self, name: impl Into<String>) -> NetId {
         let name = name.into();
@@ -639,9 +668,31 @@ impl Netlist {
         self.add_node(NodeKind::RegisterOutput(name.into()), Vec::new())
     }
 
+    /// Reserves a register output with optional physical placement intent.
+    pub fn add_register_output_with_placement(
+        &mut self,
+        name: impl Into<String>,
+        placement: Option<PlacementRegion>,
+    ) -> NetId {
+        let net = self.add_register_output(name);
+        self.set_placement(net, placement);
+        net
+    }
+
     /// Reserves one memory read-data output.
     pub fn add_memory_output(&mut self, name: impl Into<String>) -> NetId {
         self.add_node(NodeKind::MemoryOutput(name.into()), Vec::new())
+    }
+
+    /// Reserves a memory output with optional physical placement intent.
+    pub fn add_memory_output_with_placement(
+        &mut self,
+        name: impl Into<String>,
+        placement: Option<PlacementRegion>,
+    ) -> NetId {
+        let net = self.add_memory_output(name);
+        self.set_placement(net, placement);
+        net
     }
 
     /// Connects a previously reserved register output to its D/control nets.
@@ -668,7 +719,22 @@ impl Netlist {
         lhs: &[NetId],
         rhs: &[NetId],
     ) -> Result<Vec<NetId>, ValidationError> {
-        self.add_arithmetic_inner(operation, lhs, rhs, None)
+        self.add_arithmetic_inner(operation, lhs, rhs, None, None)
+    }
+
+    /// Adds a word-level arithmetic operation in a physical region.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, mismatched, or unrepresentable widths.
+    pub fn add_arithmetic_with_placement(
+        &mut self,
+        operation: ArithmeticOp,
+        lhs: &[NetId],
+        rhs: &[NetId],
+        placement: Option<PlacementRegion>,
+    ) -> Result<Vec<NetId>, ValidationError> {
+        self.add_arithmetic_inner(operation, lhs, rhs, None, placement)
     }
 
     /// Adds a wrapping word-level addition with a one-bit carry input.
@@ -685,7 +751,22 @@ impl Netlist {
         rhs: &[NetId],
         carry_in: NetId,
     ) -> Result<Vec<NetId>, ValidationError> {
-        self.add_arithmetic_inner(ArithmeticOp::Add, lhs, rhs, Some(carry_in))
+        self.add_arithmetic_inner(ArithmeticOp::Add, lhs, rhs, Some(carry_in), None)
+    }
+
+    /// Adds a carry-input addition in a physical region.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, mismatched, or unrepresentable widths.
+    pub fn add_arithmetic_with_carry_and_placement(
+        &mut self,
+        lhs: &[NetId],
+        rhs: &[NetId],
+        carry_in: NetId,
+        placement: Option<PlacementRegion>,
+    ) -> Result<Vec<NetId>, ValidationError> {
+        self.add_arithmetic_inner(ArithmeticOp::Add, lhs, rhs, Some(carry_in), placement)
     }
 
     fn add_arithmetic_inner(
@@ -694,6 +775,7 @@ impl Netlist {
         lhs: &[NetId],
         rhs: &[NetId],
         carry_in: Option<NetId>,
+        placement: Option<PlacementRegion>,
     ) -> Result<Vec<NetId>, ValidationError> {
         let name = format!("arith{}", self.arithmetic.len());
         if lhs.is_empty() || lhs.len() != rhs.len() {
@@ -709,6 +791,9 @@ impl Netlist {
                 )
             })
             .collect::<Vec<_>>();
+        for output in &outputs {
+            self.set_placement(*output, placement);
+        }
         self.arithmetic.push(ArithmeticCell {
             name,
             operation,
@@ -731,11 +816,27 @@ impl Netlist {
         lhs: &[NetId],
         rhs: &[NetId],
     ) -> Result<NetId, ValidationError> {
+        self.add_comparison_with_placement(operation, lhs, rhs, None)
+    }
+
+    /// Adds a word-level comparison in a physical region.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty or mismatched operands.
+    pub fn add_comparison_with_placement(
+        &mut self,
+        operation: ComparisonOp,
+        lhs: &[NetId],
+        rhs: &[NetId],
+        placement: Option<PlacementRegion>,
+    ) -> Result<NetId, ValidationError> {
         let name = format!("compare{}", self.comparisons.len());
         if lhs.is_empty() || lhs.len() != rhs.len() {
             return Err(ValidationError::ComparisonWidth(name));
         }
         let output = self.add_node(NodeKind::ComparisonOutput(name.clone()), Vec::new());
+        self.set_placement(output, placement);
         self.comparisons.push(ComparisonCell {
             name,
             operation,
@@ -748,6 +849,16 @@ impl Netlist {
 
     /// Adds or reuses a two-input AND gate.
     pub fn add_and(&mut self, lhs: NetId, rhs: NetId) -> NetId {
+        self.add_and_with_placement(lhs, rhs, None)
+    }
+
+    /// Adds or reuses a two-input AND gate in a physical region.
+    pub fn add_and_with_placement(
+        &mut self,
+        lhs: NetId,
+        rhs: NetId,
+        placement: Option<PlacementRegion>,
+    ) -> NetId {
         if lhs == rhs {
             return lhs;
         }
@@ -758,11 +869,26 @@ impl Netlist {
             _ => {}
         }
         let (lhs, rhs) = ordered_pair(lhs, rhs);
-        self.add_cached(LogicKey::And(lhs, rhs), NodeKind::And, vec![lhs, rhs])
+        self.add_cached_with_placement(
+            LogicKey::And(lhs, rhs),
+            NodeKind::And,
+            vec![lhs, rhs],
+            placement,
+        )
     }
 
     /// Adds or reuses a two-input OR gate.
     pub fn add_or(&mut self, lhs: NetId, rhs: NetId) -> NetId {
+        self.add_or_with_placement(lhs, rhs, None)
+    }
+
+    /// Adds or reuses a two-input OR gate in a physical region.
+    pub fn add_or_with_placement(
+        &mut self,
+        lhs: NetId,
+        rhs: NetId,
+        placement: Option<PlacementRegion>,
+    ) -> NetId {
         if lhs == rhs {
             return lhs;
         }
@@ -773,27 +899,56 @@ impl Netlist {
             _ => {}
         }
         let (lhs, rhs) = ordered_pair(lhs, rhs);
-        self.add_cached(LogicKey::Or(lhs, rhs), NodeKind::Or, vec![lhs, rhs])
+        self.add_cached_with_placement(
+            LogicKey::Or(lhs, rhs),
+            NodeKind::Or,
+            vec![lhs, rhs],
+            placement,
+        )
     }
 
     /// Adds or reuses a two-input XOR gate.
     pub fn add_xor(&mut self, lhs: NetId, rhs: NetId) -> NetId {
+        self.add_xor_with_placement(lhs, rhs, None)
+    }
+
+    /// Adds or reuses a two-input XOR gate in a physical region.
+    pub fn add_xor_with_placement(
+        &mut self,
+        lhs: NetId,
+        rhs: NetId,
+        placement: Option<PlacementRegion>,
+    ) -> NetId {
         if lhs == rhs {
             return self.add_constant(false);
         }
         match (self.constant_value(lhs), self.constant_value(rhs)) {
             (Some(false), _) => return rhs,
             (_, Some(false)) => return lhs,
-            (Some(true), _) => return self.add_not(rhs),
-            (_, Some(true)) => return self.add_not(lhs),
+            (Some(true), _) => return self.add_not_with_placement(rhs, placement),
+            (_, Some(true)) => return self.add_not_with_placement(lhs, placement),
             _ => {}
         }
         let (lhs, rhs) = ordered_pair(lhs, rhs);
-        self.add_cached(LogicKey::Xor(lhs, rhs), NodeKind::Xor, vec![lhs, rhs])
+        self.add_cached_with_placement(
+            LogicKey::Xor(lhs, rhs),
+            NodeKind::Xor,
+            vec![lhs, rhs],
+            placement,
+        )
     }
 
     /// Adds or reuses an inverter.
     pub fn add_not(&mut self, input: NetId) -> NetId {
+        self.add_not_with_placement(input, None)
+    }
+
+    /// Adds or reuses an inverter in a physical region.
+    pub fn add_not_with_placement(
+        &mut self,
+        input: NetId,
+        placement: Option<PlacementRegion>,
+    ) -> NetId {
         if let Some(value) = self.constant_value(input) {
             return self.add_constant(!value);
         }
@@ -805,21 +960,33 @@ impl Netlist {
         {
             return inputs[0];
         }
-        self.add_cached(LogicKey::Not(input), NodeKind::Not, vec![input])
+        self.add_cached_with_placement(LogicKey::Not(input), NodeKind::Not, vec![input], placement)
     }
 
     /// Adds or reuses a mux.
     pub fn add_mux(&mut self, condition: NetId, then_net: NetId, else_net: NetId) -> NetId {
+        self.add_mux_with_placement(condition, then_net, else_net, None)
+    }
+
+    /// Adds or reuses a mux in a physical region.
+    pub fn add_mux_with_placement(
+        &mut self,
+        condition: NetId,
+        then_net: NetId,
+        else_net: NetId,
+        placement: Option<PlacementRegion>,
+    ) -> NetId {
         if then_net == else_net {
             return then_net;
         }
         if let Some(value) = self.constant_value(condition) {
             return if value { then_net } else { else_net };
         }
-        self.add_cached(
+        self.add_cached_with_placement(
             LogicKey::Mux(condition, then_net, else_net),
             NodeKind::Mux,
             vec![condition, then_net, else_net],
+            placement,
         )
     }
 
@@ -1169,6 +1336,31 @@ impl Netlist {
         net
     }
 
+    fn add_cached_with_placement(
+        &mut self,
+        key: LogicKey,
+        kind: NodeKind,
+        inputs: Vec<NetId>,
+        placement: Option<PlacementRegion>,
+    ) -> NetId {
+        let Some(placement) = placement else {
+            return self.add_cached(key, kind, inputs);
+        };
+        if let Some(net) = self.placed_logic_cache.get(&(key, placement)) {
+            return *net;
+        }
+        let net = self.add_node(kind, inputs);
+        self.placements.insert(net, placement);
+        self.placed_logic_cache.insert((key, placement), net);
+        net
+    }
+
+    fn set_placement(&mut self, net: NetId, placement: Option<PlacementRegion>) {
+        if let Some(placement) = placement {
+            self.placements.insert(net, placement);
+        }
+    }
+
     fn add_node(&mut self, kind: NodeKind, inputs: Vec<NetId>) -> NetId {
         let output = NetId(self.next_net);
         self.next_net = self
@@ -1362,7 +1554,9 @@ impl Error for ValidationError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ArithmeticOp, ClockEdge, ComparisonOp, Netlist, NodeKind, RegisterCell};
+    use super::{
+        ArithmeticOp, ClockEdge, ComparisonOp, Netlist, NodeKind, PlacementRegion, RegisterCell,
+    };
 
     #[test]
     fn valid_and_gate_netlist_passes_validation() {
@@ -1394,6 +1588,34 @@ mod tests {
                 .iter()
                 .any(|node| matches!(node.kind(), NodeKind::And | NodeKind::Xor))
         );
+    }
+
+    #[test]
+    fn structurally_equal_logic_in_different_regions_is_not_shared() {
+        let mut design = Netlist::new("floorplan");
+        let lhs = design.add_input("a");
+        let rhs = design.add_input("b");
+        let left = PlacementRegion {
+            x_min: 0,
+            y_min: 0,
+            x_max: 9,
+            y_max: 9,
+        };
+        let right = PlacementRegion {
+            x_min: 10,
+            y_min: 0,
+            x_max: 19,
+            y_max: 9,
+        };
+
+        let left_net = design.add_xor_with_placement(lhs, rhs, Some(left));
+        let same_left = design.add_xor_with_placement(rhs, lhs, Some(left));
+        let right_net = design.add_xor_with_placement(lhs, rhs, Some(right));
+
+        assert_eq!(left_net, same_left);
+        assert_ne!(left_net, right_net);
+        assert_eq!(design.placement(left_net), Some(left));
+        assert_eq!(design.placement(right_net), Some(right));
     }
 
     #[test]

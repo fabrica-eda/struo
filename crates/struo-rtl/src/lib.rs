@@ -5,7 +5,7 @@
 //! and edge-triggered storage. Analyzer-owned identities must not cross this
 //! boundary.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU32;
@@ -55,6 +55,46 @@ pub struct ValueType {
     pub signed: bool,
     /// Simulation value domain.
     pub state: StateDomain,
+}
+
+/// Inclusive rectangular placement region in target tile coordinates.
+///
+/// The coordinates deliberately stay target-neutral at the RTL boundary. A
+/// physical backend decides how tile coordinates map onto its device.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PlacementRegion {
+    /// Leftmost permitted tile column.
+    pub x_min: u32,
+    /// Smallest permitted tile row.
+    pub y_min: u32,
+    /// Rightmost permitted tile column.
+    pub x_max: u32,
+    /// Largest permitted tile row.
+    pub y_max: u32,
+}
+
+impl PlacementRegion {
+    /// Creates a non-empty inclusive rectangle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either lower bound exceeds its upper bound.
+    pub fn new(x_min: u32, y_min: u32, x_max: u32, y_max: u32) -> Result<Self, RtlError> {
+        if x_min > x_max || y_min > y_max {
+            return Err(RtlError::InvalidPlacementRegion {
+                x_min,
+                y_min,
+                x_max,
+                y_max,
+            });
+        }
+        Ok(Self {
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+        })
+    }
 }
 
 /// Direction of a module port.
@@ -473,6 +513,9 @@ pub struct Module {
     registers: Vec<Register>,
     memories: Vec<Memory>,
     instances: Vec<Instance>,
+    expression_placements: HashMap<ExprId, PlacementRegion>,
+    register_placements: HashMap<String, PlacementRegion>,
+    memory_placements: HashMap<String, PlacementRegion>,
 }
 
 impl Module {
@@ -488,6 +531,9 @@ impl Module {
             registers: Vec::new(),
             memories: Vec::new(),
             instances: Vec::new(),
+            expression_placements: HashMap::new(),
+            register_placements: HashMap::new(),
+            memory_placements: HashMap::new(),
         }
     }
 
@@ -537,6 +583,91 @@ impl Module {
     #[must_use]
     pub fn instances(&self) -> &[Instance] {
         &self.instances
+    }
+
+    /// Returns the physical region attached to an expression, if any.
+    #[must_use]
+    pub fn expression_placement(&self, expression: ExprId) -> Option<PlacementRegion> {
+        self.expression_placements.get(&expression).copied()
+    }
+
+    /// Attaches a physical region to an expression and its synthesized logic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown expression or a conflicting region.
+    pub fn set_expression_placement(
+        &mut self,
+        expression: ExprId,
+        region: PlacementRegion,
+    ) -> Result<(), RtlError> {
+        self.expression(expression)?;
+        insert_placement(
+            &mut self.expression_placements,
+            expression,
+            region,
+            "expression",
+        )
+    }
+
+    /// Returns the physical region attached to a named register.
+    #[must_use]
+    pub fn register_placement(&self, name: &str) -> Option<PlacementRegion> {
+        self.register_placements.get(name).copied()
+    }
+
+    /// Attaches a physical region to a named register.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the register is missing or has another region.
+    pub fn set_register_placement(
+        &mut self,
+        name: &str,
+        region: PlacementRegion,
+    ) -> Result<(), RtlError> {
+        if !self.registers.iter().any(|register| register.name == name) {
+            return Err(RtlError::UnknownPlacedEntity {
+                kind: "register",
+                name: name.to_owned(),
+            });
+        }
+        insert_placement(
+            &mut self.register_placements,
+            name.to_owned(),
+            region,
+            "register",
+        )
+    }
+
+    /// Returns the physical region attached to a named memory.
+    #[must_use]
+    pub fn memory_placement(&self, name: &str) -> Option<PlacementRegion> {
+        self.memory_placements.get(name).copied()
+    }
+
+    /// Attaches a physical region to a named memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the memory is missing or has another region.
+    pub fn set_memory_placement(
+        &mut self,
+        name: &str,
+        region: PlacementRegion,
+    ) -> Result<(), RtlError> {
+        if !self.memories.iter().any(|memory| memory.name == name) {
+            return Err(RtlError::UnknownPlacedEntity {
+                kind: "memory",
+                name: name.to_owned(),
+            });
+        }
+        insert_placement(
+            &mut self.memory_placements,
+            name.to_owned(),
+            region,
+            "memory",
+        )
     }
 
     /// Adds a port and returns its signal identity.
@@ -1205,6 +1336,22 @@ fn validate_unique_name<'a>(
     }
 }
 
+fn insert_placement<K: Eq + std::hash::Hash>(
+    placements: &mut HashMap<K, PlacementRegion>,
+    key: K,
+    region: PlacementRegion,
+    kind: &'static str,
+) -> Result<(), RtlError> {
+    if let Some(previous) = placements.get(&key) {
+        if *previous != region {
+            return Err(RtlError::ConflictingPlacementRegion { kind });
+        }
+        return Ok(());
+    }
+    placements.insert(key, region);
+    Ok(())
+}
+
 /// Invalid hardware-semantic RTL.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RtlError {
@@ -1275,6 +1422,29 @@ pub enum RtlError {
         /// Driven bit index.
         bit: u32,
     },
+    /// A rectangle has inverted bounds.
+    InvalidPlacementRegion {
+        /// Left bound.
+        x_min: u32,
+        /// Top bound.
+        y_min: u32,
+        /// Right bound.
+        x_max: u32,
+        /// Bottom bound.
+        y_max: u32,
+    },
+    /// Placement metadata names an entity which is not present.
+    UnknownPlacedEntity {
+        /// Entity kind.
+        kind: &'static str,
+        /// Entity name.
+        name: String,
+    },
+    /// One entity was assigned two different rectangles.
+    ConflictingPlacementRegion {
+        /// Entity kind.
+        kind: &'static str,
+    },
 }
 
 impl Display for RtlError {
@@ -1326,6 +1496,21 @@ impl Display for RtlError {
                     formatter,
                     "signal `{signal}` bit {bit} has multiple drivers"
                 )
+            }
+            Self::InvalidPlacementRegion {
+                x_min,
+                y_min,
+                x_max,
+                y_max,
+            } => write!(
+                formatter,
+                "placement region lower bound ({x_min}, {y_min}) exceeds upper bound ({x_max}, {y_max})"
+            ),
+            Self::UnknownPlacedEntity { kind, name } => {
+                write!(formatter, "unknown placed {kind} `{name}`")
+            }
+            Self::ConflictingPlacementRegion { kind } => {
+                write!(formatter, "conflicting placement regions on {kind}")
             }
         }
     }

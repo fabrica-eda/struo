@@ -319,6 +319,17 @@ pub enum ImportError {
     },
     /// An array carried incompatible memory-inference directives.
     ConflictingMemoryInferencePolicies(String),
+    /// A module instance carried a malformed physical placement rectangle.
+    InvalidPlacementRegion {
+        /// Instance carrying the directive.
+        instance: String,
+        /// Original attribute value.
+        value: String,
+        /// Parse or bounds failure.
+        reason: String,
+    },
+    /// A module instance carried two different placement rectangles.
+    ConflictingPlacementRegions(String),
     /// A required array did not match the supported memory contract.
     RequiredMemoryInferenceFailed {
         /// Array that was required to become a memory.
@@ -366,6 +377,18 @@ impl Display for ImportError {
             Self::ConflictingMemoryInferencePolicies(memory) => write!(
                 formatter,
                 "memory `{memory}` has conflicting `struo_memory` policies"
+            ),
+            Self::InvalidPlacementRegion {
+                instance,
+                value,
+                reason,
+            } => write!(
+                formatter,
+                "instance `{instance}` has invalid `struo_region` value `{value}`: {reason}"
+            ),
+            Self::ConflictingPlacementRegions(instance) => write!(
+                formatter,
+                "instance `{instance}` has conflicting `struo_region` attributes"
             ),
             Self::RequiredMemoryInferenceFailed { memory, reason } => write!(
                 formatter,
