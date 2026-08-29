@@ -2437,30 +2437,34 @@ fn map_to_ecp5_with_period(
     split_branched_carry_outs(&mut wide);
     let (narrow, _) =
         map_once_with_period_and_lut_inputs(netlist, options, period_ps, io_timing, 4)?;
-    let original_cells = narrow.cells.len();
     let mut conservative = narrow.clone();
     split_branched_carry_outs(&mut conservative);
     map_dedicated_wide_muxes(&mut conservative);
     let wide_profile = mapped_lut_profile(&wide);
     let conservative_profile = mapped_lut_profile(&conservative);
-    let (mut selected, mapped_original_profile) =
+    let (mut selected, mapped_original_profile, retime_conservative) =
         if mapping_profile_key(&conservative, &conservative_profile)
             < mapping_profile_key(&wide, &wide_profile)
         {
-            (conservative, conservative_profile)
+            (conservative, conservative_profile, true)
         } else {
-            (wide, wide_profile)
+            (wide, wide_profile, false)
         };
     let original_registers = netlist.registers().len();
+    let original_cells = narrow.cells.len();
     let mut selected_registers = original_registers;
     let mut applied = false;
-    if let Some(mut retimed) = automatically_retime_mapped_luts(
-        &narrow,
-        original_cells,
-        original_registers,
-        retiming_target_period_ps,
-    )
-    .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
+    if let Some(mut retimed) = retime_conservative
+        .then(|| {
+            automatically_retime_mapped_luts(
+                &narrow,
+                original_cells,
+                original_registers,
+                retiming_target_period_ps,
+            )
+        })
+        .flatten()
+        .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
     {
         split_branched_carry_outs(&mut retimed);
         map_dedicated_wide_muxes(&mut retimed);
@@ -2895,43 +2899,49 @@ fn automatically_retime_mapped_luts(
         } else {
             profile.critical_depth.clone()
         };
-        for &register in &critical {
-            let Some(mut candidate) = backward_retime_primitive(&frontier, register) else {
-                continue;
-            };
-            merge_equivalent_flip_flops(&mut candidate);
-            let candidate_profile = mapped_lut_profile(&candidate);
-            let candidate_registers = mapped_register_count(&candidate);
-            let candidate_overall = adjusted_overall(&candidate_profile, &candidate);
-            if (!timing_driven && candidate_profile.overall_depth > original_profile.overall_depth)
-                || candidate_overall > original_profile.overall_period_ps
-                || candidate.cells.len() > cell_limit
-                || candidate_registers > register_limit
-                || mapped_comb_count(&candidate) > comb_limit
-            {
-                continue;
-            }
-            let score = retiming_score(
-                &candidate_profile,
-                timing_driven,
-                candidate.cells.len(),
-                candidate_registers,
-                candidate_overall,
-            );
-            let frontier_score = retiming_score(
-                &profile,
-                timing_driven,
-                frontier.cells.len(),
-                mapped_register_count(&frontier),
-                adjusted_overall(&profile, &frontier),
-            );
-            if score < frontier_score
-                && best
-                    .as_ref()
-                    .is_none_or(|(_, best_score): &(Ecp5Netlist, _)| score < *best_score)
-                && carry_outs_are_point_to_point(&candidate)
-            {
-                best = Some((candidate, score));
+        // A single move cannot lower a maximum shared by a timing cutset.
+        // Evaluate the cutset as a batch below instead of paying for every
+        // endpoint and then greedily accepting one flat-period move at a time.
+        if critical.len() == 1 {
+            for &register in &critical {
+                let Some(mut candidate) = backward_retime_primitive(&frontier, register) else {
+                    continue;
+                };
+                merge_equivalent_flip_flops(&mut candidate);
+                let candidate_profile = mapped_lut_profile(&candidate);
+                let candidate_registers = mapped_register_count(&candidate);
+                let candidate_overall = adjusted_overall(&candidate_profile, &candidate);
+                if (!timing_driven
+                    && candidate_profile.overall_depth > original_profile.overall_depth)
+                    || candidate_overall > original_profile.overall_period_ps
+                    || candidate.cells.len() > cell_limit
+                    || candidate_registers > register_limit
+                    || mapped_comb_count(&candidate) > comb_limit
+                {
+                    continue;
+                }
+                let score = retiming_score(
+                    &candidate_profile,
+                    timing_driven,
+                    candidate.cells.len(),
+                    candidate_registers,
+                    candidate_overall,
+                );
+                let frontier_score = retiming_score(
+                    &profile,
+                    timing_driven,
+                    frontier.cells.len(),
+                    mapped_register_count(&frontier),
+                    adjusted_overall(&profile, &frontier),
+                );
+                if score < frontier_score
+                    && best
+                        .as_ref()
+                        .is_none_or(|(_, best_score): &(Ecp5Netlist, _)| score < *best_score)
+                    && carry_outs_are_point_to_point(&candidate)
+                {
+                    best = Some((candidate, score));
+                }
             }
         }
         // Equal-delay endpoints form a timing cutset: moving any one endpoint
@@ -3163,10 +3173,10 @@ fn retiming_score(
         (
             u64::from(overall_period_ps),
             u64::from(profile.data_period_ps),
-            u64::try_from(profile.critical_timing.len()).unwrap_or(u64::MAX),
-            profile.data_depth,
+            u64::try_from(profile.data_depth).unwrap_or(u64::MAX),
             cells,
             registers,
+            profile.critical_timing.len(),
         )
     } else {
         (
@@ -7702,8 +7712,8 @@ mod tests {
 
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
-        MappedPort, MappingOptions, NextpnrJsonError, OocTimingConstraints, OpenDrainIo,
-        PllBinding, PllOutput, PortDirection, RegisterEnableFanoutConstraint,
+        MappedLutProfile, MappedPort, MappingOptions, NextpnrJsonError, OocTimingConstraints,
+        OpenDrainIo, PllBinding, PllOutput, PortDirection, RegisterEnableFanoutConstraint,
         RegisterEnableFanoutError, RegisterEnableFanoutReport, ResolvedIoTiming,
         TimingClockConstraint, TimingConstraints, TimingPathConstraint, backward_retime_ccu2c,
         backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c,
@@ -7712,7 +7722,7 @@ mod tests {
         map_to_ecp5_with_options, map_to_ecp5_with_pll, map_to_ecp5_with_timing_constraints,
         mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
         physical_bel_is_compatible, physical_feedback_matches_netlist,
-        replicate_high_fanout_enable_luts, split_branched_carry_outs,
+        replicate_high_fanout_enable_luts, retiming_score, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
     use crate::{PhysicalFeedback, PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint};
@@ -8096,6 +8106,33 @@ mod tests {
         assert!(mapped.retiming().equivalence_signed_off);
         assert_eq!(mapped.retiming().original_lut_depth, 2);
         assert_eq!(mapped.retiming().selected_lut_depth, 2);
+    }
+
+    #[test]
+    fn flat_period_retiming_does_not_trade_area_for_one_fewer_endpoint() {
+        let baseline = MappedLutProfile {
+            data_depth: 12,
+            critical_depth: vec![0, 1],
+            overall_depth: 12,
+            data_period_ps: 7_500,
+            critical_timing: vec![0, 1],
+            timing_endpoints: vec![(0, 7_500), (1, 7_500)],
+            overall_period_ps: 7_500,
+        };
+        let candidate = MappedLutProfile {
+            data_depth: 12,
+            critical_depth: vec![0, 1],
+            overall_depth: 12,
+            data_period_ps: 7_500,
+            critical_timing: vec![0],
+            timing_endpoints: vec![(0, 7_500)],
+            overall_period_ps: 7_500,
+        };
+
+        assert!(
+            retiming_score(&candidate, true, 101, 51, 7_500)
+                > retiming_score(&baseline, true, 100, 50, 7_500)
+        );
     }
 
     #[test]
