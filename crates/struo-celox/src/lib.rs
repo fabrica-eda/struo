@@ -347,6 +347,7 @@ fn emit_cell(
             clock,
             edge,
             second_port: _,
+            clock_enable: _,
         } => emit_block_ram(
             builder,
             wires,
