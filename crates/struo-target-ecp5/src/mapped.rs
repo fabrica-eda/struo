@@ -1427,6 +1427,19 @@ impl Ecp5Netlist {
                 .cells
                 .iter()
                 .filter_map(|cell| {
+                    // Rewiring can invalidate a previously legal LUT/FF pack
+                    // even when both cells retain their names. Preserve only
+                    // hard-block locations; let nextpnr repack and replace all
+                    // fabric logic, including newly created replicas.
+                    if !matches!(
+                        cell,
+                        Ecp5Cell::BlockRam { .. }
+                            | Ecp5Cell::TrellisIo { .. }
+                            | Ecp5Cell::Jtagg { .. }
+                            | Ecp5Cell::Pll { .. }
+                    ) {
+                        return None;
+                    }
                     let name = mapped_cell_name(cell);
                     let bel = feedback.bel(name)?;
                     physical_bel_is_compatible(cell, bel).then(|| (name.to_owned(), bel.to_owned()))
@@ -8908,7 +8921,7 @@ mod tests {
         assert!(refined.retiming.equivalence_signed_off);
         let json = refined.to_nextpnr_json().unwrap();
         assert!(json.contains("physical_replicate_"));
-        assert!(json.contains("NEXTPNR_BEL"));
+        assert!(!json.contains("NEXTPNR_BEL"));
 
         let far_from_closure =
             PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "300.0"), &placed)
