@@ -1,0 +1,9 @@
+{
+  "clocks": {
+    "core": {
+      "port": "clk",
+      "period_ps": 10000,
+      "uncertainty_ps": 100
+    }
+  }
+}

@@ -253,6 +253,42 @@ carry-chain, BRAM, and setup arcs; fanout-weighted timing selection is enabled
 for cones that consume about half the available period before exact
 referenced-area recovery. Unreachable Boolean logic is omitted and the
 selected cover maps to `LUT4`; registers map to `TRELLIS_FF`.
+
+For a clock goal that must be identical in technology mapping and physical
+implementation, pass a shared timing file:
+
+```sh
+struo bench/designs/counter32 --top counter32 \
+  --timing-constraints timing.json \
+  --output counter32.nextpnr.json
+```
+
+```json
+{
+  "clocks": {
+    "core": {
+      "port": "clk",
+      "period_ps": 10000,
+      "uncertainty_ps": 100
+    }
+  }
+}
+```
+
+The mapper uses the shortest effective period (`period_ps - uncertainty_ps`)
+across the named clocks. It requires every register and memory clock to be
+declared, preventing an accidental fallback to the default goal. The CLI also
+writes `counter32.nextpnr.timing.py`; pass that file to nextpnr with
+`--pre-pack`. Library flows can use `Ecp5Flow::evaluation_board_for_netlist`,
+call `write_timing_constraints_artifact`, and obtain draft, physical-candidate,
+and final commands which all reference the same generated file.
+
+The common schema reserves `input_delays_ps`, `output_delays_ps`,
+`false_paths`, and `multicycle_paths`. The current ECP5 backend rejects these
+entries explicitly because nextpnr cannot enforce them during physical
+implementation. Mapper-only I/O budgeting remains available through
+`--io-timing-constraints`; it must not be mistaken for physical sign-off.
+
 The frequency goal applies to synchronous paths. Top-level I/O paths are
 unconstrained unless their delays are named explicitly, so a combinational or
 I/O-to-register path is not silently treated as a 300 MHz path. Pass a JSON

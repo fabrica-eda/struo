@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Display, Formatter, Write as _};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use serde::ser::Serializer;
@@ -407,11 +407,11 @@ impl IoTimingConstraints {
     }
 }
 
-/// One clock available at an out-of-context module boundary.
+/// One named clock shared by technology mapping and physical implementation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct OocClockConstraint {
-    /// Scalar input port carrying this clock.
+pub struct TimingClockConstraint {
+    /// Scalar input port carrying this clock before optional target binding.
     pub port: String,
     /// Nominal clock period in picoseconds.
     pub period_ps: u32,
@@ -419,6 +419,145 @@ pub struct OocClockConstraint {
     #[serde(default)]
     pub uncertainty_ps: u32,
 }
+
+/// Source and destination selectors for a path-specific timing exception.
+///
+/// Selectors are reserved for a backend-neutral naming layer. Current callers
+/// should use `clock:<name>`, `port:<name>`, or `cell:<glob>`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimingPathConstraint {
+    /// Launch clock, port, or mapped-cell selector.
+    pub from: String,
+    /// Capture clock, port, or mapped-cell selector.
+    pub to: String,
+}
+
+/// A setup multicycle exception between two timing selectors.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MulticyclePathConstraint {
+    /// Launch clock, port, or mapped-cell selector.
+    pub from: String,
+    /// Capture clock, port, or mapped-cell selector.
+    pub to: String,
+    /// Number of capture cycles allowed for setup.
+    pub setup_cycles: u32,
+}
+
+impl TimingClockConstraint {
+    /// Returns the setup budget remaining after clock uncertainty.
+    #[must_use]
+    pub fn effective_period_ps(&self) -> Option<u32> {
+        self.period_ps
+            .checked_sub(self.uncertainty_ps)
+            .filter(|period| *period > 0)
+    }
+}
+
+/// Timing constraints consumed by both the ECP5 mapper and place-and-route.
+///
+/// When clocks are present, every sequential clock in the input netlist must
+/// be one of the named scalar ports. The mapper conservatively optimizes all
+/// domains to the shortest effective period; nextpnr receives each domain's
+/// individual effective period. The schema reserves I/O and path exceptions,
+/// but the current nextpnr backend rejects them rather than applying a
+/// mapper-only relaxation that physical implementation cannot enforce.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimingConstraints {
+    /// Named clocks indexed by a user-facing clock name.
+    #[serde(default)]
+    pub clocks: BTreeMap<String, TimingClockConstraint>,
+    /// Maximum input arrival delay by source-level port name, in picoseconds.
+    /// Currently rejected by the shared ECP5/nextpnr flow because nextpnr does
+    /// not enforce I/O timing.
+    #[serde(default)]
+    pub input_delays_ps: BTreeMap<String, u32>,
+    /// Maximum external output delay by source-level port name, in picoseconds.
+    /// Currently rejected by the shared ECP5/nextpnr flow because nextpnr does
+    /// not enforce I/O timing.
+    #[serde(default)]
+    pub output_delays_ps: BTreeMap<String, u32>,
+    /// Paths intentionally excluded from setup timing.
+    ///
+    /// The ECP5/nextpnr backend currently rejects non-empty entries because
+    /// nextpnr does not enforce false-path SDC constraints yet.
+    #[serde(default)]
+    pub false_paths: Vec<TimingPathConstraint>,
+    /// Paths allowed more than one capture cycle for setup.
+    ///
+    /// The ECP5/nextpnr backend currently rejects non-empty entries because
+    /// nextpnr does not implement multicycle path constraints.
+    #[serde(default)]
+    pub multicycle_paths: Vec<MulticyclePathConstraint>,
+}
+
+impl TimingConstraints {
+    /// Creates an empty set which falls back to [`MappingOptions::timing_goal_mhz`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            clocks: BTreeMap::new(),
+            input_delays_ps: BTreeMap::new(),
+            output_delays_ps: BTreeMap::new(),
+            false_paths: Vec::new(),
+            multicycle_paths: Vec::new(),
+        }
+    }
+
+    /// Adds or replaces a named clock.
+    #[must_use]
+    pub fn with_clock(mut self, name: impl Into<String>, clock: TimingClockConstraint) -> Self {
+        self.clocks.insert(name.into(), clock);
+        self
+    }
+
+    /// Adds or replaces a maximum input delay in picoseconds.
+    #[must_use]
+    pub fn with_input_delay_ps(mut self, port: impl Into<String>, delay_ps: u32) -> Self {
+        self.input_delays_ps.insert(port.into(), delay_ps);
+        self
+    }
+
+    /// Adds or replaces a maximum external output delay in picoseconds.
+    #[must_use]
+    pub fn with_output_delay_ps(mut self, port: impl Into<String>, delay_ps: u32) -> Self {
+        self.output_delays_ps.insert(port.into(), delay_ps);
+        self
+    }
+
+    /// Returns the shortest setup budget among the named clocks.
+    #[must_use]
+    pub fn tightest_effective_period_ps(&self) -> Option<u32> {
+        self.clocks
+            .values()
+            .filter_map(TimingClockConstraint::effective_period_ps)
+            .min()
+    }
+
+    fn io_timing(&self) -> IoTimingConstraints {
+        IoTimingConstraints {
+            input_delays_ps: self.input_delays_ps.clone(),
+            output_delays_ps: self.output_delays_ps.clone(),
+        }
+    }
+}
+
+impl From<IoTimingConstraints> for TimingConstraints {
+    fn from(io_timing: IoTimingConstraints) -> Self {
+        Self {
+            clocks: BTreeMap::new(),
+            input_delays_ps: io_timing.input_delays_ps,
+            output_delays_ps: io_timing.output_delays_ps,
+            false_paths: Vec::new(),
+            multicycle_paths: Vec::new(),
+        }
+    }
+}
+
+/// One clock available at an out-of-context module boundary.
+pub type OocClockConstraint = TimingClockConstraint;
 
 /// Timing budget for one registered out-of-context data port.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -482,6 +621,21 @@ impl OocTimingConstraints {
 struct ResolvedIoTiming {
     input_arrivals_ps: BTreeMap<u32, u32>,
     output_delays_ps: Vec<(Bit, u32)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedClockTiming {
+    name: String,
+    net_name: String,
+    bit: Bit,
+    period_ps: u32,
+    uncertainty_ps: u32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ResolvedTimingConstraints {
+    default_frequency_mhz: u32,
+    clocks: Vec<ResolvedClockTiming>,
 }
 
 #[derive(Debug)]
@@ -713,6 +867,7 @@ pub struct Ecp5Netlist {
     equivalence_proof: MappedEquivalenceProof,
     placement_hints: BTreeMap<String, String>,
     io_timing: ResolvedIoTiming,
+    timing_constraints: ResolvedTimingConstraints,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -775,6 +930,42 @@ impl Ecp5Netlist {
     #[must_use]
     pub fn ports(&self) -> &[MappedPort] {
         &self.ports
+    }
+
+    /// Returns a deterministic nextpnr pre-pack program for all named clocks.
+    ///
+    /// Clock uncertainty is represented by constraining the effective setup
+    /// period (`period_ps - uncertainty_ps`). An empty string means that the
+    /// mapping used only the global fallback frequency.
+    #[must_use]
+    pub fn nextpnr_pre_pack_timing_constraints(&self) -> String {
+        let mut source = String::new();
+        for clock in &self.timing_constraints.clocks {
+            let Ok(escaped_name) = serde_json::to_string(&clock.net_name) else {
+                continue;
+            };
+            let Ok(escaped_clock) = serde_json::to_string(&clock.name) else {
+                continue;
+            };
+            let effective_period_ps = clock.period_ps - clock.uncertainty_ps;
+            let _ = writeln!(
+                source,
+                "# clock {}: period {} ps, uncertainty {} ps\nctx.addClock({}, 1000000.0 / {})",
+                escaped_clock,
+                clock.period_ps,
+                clock.uncertainty_ps,
+                escaped_name,
+                effective_period_ps
+            );
+        }
+        source
+    }
+
+    /// Returns the nextpnr fallback frequency used for otherwise unconstrained
+    /// clock domains.
+    #[must_use]
+    pub fn nextpnr_default_frequency_mhz(&self) -> u32 {
+        self.timing_constraints.default_frequency_mhz.max(1)
     }
 
     /// Returns physical primitives in dependency order.
@@ -1569,6 +1760,51 @@ pub fn map_to_ecp5_with_constraints(
         io_timing,
         period_ps,
         retiming_target_period_ps,
+        ResolvedTimingConstraints::default(),
+    )
+}
+
+/// Maps a target-independent netlist with one timing context shared by
+/// technology mapping and physical implementation.
+///
+/// Named clocks replace the global mapper frequency. All sequential clocks
+/// must then be declared. The shortest effective clock period drives the
+/// mapper, while [`Ecp5Netlist::nextpnr_pre_pack_timing_constraints`] retains
+/// each individual clock for place-and-route.
+///
+/// # Errors
+///
+/// Returns an error if the source netlist, a clock, or an I/O constraint is
+/// invalid.
+pub fn map_to_ecp5_with_timing_constraints(
+    netlist: &Netlist,
+    options: MappingOptions,
+    constraints: &TimingConstraints,
+) -> Result<Ecp5Netlist, MappingError> {
+    netlist.validate()?;
+    let io_timing = constraints.io_timing();
+    validate_io_timing(netlist, &io_timing)?;
+    let timing = resolve_timing_constraints(netlist, constraints)?;
+    let period_ps = constraints
+        .tightest_effective_period_ps()
+        .unwrap_or_else(|| 1_000_000u32 / options.timing_goal_mhz.max(1));
+    let options = if constraints.clocks.is_empty() {
+        options
+    } else {
+        MappingOptions {
+            timing_goal_mhz: 1_000_000u32.div_ceil(period_ps.max(1)),
+            ..options
+        }
+    };
+    let retiming_target_period_ps = period_ps.saturating_mul(RETIMING_PERIOD_MARGIN_NUMERATOR)
+        / RETIMING_PERIOD_MARGIN_DENOMINATOR;
+    map_to_ecp5_with_period(
+        netlist,
+        options,
+        &io_timing,
+        period_ps,
+        retiming_target_period_ps,
+        timing,
     )
 }
 
@@ -1598,18 +1834,141 @@ pub fn map_to_ecp5_ooc(
         .period_ps
         .saturating_mul(RETIMING_PERIOD_MARGIN_NUMERATOR)
         / RETIMING_PERIOD_MARGIN_DENOMINATOR;
+    let timing = resolve_ooc_clock_timing(netlist, constraints)?;
     map_to_ecp5_with_period(
         netlist,
         options,
         &normalized.io_timing,
         normalized.period_ps,
         retiming_target_period_ps,
+        timing,
     )
 }
 
 struct NormalizedOocTiming {
     io_timing: IoTimingConstraints,
     period_ps: u32,
+}
+
+fn resolve_timing_constraints(
+    netlist: &Netlist,
+    constraints: &TimingConstraints,
+) -> Result<ResolvedTimingConstraints, MappingError> {
+    if !constraints.input_delays_ps.is_empty() || !constraints.output_delays_ps.is_empty() {
+        return Err(MappingError::InvalidTimingConstraint(
+            "I/O delays are not supported by the current ECP5/nextpnr backend; use mapper-only `IoTimingConstraints` when physical sign-off is not required".into(),
+        ));
+    }
+    if !constraints.false_paths.is_empty() {
+        return Err(MappingError::InvalidTimingConstraint(
+            "false paths are not supported by the current ECP5/nextpnr backend".into(),
+        ));
+    }
+    if !constraints.multicycle_paths.is_empty() {
+        return Err(MappingError::InvalidTimingConstraint(
+            "multicycle paths are not supported by the current ECP5/nextpnr backend".into(),
+        ));
+    }
+    resolve_clock_timing(netlist, &constraints.clocks, false)
+}
+
+fn resolve_ooc_clock_timing(
+    netlist: &Netlist,
+    constraints: &OocTimingConstraints,
+) -> Result<ResolvedTimingConstraints, MappingError> {
+    resolve_clock_timing(netlist, &constraints.clocks, true)
+}
+
+fn resolve_clock_timing(
+    netlist: &Netlist,
+    clocks: &BTreeMap<String, TimingClockConstraint>,
+    ooc: bool,
+) -> Result<ResolvedTimingConstraints, MappingError> {
+    if clocks.is_empty() {
+        return Ok(ResolvedTimingConstraints::default());
+    }
+    let invalid = |message: String| {
+        if ooc {
+            MappingError::InvalidOocConstraint(message)
+        } else {
+            MappingError::InvalidTimingConstraint(message)
+        }
+    };
+    let mut ports = BTreeSet::new();
+    let mut clock_nets = HashSet::new();
+    let mut resolved = Vec::with_capacity(clocks.len());
+    for (name, clock) in clocks {
+        if name.trim().is_empty() {
+            return Err(invalid("clock names must not be empty".into()));
+        }
+        let Some(effective_period_ps) = clock.effective_period_ps() else {
+            return Err(invalid(format!(
+                "clock `{name}` period {} ps must be greater than its uncertainty {} ps",
+                clock.period_ps, clock.uncertainty_ps
+            )));
+        };
+        debug_assert!(effective_period_ps > 0);
+        let port = netlist
+            .ports()
+            .iter()
+            .find(|port| port.name() == clock.port)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "clock `{name}` port `{}` was not found",
+                    clock.port
+                ))
+            })?;
+        if port.direction() != IrPortDirection::Input {
+            return Err(invalid(format!(
+                "clock `{name}` port `{}` is not an input",
+                clock.port
+            )));
+        }
+        if port.bits().len() != 1 {
+            return Err(invalid(format!(
+                "clock `{name}` port `{}` has width {}, expected one bit",
+                clock.port,
+                port.bits().len()
+            )));
+        }
+        if !ports.insert(clock.port.as_str()) {
+            return Err(invalid(format!(
+                "clock port `{}` is assigned to more than one named clock",
+                clock.port
+            )));
+        }
+        let net = port.bits()[0];
+        clock_nets.insert(net);
+        resolved.push(ResolvedClockTiming {
+            name: name.clone(),
+            net_name: clock.port.clone(),
+            bit: wire_for(net),
+            period_ps: clock.period_ps,
+            uncertainty_ps: clock.uncertainty_ps,
+        });
+    }
+
+    for (kind, name, clock) in netlist
+        .registers()
+        .iter()
+        .map(|register| ("register", register.name(), register.clock()))
+        .chain(
+            netlist
+                .memories()
+                .iter()
+                .map(|memory| ("memory", memory.name(), memory.clock())),
+        )
+    {
+        if !clock_nets.contains(&clock) {
+            return Err(invalid(format!(
+                "{kind} `{name}` uses a clock that is not declared in `clocks`"
+            )));
+        }
+    }
+    Ok(ResolvedTimingConstraints {
+        default_frequency_mhz: 0,
+        clocks: resolved,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2068,6 +2427,7 @@ fn map_to_ecp5_with_period(
     io_timing: &IoTimingConstraints,
     period_ps: u32,
     retiming_target_period_ps: u32,
+    mut timing_constraints: ResolvedTimingConstraints,
 ) -> Result<Ecp5Netlist, MappingError> {
     // A self-contained wide cut can implement arbitrary LUT5/LUT6/LUT7 functions,
     // while the conservative cover can reuse already mapped LUT outputs and
@@ -2134,6 +2494,8 @@ fn map_to_ecp5_with_period(
         unobservable_cells_removed: selected.equivalence_proof.unobservable_cells_removed,
         equivalence_signed_off,
     };
+    timing_constraints.default_frequency_mhz = options.timing_goal_mhz.max(1);
+    selected.timing_constraints = timing_constraints;
     Ok(selected)
 }
 
@@ -5888,6 +6250,7 @@ fn map_once_with_period_and_lut_inputs(
             },
             placement_hints: BTreeMap::new(),
             io_timing,
+            timing_constraints: ResolvedTimingConstraints::default(),
         },
         quality,
     ))
@@ -6294,6 +6657,9 @@ impl Error for RegisterEnableFanoutError {}
 pub enum MappingError {
     /// Source netlist is invalid.
     InvalidNetlist(ValidationError),
+    /// A shared mapping/place-and-route timing file is inconsistent with the
+    /// synthesized design.
+    InvalidTimingConstraint(String),
     /// An out-of-context timing file is incomplete or inconsistent with the
     /// synthesized boundary.
     InvalidOocConstraint(String),
@@ -6399,6 +6765,9 @@ impl Display for MappingError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidNetlist(error) => write!(formatter, "invalid netlist: {error}"),
+            Self::InvalidTimingConstraint(message) => {
+                write!(formatter, "invalid timing constraint: {message}")
+            }
             Self::InvalidOocConstraint(message) => {
                 write!(formatter, "invalid OOC timing constraint: {message}")
             }
@@ -6510,6 +6879,7 @@ impl Error for MappingError {
         match self {
             Self::InvalidNetlist(error) => Some(error),
             Self::UnsupportedMemoryGeometry { .. }
+            | Self::InvalidTimingConstraint(_)
             | Self::InvalidOocConstraint(_)
             | Self::TimingPortNotFound(_)
             | Self::TimingPortDirection { .. }
@@ -6629,7 +6999,7 @@ impl From<&Ecp5Netlist> for JsonDesign {
                 )
             })
             .collect();
-        let netnames = netlist
+        let mut netnames = netlist
             .ports
             .iter()
             .map(|port| {
@@ -6642,7 +7012,16 @@ impl From<&Ecp5Netlist> for JsonDesign {
                     },
                 )
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        for clock in &netlist.timing_constraints.clocks {
+            netnames
+                .entry(clock.net_name.clone())
+                .or_insert_with(|| JsonNet {
+                    hide_name: 0,
+                    bits: vec![clock.bit],
+                    attributes: BTreeMap::new(),
+                });
+        }
         let mut cells = netlist
             .cells
             .iter()
@@ -7326,10 +7705,11 @@ mod tests {
         MappedPort, MappingOptions, NextpnrJsonError, OocTimingConstraints, OpenDrainIo,
         PllBinding, PllOutput, PortDirection, RegisterEnableFanoutConstraint,
         RegisterEnableFanoutError, RegisterEnableFanoutReport, ResolvedIoTiming,
-        backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names,
-        forward_retime_ccu2c, forward_retime_lut, map_dedicated_wide_muxes, map_once, map_to_ecp5,
-        map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
-        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
+        TimingClockConstraint, TimingConstraints, TimingPathConstraint, backward_retime_ccu2c,
+        backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c,
+        forward_retime_lut, map_dedicated_wide_muxes, map_once, map_to_ecp5, map_to_ecp5_ooc,
+        map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
+        map_to_ecp5_with_options, map_to_ecp5_with_pll, map_to_ecp5_with_timing_constraints,
         mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
         physical_bel_is_compatible, physical_feedback_matches_netlist,
         replicate_high_fanout_enable_luts, split_branched_carry_outs,
@@ -7410,6 +7790,67 @@ mod tests {
         let mapped = map_to_ecp5_ooc(&source, &constraints).unwrap();
 
         assert!(mapped.retiming().original_overall_period_ps > 3_200);
+    }
+
+    #[test]
+    fn shares_named_clock_constraints_with_mapping_and_nextpnr() {
+        let source = registered_ooc_netlist("clock");
+        let constraints = TimingConstraints::new().with_clock(
+            "core",
+            TimingClockConstraint {
+                port: "clock".into(),
+                period_ps: 10_000,
+                uncertainty_ps: 250,
+            },
+        );
+
+        let mapped =
+            map_to_ecp5_with_timing_constraints(&source, MappingOptions::default(), &constraints)
+                .unwrap();
+
+        assert_eq!(constraints.tightest_effective_period_ps(), Some(9_750));
+        assert_eq!(mapped.nextpnr_default_frequency_mhz(), 103);
+        let pre_pack = mapped.nextpnr_pre_pack_timing_constraints();
+        assert!(pre_pack.contains("ctx.addClock(\"clock\", 1000000.0 / 9750)"));
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        assert!(json["modules"]["registered_ooc"]["netnames"]["clock"].is_object());
+    }
+
+    #[test]
+    fn named_clock_constraints_reject_undeclared_state_domains() {
+        let mut source = registered_ooc_netlist("clock_b");
+        source.add_input("clock_a");
+        let constraints = TimingConstraints::new().with_clock(
+            "core",
+            TimingClockConstraint {
+                port: "clock_a".into(),
+                period_ps: 10_000,
+                uncertainty_ps: 0,
+            },
+        );
+
+        let error =
+            map_to_ecp5_with_timing_constraints(&source, MappingOptions::default(), &constraints)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("not declared in `clocks`"));
+    }
+
+    #[test]
+    fn rejects_exceptions_that_nextpnr_cannot_enforce() {
+        let source = registered_ooc_netlist("clock");
+        let mut constraints = TimingConstraints::new();
+        constraints.false_paths.push(TimingPathConstraint {
+            from: "port:request".into(),
+            to: "cell:response_q".into(),
+        });
+
+        let error =
+            map_to_ecp5_with_timing_constraints(&source, MappingOptions::default(), &constraints)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("false paths are not supported"));
     }
 
     #[test]
