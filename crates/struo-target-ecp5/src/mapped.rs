@@ -34,7 +34,6 @@ const RETIMING_PERIOD_MARGIN_DENOMINATOR: u32 = 10;
 // 100 ps more than that model, while dedicated carry hops bypass this charge.
 const MAPPED_ROUTE_GUARD_PS: u32 = 100;
 const MAX_ENABLE_FANOUT_PER_REPLICA: usize = 16;
-const PHYSICAL_REWRITE_MIN_GOAL_PERCENT: u32 = 98;
 const PHYSICAL_RETIME_MIN_GOAL_PERCENT: u32 = 95;
 const PHYSICAL_RETIME_MODEL_BRIDGE_PS: u32 = 400;
 // PFUMX and L6MUX21 data inputs use dedicated intra-PFU/inter-slice wiring.
@@ -189,6 +188,9 @@ impl JtaggBinding {
 /// One clock output of an ECP5 `EHXPLLL` primitive.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum PllOutput {
+    /// Dedicated internal feedback output (`CLKINTFB`).
+    #[serde(rename = "CLKINTFB")]
+    Clkintfb,
     /// Primary output (`CLKOP`).
     #[serde(rename = "CLKOP")]
     Clkop,
@@ -206,6 +208,7 @@ pub enum PllOutput {
 impl PllOutput {
     fn port(self) -> &'static str {
         match self {
+            Self::Clkintfb => "CLKINTFB",
             Self::Clkop => "CLKOP",
             Self::Clkos => "CLKOS",
             Self::Clkos2 => "CLKOS2",
@@ -231,7 +234,8 @@ pub struct PllBinding {
     pub locked_port: String,
     /// PLL output routed into the core.
     pub fabric_output: PllOutput,
-    /// PLL output looped back to `CLKFB`.
+    /// PLL output looped back to `CLKFB`, normally `CLKINTFB` for
+    /// `FEEDBK_PATH=INT_OP` as emitted by `ecppll`.
     pub feedback_output: PllOutput,
     /// Raw `EHXPLLL` parameters written to nextpnr JSON.
     #[serde(default)]
@@ -905,7 +909,7 @@ pub struct RetimingSelection {
     pub certified_primitive_moves: usize,
     /// Structurally equivalent generated registers merged in the selected result.
     pub equivalent_register_merges: usize,
-    /// Combinational cells replicated without changing their truth tables.
+    /// Cells replicated without changing their combinational or sequential behavior.
     pub equivalent_logic_replications: usize,
     /// Sinks reassigned between equivalent replicas using physical feedback.
     pub equivalent_physical_rewires: usize,
@@ -1348,15 +1352,12 @@ impl Ecp5Netlist {
         if feedback.meets_timing_goal() || !physical_feedback_matches_netlist(&refined, feedback) {
             return refined;
         }
-        let (replicas, critical_rewires, cluster_rewires) =
-            if feedback.is_near_timing_closure(PHYSICAL_REWRITE_MIN_GOAL_PERCENT) {
-                let (replicas, critical_rewires) =
-                    replicate_physically_critical_luts(&mut refined, feedback);
-                let cluster_rewires = recluster_replicated_enable_sinks(&mut refined, feedback);
-                (replicas, critical_rewires, cluster_rewires)
-            } else {
-                (0, 0, 0)
-            };
+        // Branch replication is bounded and equivalence-checked below. Do not
+        // suppress it based on aggregate Fmax: one isolated high-fanout branch
+        // can account for an arbitrarily large fraction of the miss.
+        let (replicas, critical_rewires) =
+            replicate_physically_critical_cells(&mut refined, feedback);
+        let cluster_rewires = recluster_replicated_enable_sinks(&mut refined, feedback);
         let rewires = critical_rewires + cluster_rewires;
         let physical_retiming_moves =
             if rewires == 0 && feedback.is_near_timing_closure(PHYSICAL_RETIME_MIN_GOAL_PERCENT) {
@@ -1636,7 +1637,14 @@ fn physical_feedback_matches_netlist(netlist: &Ecp5Netlist, feedback: &PhysicalF
     let mut expected = 0usize;
     let mut missing = 0usize;
     for cell in &netlist.cells {
-        if matches!(cell, Ecp5Cell::Ccu2c { .. }) {
+        // These logical cascade primitives are absorbed into their LUT
+        // packing groups and therefore have no independent placed BEL in a
+        // native physical report. Their member LUTs still provide the stable
+        // placement correspondence needed by physical feedback.
+        if matches!(
+            cell,
+            Ecp5Cell::PfuMux { .. } | Ecp5Cell::L6Mux21 { .. } | Ecp5Cell::Ccu2c { .. }
+        ) {
             continue;
         }
         expected += 1;
@@ -1653,7 +1661,7 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
     match cell {
         Ecp5Cell::Lut4 { .. } => bel.contains(".K"),
         Ecp5Cell::FlipFlop { .. } => bel.contains(".FF"),
-        Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD"),
+        Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD") || bel.contains("/EBR"),
         Ecp5Cell::TrellisIo { .. } => bel.contains("PIO"),
         Ecp5Cell::Jtagg { .. } => bel.contains("JTAGG"),
         Ecp5Cell::Pll { .. } => bel.contains("PLL"),
@@ -3512,12 +3520,12 @@ fn recluster_replicated_enable_sinks(
     rewires
 }
 
-fn replicate_physically_critical_luts(
+fn replicate_physically_critical_cells(
     netlist: &mut Ecp5Netlist,
     feedback: &PhysicalFeedback,
 ) -> (usize, usize) {
     const MAX_PHYSICAL_REPLICAS: usize = 16;
-    const MAX_REPLICATED_NET_FANOUT: usize = 16;
+    const MAX_REPLICATED_BRANCH_FANOUT: usize = 16;
 
     let mut next_wire = maximum_mapped_wire(netlist)
         .and_then(|wire| wire.checked_add(1))
@@ -3545,17 +3553,16 @@ fn replicate_physically_critical_luts(
             .collect::<HashSet<_>>();
         if violating_sinks.is_empty()
             || violating_sinks.len() >= eligible_sinks.len()
-            || eligible_sinks.len() > MAX_REPLICATED_NET_FANOUT
+            || violating_sinks.len() > MAX_REPLICATED_BRANCH_FANOUT
         {
             continue;
         }
-        let Some((inputs, output, init)) = netlist.cells.iter().find_map(|cell| match cell {
-            Ecp5Cell::Lut4 {
-                name,
-                inputs,
-                output,
-                init,
-            } if name == &timing.driver => Some((*inputs, *output, *init)),
+        let Some((mut replica, output)) = netlist.cells.iter().find_map(|cell| match cell {
+            Ecp5Cell::Lut4 { name, output, .. } | Ecp5Cell::FlipFlop { name, output, .. }
+                if name == &timing.driver =>
+            {
+                Some((cell.clone(), *output))
+            }
             _ => None,
         }) else {
             continue;
@@ -3577,12 +3584,14 @@ fn replicate_physically_critical_luts(
             }
             continue;
         }
-        netlist.cells.push(Ecp5Cell::Lut4 {
-            name: format!("physical_replicate_{}_{replicas}", timing.driver),
-            inputs,
-            output: clone_output,
-            init,
-        });
+        match &mut replica {
+            Ecp5Cell::Lut4 { name, output, .. } | Ecp5Cell::FlipFlop { name, output, .. } => {
+                *name = format!("physical_replicate_{}_{replicas}", timing.driver);
+                *output = clone_output;
+            }
+            _ => unreachable!("only LUT and flip-flop drivers are selected"),
+        }
+        netlist.cells.push(replica);
         replicas += 1;
         rewires += clone_rewires;
     }
@@ -5880,10 +5889,13 @@ fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
             output_clock,
             locked,
             ..
-        } => [*feedback_clock, *output_clock, *locked]
-            .into_iter()
-            .map(Bit::Wire)
-            .collect(),
+        } => {
+            let mut outputs = vec![Bit::Wire(*output_clock), Bit::Wire(*locked)];
+            if feedback_clock != output_clock {
+                outputs.push(Bit::Wire(*feedback_clock));
+            }
+            outputs
+        }
     }
 }
 
@@ -7680,7 +7692,7 @@ fn block_ram_parameters(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::num::NonZeroU32;
 
     use struo_ir::{
@@ -7699,10 +7711,11 @@ mod tests {
         map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
         map_to_ecp5_with_options, map_to_ecp5_with_pll, map_to_ecp5_with_timing_constraints,
         mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
+        physical_bel_is_compatible, physical_feedback_matches_netlist,
         replicate_high_fanout_enable_luts, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
-    use crate::PhysicalFeedback;
+    use crate::{PhysicalFeedback, PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint};
 
     fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
         let mut source = Netlist::new("arithmetic");
@@ -8638,7 +8651,7 @@ mod tests {
         let far_from_closure =
             PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "300.0"), &placed)
                 .unwrap();
-        assert_eq!(mapped.apply_physical_feedback(&far_from_closure), mapped);
+        assert_ne!(mapped.apply_physical_feedback(&far_from_closure), mapped);
 
         let incompatible = PhysicalFeedback::from_nextpnr_json(
             &report,
@@ -8651,6 +8664,232 @@ mod tests {
             PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "321.0"), &placed)
                 .unwrap();
         assert_eq!(mapped.apply_physical_feedback(&passing), mapped);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn physical_feedback_replicates_a_small_violating_branch_of_a_high_fanout_lut() {
+        let mut source = Netlist::new("physical_high_fanout");
+        let clock = source.add_input("clock");
+        let lhs = source.add_input("lhs");
+        let rhs = source.add_input("rhs");
+        let data = source.add_and(lhs, rhs);
+        for index in 0..20 {
+            let name = format!("value{index}");
+            let output = source.add_register_output(&name);
+            source.add_register(RegisterCell::new(
+                name.clone(),
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                None,
+                None,
+            ));
+            source.add_output(format!("output{index}"), output);
+        }
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+        let (driver, output) = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::Lut4 { name, output, .. }
+                    if mapped_wire_fanout(&mapped, *output) == 20 =>
+                {
+                    Some((name.clone(), *output))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let sinks = mapped
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                Ecp5Cell::FlipFlop {
+                    name,
+                    data: Bit::Wire(wire),
+                    ..
+                } if *wire == output => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let placements = mapped
+            .cells
+            .iter()
+            .filter(|cell| !matches!(cell, Ecp5Cell::Ccu2c { .. }))
+            .map(|cell| {
+                (
+                    mapped_cell_name(cell).to_owned(),
+                    PhysicalLocation { x: 1, y: 1 },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let bels = mapped
+            .cells
+            .iter()
+            .filter_map(|cell| {
+                let bel = match cell {
+                    Ecp5Cell::Lut4 { .. } => "X1/Y1/SLICEA.K0",
+                    Ecp5Cell::FlipFlop { .. } => "X1/Y1/SLICEA.FF0",
+                    Ecp5Cell::TrellisIo { .. } => "X1/Y1/PIOA",
+                    Ecp5Cell::Ccu2c { .. } => return None,
+                    _ => unreachable!("fixture maps only LUTs, FFs, and IOs"),
+                };
+                Some((mapped_cell_name(cell).to_owned(), bel.to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let endpoints = sinks
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| PhysicalTimingEndpoint {
+                cell: cell.clone(),
+                port: "DI".into(),
+                delay_ps: if index == 0 { 4_000 } else { 2_000 },
+                budget_ps: 3_000,
+            })
+            .collect();
+        let feedback = PhysicalFeedback::from_observations(
+            placements,
+            bels,
+            vec![PhysicalNetTiming {
+                driver,
+                net: "critical".into(),
+                endpoints,
+            }],
+            Vec::new(),
+            BTreeMap::from([("clock".into(), (319_000, 320_000))]),
+        );
+        let mut mapped_with_absorbed_mux = mapped.clone();
+        mapped_with_absorbed_mux.cells.push(Ecp5Cell::PfuMux {
+            name: "absorbed_mux".into(),
+            lut_true: Bit::Zero,
+            lut_false: Bit::Zero,
+            select: Bit::Zero,
+            output: u32::MAX,
+        });
+        assert!(physical_feedback_matches_netlist(
+            &mapped_with_absorbed_mux,
+            &feedback
+        ));
+
+        let refined = mapped.apply_physical_feedback(&feedback);
+
+        assert_eq!(refined.cells.len(), mapped.cells.len() + 1);
+        assert_eq!(refined.retiming.equivalent_physical_rewires, 1);
+        assert!(refined.retiming.equivalence_signed_off);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn physical_feedback_replicates_a_critical_high_fanout_flip_flop() {
+        let mut source = Netlist::new("physical_high_fanout_ff");
+        let clock = source.add_input("clock");
+        let seed = source.add_input("seed");
+        let state = source.add_register_output("state");
+        source.add_register(RegisterCell::new(
+            "state",
+            state,
+            seed,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        for index in 0..20 {
+            let input = source.add_input(format!("input{index}"));
+            let mixed = source.add_xor(state, input);
+            source.add_output(format!("output{index}"), mixed);
+        }
+        let (mapped, _) = map_once(
+            &source,
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+        let (driver, output) = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::FlipFlop { name, output, .. }
+                    if mapped_wire_fanout(&mapped, *output) == 20 =>
+                {
+                    Some((name.clone(), *output))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let sinks = mapped
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                Ecp5Cell::Lut4 { name, inputs, .. } if inputs.contains(&Bit::Wire(output)) => {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sinks.len(), 20);
+        let placements = mapped
+            .cells
+            .iter()
+            .filter(|cell| !matches!(cell, Ecp5Cell::Ccu2c { .. }))
+            .map(|cell| {
+                (
+                    mapped_cell_name(cell).to_owned(),
+                    PhysicalLocation { x: 1, y: 1 },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let bels = mapped
+            .cells
+            .iter()
+            .filter_map(|cell| {
+                let bel = match cell {
+                    Ecp5Cell::Lut4 { .. } => "X1/Y1/SLICEA.K0",
+                    Ecp5Cell::FlipFlop { .. } => "X1/Y1/SLICEA.FF0",
+                    Ecp5Cell::TrellisIo { .. } => "X1/Y1/PIOA",
+                    Ecp5Cell::Ccu2c { .. } => return None,
+                    _ => unreachable!("fixture maps only LUTs, FFs, and IOs"),
+                };
+                Some((mapped_cell_name(cell).to_owned(), bel.to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let endpoints = sinks
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| PhysicalTimingEndpoint {
+                cell: cell.clone(),
+                port: "A".into(),
+                delay_ps: if index < 4 { 4_000 } else { 2_000 },
+                budget_ps: 3_000,
+            })
+            .collect();
+        let feedback = PhysicalFeedback::from_observations(
+            placements,
+            bels,
+            vec![PhysicalNetTiming {
+                driver,
+                net: "critical".into(),
+                endpoints,
+            }],
+            Vec::new(),
+            BTreeMap::from([("clock".into(), (319_000, 320_000))]),
+        );
+
+        let refined = mapped.apply_physical_feedback(&feedback);
+
+        assert_eq!(refined.cells.len(), mapped.cells.len() + 1);
+        assert_eq!(refined.retiming.equivalent_physical_rewires, 4);
+        assert!(refined.cells.iter().any(|cell| matches!(
+            cell,
+            Ecp5Cell::FlipFlop { name, .. } if name.starts_with("physical_replicate_")
+        )));
+        assert!(refined.retiming.equivalence_signed_off);
     }
 
     #[test]
@@ -10038,6 +10277,34 @@ mod tests {
         assert_eq!(cell["connections"]["CLKFB"], cell["connections"]["CLKOP"]);
         assert_ne!(cell["connections"]["CLKOP"], cell["connections"]["CLKOS"]);
         assert_eq!(cell["port_directions"]["CLKOS"], "output");
+
+        let shared_output = PllBinding::new(
+            "clk",
+            "clk_250",
+            "pll_locked",
+            PllOutput::Clkop,
+            PllOutput::Clkop,
+        );
+        let shared_output_mapped = map_to_ecp5_with_pll(&source, &shared_output).unwrap();
+        assert!(verify_mapped_equivalence_proof(
+            &shared_output_mapped,
+            shared_output_mapped.retiming.applied
+        ));
+
+        let internal_feedback = PllBinding::new(
+            "clk",
+            "clk_250",
+            "pll_locked",
+            PllOutput::Clkop,
+            PllOutput::Clkintfb,
+        );
+        let internal_feedback_mapped = map_to_ecp5_with_pll(&source, &internal_feedback).unwrap();
+        let internal_json: serde_json::Value =
+            serde_json::from_str(&internal_feedback_mapped.to_nextpnr_json().unwrap()).unwrap();
+        let pll = &internal_json["modules"]["pll_top"]["cells"]["pll"];
+        assert_eq!(pll["connections"]["CLKFB"], pll["connections"]["CLKINTFB"]);
+        assert_ne!(pll["connections"]["CLKOP"], pll["connections"]["CLKINTFB"]);
+        assert_eq!(pll["port_directions"]["CLKINTFB"], "output");
     }
 
     #[test]
@@ -10167,15 +10434,23 @@ mod tests {
         source.add_output_port("read_data", &read_data).unwrap();
 
         let mapped = map_to_ecp5(&source).unwrap();
-        assert!(mapped.cells().iter().any(|cell| matches!(
-            cell,
-            Ecp5Cell::BlockRam {
-                physical_width: 9,
-                depth: 256,
-                word_width: 8,
-                ..
-            }
-        )));
+        let block_ram = mapped
+            .cells()
+            .iter()
+            .find(|cell| {
+                matches!(
+                    cell,
+                    Ecp5Cell::BlockRam {
+                        physical_width: 9,
+                        depth: 256,
+                        word_width: 8,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(physical_bel_is_compatible(block_ram, "X1/Y1/DP16KD"));
+        assert!(physical_bel_is_compatible(block_ram, "R46C58/EBR0"));
 
         let json: serde_json::Value =
             serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();

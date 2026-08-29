@@ -59,6 +59,27 @@ pub struct PhysicalFeedback {
 }
 
 impl PhysicalFeedback {
+    /// Builds feedback from observations produced by a physical tool adapter.
+    ///
+    /// This is the tool-independent counterpart of [`Self::from_nextpnr_json`]
+    /// for integrations that already hold placed and timed objects in memory.
+    #[must_use]
+    pub fn from_observations(
+        placements: BTreeMap<String, PhysicalLocation>,
+        bels: BTreeMap<String, String>,
+        net_timings: Vec<PhysicalNetTiming>,
+        critical_paths: Vec<PhysicalCriticalPath>,
+        clock_fmax_khz: BTreeMap<String, (u32, u32)>,
+    ) -> Self {
+        Self {
+            placements,
+            bels,
+            net_timings,
+            critical_paths,
+            clock_fmax_khz,
+        }
+    }
+
     /// Reads nextpnr's detailed timing report and post-placement JSON into the
     /// tool-independent feedback representation.
     ///
