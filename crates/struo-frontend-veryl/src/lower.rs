@@ -47,7 +47,7 @@ struct MemoryWritePattern {
     edge: ClockEdge,
     address: Expression,
     data: Expression,
-    enable: Option<Expression>,
+    enable: Vec<Expression>,
 }
 
 #[derive(Clone)]
@@ -56,7 +56,7 @@ struct MemoryReadPattern {
     edge: ClockEdge,
     address: Expression,
     data: VarId,
-    enable: Option<Expression>,
+    enable: Vec<Expression>,
 }
 
 #[derive(Default)]
@@ -351,12 +351,8 @@ impl<'a> ModuleLowerer<'a> {
         let write_data = self.lower_expression(&write.data, &env)?;
         let write_data = self.resize(write_data, word.width.get(), word.signed)?;
         let write_enable = self.lower_memory_enable(write.enable, &env)?;
-        let read_enable = read
-            .enable
-            .map(|enable| {
-                self.lower_expression(&enable, &env)
-                    .and_then(|x| self.boolean(x))
-            })
+        let read_enable = (!read.enable.is_empty())
+            .then(|| self.lower_memory_enable(read.enable, &env))
             .transpose()?;
         let port_name = if port_index == 0 { "a" } else { "b" };
         let write_enable =
@@ -424,16 +420,20 @@ impl<'a> ModuleLowerer<'a> {
 
     fn lower_memory_enable(
         &mut self,
-        enable: Option<Expression>,
+        enable: Vec<Expression>,
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
-        match enable {
-            Some(enable) => {
-                let enable = self.lower_expression(&enable, env)?;
-                self.boolean(enable)
-            }
-            None => Ok(self.constant(1, 1)),
+        let mut result = self.constant(1, 1);
+        for enable in enable {
+            let enable = self.lower_expression(&enable, env)?;
+            let enable = self.boolean(enable)?;
+            result = LoweredExpr {
+                id: self.rtl.binary(BinaryOp::And, result.id, enable.id)?,
+                width: 1,
+                signed: false,
+            };
         }
+        Ok(result)
     }
 
     fn source_clock(&self, ff: &FfDeclaration) -> Result<(SignalKey, ClockEdge), ImportError> {
@@ -1715,13 +1715,13 @@ enum MemoryStatementPattern {
         memory: VarId,
         address: Expression,
         data: Expression,
-        enable: Option<Expression>,
+        enable: Vec<Expression>,
     },
     Read {
         memory: VarId,
         address: Expression,
         data: VarId,
-        enable: Option<Expression>,
+        enable: Vec<Expression>,
     },
 }
 
@@ -1729,33 +1729,47 @@ fn memory_statement_patterns(
     statement: &Statement,
     memories: &HashSet<VarId>,
 ) -> Vec<MemoryStatementPattern> {
+    memory_statement_patterns_with_enable(statement, memories, &[])
+}
+
+fn memory_statement_patterns_with_enable(
+    statement: &Statement,
+    memories: &HashSet<VarId>,
+    inherited_enable: &[Expression],
+) -> Vec<MemoryStatementPattern> {
     if let Statement::If(branch) = statement {
-        if branch.false_side.is_empty()
-            && let [inner] = branch.true_side.as_slice()
-        {
-            return direct_memory_statement(inner, memories, Some(branch.cond.clone()))
-                .into_iter()
+        if branch.false_side.is_empty() {
+            let mut enable = inherited_enable.to_vec();
+            enable.push(branch.cond.clone());
+            return branch
+                .true_side
+                .iter()
+                .flat_map(|statement| {
+                    memory_statement_patterns_with_enable(statement, memories, &enable)
+                })
                 .collect();
         }
         if let ([true_statement], [false_statement]) =
             (branch.true_side.as_slice(), branch.false_side.as_slice())
         {
             let mut patterns = Vec::new();
-            if let Some(pattern) =
-                direct_memory_statement(true_statement, memories, Some(branch.cond.clone()))
-            {
+            let mut true_enable = inherited_enable.to_vec();
+            true_enable.push(branch.cond.clone());
+            if let Some(pattern) = direct_memory_statement(true_statement, memories, true_enable) {
                 patterns.push(pattern);
             }
             // A block-RAM port remains physically readable while writing. The
             // false-side read therefore needs no separate enable; consumers
             // observe it only on cycles where the source selected that arm.
-            if let Some(pattern) = direct_memory_statement(false_statement, memories, None) {
+            if let Some(pattern) =
+                direct_memory_statement(false_statement, memories, inherited_enable.to_vec())
+            {
                 patterns.push(pattern);
             }
             return patterns;
         }
     }
-    direct_memory_statement(statement, memories, None)
+    direct_memory_statement(statement, memories, inherited_enable.to_vec())
         .into_iter()
         .collect()
 }
@@ -1763,7 +1777,7 @@ fn memory_statement_patterns(
 fn direct_memory_statement(
     statement: &Statement,
     memories: &HashSet<VarId>,
-    enable: Option<Expression>,
+    enable: Vec<Expression>,
 ) -> Option<MemoryStatementPattern> {
     let Statement::Assign(assign) = statement else {
         return None;
@@ -2241,6 +2255,8 @@ module TrueDualPortMemoryTop (
     addr_b: input  'a logic<4>,
     we_a  : input  'a logic,
     we_b  : input  'a logic,
+    ce_a  : input  'a logic,
+    ce_b  : input  'a logic,
     data_a: input  'a logic<8>,
     data_b: input  'a logic<8>,
     read_a: output 'a logic<8>,
@@ -2250,12 +2266,16 @@ module TrueDualPortMemoryTop (
     var words: 'a logic<8> [16];
 
     always_ff (clk_a) {
-        if we_a { words[addr_a] = data_a; }
-        else { read_a = words[addr_a]; }
+        if ce_a {
+            if we_a { words[addr_a] = data_a; }
+            else { read_a = words[addr_a]; }
+        }
     }
     always_ff (clk_b) {
-        if we_b { words[addr_b] = data_b; }
-        else { read_b = words[addr_b]; }
+        if ce_b {
+            if we_b { words[addr_b] = data_b; }
+            else { read_b = words[addr_b]; }
+        }
     }
 }
 "#;
@@ -2863,6 +2883,8 @@ module StructInstanceTop (
         .unwrap();
         let memory = &design.top_module().unwrap().memories()[0];
         assert!(memory.second_port.is_some());
+        assert!(memory.read_enable.is_some());
+        assert!(memory.second_port.as_ref().unwrap().read_enable.is_some());
 
         let synthesized = synthesize(&design).unwrap();
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
@@ -2874,6 +2896,8 @@ module StructInstanceTop (
         assert!(json.contains("\"INV\""));
         assert!(json.contains("\"DOA0\""));
         assert!(json.contains("\"DOB0\""));
+        assert!(json.contains("\"CEAMUX\": \"CEA\""));
+        assert!(json.contains("\"CEBMUX\": \"CEB\""));
     }
 
     #[test]

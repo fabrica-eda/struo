@@ -222,6 +222,7 @@ fn reserve_cell_output(
             name,
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked,
             ..
         } => {
@@ -236,6 +237,17 @@ fn reserve_cell_output(
                         wires,
                         wire,
                         format!("__struo_pll_{name}_{label}_{wire}"),
+                        bit_type,
+                    )?;
+                }
+            }
+            for (output, wire) in additional_output_clocks {
+                if !wires.contains_key(wire) {
+                    reserve_scalar(
+                        builder,
+                        wires,
+                        *wire,
+                        format!("__struo_pll_{name}_{}_{}", output.port(), wire),
                         bit_type,
                     )?;
                 }
@@ -347,6 +359,7 @@ fn emit_cell(
             clock,
             edge,
             second_port: _,
+            clock_enable: _,
         } => emit_block_ram(
             builder,
             wires,
@@ -408,6 +421,7 @@ fn emit_cell(
             reference_clock,
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked,
             ..
         } => emit_cycle_pll(
@@ -415,8 +429,8 @@ fn emit_cell(
             wires,
             constants,
             *reference_clock,
-            *feedback_clock,
-            *output_clock,
+            [*feedback_clock, *output_clock],
+            additional_output_clocks,
             *locked,
         ),
     }
@@ -427,16 +441,23 @@ fn emit_cycle_pll(
     wires: &BTreeMap<u32, WireRef>,
     constants: Constants,
     reference_clock: Bit,
-    feedback_clock: u32,
-    output_clock: u32,
+    primary_output_clocks: [u32; 2],
+    additional_output_clocks: &[(struo_target_ecp5::PllOutput, u32)],
     locked: u32,
 ) -> Result<(), CeloxAdapterError> {
+    let [feedback_clock, output_clock] = primary_output_clocks;
     let reference = bit_expression(builder, wires, constants, reference_clock)?;
     let feedback = builder.whole(wire_ref(wires, feedback_clock)?.signal)?;
     builder.assign(feedback, reference)?;
     if output_clock != feedback_clock {
         let output = builder.whole(wire_ref(wires, output_clock)?.signal)?;
         builder.assign(output, reference)?;
+    }
+    for (_, wire) in additional_output_clocks {
+        if *wire != feedback_clock && *wire != output_clock {
+            let output = builder.whole(wire_ref(wires, *wire)?.signal)?;
+            builder.assign(output, reference)?;
+        }
     }
     let locked = builder.whole(wire_ref(wires, locked)?.signal)?;
     builder.assign(locked, constants.one_expression)?;

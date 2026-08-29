@@ -186,7 +186,7 @@ impl JtaggBinding {
 }
 
 /// One clock output of an ECP5 `EHXPLLL` primitive.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
 pub enum PllOutput {
     /// Dedicated internal feedback output (`CLKINTFB`).
     #[serde(rename = "CLKINTFB")]
@@ -206,7 +206,9 @@ pub enum PllOutput {
 }
 
 impl PllOutput {
-    fn port(self) -> &'static str {
+    /// Returns the `EHXPLLL` primitive port name.
+    #[must_use]
+    pub const fn port(self) -> &'static str {
         match self {
             Self::Clkintfb => "CLKINTFB",
             Self::Clkop => "CLKOP",
@@ -234,6 +236,9 @@ pub struct PllBinding {
     pub locked_port: String,
     /// PLL output routed into the core.
     pub fabric_output: PllOutput,
+    /// Additional logical clock ports driven by other outputs of this PLL.
+    #[serde(default)]
+    pub additional_output_clock_ports: BTreeMap<String, PllOutput>,
     /// PLL output looped back to `CLKFB`, normally `CLKINTFB` for
     /// `FEEDBK_PATH=INT_OP` as emitted by `ecppll`.
     pub feedback_output: PllOutput,
@@ -260,6 +265,7 @@ impl PllBinding {
             output_clock_port: output_clock_port.into(),
             locked_port: locked_port.into(),
             fabric_output,
+            additional_output_clock_ports: BTreeMap::new(),
             feedback_output,
             parameters: BTreeMap::new(),
             attributes: BTreeMap::new(),
@@ -800,6 +806,9 @@ pub enum Ecp5Cell {
         read_data: Vec<u32>,
         /// Optional read clock enable.
         read_enable: Option<Control>,
+        /// Physical first-port clock enable. For a true-dual-port RAM this
+        /// asserts when either the read or write operation is enabled.
+        clock_enable: Option<Control>,
         /// First-port clock.
         clock: Bit,
         /// First-port active clock edge.
@@ -855,6 +864,8 @@ pub enum Ecp5Cell {
         feedback_clock: u32,
         /// Fabric clock output wire.
         output_clock: u32,
+        /// Other PLL outputs routed into logical fabric clock ports.
+        additional_output_clocks: Vec<(PllOutput, u32)>,
         /// Lock indication output wire.
         locked: u32,
         /// PLL output routed into the core.
@@ -881,6 +892,8 @@ pub struct BlockRamPort {
     pub read_data: Vec<u32>,
     /// Optional read clock enable.
     pub read_enable: Option<Control>,
+    /// Physical port clock enable, including both reads and writes.
+    pub clock_enable: Option<Control>,
     /// Port clock.
     pub clock: Bit,
     /// Active clock edge.
@@ -896,6 +909,9 @@ impl BlockRamPort {
         if let Some(enable) = &mut self.read_enable {
             replace(&mut enable.signal);
         }
+        if let Some(enable) = &mut self.clock_enable {
+            replace(&mut enable.signal);
+        }
         replace(&mut self.clock);
     }
 
@@ -906,6 +922,9 @@ impl BlockRamPort {
         visit(self.write_enable.signal);
         visit(self.clock);
         if let Some(enable) = self.read_enable {
+            visit(enable.signal);
+        }
+        if let Some(enable) = self.clock_enable {
             visit(enable.signal);
         }
     }
@@ -1119,6 +1138,40 @@ impl Ecp5Netlist {
             resolved.push((index, wire));
         }
         let output_clock = resolved[1].1;
+        let mut additional_output_clocks = Vec::new();
+        let mut additional_port_indices = Vec::new();
+        let mut outputs = HashSet::from([binding.fabric_output, binding.feedback_output]);
+        for (name, output) in &binding.additional_output_clock_ports {
+            if !names.insert(name.as_str()) {
+                return Err(MappingError::PllPortRepeated(name.clone()));
+            }
+            if !outputs.insert(*output) {
+                return Err(MappingError::PllPortRepeated(output.port().into()));
+            }
+            let (index, port) = self
+                .ports
+                .iter()
+                .enumerate()
+                .find(|(_, port)| port.name == *name)
+                .ok_or_else(|| MappingError::PllPortNotFound(name.clone()))?;
+            if port.direction != PortDirection::Input {
+                return Err(MappingError::PllPortDirection {
+                    port: name.clone(),
+                    actual: port.direction,
+                });
+            }
+            if port.bits.len() != 1 {
+                return Err(MappingError::PllPortNotScalar {
+                    port: name.clone(),
+                    width: port.bits.len(),
+                });
+            }
+            let Bit::Wire(wire) = port.bits[0] else {
+                return Err(MappingError::PllOutputIsConstant(name.clone()));
+            };
+            additional_output_clocks.push((*output, wire));
+            additional_port_indices.push(index);
+        }
         let feedback_clock = if binding.fabric_output == binding.feedback_output {
             output_clock
         } else {
@@ -1132,13 +1185,15 @@ impl Ecp5Netlist {
             reference_clock: Bit::Wire(resolved[0].1),
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked: resolved[2].1,
             fabric_output: binding.fabric_output,
             feedback_output: binding.feedback_output,
             parameters: binding.parameters.clone(),
             attributes: binding.attributes.clone(),
         });
-        let mut removed = [resolved[1].0, resolved[2].0];
+        let mut removed = vec![resolved[1].0, resolved[2].0];
+        removed.extend(additional_port_indices);
         removed.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
         for index in removed {
             self.ports.remove(index);
@@ -3775,6 +3830,7 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
             write_enable,
             read_address,
             read_enable,
+            clock_enable,
             clock,
             second_port,
             ..
@@ -3789,6 +3845,9 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
             replace(&mut write_enable.signal);
             if let Some(read_enable) = read_enable {
                 replace(&mut read_enable.signal);
+            }
+            if let Some(clock_enable) = clock_enable {
+                replace(&mut clock_enable.signal);
             }
             replace(clock);
             if let Some(port) = second_port {
@@ -3871,12 +3930,19 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         Ecp5Cell::BlockRam {
             write_enable,
             read_enable,
+            clock_enable,
+            second_port,
             ..
-        } => Some(
-            read_enable
-                .map_or(0, |control| bit_lut_depth(control.signal, &depths))
-                .max(bit_lut_depth(write_enable.signal, &depths)),
-        ),
+        } => [Some(*write_enable), *read_enable, *clock_enable]
+            .into_iter()
+            .flatten()
+            .chain(second_port.iter().flat_map(|port| {
+                [Some(port.write_enable), port.read_enable, port.clock_enable]
+                    .into_iter()
+                    .flatten()
+            }))
+            .map(|control| bit_lut_depth(control.signal, &depths))
+            .max(),
         Ecp5Cell::Lut4 { .. }
         | Ecp5Cell::PfuMux { .. }
         | Ecp5Cell::L6Mux21 { .. }
@@ -3929,15 +3995,18 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         Ecp5Cell::BlockRam {
             write_enable,
             read_enable,
+            clock_enable,
+            second_port,
             ..
-        } => read_enable
-            .and_then(|control| mapped_setup_period(control.signal, &arrivals, &fanouts))
+        } => [Some(*write_enable), *read_enable, *clock_enable]
             .into_iter()
-            .chain(mapped_setup_period(
-                write_enable.signal,
-                &arrivals,
-                &fanouts,
-            ))
+            .flatten()
+            .chain(second_port.iter().flat_map(|port| {
+                [Some(port.write_enable), port.read_enable, port.clock_enable]
+                    .into_iter()
+                    .flatten()
+            }))
+            .filter_map(|control| mapped_setup_period(control.signal, &arrivals, &fanouts))
             .max(),
         Ecp5Cell::Lut4 { .. }
         | Ecp5Cell::PfuMux { .. }
@@ -5502,6 +5571,7 @@ fn replace_mapped_wire_uses(netlist: &mut Ecp5Netlist, from: u32, to: u32) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn replace_mapped_cell_wire_uses(cell: &mut Ecp5Cell, from: u32, to: u32) {
     let mut replace = |bit: &mut Bit| {
         if *bit == Bit::Wire(from) {
@@ -5564,6 +5634,7 @@ fn replace_mapped_cell_wire_uses(cell: &mut Ecp5Cell, from: u32, to: u32) {
             write_enable,
             read_address,
             read_enable,
+            clock_enable,
             clock,
             second_port,
             ..
@@ -5577,6 +5648,9 @@ fn replace_mapped_cell_wire_uses(cell: &mut Ecp5Cell, from: u32, to: u32) {
             }
             replace(&mut write_enable.signal);
             if let Some(control) = read_enable {
+                replace(&mut control.signal);
+            }
+            if let Some(control) = clock_enable {
                 replace(&mut control.signal);
             }
             replace(clock);
@@ -5889,6 +5963,7 @@ fn cell_input_bits(cell: &Ecp5Cell) -> Vec<Bit> {
     bits
 }
 
+#[allow(clippy::too_many_lines)]
 fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
     match cell {
         Ecp5Cell::Lut4 { inputs, .. } => {
@@ -5946,6 +6021,7 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
             write_enable,
             read_address,
             read_enable,
+            clock_enable,
             clock,
             second_port,
             ..
@@ -5960,6 +6036,9 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
             visit(write_enable.signal);
             visit(*clock);
             if let Some(control) = read_enable {
+                visit(control.signal);
+            }
+            if let Some(control) = clock_enable {
                 visit(control.signal);
             }
             if let Some(port) = second_port {
@@ -6035,10 +6114,16 @@ fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
         Ecp5Cell::Pll {
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked,
             ..
         } => {
             let mut outputs = vec![Bit::Wire(*output_clock), Bit::Wire(*locked)];
+            outputs.extend(
+                additional_output_clocks
+                    .iter()
+                    .map(|(_, wire)| Bit::Wire(*wire)),
+            );
             if feedback_clock != output_clock {
                 outputs.push(Bit::Wire(*feedback_clock));
             }
@@ -6319,6 +6404,26 @@ fn map_once_with_period_and_lut_inputs(
     }
 
     let (bits, mut cells) = emitter.finish();
+    let mut next_wire = bits
+        .iter()
+        .flatten()
+        .filter_map(|bit| match bit {
+            Bit::Wire(wire) => Some(*wire),
+            Bit::Zero | Bit::One => None,
+        })
+        .chain(
+            cells
+                .iter()
+                .flat_map(cell_output_bits)
+                .filter_map(|bit| match bit {
+                    Bit::Wire(wire) => Some(wire),
+                    Bit::Zero | Bit::One => None,
+                }),
+        )
+        .max()
+        .unwrap_or(1)
+        .checked_add(1)
+        .expect("mapped netlist exceeds the Yosys JSON range");
 
     for register in netlist.registers() {
         if constant_registers.contains_key(&register.output()) {
@@ -6347,7 +6452,7 @@ fn map_once_with_period_and_lut_inputs(
     }
 
     for memory in netlist.memories() {
-        map_memory(memory, &bits, &mut cells)?;
+        map_memory(memory, &bits, &mut cells, &mut next_wire)?;
     }
 
     let ports = netlist
@@ -6606,10 +6711,12 @@ fn node_for(netlist: &Netlist, net: NetId) -> &struo_ir::Node {
     &netlist.nodes()[net.index() as usize]
 }
 
+#[allow(clippy::too_many_lines)]
 fn map_memory(
     memory: &MemoryCell,
     bits: &[Option<Bit>],
     cells: &mut Vec<Ecp5Cell>,
+    next_wire: &mut u32,
 ) -> Result<(), MappingError> {
     if let Some(second_port) = memory.second_port() {
         if memory.read_address() != memory.write_address() {
@@ -6648,12 +6755,70 @@ fn map_memory(
             write_address[0] = Bit::One;
             write_address[1] = Bit::One;
         }
+        let name = if chunk_count == 1 {
+            format!("bram_{}", memory.name())
+        } else {
+            format!("bram_{}_{chunk}", memory.name())
+        };
+        let write_enable = Control {
+            signal: mapped_bit(bits, memory.write_enable().signal),
+            active: memory.write_enable().active,
+        };
+        let read_enable = memory.read_enable().map(|enable| Control {
+            signal: mapped_bit(bits, enable.signal),
+            active: enable.active,
+        });
+        let clock_enable = memory.second_port().and_then(|_| {
+            materialize_memory_clock_enable(
+                &format!("{name}_cea"),
+                write_enable,
+                read_enable,
+                cells,
+                next_wire,
+            )
+        });
+        let second_port = memory.second_port().map(|port| {
+            let start = chunk * usize::from(chunk_width);
+            let end = (start + write_data.len()).min(port.write_data().len());
+            let mut address = physical_address(bits, port.write_address(), physical_width);
+            if physical_width == 18 {
+                address[0] = Bit::One;
+                address[1] = Bit::One;
+            }
+            let write_enable = Control {
+                signal: mapped_bit(bits, port.write_enable().signal),
+                active: port.write_enable().active,
+            };
+            let read_enable = port.read_enable().map(|enable| Control {
+                signal: mapped_bit(bits, enable.signal),
+                active: enable.active,
+            });
+            let clock_enable = materialize_memory_clock_enable(
+                &format!("{name}_ceb"),
+                write_enable,
+                read_enable,
+                cells,
+                next_wire,
+            );
+            BlockRamPort {
+                address: Box::new(address),
+                write_data: port.write_data()[start..end]
+                    .iter()
+                    .map(|net| mapped_bit(bits, *net))
+                    .collect(),
+                write_enable,
+                read_data: port.read_data()[start..end]
+                    .iter()
+                    .map(|net| wire_number(*net))
+                    .collect(),
+                read_enable,
+                clock_enable,
+                clock: mapped_bit(bits, port.clock()),
+                edge: port.edge(),
+            }
+        });
         cells.push(Ecp5Cell::BlockRam {
-            name: if chunk_count == 1 {
-                format!("bram_{}", memory.name())
-            } else {
-                format!("bram_{}_{chunk}", memory.name())
-            },
+            name,
             depth: memory.depth(),
             word_width,
             physical_width,
@@ -6662,55 +6827,57 @@ fn map_memory(
                 .iter()
                 .map(|net| mapped_bit(bits, *net))
                 .collect(),
-            write_enable: Control {
-                signal: mapped_bit(bits, memory.write_enable().signal),
-                active: memory.write_enable().active,
-            },
+            write_enable,
             read_address: Box::new(physical_address(
                 bits,
                 memory.read_address(),
                 physical_width,
             )),
             read_data: read_data.iter().map(|net| wire_number(*net)).collect(),
-            read_enable: memory.read_enable().map(|enable| Control {
-                signal: mapped_bit(bits, enable.signal),
-                active: enable.active,
-            }),
+            read_enable,
+            clock_enable,
             clock: mapped_bit(bits, memory.clock()),
             edge: memory.edge(),
-            second_port: memory.second_port().map(|port| {
-                let start = chunk * usize::from(chunk_width);
-                let end = (start + write_data.len()).min(port.write_data().len());
-                let mut address = physical_address(bits, port.write_address(), physical_width);
-                if physical_width == 18 {
-                    address[0] = Bit::One;
-                    address[1] = Bit::One;
-                }
-                BlockRamPort {
-                    address: Box::new(address),
-                    write_data: port.write_data()[start..end]
-                        .iter()
-                        .map(|net| mapped_bit(bits, *net))
-                        .collect(),
-                    write_enable: Control {
-                        signal: mapped_bit(bits, port.write_enable().signal),
-                        active: port.write_enable().active,
-                    },
-                    read_data: port.read_data()[start..end]
-                        .iter()
-                        .map(|net| wire_number(*net))
-                        .collect(),
-                    read_enable: port.read_enable().map(|enable| Control {
-                        signal: mapped_bit(bits, enable.signal),
-                        active: enable.active,
-                    }),
-                    clock: mapped_bit(bits, port.clock()),
-                    edge: port.edge(),
-                }
-            }),
+            second_port,
         });
     }
     Ok(())
+}
+
+fn materialize_memory_clock_enable(
+    name: &str,
+    write_enable: Control,
+    read_enable: Option<Control>,
+    cells: &mut Vec<Ecp5Cell>,
+    next_wire: &mut u32,
+) -> Option<Control> {
+    let read_enable = read_enable?;
+    let output = *next_wire;
+    *next_wire = next_wire
+        .checked_add(1)
+        .expect("mapped netlist exceeds the Yosys JSON range");
+    let init = (0..16).fold(0u16, |init, assignment| {
+        let write_signal = assignment & 1 != 0;
+        let read_signal = assignment & 2 != 0;
+        let write_active = write_signal == (write_enable.active == ActiveLevel::High);
+        let read_active = read_signal == (read_enable.active == ActiveLevel::High);
+        init | (u16::from(write_active || read_active) << assignment)
+    });
+    cells.push(Ecp5Cell::Lut4 {
+        name: name.into(),
+        inputs: [
+            write_enable.signal,
+            read_enable.signal,
+            Bit::Zero,
+            Bit::Zero,
+        ],
+        output,
+        init,
+    });
+    Some(Control {
+        signal: Bit::Wire(output),
+        active: ActiveLevel::High,
+    })
 }
 
 impl From<bool> for Bit {
@@ -7320,6 +7487,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
             read_address,
             read_data,
             read_enable,
+            clock_enable,
             clock,
             edge,
             second_port,
@@ -7334,6 +7502,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
                 **read_address,
                 read_data,
                 *read_enable,
+                *clock_enable,
                 *clock,
                 *edge,
                 second_port.as_ref(),
@@ -7381,6 +7550,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
             reference_clock,
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked,
             fabric_output,
             feedback_output,
@@ -7392,6 +7562,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
                 *reference_clock,
                 *feedback_clock,
                 *output_clock,
+                additional_output_clocks,
                 *locked,
                 *fabric_output,
                 *feedback_output,
@@ -7407,6 +7578,7 @@ fn json_pll(
     reference_clock: Bit,
     feedback_clock: u32,
     output_clock: u32,
+    additional_output_clocks: &[(PllOutput, u32)],
     locked: u32,
     fabric_output: PllOutput,
     feedback_output: PllOutput,
@@ -7448,6 +7620,10 @@ fn json_pll(
     );
     port_directions.insert(fabric_output.port().into(), "output");
     connections.insert(fabric_output.port().into(), vec![Bit::Wire(output_clock)]);
+    for (output, wire) in additional_output_clocks {
+        port_directions.insert(output.port().into(), "output");
+        connections.insert(output.port().into(), vec![Bit::Wire(*wire)]);
+    }
     JsonCell {
         hide_name: 0,
         r#type: "EHXPLLL",
@@ -7769,6 +7945,14 @@ fn control_mux(control: Option<Control>) -> String {
     }
 }
 
+fn block_ram_control_mux(control: Option<Control>, pin: &str) -> String {
+    match control.map(|control| control.active) {
+        None => "1".into(),
+        Some(ActiveLevel::High) => pin.into(),
+        Some(ActiveLevel::Low) => "INV".into(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn json_block_ram(
     width: u8,
@@ -7778,11 +7962,19 @@ fn json_block_ram(
     read_address: [Bit; 14],
     read_data: &[u32],
     read_enable: Option<Control>,
+    clock_enable: Option<Control>,
     clock: Bit,
     edge: ClockEdge,
     second_port: Option<&BlockRamPort>,
 ) -> JsonCell {
-    let parameters = block_ram_parameters(width, write_enable, read_enable, edge, second_port);
+    let parameters = block_ram_parameters(
+        width,
+        write_enable,
+        read_enable,
+        clock_enable,
+        edge,
+        second_port,
+    );
 
     let mut port_directions = BTreeMap::new();
     let mut connections = BTreeMap::new();
@@ -7799,7 +7991,10 @@ fn json_block_ram(
             write_data.get(index).copied().unwrap_or(Bit::Zero),
         );
     }
-    input("CEA".into(), Bit::One);
+    input(
+        "CEA".into(),
+        clock_enable.map_or(Bit::One, |enable| enable.signal),
+    );
     input("OCEA".into(), Bit::One);
     input("CLKA".into(), clock);
     input("WEA".into(), write_enable.signal);
@@ -7822,7 +8017,9 @@ fn json_block_ram(
     input(
         "CEB".into(),
         if second_port.is_some() {
-            Bit::One
+            second_port
+                .and_then(|port| port.clock_enable)
+                .map_or(Bit::One, |enable| enable.signal)
         } else {
             read_enable.map_or(Bit::One, |enable| enable.signal)
         },
@@ -7868,6 +8065,7 @@ fn block_ram_parameters(
     width: u8,
     write_enable: Control,
     read_enable: Option<Control>,
+    clock_enable: Option<Control>,
     edge: ClockEdge,
     second_port: Option<&BlockRamPort>,
 ) -> BTreeMap<String, String> {
@@ -7910,7 +8108,7 @@ fn block_ram_parameters(
             .into(),
         ),
     ]);
-    parameters.insert("CEAMUX".into(), "1".into());
+    parameters.insert("CEAMUX".into(), block_ram_control_mux(clock_enable, "CEA"));
     parameters.insert(
         "CEBMUX".into(),
         match second_port
@@ -7933,7 +8131,10 @@ fn block_ram_parameters(
             }
             .into(),
         );
-        parameters.insert("CEBMUX".into(), "1".into());
+        parameters.insert(
+            "CEBMUX".into(),
+            block_ram_control_mux(port.clock_enable, "CEB"),
+        );
     }
     parameters
 }
@@ -10503,6 +10704,7 @@ mod tests {
         let mut source = Netlist::new("pll_top");
         source.add_input("clk");
         source.add_input("clk_250");
+        source.add_input("clk_125");
         source.add_input("pll_locked");
         let mut binding = PllBinding::new(
             "clk",
@@ -10511,6 +10713,9 @@ mod tests {
             PllOutput::Clkos,
             PllOutput::Clkop,
         );
+        binding
+            .additional_output_clock_ports
+            .insert("clk_125".into(), PllOutput::Clkos2);
         binding.parameters.extend(
             [
                 ("CLKI_DIV", "3"),
@@ -10540,8 +10745,10 @@ mod tests {
             [Ecp5Cell::Pll {
                 fabric_output: PllOutput::Clkos,
                 feedback_output: PllOutput::Clkop,
+                additional_output_clocks,
                 ..
-            }]
+            }] if additional_output_clocks.len() == 1
+                && additional_output_clocks[0].0 == PllOutput::Clkos2
         ));
         let json: serde_json::Value =
             serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
@@ -10552,6 +10759,7 @@ mod tests {
         assert_eq!(cell["connections"]["CLKFB"], cell["connections"]["CLKOP"]);
         assert_ne!(cell["connections"]["CLKOP"], cell["connections"]["CLKOS"]);
         assert_eq!(cell["port_directions"]["CLKOS"], "output");
+        assert_eq!(cell["port_directions"]["CLKOS2"], "output");
 
         let shared_output = PllBinding::new(
             "clk",
@@ -10743,6 +10951,8 @@ mod tests {
         let clock_b = source.add_input("clock_b");
         let enable_a = source.add_input("enable_a");
         let enable_b = source.add_input("enable_b");
+        let read_enable_a = source.add_input("read_enable_a");
+        let read_enable_b = source.add_input("read_enable_b");
         let address_a = source.add_input_port("address_a", NonZeroU32::new(8).unwrap());
         let address_b = source.add_input_port("address_b", NonZeroU32::new(8).unwrap());
         let write_a = source.add_input_port("write_a", NonZeroU32::new(8).unwrap());
@@ -10763,7 +10973,7 @@ mod tests {
                 256,
                 address_a.clone(),
                 read_a.clone(),
-                None,
+                Some(active_high(read_enable_a)),
                 address_a.clone(),
                 write_a,
                 active_high(enable_a),
@@ -10773,7 +10983,7 @@ mod tests {
             .with_second_port(MemoryPort::new(
                 address_b.clone(),
                 read_b.clone(),
-                None,
+                Some(active_high(read_enable_b)),
                 address_b.clone(),
                 write_b,
                 active_high(enable_b),
@@ -10792,6 +11002,16 @@ mod tests {
 
         assert_eq!(cell["parameters"]["CLKAMUX"], "CLKA");
         assert_eq!(cell["parameters"]["CLKBMUX"], "INV");
+        assert_eq!(cell["parameters"]["CEAMUX"], "CEA");
+        assert_eq!(cell["parameters"]["CEBMUX"], "CEB");
+        let cea = &module["cells"]["bram_words_cea"];
+        let ceb = &module["cells"]["bram_words_ceb"];
+        assert_eq!(cea["type"], "LUT4");
+        assert_eq!(cea["parameters"]["INIT"], "1110111011101110");
+        assert_eq!(ceb["type"], "LUT4");
+        assert_eq!(ceb["parameters"]["INIT"], "1110111011101110");
+        assert_eq!(cell["connections"]["CEA"], cea["connections"]["Z"]);
+        assert_eq!(cell["connections"]["CEB"], ceb["connections"]["Z"]);
         assert_eq!(
             cell["connections"]["CLKA"],
             module["ports"]["clock_a"]["bits"]
