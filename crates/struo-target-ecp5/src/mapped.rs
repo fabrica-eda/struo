@@ -7627,11 +7627,23 @@ fn json_pll(
     JsonCell {
         hide_name: 0,
         r#type: "EHXPLLL",
-        parameters: parameters.clone(),
+        // JSON parameters containing only `0` and `1` are bit vectors, not
+        // decimal strings. Encode every numeric PLL parameter uniformly so
+        // values such as decimal 10 cannot be misread as binary 2.
+        parameters: parameters
+            .iter()
+            .map(|(name, value)| (name.clone(), json_numeric_parameter(value)))
+            .collect(),
         attributes: attributes.clone(),
         port_directions,
         connections,
     }
+}
+
+fn json_numeric_parameter(value: &str) -> String {
+    value
+        .parse::<u64>()
+        .map_or_else(|_| value.to_owned(), |value| format!("{value:064b}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10722,6 +10734,7 @@ mod tests {
                 ("CLKFB_DIV", "5"),
                 ("CLKOP_DIV", "25"),
                 ("CLKOS_DIV", "2"),
+                ("CLKOS2_DIV", "10"),
                 ("FEEDBK_PATH", "CLKOP"),
             ]
             .map(|(name, value)| (name.into(), value.into())),
@@ -10754,7 +10767,8 @@ mod tests {
             serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
         let cell = &json["modules"]["pll_top"]["cells"]["pll"];
         assert_eq!(cell["type"], "EHXPLLL");
-        assert_eq!(cell["parameters"]["CLKI_DIV"], "3");
+        assert_eq!(cell["parameters"]["CLKI_DIV"], format!("{:064b}", 3));
+        assert_eq!(cell["parameters"]["CLKOS2_DIV"], format!("{:064b}", 10));
         assert_eq!(cell["attributes"]["FREQUENCY_PIN_CLKI"], "12");
         assert_eq!(cell["connections"]["CLKFB"], cell["connections"]["CLKOP"]);
         assert_ne!(cell["connections"]["CLKOP"], cell["connections"]["CLKOS"]);
