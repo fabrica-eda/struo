@@ -186,7 +186,7 @@ impl JtaggBinding {
 }
 
 /// One clock output of an ECP5 `EHXPLLL` primitive.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
 pub enum PllOutput {
     /// Dedicated internal feedback output (`CLKINTFB`).
     #[serde(rename = "CLKINTFB")]
@@ -206,7 +206,9 @@ pub enum PllOutput {
 }
 
 impl PllOutput {
-    fn port(self) -> &'static str {
+    /// Returns the `EHXPLLL` primitive port name.
+    #[must_use]
+    pub const fn port(self) -> &'static str {
         match self {
             Self::Clkintfb => "CLKINTFB",
             Self::Clkop => "CLKOP",
@@ -234,6 +236,9 @@ pub struct PllBinding {
     pub locked_port: String,
     /// PLL output routed into the core.
     pub fabric_output: PllOutput,
+    /// Additional logical clock ports driven by other outputs of this PLL.
+    #[serde(default)]
+    pub additional_output_clock_ports: BTreeMap<String, PllOutput>,
     /// PLL output looped back to `CLKFB`, normally `CLKINTFB` for
     /// `FEEDBK_PATH=INT_OP` as emitted by `ecppll`.
     pub feedback_output: PllOutput,
@@ -260,6 +265,7 @@ impl PllBinding {
             output_clock_port: output_clock_port.into(),
             locked_port: locked_port.into(),
             fabric_output,
+            additional_output_clock_ports: BTreeMap::new(),
             feedback_output,
             parameters: BTreeMap::new(),
             attributes: BTreeMap::new(),
@@ -858,6 +864,8 @@ pub enum Ecp5Cell {
         feedback_clock: u32,
         /// Fabric clock output wire.
         output_clock: u32,
+        /// Other PLL outputs routed into logical fabric clock ports.
+        additional_output_clocks: Vec<(PllOutput, u32)>,
         /// Lock indication output wire.
         locked: u32,
         /// PLL output routed into the core.
@@ -1130,6 +1138,40 @@ impl Ecp5Netlist {
             resolved.push((index, wire));
         }
         let output_clock = resolved[1].1;
+        let mut additional_output_clocks = Vec::new();
+        let mut additional_port_indices = Vec::new();
+        let mut outputs = HashSet::from([binding.fabric_output, binding.feedback_output]);
+        for (name, output) in &binding.additional_output_clock_ports {
+            if !names.insert(name.as_str()) {
+                return Err(MappingError::PllPortRepeated(name.clone()));
+            }
+            if !outputs.insert(*output) {
+                return Err(MappingError::PllPortRepeated(output.port().into()));
+            }
+            let (index, port) = self
+                .ports
+                .iter()
+                .enumerate()
+                .find(|(_, port)| port.name == *name)
+                .ok_or_else(|| MappingError::PllPortNotFound(name.clone()))?;
+            if port.direction != PortDirection::Input {
+                return Err(MappingError::PllPortDirection {
+                    port: name.clone(),
+                    actual: port.direction,
+                });
+            }
+            if port.bits.len() != 1 {
+                return Err(MappingError::PllPortNotScalar {
+                    port: name.clone(),
+                    width: port.bits.len(),
+                });
+            }
+            let Bit::Wire(wire) = port.bits[0] else {
+                return Err(MappingError::PllOutputIsConstant(name.clone()));
+            };
+            additional_output_clocks.push((*output, wire));
+            additional_port_indices.push(index);
+        }
         let feedback_clock = if binding.fabric_output == binding.feedback_output {
             output_clock
         } else {
@@ -1143,13 +1185,15 @@ impl Ecp5Netlist {
             reference_clock: Bit::Wire(resolved[0].1),
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked: resolved[2].1,
             fabric_output: binding.fabric_output,
             feedback_output: binding.feedback_output,
             parameters: binding.parameters.clone(),
             attributes: binding.attributes.clone(),
         });
-        let mut removed = [resolved[1].0, resolved[2].0];
+        let mut removed = vec![resolved[1].0, resolved[2].0];
+        removed.extend(additional_port_indices);
         removed.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
         for index in removed {
             self.ports.remove(index);
@@ -6070,10 +6114,16 @@ fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
         Ecp5Cell::Pll {
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked,
             ..
         } => {
             let mut outputs = vec![Bit::Wire(*output_clock), Bit::Wire(*locked)];
+            outputs.extend(
+                additional_output_clocks
+                    .iter()
+                    .map(|(_, wire)| Bit::Wire(*wire)),
+            );
             if feedback_clock != output_clock {
                 outputs.push(Bit::Wire(*feedback_clock));
             }
@@ -7500,6 +7550,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
             reference_clock,
             feedback_clock,
             output_clock,
+            additional_output_clocks,
             locked,
             fabric_output,
             feedback_output,
@@ -7511,6 +7562,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
                 *reference_clock,
                 *feedback_clock,
                 *output_clock,
+                additional_output_clocks,
                 *locked,
                 *fabric_output,
                 *feedback_output,
@@ -7526,6 +7578,7 @@ fn json_pll(
     reference_clock: Bit,
     feedback_clock: u32,
     output_clock: u32,
+    additional_output_clocks: &[(PllOutput, u32)],
     locked: u32,
     fabric_output: PllOutput,
     feedback_output: PllOutput,
@@ -7567,6 +7620,10 @@ fn json_pll(
     );
     port_directions.insert(fabric_output.port().into(), "output");
     connections.insert(fabric_output.port().into(), vec![Bit::Wire(output_clock)]);
+    for (output, wire) in additional_output_clocks {
+        port_directions.insert(output.port().into(), "output");
+        connections.insert(output.port().into(), vec![Bit::Wire(*wire)]);
+    }
     JsonCell {
         hide_name: 0,
         r#type: "EHXPLLL",
@@ -10647,6 +10704,7 @@ mod tests {
         let mut source = Netlist::new("pll_top");
         source.add_input("clk");
         source.add_input("clk_250");
+        source.add_input("clk_125");
         source.add_input("pll_locked");
         let mut binding = PllBinding::new(
             "clk",
@@ -10655,6 +10713,9 @@ mod tests {
             PllOutput::Clkos,
             PllOutput::Clkop,
         );
+        binding
+            .additional_output_clock_ports
+            .insert("clk_125".into(), PllOutput::Clkos2);
         binding.parameters.extend(
             [
                 ("CLKI_DIV", "3"),
@@ -10684,8 +10745,10 @@ mod tests {
             [Ecp5Cell::Pll {
                 fabric_output: PllOutput::Clkos,
                 feedback_output: PllOutput::Clkop,
+                additional_output_clocks,
                 ..
-            }]
+            }] if additional_output_clocks.len() == 1
+                && additional_output_clocks[0].0 == PllOutput::Clkos2
         ));
         let json: serde_json::Value =
             serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
@@ -10696,6 +10759,7 @@ mod tests {
         assert_eq!(cell["connections"]["CLKFB"], cell["connections"]["CLKOP"]);
         assert_ne!(cell["connections"]["CLKOP"], cell["connections"]["CLKOS"]);
         assert_eq!(cell["port_directions"]["CLKOS"], "output");
+        assert_eq!(cell["port_directions"]["CLKOS2"], "output");
 
         let shared_output = PllBinding::new(
             "clk",
