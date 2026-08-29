@@ -313,12 +313,94 @@ impl ArithmeticCell {
     }
 }
 
-/// One synchronous, simple-dual-port memory retained for block-RAM mapping.
+/// A second independently clocked read/write port on a memory cell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryPort {
+    read_address: Vec<NetId>,
+    read_data: Vec<NetId>,
+    read_enable: Option<EnableControl>,
+    write_address: Vec<NetId>,
+    write_data: Vec<NetId>,
+    write_enable: EnableControl,
+    clock: NetId,
+    edge: ClockEdge,
+}
+
+impl MemoryPort {
+    /// Creates a fully connected synchronous read/write port.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        read_address: Vec<NetId>,
+        read_data: Vec<NetId>,
+        read_enable: Option<EnableControl>,
+        write_address: Vec<NetId>,
+        write_data: Vec<NetId>,
+        write_enable: EnableControl,
+        clock: NetId,
+        edge: ClockEdge,
+    ) -> Self {
+        Self {
+            read_address,
+            read_data,
+            read_enable,
+            write_address,
+            write_data,
+            write_enable,
+            clock,
+            edge,
+        }
+    }
+
+    /// Returns read-address bits least-significant first.
+    #[must_use]
+    pub fn read_address(&self) -> &[NetId] {
+        &self.read_address
+    }
+    /// Returns read-data bits least-significant first.
+    #[must_use]
+    pub fn read_data(&self) -> &[NetId] {
+        &self.read_data
+    }
+    /// Returns the optional read clock enable.
+    #[must_use]
+    pub const fn read_enable(&self) -> Option<EnableControl> {
+        self.read_enable
+    }
+    /// Returns write-address bits least-significant first.
+    #[must_use]
+    pub fn write_address(&self) -> &[NetId] {
+        &self.write_address
+    }
+    /// Returns write-data bits least-significant first.
+    #[must_use]
+    pub fn write_data(&self) -> &[NetId] {
+        &self.write_data
+    }
+    /// Returns the write enable.
+    #[must_use]
+    pub const fn write_enable(&self) -> EnableControl {
+        self.write_enable
+    }
+    /// Returns the port clock.
+    #[must_use]
+    pub const fn clock(&self) -> NetId {
+        self.clock
+    }
+    /// Returns the active clock edge.
+    #[must_use]
+    pub const fn edge(&self) -> ClockEdge {
+        self.edge
+    }
+}
+
+/// One synchronous memory retained for block-RAM mapping.
 ///
 /// Addresses and words are stored least-significant bit first. The read and
-/// write ports share a clock and edge. A read samples its address on the active
-/// edge and updates `read_data` one cycle later. A simultaneous read and write
-/// to the same address has target-specific collision behavior.
+/// write operations within each port share a clock and edge. A read samples
+/// its address on the active edge and updates `read_data` one cycle later. An
+/// optional second port has its own clock and edge. Simultaneous accesses to
+/// the same address have target-specific collision behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryCell {
     name: String,
@@ -331,6 +413,7 @@ pub struct MemoryCell {
     write_enable: EnableControl,
     clock: NetId,
     edge: ClockEdge,
+    second_port: Option<MemoryPort>,
 }
 
 impl MemoryCell {
@@ -360,7 +443,15 @@ impl MemoryCell {
             write_enable,
             clock,
             edge,
+            second_port: None,
         }
+    }
+
+    /// Adds a second independently clocked read/write port.
+    #[must_use]
+    pub fn with_second_port(mut self, port: MemoryPort) -> Self {
+        self.second_port = Some(port);
+        self
     }
 
     /// Returns the stable diagnostic name.
@@ -421,6 +512,12 @@ impl MemoryCell {
     #[must_use]
     pub const fn edge(&self) -> ClockEdge {
         self.edge
+    }
+
+    /// Returns the optional second port.
+    #[must_use]
+    pub const fn second_port(&self) -> Option<&MemoryPort> {
+        self.second_port.as_ref()
     }
 }
 
@@ -1067,6 +1164,41 @@ impl Netlist {
             {
                 if !defined_nets.contains(&input) {
                     return Err(ValidationError::UndefinedNet(input));
+                }
+            }
+            if let Some(port) = &memory.second_port {
+                if port.read_address.is_empty()
+                    || port.read_address.len() != port.write_address.len()
+                    || port.read_address.len() != memory.read_address.len()
+                {
+                    return Err(ValidationError::MemoryAddressWidth(memory.name.clone()));
+                }
+                if port.read_data.is_empty()
+                    || port.read_data.len() != port.write_data.len()
+                    || port.read_data.len() != memory.read_data.len()
+                {
+                    return Err(ValidationError::MemoryWordWidth(memory.name.clone()));
+                }
+                for output in &port.read_data {
+                    if !memory_outputs.contains(output) {
+                        return Err(ValidationError::InvalidMemoryOutput(*output));
+                    }
+                    if !connected_memory_outputs.insert(*output) {
+                        return Err(ValidationError::MultipleDrivers(*output));
+                    }
+                }
+                for input in port
+                    .read_address
+                    .iter()
+                    .chain(&port.write_address)
+                    .chain(&port.write_data)
+                    .copied()
+                    .chain([port.clock, port.write_enable.signal])
+                    .chain(port.read_enable.map(|enable| enable.signal))
+                {
+                    if !defined_nets.contains(&input) {
+                        return Err(ValidationError::UndefinedNet(input));
+                    }
                 }
             }
         }

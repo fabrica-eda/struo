@@ -35,6 +35,16 @@ use struo_target_ecp5::{Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection
 pub fn ecp5_frontend_artifact(
     netlist: &Ecp5Netlist,
 ) -> Result<FrontendArtifact, CeloxAdapterError> {
+    if let Some(name) = netlist.cells().iter().find_map(|cell| match cell {
+        Ecp5Cell::BlockRam {
+            name,
+            second_port: Some(_),
+            ..
+        } => Some(name.clone()),
+        _ => None,
+    }) {
+        return Err(CeloxAdapterError::UnsupportedTrueDualPortMemory(name));
+    }
     let bit_type = ValueType::bits(1)?;
     let mut builder = ModuleBuilder::new(netlist.name())?;
     let mut wires = BTreeMap::new();
@@ -336,6 +346,7 @@ fn emit_cell(
             read_enable,
             clock,
             edge,
+            second_port: _,
         } => emit_block_ram(
             builder,
             wires,
@@ -934,6 +945,8 @@ pub enum CeloxAdapterError {
     MissingWire(u32),
     /// A register control references one bit within a vector signal.
     NonScalarControl(u32),
+    /// The cycle-level Celox adapter cannot represent two independent clocks.
+    UnsupportedTrueDualPortMemory(String),
 }
 
 impl Display for CeloxAdapterError {
@@ -948,6 +961,10 @@ impl Display for CeloxAdapterError {
                     "mapped wire {wire} is not a scalar control signal"
                 )
             }
+            Self::UnsupportedTrueDualPortMemory(memory) => write!(
+                formatter,
+                "mapped true-dual-port memory `{memory}` is not supported by the Celox adapter"
+            ),
         }
     }
 }
@@ -956,7 +973,10 @@ impl Error for CeloxAdapterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Build(error) => Some(error),
-            Self::DuplicateWire(_) | Self::MissingWire(_) | Self::NonScalarControl(_) => None,
+            Self::DuplicateWire(_)
+            | Self::MissingWire(_)
+            | Self::NonScalarControl(_)
+            | Self::UnsupportedTrueDualPortMemory(_) => None,
         }
     }
 }
@@ -972,7 +992,8 @@ mod tests {
     use std::num::NonZeroU32;
 
     use struo_ir::{
-        ActiveLevel, ArithmeticOp, ClockEdge, EnableControl, Netlist, RegisterCell, ResetControl,
+        ActiveLevel, ArithmeticOp, ClockEdge, EnableControl, MemoryCell, MemoryPort, Netlist,
+        RegisterCell, ResetControl,
     };
     use struo_rtl::{
         BinaryOp, BitWidth, ClockEdge as RtlClockEdge, Constant, Design, Enable, Memory, Module,
@@ -985,7 +1006,7 @@ mod tests {
         map_to_ecp5_with_options, map_to_ecp5_with_pll,
     };
 
-    use super::{ecp5_frontend_artifact, ecp5_simulator};
+    use super::{CeloxAdapterError, ecp5_frontend_artifact, ecp5_simulator};
 
     fn bits(width: u32) -> ValueType {
         ValueType {
@@ -1441,6 +1462,7 @@ mod tests {
             },
             clock,
             edge: RtlClockEdge::Rising,
+            second_port: None,
         });
         let mut design = Design::new("Scratchpad");
         design.add_module(module);
@@ -1633,5 +1655,57 @@ mod tests {
         assert_eq!(artifact.port_order().len(), 2);
         assert_eq!(input.value_type().width(), 3);
         assert_eq!(output.value_type().width(), 3);
+    }
+
+    #[test]
+    fn rejects_true_dual_port_memory_instead_of_ignoring_its_second_port() {
+        let mut source = Netlist::new("true_dual_port");
+        let clock_a = source.add_input("clock_a");
+        let clock_b = source.add_input("clock_b");
+        let enable_a = source.add_input("enable_a");
+        let enable_b = source.add_input("enable_b");
+        let address_a = vec![source.add_input("address_a")];
+        let address_b = vec![source.add_input("address_b")];
+        let write_a = vec![source.add_input("write_a")];
+        let write_b = vec![source.add_input("write_b")];
+        let read_a = vec![source.add_memory_output("read_a")];
+        let read_b = vec![source.add_memory_output("read_b")];
+        let active_high = |signal| EnableControl {
+            signal,
+            active: ActiveLevel::High,
+        };
+        source.add_memory(
+            MemoryCell::new(
+                "words",
+                2,
+                address_a.clone(),
+                read_a.clone(),
+                None,
+                address_a,
+                write_a,
+                active_high(enable_a),
+                clock_a,
+                ClockEdge::Rising,
+            )
+            .with_second_port(MemoryPort::new(
+                address_b.clone(),
+                read_b.clone(),
+                None,
+                address_b,
+                write_b,
+                active_high(enable_b),
+                clock_b,
+                ClockEdge::Falling,
+            )),
+        );
+        source.add_output_port("read_a", &read_a).unwrap();
+        source.add_output_port("read_b", &read_b).unwrap();
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        assert!(matches!(
+            ecp5_frontend_artifact(&mapped),
+            Err(CeloxAdapterError::UnsupportedTrueDualPortMemory(memory))
+                if memory == "bram_words"
+        ));
     }
 }

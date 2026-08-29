@@ -670,6 +670,15 @@ impl MappingDemand {
                 .copied()
                 .chain([memory.clock(), memory.write_enable().signal])
                 .chain(memory.read_enable().map(|enable| enable.signal))
+                .chain(memory.second_port().into_iter().flat_map(|port| {
+                    port.read_address()
+                        .iter()
+                        .chain(port.write_address())
+                        .chain(port.write_data())
+                        .copied()
+                        .chain([port.clock(), port.write_enable().signal])
+                        .chain(port.read_enable().map(|enable| enable.signal))
+                }))
         });
         let arithmetic_roots = netlist.arithmetic().iter().flat_map(|cell| {
             cell.lhs()
@@ -769,7 +778,7 @@ pub enum Ecp5Cell {
         /// Optional local set/reset.
         reset: Option<Reset>,
     },
-    /// One ECP5 18-Kibit embedded block RAM in simple-dual-port mode.
+    /// One ECP5 18-Kibit embedded block RAM.
     BlockRam {
         /// Stable cell name.
         name: String,
@@ -791,10 +800,12 @@ pub enum Ecp5Cell {
         read_data: Vec<u32>,
         /// Optional read clock enable.
         read_enable: Option<Control>,
-        /// Shared port clock.
+        /// First-port clock.
         clock: Bit,
-        /// Shared active clock edge.
+        /// First-port active clock edge.
         edge: ClockEdge,
+        /// Optional second independently clocked read/write port.
+        second_port: Option<BlockRamPort>,
     },
     /// Bidirectional ECP5 I/O buffer.
     TrellisIo {
@@ -855,6 +866,49 @@ pub enum Ecp5Cell {
         /// Raw primitive attributes.
         attributes: BTreeMap<String, String>,
     },
+}
+
+/// Connections for a second true-dual-port ECP5 block-RAM port.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockRamPort {
+    /// Fourteen physical address pins shared by reads and writes.
+    pub address: Box<[Bit; 14]>,
+    /// Logical write-data bits, least-significant first.
+    pub write_data: Vec<Bit>,
+    /// Write enable.
+    pub write_enable: Control,
+    /// Logical read-data output wires, least-significant first.
+    pub read_data: Vec<u32>,
+    /// Optional read clock enable.
+    pub read_enable: Option<Control>,
+    /// Port clock.
+    pub clock: Bit,
+    /// Active clock edge.
+    pub edge: ClockEdge,
+}
+
+impl BlockRamPort {
+    fn replace_input_bits(&mut self, replace: &mut impl FnMut(&mut Bit)) {
+        for bit in self.address.iter_mut().chain(&mut self.write_data) {
+            replace(bit);
+        }
+        replace(&mut self.write_enable.signal);
+        if let Some(enable) = &mut self.read_enable {
+            replace(&mut enable.signal);
+        }
+        replace(&mut self.clock);
+    }
+
+    fn for_each_input_bit(&self, visit: &mut impl FnMut(Bit)) {
+        for bit in self.address.iter().chain(&self.write_data) {
+            visit(*bit);
+        }
+        visit(self.write_enable.signal);
+        visit(self.clock);
+        if let Some(enable) = self.read_enable {
+            visit(enable.signal);
+        }
+    }
 }
 
 /// Technology-mapped ECP5 netlist used by both simulation and nextpnr.
@@ -1373,6 +1427,19 @@ impl Ecp5Netlist {
                 .cells
                 .iter()
                 .filter_map(|cell| {
+                    // Rewiring can invalidate a previously legal LUT/FF pack
+                    // even when both cells retain their names. Preserve only
+                    // hard-block locations; let nextpnr repack and replace all
+                    // fabric logic, including newly created replicas.
+                    if !matches!(
+                        cell,
+                        Ecp5Cell::BlockRam { .. }
+                            | Ecp5Cell::TrellisIo { .. }
+                            | Ecp5Cell::Jtagg { .. }
+                            | Ecp5Cell::Pll { .. }
+                    ) {
+                        return None;
+                    }
                     let name = mapped_cell_name(cell);
                     let bel = feedback.bel(name)?;
                     physical_bel_is_compatible(cell, bel).then(|| (name.to_owned(), bel.to_owned()))
@@ -1952,12 +2019,13 @@ fn resolve_clock_timing(
         .registers()
         .iter()
         .map(|register| ("register", register.name(), register.clock()))
-        .chain(
-            netlist
-                .memories()
-                .iter()
-                .map(|memory| ("memory", memory.name(), memory.clock())),
-        )
+        .chain(netlist.memories().iter().flat_map(|memory| {
+            std::iter::once(("memory", memory.name(), memory.clock())).chain(
+                memory
+                    .second_port()
+                    .map(|port| ("memory second port", memory.name(), port.clock())),
+            )
+        }))
     {
         if !clock_nets.contains(&clock) {
             return Err(invalid(format!(
@@ -2187,6 +2255,19 @@ fn validate_ooc_input_boundary(
         {
             sequential_sinks[input.index() as usize].push(memory.clock());
         }
+        if let Some(port) = memory.second_port() {
+            for input in port
+                .read_address()
+                .iter()
+                .chain(port.write_address())
+                .chain(port.write_data())
+                .copied()
+                .chain([port.write_enable().signal])
+                .chain(port.read_enable().map(|enable| enable.signal))
+            {
+                sequential_sinks[input.index() as usize].push(port.clock());
+            }
+        }
     }
 
     for (bit_index, start) in port.bits().iter().copied().enumerate() {
@@ -2305,6 +2386,19 @@ fn validate_ooc_asynchronous_control(
         {
             forbidden_sinks[input.index() as usize] = true;
         }
+        if let Some(port) = memory.second_port() {
+            for input in port
+                .read_address()
+                .iter()
+                .chain(port.write_address())
+                .chain(port.write_data())
+                .copied()
+                .chain([port.write_enable().signal, port.clock()])
+                .chain(port.read_enable().map(|enable| enable.signal))
+            {
+                forbidden_sinks[input.index() as usize] = true;
+            }
+        }
     }
 
     let mut pending = port.bits().to_vec();
@@ -2369,13 +2463,21 @@ fn validate_ooc_output_boundary(
                     }
                 }
                 NodeKind::MemoryOutput(_) => {
-                    let memory = netlist
+                    let memory_clock = netlist
                         .memories()
                         .iter()
-                        .find(|memory| memory.read_data().contains(&net))
+                        .find_map(|memory| {
+                            if memory.read_data().contains(&net) {
+                                Some(memory.clock())
+                            } else {
+                                memory.second_port().and_then(|port| {
+                                    port.read_data().contains(&net).then_some(port.clock())
+                                })
+                            }
+                        })
                         .expect("validated memory outputs are connected");
                     found_sequential = true;
-                    if memory.clock() != expected_clock {
+                    if memory_clock != expected_clock {
                         return Err(MappingError::InvalidOocConstraint(format!(
                             "output `{}[{bit_index}]` is sourced by memory outside declared clock `{clock_name}`",
                             port.name()
@@ -3608,6 +3710,7 @@ fn replicate_physically_critical_cells(
     (replicas, rewires)
 }
 
+#[allow(clippy::too_many_lines)]
 fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize {
     let mut replacements = 0usize;
     let mut replace = |bit: &mut Bit| {
@@ -3673,6 +3776,7 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
             read_address,
             read_enable,
             clock,
+            second_port,
             ..
         } => {
             for bit in write_address
@@ -3687,6 +3791,9 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
                 replace(&mut read_enable.signal);
             }
             replace(clock);
+            if let Some(port) = second_port {
+                port.replace_input_bits(&mut replace);
+            }
         }
         Ecp5Cell::TrellisIo {
             fabric_output,
@@ -3880,8 +3987,15 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
             Ecp5Cell::FlipFlop { output, .. } => {
                 depths.insert(*output, 0);
             }
-            Ecp5Cell::BlockRam { read_data, .. } => {
-                for output in read_data {
+            Ecp5Cell::BlockRam {
+                read_data,
+                second_port,
+                ..
+            } => {
+                for output in read_data
+                    .iter()
+                    .chain(second_port.iter().flat_map(|port| &port.read_data))
+                {
                     depths.insert(*output, 0);
                 }
             }
@@ -4003,8 +4117,15 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
             Ecp5Cell::FlipFlop { output, .. } => {
                 arrivals.insert(*output, FLIP_FLOP_CLOCK_TO_OUTPUT_PS);
             }
-            Ecp5Cell::BlockRam { read_data, .. } => {
-                for output in read_data {
+            Ecp5Cell::BlockRam {
+                read_data,
+                second_port,
+                ..
+            } => {
+                for output in read_data
+                    .iter()
+                    .chain(second_port.iter().flat_map(|port| &port.read_data))
+                {
                     arrivals.insert(*output, BRAM_CLOCK_TO_OUTPUT_PS);
                 }
             }
@@ -5382,7 +5503,7 @@ fn replace_mapped_wire_uses(netlist: &mut Ecp5Netlist, from: u32, to: u32) {
 }
 
 fn replace_mapped_cell_wire_uses(cell: &mut Ecp5Cell, from: u32, to: u32) {
-    let replace = |bit: &mut Bit| {
+    let mut replace = |bit: &mut Bit| {
         if *bit == Bit::Wire(from) {
             *bit = Bit::Wire(to);
         }
@@ -5444,6 +5565,7 @@ fn replace_mapped_cell_wire_uses(cell: &mut Ecp5Cell, from: u32, to: u32) {
             read_address,
             read_enable,
             clock,
+            second_port,
             ..
         } => {
             for bit in write_address
@@ -5458,6 +5580,9 @@ fn replace_mapped_cell_wire_uses(cell: &mut Ecp5Cell, from: u32, to: u32) {
                 replace(&mut control.signal);
             }
             replace(clock);
+            if let Some(port) = second_port {
+                port.replace_input_bits(&mut replace);
+            }
         }
         Ecp5Cell::TrellisIo {
             fabric_output,
@@ -5822,6 +5947,7 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
             read_address,
             read_enable,
             clock,
+            second_port,
             ..
         } => {
             for bit in write_address
@@ -5835,6 +5961,9 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
             visit(*clock);
             if let Some(control) = read_enable {
                 visit(control.signal);
+            }
+            if let Some(port) = second_port {
+                port.for_each_input_bit(&mut visit);
             }
         }
         Ecp5Cell::TrellisIo {
@@ -5877,7 +6006,16 @@ fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
             .chain([*carry_out])
             .map(Bit::Wire)
             .collect(),
-        Ecp5Cell::BlockRam { read_data, .. } => read_data.iter().copied().map(Bit::Wire).collect(),
+        Ecp5Cell::BlockRam {
+            read_data,
+            second_port,
+            ..
+        } => read_data
+            .iter()
+            .chain(second_port.iter().flat_map(|port| &port.read_data))
+            .copied()
+            .map(Bit::Wire)
+            .collect(),
         Ecp5Cell::TrellisIo { fabric_input, .. } => vec![Bit::Wire(*fabric_input)],
         Ecp5Cell::Jtagg {
             tdi,
@@ -6473,6 +6611,20 @@ fn map_memory(
     bits: &[Option<Bit>],
     cells: &mut Vec<Ecp5Cell>,
 ) -> Result<(), MappingError> {
+    if let Some(second_port) = memory.second_port() {
+        if memory.read_address() != memory.write_address() {
+            return Err(MappingError::UnsupportedTrueDualPortAddresses {
+                memory: memory.name().into(),
+                port: 'A',
+            });
+        }
+        if second_port.read_address() != second_port.write_address() {
+            return Err(MappingError::UnsupportedTrueDualPortAddresses {
+                memory: memory.name().into(),
+                port: 'B',
+            });
+        }
+    }
     let geometry_error = || MappingError::UnsupportedMemoryGeometry {
         memory: memory.name().into(),
         depth: memory.depth(),
@@ -6526,6 +6678,36 @@ fn map_memory(
             }),
             clock: mapped_bit(bits, memory.clock()),
             edge: memory.edge(),
+            second_port: memory.second_port().map(|port| {
+                let start = chunk * usize::from(chunk_width);
+                let end = (start + write_data.len()).min(port.write_data().len());
+                let mut address = physical_address(bits, port.write_address(), physical_width);
+                if physical_width == 18 {
+                    address[0] = Bit::One;
+                    address[1] = Bit::One;
+                }
+                BlockRamPort {
+                    address: Box::new(address),
+                    write_data: port.write_data()[start..end]
+                        .iter()
+                        .map(|net| mapped_bit(bits, *net))
+                        .collect(),
+                    write_enable: Control {
+                        signal: mapped_bit(bits, port.write_enable().signal),
+                        active: port.write_enable().active,
+                    },
+                    read_data: port.read_data()[start..end]
+                        .iter()
+                        .map(|net| wire_number(*net))
+                        .collect(),
+                    read_enable: port.read_enable().map(|enable| Control {
+                        signal: mapped_bit(bits, enable.signal),
+                        active: enable.active,
+                    }),
+                    clock: mapped_bit(bits, port.clock()),
+                    edge: port.edge(),
+                }
+            }),
         });
     }
     Ok(())
@@ -6693,6 +6875,13 @@ pub enum MappingError {
         /// Requested word width.
         width: usize,
     },
+    /// A true-dual-port DP16KD port was given separate read and write addresses.
+    UnsupportedTrueDualPortAddresses {
+        /// Memory name.
+        memory: String,
+        /// Physical port whose address expressions differ.
+        port: char,
+    },
     /// A named split I/O port does not exist.
     IoPortNotFound(String),
     /// The physical pad name conflicts with an existing mapped port.
@@ -6800,6 +6989,10 @@ impl Display for MappingError {
                 formatter,
                 "memory {memory} ({depth}x{width}) cannot be mapped to ECP5 DP16KD primitives"
             ),
+            Self::UnsupportedTrueDualPortAddresses { memory, port } => write!(
+                formatter,
+                "true-dual-port memory {memory} uses different read and write addresses on DP16KD port {port}"
+            ),
             Self::IoPortNotFound(port) => {
                 write!(formatter, "open-drain I/O port `{port}` was not found")
             }
@@ -6889,6 +7082,7 @@ impl Error for MappingError {
         match self {
             Self::InvalidNetlist(error) => Some(error),
             Self::UnsupportedMemoryGeometry { .. }
+            | Self::UnsupportedTrueDualPortAddresses { .. }
             | Self::InvalidTimingConstraint(_)
             | Self::InvalidOocConstraint(_)
             | Self::TimingPortNotFound(_)
@@ -7128,6 +7322,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
             read_enable,
             clock,
             edge,
+            second_port,
             ..
         } => (
             name.clone(),
@@ -7141,6 +7336,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
                 *read_enable,
                 *clock,
                 *edge,
+                second_port.as_ref(),
             ),
         ),
         Ecp5Cell::TrellisIo {
@@ -7584,8 +7780,9 @@ fn json_block_ram(
     read_enable: Option<Control>,
     clock: Bit,
     edge: ClockEdge,
+    second_port: Option<&BlockRamPort>,
 ) -> JsonCell {
-    let parameters = block_ram_parameters(width, write_enable, read_enable, edge);
+    let parameters = block_ram_parameters(width, write_enable, read_enable, edge, second_port);
 
     let mut port_directions = BTreeMap::new();
     let mut connections = BTreeMap::new();
@@ -7610,27 +7807,52 @@ fn json_block_ram(
     for index in 0..3 {
         input(format!("CSA{index}"), Bit::Zero);
     }
-    for (index, bit) in read_address.into_iter().enumerate() {
+    let port_b_address = second_port.map_or(read_address, |port| *port.address);
+    for (index, bit) in port_b_address.into_iter().enumerate() {
         input(format!("ADB{index}"), bit);
     }
     for index in 0..18 {
-        input(format!("DIB{index}"), Bit::Zero);
+        input(
+            format!("DIB{index}"),
+            second_port
+                .and_then(|port| port.write_data.get(index).copied())
+                .unwrap_or(Bit::Zero),
+        );
     }
     input(
         "CEB".into(),
-        read_enable.map_or(Bit::One, |enable| enable.signal),
+        if second_port.is_some() {
+            Bit::One
+        } else {
+            read_enable.map_or(Bit::One, |enable| enable.signal)
+        },
     );
     input("OCEB".into(), Bit::One);
-    input("CLKB".into(), clock);
-    input("WEB".into(), Bit::Zero);
+    input("CLKB".into(), second_port.map_or(clock, |port| port.clock));
+    input(
+        "WEB".into(),
+        second_port.map_or(Bit::Zero, |port| port.write_enable.signal),
+    );
     input("RSTB".into(), Bit::Zero);
     for index in 0..3 {
         input(format!("CSB{index}"), Bit::Zero);
     }
+    let (primary_output_name, port_b_read_data) = if let Some(port) = second_port {
+        ("DOA", port.read_data.as_slice())
+    } else {
+        ("DOB", read_data)
+    };
     for (index, wire) in read_data.iter().enumerate() {
-        let name = format!("DOB{index}");
+        let name = format!("{primary_output_name}{index}");
         port_directions.insert(name.clone(), "output");
         connections.insert(name, vec![Bit::Wire(*wire)]);
+    }
+    if second_port.is_some() {
+        for (index, wire) in port_b_read_data.iter().enumerate() {
+            let name = format!("DOB{index}");
+            port_directions.insert(name.clone(), "output");
+            connections.insert(name, vec![Bit::Wire(*wire)]);
+        }
     }
     JsonCell {
         hide_name: 0,
@@ -7647,6 +7869,7 @@ fn block_ram_parameters(
     write_enable: Control,
     read_enable: Option<Control>,
     edge: ClockEdge,
+    second_port: Option<&BlockRamPort>,
 ) -> BTreeMap<String, String> {
     let mut parameters = BTreeMap::from([
         ("DATA_WIDTH_A".into(), width.to_string()),
@@ -7671,7 +7894,7 @@ fn block_ram_parameters(
         ),
         (
             "CLKBMUX".into(),
-            if edge == ClockEdge::Rising {
+            if second_port.map_or(edge, |port| port.edge) == ClockEdge::Rising {
                 "CLKB"
             } else {
                 "INV"
@@ -7690,13 +7913,28 @@ fn block_ram_parameters(
     parameters.insert("CEAMUX".into(), "1".into());
     parameters.insert(
         "CEBMUX".into(),
-        match read_enable.map(|enable| enable.active) {
+        match second_port
+            .and_then(|port| port.read_enable)
+            .or(read_enable)
+            .map(|enable| enable.active)
+        {
             None => "1",
             Some(ActiveLevel::High) => "CEB",
             Some(ActiveLevel::Low) => "INV",
         }
         .into(),
     );
+    if let Some(port) = second_port {
+        parameters.insert(
+            "WEBMUX".into(),
+            match port.write_enable.active {
+                ActiveLevel::High => "WEB",
+                ActiveLevel::Low => "INV",
+            }
+            .into(),
+        );
+        parameters.insert("CEBMUX".into(), "1".into());
+    }
     parameters
 }
 
@@ -7706,8 +7944,8 @@ mod tests {
     use std::num::NonZeroU32;
 
     use struo_ir::{
-        ActiveLevel, ArithmeticOp, ClockEdge, ComparisonOp, EnableControl, MemoryCell, Netlist,
-        RegisterCell, ResetControl,
+        ActiveLevel, ArithmeticOp, ClockEdge, ComparisonOp, EnableControl, MemoryCell, MemoryPort,
+        Netlist, RegisterCell, ResetControl,
     };
 
     use super::{
@@ -8683,7 +8921,7 @@ mod tests {
         assert!(refined.retiming.equivalence_signed_off);
         let json = refined.to_nextpnr_json().unwrap();
         assert!(json.contains("physical_replicate_"));
-        assert!(json.contains("NEXTPNR_BEL"));
+        assert!(!json.contains("NEXTPNR_BEL"));
 
         let far_from_closure =
             PhysicalFeedback::from_nextpnr_json(&report.replace("319.0", "300.0"), &placed)
@@ -10496,5 +10734,133 @@ mod tests {
         assert_eq!(cell["parameters"]["DATA_WIDTH_A"], "9");
         assert_eq!(cell["connections"]["ADA3"][0], 12);
         assert_eq!(cell["connections"]["DOB7"][0], 35);
+    }
+
+    #[test]
+    fn maps_true_dual_port_addresses_and_clock_edges_to_the_same_physical_port() {
+        let mut source = Netlist::new("true_dual_port");
+        let clock_a = source.add_input("clock_a");
+        let clock_b = source.add_input("clock_b");
+        let enable_a = source.add_input("enable_a");
+        let enable_b = source.add_input("enable_b");
+        let address_a = source.add_input_port("address_a", NonZeroU32::new(8).unwrap());
+        let address_b = source.add_input_port("address_b", NonZeroU32::new(8).unwrap());
+        let write_a = source.add_input_port("write_a", NonZeroU32::new(8).unwrap());
+        let write_b = source.add_input_port("write_b", NonZeroU32::new(8).unwrap());
+        let read_a = (0..8)
+            .map(|bit| source.add_memory_output(format!("read_a[{bit}]")))
+            .collect::<Vec<_>>();
+        let read_b = (0..8)
+            .map(|bit| source.add_memory_output(format!("read_b[{bit}]")))
+            .collect::<Vec<_>>();
+        let active_high = |signal| EnableControl {
+            signal,
+            active: ActiveLevel::High,
+        };
+        source.add_memory(
+            MemoryCell::new(
+                "words",
+                256,
+                address_a.clone(),
+                read_a.clone(),
+                None,
+                address_a.clone(),
+                write_a,
+                active_high(enable_a),
+                clock_a,
+                ClockEdge::Rising,
+            )
+            .with_second_port(MemoryPort::new(
+                address_b.clone(),
+                read_b.clone(),
+                None,
+                address_b.clone(),
+                write_b,
+                active_high(enable_b),
+                clock_b,
+                ClockEdge::Falling,
+            )),
+        );
+        source.add_output_port("read_a", &read_a).unwrap();
+        source.add_output_port("read_b", &read_b).unwrap();
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let module = &json["modules"]["true_dual_port"];
+        let cell = &module["cells"]["bram_words"];
+
+        assert_eq!(cell["parameters"]["CLKAMUX"], "CLKA");
+        assert_eq!(cell["parameters"]["CLKBMUX"], "INV");
+        assert_eq!(
+            cell["connections"]["CLKA"],
+            module["ports"]["clock_a"]["bits"]
+        );
+        assert_eq!(
+            cell["connections"]["CLKB"],
+            module["ports"]["clock_b"]["bits"]
+        );
+        for bit in 0..8 {
+            assert_eq!(
+                cell["connections"][format!("ADA{}", bit + 3)],
+                serde_json::json!([module["ports"]["address_a"]["bits"][bit]])
+            );
+            assert_eq!(
+                cell["connections"][format!("ADB{}", bit + 3)],
+                serde_json::json!([module["ports"]["address_b"]["bits"][bit]])
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_separate_read_and_write_addresses_on_a_true_dual_port() {
+        let mut source = Netlist::new("unsupported_true_dual_port");
+        let clock = source.add_input("clock");
+        let enable = source.add_input("enable");
+        let read_address_a = vec![source.add_input("read_address_a")];
+        let write_address_a = vec![source.add_input("write_address_a")];
+        let address_b = vec![source.add_input("address_b")];
+        let write_a = vec![source.add_input("write_a")];
+        let write_b = vec![source.add_input("write_b")];
+        let read_a = vec![source.add_memory_output("read_a")];
+        let read_b = vec![source.add_memory_output("read_b")];
+        let write_enable = EnableControl {
+            signal: enable,
+            active: ActiveLevel::High,
+        };
+        source.add_memory(
+            MemoryCell::new(
+                "words",
+                2,
+                read_address_a,
+                read_a.clone(),
+                None,
+                write_address_a,
+                write_a,
+                write_enable,
+                clock,
+                ClockEdge::Rising,
+            )
+            .with_second_port(MemoryPort::new(
+                address_b.clone(),
+                read_b.clone(),
+                None,
+                address_b,
+                write_b,
+                write_enable,
+                clock,
+                ClockEdge::Falling,
+            )),
+        );
+        source.add_output_port("read_a", &read_a).unwrap();
+        source.add_output_port("read_b", &read_b).unwrap();
+
+        assert!(matches!(
+            map_to_ecp5(&source),
+            Err(super::MappingError::UnsupportedTrueDualPortAddresses {
+                memory,
+                port: 'A'
+            }) if memory == "words"
+        ));
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use struo_rtl::{
-    BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory,
+    BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory, MemoryPort,
     Module as RtlModule, Polarity, Port, PortDirection, Register, Reset, ResetMode, SignalId,
     SignalSlice, StateDomain, UnaryOp, ValueType,
 };
@@ -61,8 +61,8 @@ struct MemoryReadPattern {
 
 #[derive(Default)]
 struct PartialMemoryPattern {
-    write: Option<MemoryWritePattern>,
-    read: Option<MemoryReadPattern>,
+    writes: Vec<MemoryWritePattern>,
+    reads: Vec<MemoryReadPattern>,
 }
 
 /// Lowers analyzed Veryl AIR into Struo RTL without generated Verilog.
@@ -184,29 +184,44 @@ impl<'a> ModuleLowerer<'a> {
 
         let mut patterns = self.collect_memory_patterns(&self.inferred_memories)?;
         for memory_id in candidates {
-            let pattern = patterns.remove(&memory_id).unwrap_or_default();
-            let (write, read) = match (pattern.write, pattern.read) {
-                (Some(write), Some(read)) => (write, read),
-                (None, Some(_)) => {
+            let mut pattern = patterns.remove(&memory_id).unwrap_or_default();
+            if pattern.writes.is_empty() || pattern.reads.is_empty() {
+                let missing = if pattern.writes.is_empty() && pattern.reads.is_empty() {
+                    "no supported synchronous read or write port was found"
+                } else if pattern.writes.is_empty() {
+                    "no supported synchronous write port was found"
+                } else {
+                    "no supported synchronous read port was found"
+                };
+                return Err(self.memory_inference_failure(memory_id, missing));
+            }
+            if pattern.writes.len() > 2 || pattern.reads.len() > 2 {
+                return Err(self.memory_inference_failure(
+                    memory_id,
+                    "more than two read/write ports are not supported",
+                ));
+            }
+            let mut ports = Vec::new();
+            for write in pattern.writes {
+                let Some(index) = pattern
+                    .reads
+                    .iter()
+                    .position(|read| read.clock == write.clock && read.edge == write.edge)
+                else {
                     return Err(self.memory_inference_failure(
                         memory_id,
-                        "no supported synchronous write port was found",
+                        "each write port requires a read port on the same clock edge",
                     ));
-                }
-                (Some(_), None) => {
-                    return Err(self.memory_inference_failure(
-                        memory_id,
-                        "no supported synchronous read port was found",
-                    ));
-                }
-                (None, None) => {
-                    return Err(self.memory_inference_failure(
-                        memory_id,
-                        "no supported synchronous read or write port was found",
-                    ));
-                }
-            };
-            if let Err(error) = self.lower_inferred_memory(memory_id, write, read) {
+                };
+                ports.push((write, pattern.reads.remove(index)));
+            }
+            if !pattern.reads.is_empty() {
+                return Err(self.memory_inference_failure(
+                    memory_id,
+                    "each read port requires a write port on the same clock edge",
+                ));
+            }
+            if let Err(error) = self.lower_inferred_memory(memory_id, ports) {
                 return Err(self.requirement_failure(memory_id, error));
             }
         }
@@ -224,51 +239,44 @@ impl<'a> ModuleLowerer<'a> {
             };
             let (clock, edge) = self.source_clock(ff)?;
             for statement in &ff.statements {
-                let Some(pattern) = memory_statement_pattern(statement, candidates) else {
-                    continue;
-                };
-                match pattern {
-                    MemoryStatementPattern::Write {
-                        memory,
-                        address,
-                        data,
-                        enable,
-                    } => {
-                        let slot = &mut patterns.entry(memory).or_default().write;
-                        if slot.is_some() {
-                            return Err(self.memory_inference_failure(
-                                memory,
-                                "multiple write ports are not supported",
-                            ));
-                        }
-                        *slot = Some(MemoryWritePattern {
-                            clock: clock.clone(),
-                            edge,
+                for pattern in memory_statement_patterns(statement, candidates) {
+                    match pattern {
+                        MemoryStatementPattern::Write {
+                            memory,
                             address,
                             data,
                             enable,
-                        });
-                    }
-                    MemoryStatementPattern::Read {
-                        memory,
-                        address,
-                        data,
-                        enable,
-                    } => {
-                        let slot = &mut patterns.entry(memory).or_default().read;
-                        if slot.is_some() {
-                            return Err(self.memory_inference_failure(
-                                memory,
-                                "multiple read ports are not supported",
-                            ));
+                        } => {
+                            patterns
+                                .entry(memory)
+                                .or_default()
+                                .writes
+                                .push(MemoryWritePattern {
+                                    clock: clock.clone(),
+                                    edge,
+                                    address,
+                                    data,
+                                    enable,
+                                });
                         }
-                        *slot = Some(MemoryReadPattern {
-                            clock: clock.clone(),
-                            edge,
+                        MemoryStatementPattern::Read {
+                            memory,
                             address,
                             data,
                             enable,
-                        });
+                        } => {
+                            patterns
+                                .entry(memory)
+                                .or_default()
+                                .reads
+                                .push(MemoryReadPattern {
+                                    clock: clock.clone(),
+                                    edge,
+                                    address,
+                                    data,
+                                    enable,
+                                });
+                        }
                     }
                 }
             }
@@ -279,15 +287,8 @@ impl<'a> ModuleLowerer<'a> {
     fn lower_inferred_memory(
         &mut self,
         memory_id: VarId,
-        write: MemoryWritePattern,
-        read: MemoryReadPattern,
+        ports: Vec<(MemoryWritePattern, MemoryReadPattern)>,
     ) -> Result<(), ImportError> {
-        if write.clock != read.clock || write.edge != read.edge {
-            return Err(self.memory_inference_failure(
-                memory_id,
-                "read and write ports use different clocks or clock edges",
-            ));
-        }
         let variable = &self.source.variables[&memory_id];
         if variable.r#type.array.dims() != 1 {
             return Err(self.memory_inference_failure(
@@ -306,6 +307,42 @@ impl<'a> ModuleLowerer<'a> {
         }
         let word = value_type(&variable.r#type, &self.variable_name(memory_id))?;
         let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1);
+        let mut ports = ports
+            .into_iter()
+            .enumerate()
+            .map(|(index, (write, read))| {
+                self.lower_memory_port(memory_id, index, word, address_width, write, read)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let primary = ports.remove(0);
+        let second_port = ports.pop();
+        self.rtl.add_memory(Memory {
+            name: self.variable_name(memory_id),
+            word,
+            depth,
+            read_latency: 1,
+            read_address: primary.read_address,
+            read_data: primary.read_data,
+            read_enable: primary.read_enable,
+            write_address: primary.write_address,
+            write_data: primary.write_data,
+            write_enable: primary.write_enable,
+            clock: primary.clock,
+            edge: primary.edge,
+            second_port,
+        });
+        Ok(())
+    }
+
+    fn lower_memory_port(
+        &mut self,
+        memory_id: VarId,
+        port_index: usize,
+        word: ValueType,
+        address_width: u32,
+        write: MemoryWritePattern,
+        read: MemoryReadPattern,
+    ) -> Result<MemoryPort, ImportError> {
         let env = self.read_env()?;
         let read_address = self.lower_expression(&read.address, &env)?;
         let read_address = self.resize(read_address, address_width, false)?;
@@ -321,15 +358,15 @@ impl<'a> ModuleLowerer<'a> {
                     .and_then(|x| self.boolean(x))
             })
             .transpose()?;
-        let write_enable = self.materialize_memory_enable(memory_id, "write", write_enable)?;
+        let port_name = if port_index == 0 { "a" } else { "b" };
+        let write_enable =
+            self.materialize_memory_enable(memory_id, &format!("write_{port_name}"), write_enable)?;
         let read_enable = read_enable
-            .map(|enable| self.materialize_memory_enable(memory_id, "read", enable))
+            .map(|enable| {
+                self.materialize_memory_enable(memory_id, &format!("read_{port_name}"), enable)
+            })
             .transpose()?;
-        self.rtl.add_memory(Memory {
-            name: self.variable_name(memory_id),
-            word,
-            depth,
-            read_latency: 1,
+        Ok(MemoryPort {
             read_address: read_address.id,
             read_data: self.signal(&SignalKey {
                 id: read.data,
@@ -347,8 +384,7 @@ impl<'a> ModuleLowerer<'a> {
             },
             clock: self.signal(&write.clock)?,
             edge: write.edge,
-        });
-        Ok(())
+        })
     }
 
     fn memory_policy(&self, memory: VarId) -> MemoryInferencePolicy {
@@ -648,11 +684,7 @@ impl<'a> ModuleLowerer<'a> {
         child: &RtlModule,
         prefix: &str,
     ) -> Result<HashMap<SignalId, SignalId>, ImportError> {
-        if !child.instances().is_empty() {
-            return Err(ImportError::UnsupportedBehavior(
-                "unflattened nested module instance".into(),
-            ));
-        }
+        reject_nested_instances(child)?;
 
         let mut signals = HashMap::new();
         for signal in child.signals() {
@@ -745,6 +777,10 @@ impl<'a> ModuleLowerer<'a> {
                 },
                 clock: signals[&memory.clock],
                 edge: memory.edge,
+                second_port: memory
+                    .second_port
+                    .as_ref()
+                    .map(|port| remap_memory_port(port, &expressions, &signals)),
             });
         }
         Ok(signals)
@@ -769,7 +805,7 @@ impl<'a> ModuleLowerer<'a> {
         let mut changed = BTreeSet::new();
 
         for statement in &ff.statements {
-            if memory_statement_pattern(statement, &self.inferred_memories).is_some() {
+            if !memory_statement_patterns(statement, &self.inferred_memories).is_empty() {
                 continue;
             }
             if let Statement::IfReset(branch) = statement {
@@ -1590,22 +1626,21 @@ fn memory_candidates(
             continue;
         };
         for statement in &ff.statements {
-            let Some(pattern) = memory_statement_pattern(statement, &arrays) else {
-                continue;
-            };
-            let (memory, address) = match &pattern {
-                MemoryStatementPattern::Write {
-                    memory, address, ..
+            for pattern in memory_statement_patterns(statement, &arrays) {
+                let (memory, address) = match &pattern {
+                    MemoryStatementPattern::Write {
+                        memory, address, ..
+                    }
+                    | MemoryStatementPattern::Read {
+                        memory, address, ..
+                    } => (*memory, address),
+                };
+                if static_array_index(address).is_err()
+                    && policies.get(&memory).copied().unwrap_or_default()
+                        != MemoryInferencePolicy::Forbidden
+                {
+                    candidates.insert(memory);
                 }
-                | MemoryStatementPattern::Read {
-                    memory, address, ..
-                } => (*memory, address),
-            };
-            if static_array_index(address).is_err()
-                && policies.get(&memory).copied().unwrap_or_default()
-                    != MemoryInferencePolicy::Forbidden
-            {
-                candidates.insert(memory);
             }
         }
     }
@@ -1690,17 +1725,39 @@ enum MemoryStatementPattern {
     },
 }
 
-fn memory_statement_pattern(
+fn memory_statement_patterns(
     statement: &Statement,
     memories: &HashSet<VarId>,
-) -> Option<MemoryStatementPattern> {
-    if let Statement::If(branch) = statement
-        && branch.false_side.is_empty()
-        && let [inner] = branch.true_side.as_slice()
-    {
-        return direct_memory_statement(inner, memories, Some(branch.cond.clone()));
+) -> Vec<MemoryStatementPattern> {
+    if let Statement::If(branch) = statement {
+        if branch.false_side.is_empty()
+            && let [inner] = branch.true_side.as_slice()
+        {
+            return direct_memory_statement(inner, memories, Some(branch.cond.clone()))
+                .into_iter()
+                .collect();
+        }
+        if let ([true_statement], [false_statement]) =
+            (branch.true_side.as_slice(), branch.false_side.as_slice())
+        {
+            let mut patterns = Vec::new();
+            if let Some(pattern) =
+                direct_memory_statement(true_statement, memories, Some(branch.cond.clone()))
+            {
+                patterns.push(pattern);
+            }
+            // A block-RAM port remains physically readable while writing. The
+            // false-side read therefore needs no separate enable; consumers
+            // observe it only on cycles where the source selected that arm.
+            if let Some(pattern) = direct_memory_statement(false_statement, memories, None) {
+                patterns.push(pattern);
+            }
+            return patterns;
+        }
     }
     direct_memory_statement(statement, memories, None)
+        .into_iter()
+        .collect()
 }
 
 fn direct_memory_statement(
@@ -1753,6 +1810,39 @@ fn copy_constant(value: &Constant) -> Constant {
         }
     }
     Constant::new(value.width(), words)
+}
+
+fn remap_memory_port(
+    port: &MemoryPort,
+    expressions: &HashMap<ExprId, ExprId>,
+    signals: &HashMap<SignalId, SignalId>,
+) -> MemoryPort {
+    MemoryPort {
+        read_address: expressions[&port.read_address],
+        read_data: signals[&port.read_data],
+        read_enable: port.read_enable.map(|enable| Enable {
+            signal: signals[&enable.signal],
+            polarity: enable.polarity,
+        }),
+        write_address: expressions[&port.write_address],
+        write_data: expressions[&port.write_data],
+        write_enable: Enable {
+            signal: signals[&port.write_enable.signal],
+            polarity: port.write_enable.polarity,
+        },
+        clock: signals[&port.clock],
+        edge: port.edge,
+    }
+}
+
+fn reject_nested_instances(module: &RtlModule) -> Result<(), ImportError> {
+    if module.instances().is_empty() {
+        Ok(())
+    } else {
+        Err(ImportError::UnsupportedBehavior(
+            "unflattened nested module instance".into(),
+        ))
+    }
 }
 
 fn array_indices(r#type: &Type, name: &str) -> Result<Vec<Vec<usize>>, ImportError> {
@@ -2142,6 +2232,33 @@ module MemoryTop (
     }
 }
 ";
+
+    const TRUE_DUAL_PORT_MEMORY_SOURCE: &str = r#"
+module TrueDualPortMemoryTop (
+    clk_a : input  'a clock,
+    clk_b : input  'a clock_negedge,
+    addr_a: input  'a logic<4>,
+    addr_b: input  'a logic<4>,
+    we_a  : input  'a logic,
+    we_b  : input  'a logic,
+    data_a: input  'a logic<8>,
+    data_b: input  'a logic<8>,
+    read_a: output 'a logic<8>,
+    read_b: output 'a logic<8>,
+) {
+    #[sv("struo_memory = \"required\"")]
+    var words: 'a logic<8> [16];
+
+    always_ff (clk_a) {
+        if we_a { words[addr_a] = data_a; }
+        else { read_a = words[addr_a]; }
+    }
+    always_ff (clk_b) {
+        if we_b { words[addr_b] = data_b; }
+        else { read_b = words[addr_b]; }
+    }
+}
+"#;
 
     const REQUIRED_ASYNC_MEMORY_SOURCE: &str = r#"
 module RequiredAsyncMemoryTop (
@@ -2734,6 +2851,29 @@ module StructInstanceTop (
         set(&mut simulator, "read_address", 3);
         tick(&mut simulator);
         assert_value(&mut simulator, "read_data", 0x5a);
+    }
+
+    #[test]
+    fn infers_independently_clocked_true_dual_port_block_ram() {
+        let design = analyze_and_lower(
+            TRUE_DUAL_PORT_MEMORY_SOURCE,
+            "true_dual_port_memory_lowering",
+            "TrueDualPortMemoryTop",
+        )
+        .unwrap();
+        let memory = &design.top_module().unwrap().memories()[0];
+        assert!(memory.second_port.is_some());
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let json = mapped.to_nextpnr_json().unwrap();
+        assert!(json.contains("\"WEAMUX\": \"WEA\""));
+        assert!(json.contains("\"WEBMUX\": \"WEB\""));
+        assert!(json.contains("\"CLKAMUX\""));
+        assert!(json.contains("\"CLKBMUX\""));
+        assert!(json.contains("\"INV\""));
+        assert!(json.contains("\"DOA0\""));
+        assert!(json.contains("\"DOB0\""));
     }
 
     #[test]
