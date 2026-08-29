@@ -379,6 +379,15 @@ fn structural_fanouts(netlist: &Netlist) -> Vec<usize> {
             .copied()
             .chain([memory.clock(), memory.write_enable().signal])
             .chain(memory.read_enable().map(|enable| enable.signal))
+            .chain(memory.second_port().into_iter().flat_map(|port| {
+                port.read_address()
+                    .iter()
+                    .chain(port.write_address())
+                    .chain(port.write_data())
+                    .copied()
+                    .chain([port.clock(), port.write_enable().signal])
+                    .chain(port.read_enable().map(|enable| enable.signal))
+            }))
         {
             add(input);
         }
@@ -534,6 +543,15 @@ fn required_times(
             .copied()
             .chain([memory.write_enable().signal])
             .chain(memory.read_enable().map(|enable| enable.signal))
+            .chain(memory.second_port().into_iter().flat_map(|port| {
+                port.read_address()
+                    .iter()
+                    .chain(port.write_address())
+                    .chain(port.write_data())
+                    .copied()
+                    .chain([port.write_enable().signal])
+                    .chain(port.read_enable().map(|enable| enable.signal))
+            }))
         {
             constrain(input, BRAM_SETUP_PS);
         }

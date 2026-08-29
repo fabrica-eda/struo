@@ -79,9 +79,9 @@ across module boundaries, parameter-bounded generate-for instances, procedural
 conditionals, static packed selects, packed struct constructors and member
 accesses, procedural case statements with value or range arms, arithmetic,
 comparisons, shifts, concatenations, and synchronous or asynchronous resets.
-One-dimensional dynamically indexed arrays with one conditional write port and
-one registered read port are inferred as synchronous block memories. Other
-unsupported constructs fail explicitly.
+One-dimensional dynamically indexed arrays with one or two synchronous
+read/write ports are inferred as block memories. The two-port form may use
+independent clocks and edges. Other unsupported constructs fail explicitly.
 
 ## First hardware target
 
@@ -525,12 +525,17 @@ done
 Module instances are flattened before synthesis; the implemented path consumes
 analyzer AIR directly and does not depend on generated Verilog.
 
-The BRAM inference contract is intentionally explicit: read and write ports
-share one clock edge, reads have one-cycle latency, writes cover the whole word,
-and arrays have one unpacked dimension with at most 16,384 words. Memory reset,
-initial contents, byte enables, asynchronous reads, multiple ports, and
-defined same-address read/write collision behavior remain unsupported and fail
-instead of being lowered to flip-flops silently.
+The BRAM inference contract is intentionally explicit: reads have one-cycle
+latency, writes cover the whole word, and arrays have one unpacked dimension
+with at most 16,384 words. A memory may have one synchronous read/write port,
+or two independently clocked read/write ports. Each physical ECP5 port has one
+shared read/write address; the two-port Veryl form therefore uses a conditional
+write with the read in its `else` branch and the same indexed address expression.
+Memory reset, initial contents, byte enables, asynchronous reads, three or more
+ports, and defined same-address cross-port collision behavior remain unsupported
+and fail instead of being lowered to flip-flops silently. The post-map Celox
+adapter currently rejects independently clocked true-dual-port memories; the
+ECP5 nextpnr exporter supports them directly.
 
 Inference intent can be attached to an unpacked array with Veryl's portable
 SystemVerilog-attribute escape. `preferred` is the default and preserves

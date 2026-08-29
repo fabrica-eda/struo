@@ -422,6 +422,27 @@ pub struct Register {
     pub reset: Option<Reset>,
 }
 
+/// One independently clocked read/write port of a block memory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryPort {
+    /// Address sampled by the synchronous read port.
+    pub read_address: ExprId,
+    /// Whole signal driven by the read port.
+    pub read_data: SignalId,
+    /// Optional read clock enable.
+    pub read_enable: Option<Enable>,
+    /// Address sampled by the synchronous write port.
+    pub write_address: ExprId,
+    /// Word written when `write_enable` is asserted.
+    pub write_data: ExprId,
+    /// Write-port enable and polarity.
+    pub write_enable: Enable,
+    /// Port clock.
+    pub clock: SignalId,
+    /// Active port clock edge.
+    pub edge: ClockEdge,
+}
+
 /// A memory that should remain recognizable for block-RAM inference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Memory {
@@ -449,6 +470,8 @@ pub struct Memory {
     pub clock: SignalId,
     /// Active edge shared by the read and write ports.
     pub edge: ClockEdge,
+    /// Optional second independently clocked read/write port.
+    pub second_port: Option<MemoryPort>,
 }
 
 /// A preserved module or black-box instance.
@@ -928,43 +951,55 @@ impl Module {
             }
             let address_width =
                 BitWidth::new((u32::BITS - (memory.depth - 1).leading_zeros()).max(1))?;
-            for address in [memory.read_address, memory.write_address] {
-                let actual = self.expression(address)?.r#type.width;
-                if actual != address_width {
+            let primary = MemoryPort {
+                read_address: memory.read_address,
+                read_data: memory.read_data,
+                read_enable: memory.read_enable,
+                write_address: memory.write_address,
+                write_data: memory.write_data,
+                write_enable: memory.write_enable,
+                clock: memory.clock,
+                edge: memory.edge,
+            };
+            for port in std::iter::once(&primary).chain(memory.second_port.iter()) {
+                for address in [port.read_address, port.write_address] {
+                    let actual = self.expression(address)?.r#type.width;
+                    if actual != address_width {
+                        return Err(RtlError::WidthMismatch {
+                            expected: address_width,
+                            actual,
+                        });
+                    }
+                }
+                let read_data = self.signal(port.read_data)?;
+                if read_data.direction == Some(PortDirection::Input) {
+                    return Err(RtlError::DriveInput(read_data.name.clone()));
+                }
+                if read_data.r#type.width != memory.word.width {
                     return Err(RtlError::WidthMismatch {
-                        expected: address_width,
-                        actual,
+                        expected: memory.word.width,
+                        actual: read_data.r#type.width,
                     });
                 }
-            }
-            let read_data = self.signal(memory.read_data)?;
-            if read_data.direction == Some(PortDirection::Input) {
-                return Err(RtlError::DriveInput(read_data.name.clone()));
-            }
-            if read_data.r#type.width != memory.word.width {
-                return Err(RtlError::WidthMismatch {
-                    expected: memory.word.width,
-                    actual: read_data.r#type.width,
-                });
-            }
-            let write_width = self.expression(memory.write_data)?.r#type.width;
-            if write_width != memory.word.width {
-                return Err(RtlError::WidthMismatch {
-                    expected: memory.word.width,
-                    actual: write_width,
-                });
-            }
-            self.validate_control(memory.clock, "memory clock")?;
-            self.validate_control(memory.write_enable.signal, "memory write enable")?;
-            if let Some(enable) = memory.read_enable {
-                self.validate_control(enable.signal, "memory read enable")?;
-            }
-            for bit in 0..read_data.r#type.width.get() {
-                if !driven_bits.insert((memory.read_data, bit)) {
-                    return Err(RtlError::MultipleDrivers {
-                        signal: read_data.name.clone(),
-                        bit,
+                let write_width = self.expression(port.write_data)?.r#type.width;
+                if write_width != memory.word.width {
+                    return Err(RtlError::WidthMismatch {
+                        expected: memory.word.width,
+                        actual: write_width,
                     });
+                }
+                self.validate_control(port.clock, "memory clock")?;
+                self.validate_control(port.write_enable.signal, "memory write enable")?;
+                if let Some(enable) = port.read_enable {
+                    self.validate_control(enable.signal, "memory read enable")?;
+                }
+                for bit in 0..read_data.r#type.width.get() {
+                    if !driven_bits.insert((port.read_data, bit)) {
+                        return Err(RtlError::MultipleDrivers {
+                            signal: read_data.name.clone(),
+                            bit,
+                        });
+                    }
                 }
             }
         }

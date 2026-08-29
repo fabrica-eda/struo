@@ -7,7 +7,8 @@ use std::num::NonZeroU32;
 
 use struo_ir::{
     ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, ComparisonOp, EnableControl, MemoryCell,
-    NetId, Netlist, NodeKind, RegisterCell, ResetControl, ValidationError,
+    MemoryPort as IrMemoryPort, NetId, Netlist, NodeKind, RegisterCell, ResetControl,
+    ValidationError,
 };
 use struo_rtl::{
     BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, Polarity, PortDirection, ResetMode,
@@ -182,14 +183,21 @@ impl<'a> Lowering<'a> {
             }
         }
         for memory in self.module.memories() {
-            let target = &self.module.signals()[memory.read_data.index() as usize];
-            for bit in 0..target.r#type().width.get() as usize {
-                let net = self.netlist.add_memory_output(bit_name(
-                    &memory.name,
-                    target.r#type().width.get(),
-                    bit,
-                ));
-                self.signal_bits[memory.read_data.index() as usize][bit] = Some(net);
+            for (suffix, read_data) in std::iter::once(("", memory.read_data)).chain(
+                memory
+                    .second_port
+                    .as_ref()
+                    .map(|port| ("_b", port.read_data)),
+            ) {
+                let target = &self.module.signals()[read_data.index() as usize];
+                for bit in 0..target.r#type().width.get() as usize {
+                    let net = self.netlist.add_memory_output(bit_name(
+                        &format!("{}{suffix}", memory.name),
+                        target.r#type().width.get(),
+                        bit,
+                    ));
+                    self.signal_bits[read_data.index() as usize][bit] = Some(net);
+                }
             }
         }
     }
@@ -284,7 +292,7 @@ impl<'a> Lowering<'a> {
                         })
                 })
                 .transpose()?;
-            self.netlist.add_memory(MemoryCell::new(
+            let mut cell = MemoryCell::new(
                 &memory.name,
                 memory.depth,
                 read_address,
@@ -298,7 +306,44 @@ impl<'a> Lowering<'a> {
                     ClockEdge::Rising => IrClockEdge::Rising,
                     ClockEdge::Falling => IrClockEdge::Falling,
                 },
-            ));
+            );
+            if let Some(port) = &memory.second_port {
+                let read_data = self.signal_bits[port.read_data.index() as usize]
+                    .iter()
+                    .map(|net| net.expect("memory outputs were reserved"))
+                    .collect();
+                let read_address = self.lower_expression(port.read_address)?;
+                let write_address = self.lower_expression(port.write_address)?;
+                let write_data = self.lower_expression(port.write_data)?;
+                let write_enable = EnableControl {
+                    signal: self.resolve_signal_bit(port.write_enable.signal, 0)?,
+                    active: lower_polarity(port.write_enable.polarity),
+                };
+                let read_enable = port
+                    .read_enable
+                    .map(|enable| {
+                        self.resolve_signal_bit(enable.signal, 0)
+                            .map(|signal| EnableControl {
+                                signal,
+                                active: lower_polarity(enable.polarity),
+                            })
+                    })
+                    .transpose()?;
+                cell = cell.with_second_port(IrMemoryPort::new(
+                    read_address,
+                    read_data,
+                    read_enable,
+                    write_address,
+                    write_data,
+                    write_enable,
+                    self.resolve_signal_bit(port.clock, 0)?,
+                    match port.edge {
+                        ClockEdge::Rising => IrClockEdge::Rising,
+                        ClockEdge::Falling => IrClockEdge::Falling,
+                    },
+                ));
+            }
+            self.netlist.add_memory(cell);
         }
         Ok(())
     }
@@ -1015,6 +1060,26 @@ fn qualified_payload_is_unobservable(
                     .read_address()
                     .iter()
                     .any(|net| net_is_tainted(&influence, *net)))
+            || memory.second_port().is_some_and(|port| {
+                net_is_tainted(&influence, port.clock())
+                    || net_is_tainted(&influence, port.write_enable().signal)
+                    || port
+                        .read_enable()
+                        .is_some_and(|enable| net_is_tainted(&influence, enable.signal))
+                    || (!control_is_inactive(port.write_enable(), &influence)
+                        && port
+                            .write_address()
+                            .iter()
+                            .chain(port.write_data())
+                            .any(|net| net_is_tainted(&influence, *net)))
+                    || (!port
+                        .read_enable()
+                        .is_some_and(|enable| control_is_inactive(enable, &influence))
+                        && port
+                            .read_address()
+                            .iter()
+                            .any(|net| net_is_tainted(&influence, *net)))
+            })
     }) {
         return false;
     }
@@ -1407,6 +1472,7 @@ mod tests {
             },
             clock,
             edge: ClockEdge::Rising,
+            second_port: None,
         });
         let mut design = Design::new("Scratchpad");
         design.add_module(module);
