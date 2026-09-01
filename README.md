@@ -526,34 +526,48 @@ done
 Module instances are flattened before synthesis; the implemented path consumes
 analyzer AIR directly and does not depend on generated Verilog.
 
-The BRAM inference contract is intentionally explicit: reads have one-cycle
-latency, writes cover the whole word, and arrays have one unpacked dimension
-with at most 16,384 words. A memory may have one synchronous read/write port,
-or two independently clocked read/write ports. Each physical ECP5 port has one
-shared read/write address; the two-port Veryl form therefore uses a conditional
-write with the read in its `else` branch and the same indexed address expression.
-Memory reset, initial contents, byte enables, asynchronous reads, three or more
-ports, and defined same-address cross-port collision behavior remain unsupported
-and fail instead of being lowered to flip-flops silently. The post-map Celox
-adapter currently rejects independently clocked true-dual-port memories; the
-ECP5 nextpnr exporter supports them directly.
+Memory inference has two explicit physical styles. `block` uses ECP5 `DP16KD`:
+reads have one-cycle latency, writes cover the whole word, and arrays have one
+unpacked dimension with at most 16,384 words. A block memory may have one
+synchronous read/write port, or two independently clocked read/write ports.
+Each physical ECP5 port has one shared read/write address; the two-port Veryl
+form therefore uses a conditional write with the read in its `else` branch and
+the same indexed address expression.
+
+`distributed` uses ECP5 `TRELLIS_DPR16X4` LUT RAM. It accepts one synchronous
+whole-word write and one asynchronous read, currently up to 128 words and any
+positive word width. Depth is tiled in 16-word banks and width in four-bit
+chunks, so `logic [128]` maps to eight distributed-RAM primitives instead of
+128 flip-flops.
+
+Memory reset, initial contents, byte enables, unsupported port shapes, and
+defined same-address collision behavior remain unsupported and fail instead of
+silently changing the requested memory type. The post-map Celox adapter
+currently rejects independently clocked true-dual-port block memories; the ECP5
+nextpnr exporter supports them directly.
 
 Inference intent can be attached to an unpacked array with Veryl's portable
-SystemVerilog-attribute escape. `preferred` is the default and preserves
-automatic inference, `required` makes a failed match an explicit diagnostic,
-and `forbidden` prevents the array from becoming a memory:
+SystemVerilog-attribute escape. `block` and `distributed` select a physical
+memory type and make a failed match an explicit diagnostic. `preferred` is the
+default and preserves automatic synchronous block-memory inference, `required`
+requires that automatic inference to succeed, and `forbidden` keeps the array
+in ordinary logic:
 
 ```veryl
-#[sv("struo_memory = \"required\"")]
+#[sv("struo_memory = \"block\"")]
 var words: logic<32> [1024];
+
+#[sv("struo_memory = \"distributed\"")]
+var flags: logic [128];
 ```
 
 Veryl 0.20.3 rejects tool-defined attribute names, which is why this uses
 `sv(...)` instead of a Struo-specific attribute namespace. Struo consumes only
-the `struo_memory` key and ignores unrelated `sv` attributes. A required array
-that violates the contract reports the array name and the first unsupported
-port property. Physical geometry is checked later by the target mapper, which
-also fails rather than replacing an inferred memory with registers.
+the `struo_memory` key and ignores unrelated `sv` attributes. An explicitly
+typed array that violates its contract reports the array name and the first
+unsupported port property. Physical geometry is checked later by the target
+mapper, which also fails rather than replacing an inferred memory with
+registers.
 
 ## Veryl AXI4 synthesis stress design
 

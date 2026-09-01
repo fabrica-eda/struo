@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory, MemoryPort,
-    Module as RtlModule, Polarity, Port, PortDirection, Register, Reset, ResetMode, SignalId,
-    SignalSlice, StateDomain, UnaryOp, ValueType,
+    MemoryStyle, Module as RtlModule, Polarity, Port, PortDirection, Register, Reset, ResetMode,
+    SignalId, SignalSlice, StateDomain, UnaryOp, ValueType,
 };
 use veryl_analyzer::ir::{
     AssignDestination, CasePattern, CaseStatement, Component, Comptime, Declaration, Expression,
@@ -65,10 +65,18 @@ struct MemoryReadPattern {
     enable: Vec<Expression>,
 }
 
+#[derive(Clone)]
+struct AsyncMemoryReadPattern {
+    address: Expression,
+    data: VarId,
+    enable: Vec<Expression>,
+}
+
 #[derive(Default)]
 struct PartialMemoryPattern {
     writes: Vec<MemoryWritePattern>,
     reads: Vec<MemoryReadPattern>,
+    async_reads: Vec<AsyncMemoryReadPattern>,
 }
 
 /// Lowers analyzed Veryl AIR into Struo RTL without generated Verilog.
@@ -191,6 +199,12 @@ impl<'a> ModuleLowerer<'a> {
         let mut patterns = self.collect_memory_patterns(&self.inferred_memories)?;
         for memory_id in candidates {
             let mut pattern = patterns.remove(&memory_id).unwrap_or_default();
+            if self.memory_policy(memory_id) == MemoryInferencePolicy::Distributed {
+                if let Err(error) = self.lower_distributed_memory(memory_id, pattern) {
+                    return Err(self.requirement_failure(memory_id, error));
+                }
+                continue;
+            }
             if pattern.writes.is_empty() || pattern.reads.is_empty() {
                 let missing = if pattern.writes.is_empty() && pattern.reads.is_empty() {
                     "no supported synchronous read or write port was found"
@@ -240,51 +254,71 @@ impl<'a> ModuleLowerer<'a> {
     ) -> Result<HashMap<VarId, PartialMemoryPattern>, ImportError> {
         let mut patterns = HashMap::<VarId, PartialMemoryPattern>::new();
         for declaration in &self.source.declarations {
-            let Declaration::Ff(ff) = declaration else {
-                continue;
-            };
-            let (clock, edge) = self.source_clock(ff)?;
-            for statement in &ff.statements {
-                for pattern in memory_statement_patterns(statement, candidates) {
-                    match pattern {
-                        MemoryStatementPattern::Write {
-                            memory,
-                            address,
-                            data,
-                            enable,
-                        } => {
-                            patterns
-                                .entry(memory)
-                                .or_default()
-                                .writes
-                                .push(MemoryWritePattern {
-                                    clock: clock.clone(),
-                                    edge,
+            match declaration {
+                Declaration::Ff(ff) => {
+                    let (clock, edge) = self.source_clock(ff)?;
+                    for statement in &ff.statements {
+                        for pattern in memory_statement_patterns(statement, candidates) {
+                            match pattern {
+                                MemoryStatementPattern::Write {
+                                    memory,
                                     address,
                                     data,
                                     enable,
-                                });
-                        }
-                        MemoryStatementPattern::Read {
-                            memory,
-                            address,
-                            data,
-                            enable,
-                        } => {
-                            patterns
-                                .entry(memory)
-                                .or_default()
-                                .reads
-                                .push(MemoryReadPattern {
-                                    clock: clock.clone(),
-                                    edge,
+                                } => {
+                                    patterns.entry(memory).or_default().writes.push(
+                                        MemoryWritePattern {
+                                            clock: clock.clone(),
+                                            edge,
+                                            address,
+                                            data,
+                                            enable,
+                                        },
+                                    );
+                                }
+                                MemoryStatementPattern::Read {
+                                    memory,
                                     address,
                                     data,
                                     enable,
-                                });
+                                } => {
+                                    patterns.entry(memory).or_default().reads.push(
+                                        MemoryReadPattern {
+                                            clock: clock.clone(),
+                                            edge,
+                                            address,
+                                            data,
+                                            enable,
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                 }
+                Declaration::Comb(comb) => {
+                    for statement in &comb.statements {
+                        for pattern in memory_statement_patterns(statement, candidates) {
+                            let MemoryStatementPattern::Read {
+                                memory,
+                                address,
+                                data,
+                                enable,
+                            } = pattern
+                            else {
+                                continue;
+                            };
+                            patterns.entry(memory).or_default().async_reads.push(
+                                AsyncMemoryReadPattern {
+                                    address,
+                                    data,
+                                    enable,
+                                },
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         Ok(patterns)
@@ -326,6 +360,11 @@ impl<'a> ModuleLowerer<'a> {
             name: self.variable_name(memory_id),
             word,
             depth,
+            style: if self.memory_policy(memory_id) == MemoryInferencePolicy::Block {
+                MemoryStyle::Block
+            } else {
+                MemoryStyle::Auto
+            },
             read_latency: 1,
             read_address: primary.read_address,
             read_data: primary.read_data,
@@ -336,6 +375,78 @@ impl<'a> ModuleLowerer<'a> {
             clock: primary.clock,
             edge: primary.edge,
             second_port,
+        });
+        Ok(())
+    }
+
+    fn lower_distributed_memory(
+        &mut self,
+        memory_id: VarId,
+        mut pattern: PartialMemoryPattern,
+    ) -> Result<(), ImportError> {
+        if pattern.writes.len() != 1 || pattern.async_reads.len() != 1 || !pattern.reads.is_empty()
+        {
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "distributed RAM requires exactly one synchronous write and one asynchronous read port",
+            ));
+        }
+        let variable = &self.source.variables[&memory_id];
+        if variable.r#type.array.dims() != 1 {
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "the array must have exactly one unpacked dimension",
+            ));
+        }
+        let depth = variable
+            .r#type
+            .total_array()
+            .ok_or_else(|| ImportError::NonConcreteWidth(self.variable_name(memory_id)))?;
+        let depth = u32::try_from(depth)
+            .map_err(|_| ImportError::WidthTooLarge(self.variable_name(memory_id)))?;
+        if depth == 0 {
+            return Err(self.memory_inference_failure(memory_id, "the array has zero depth"));
+        }
+        let word = value_type(&variable.r#type, &self.variable_name(memory_id))?;
+        let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1);
+        let write = pattern.writes.remove(0);
+        let read = pattern.async_reads.remove(0);
+        if !read.enable.is_empty() {
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "distributed RAM asynchronous reads cannot have an enable",
+            ));
+        }
+        let env = self.read_env()?;
+        let read_address = self.lower_expression(&read.address, &env)?;
+        let read_address = self.resize(read_address, address_width, false)?;
+        let write_address = self.lower_expression(&write.address, &env)?;
+        let write_address = self.resize(write_address, address_width, false)?;
+        let write_data = self.lower_expression(&write.data, &env)?;
+        let write_data = self.resize(write_data, word.width.get(), word.signed)?;
+        let write_enable = self.lower_memory_enable(write.enable, &env)?;
+        let write_enable = self.materialize_memory_enable(memory_id, "write_a", write_enable)?;
+        self.rtl.add_memory(Memory {
+            name: self.variable_name(memory_id),
+            word,
+            depth,
+            style: MemoryStyle::Distributed,
+            read_latency: 0,
+            read_address: read_address.id,
+            read_data: self.signal(&SignalKey {
+                id: read.data,
+                index: Vec::new(),
+            })?,
+            read_enable: None,
+            write_address: write_address.id,
+            write_data: write_data.id,
+            write_enable: Enable {
+                signal: write_enable,
+                polarity: Polarity::ActiveHigh,
+            },
+            clock: self.signal(&write.clock)?,
+            edge: write.edge,
+            second_port: None,
         });
         Ok(())
     }
@@ -399,7 +510,12 @@ impl<'a> ModuleLowerer<'a> {
     fn memory_inference_failure(&self, memory: VarId, reason: impl Into<String>) -> ImportError {
         let memory_name = self.variable_name(memory);
         let reason = reason.into();
-        if self.memory_policy(memory) == MemoryInferencePolicy::Required {
+        if matches!(
+            self.memory_policy(memory),
+            MemoryInferencePolicy::Required
+                | MemoryInferencePolicy::Block
+                | MemoryInferencePolicy::Distributed
+        ) {
             ImportError::RequiredMemoryInferenceFailed {
                 memory: memory_name,
                 reason,
@@ -412,8 +528,12 @@ impl<'a> ModuleLowerer<'a> {
     }
 
     fn requirement_failure(&self, memory: VarId, error: ImportError) -> ImportError {
-        if self.memory_policy(memory) != MemoryInferencePolicy::Required
-            || matches!(error, ImportError::RequiredMemoryInferenceFailed { .. })
+        if !matches!(
+            self.memory_policy(memory),
+            MemoryInferencePolicy::Required
+                | MemoryInferencePolicy::Block
+                | MemoryInferencePolicy::Distributed
+        ) || matches!(error, ImportError::RequiredMemoryInferenceFailed { .. })
         {
             error
         } else {
@@ -486,8 +606,14 @@ impl<'a> ModuleLowerer<'a> {
                 Declaration::Comb(comb) => {
                     let initial = self.read_env()?;
                     let mut env = initial.clone();
-                    let changed =
-                        self.lower_statements(&comb.statements, &initial, &mut env, false)?;
+                    let mut changed = BTreeSet::new();
+                    for statement in &comb.statements {
+                        if !memory_statement_patterns(statement, &self.inferred_memories).is_empty()
+                        {
+                            continue;
+                        }
+                        changed.extend(self.lower_statement(statement, &initial, &mut env, false)?);
+                    }
                     for key in changed {
                         if !driven_comb.insert(key.clone()) || driven_ff.contains(&key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
@@ -768,6 +894,7 @@ impl<'a> ModuleLowerer<'a> {
                 name: format!("{prefix}.{}", memory.name),
                 word: memory.word,
                 depth: memory.depth,
+                style: memory.style,
                 read_latency: memory.read_latency,
                 read_address: expressions[&memory.read_address],
                 read_data: signals[&memory.read_data],
@@ -1782,7 +1909,15 @@ fn memory_candidates(
         .collect::<HashSet<_>>();
     let mut candidates = policies
         .iter()
-        .filter_map(|(id, policy)| (*policy == MemoryInferencePolicy::Required).then_some(*id))
+        .filter_map(|(id, policy)| {
+            matches!(
+                policy,
+                MemoryInferencePolicy::Required
+                    | MemoryInferencePolicy::Block
+                    | MemoryInferencePolicy::Distributed
+            )
+            .then_some(*id)
+        })
         .collect::<HashSet<_>>();
     let mut accesses = HashMap::<VarId, (bool, bool, bool)>::new();
     for declaration in &source.declarations {
@@ -1842,6 +1977,8 @@ fn memory_inference_policies(
                 "preferred" => MemoryInferencePolicy::Preferred,
                 "required" => MemoryInferencePolicy::Required,
                 "forbidden" => MemoryInferencePolicy::Forbidden,
+                "block" => MemoryInferencePolicy::Block,
+                "distributed" => MemoryInferencePolicy::Distributed,
                 _ => {
                     return Err(ImportError::InvalidMemoryInferencePolicy {
                         memory: variable.path.to_string(),
@@ -2182,7 +2319,9 @@ mod tests {
     use struo_celox::ecp5_simulator;
     use struo_rtl::ExprKind;
     use struo_synth::synthesize;
-    use struo_target_ecp5::{JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg};
+    use struo_target_ecp5::{
+        Ecp5Cell, Ecp5MemoryImplementation, JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg,
+    };
 
     use crate::{ImportError, analyze_and_lower};
 
@@ -2468,6 +2607,30 @@ module RequiredAsyncMemoryTop (
 ) {
     #[sv("struo_memory = \"required\"")]
     var words: logic<8> [16];
+
+    always_ff (clk) {
+        if write_enable {
+            words[write_address] = write_data;
+        }
+    }
+
+    always_comb {
+        read_data = words[read_address];
+    }
+}
+"#;
+
+    const DISTRIBUTED_MEMORY_SOURCE: &str = r#"
+module DistributedMemoryTop (
+    clk          : input  clock_posedge,
+    write_enable : input  logic,
+    read_address : input  logic<7>,
+    write_address: input  logic<7>,
+    write_data   : input  logic,
+    read_data    : output logic,
+) {
+    #[sv("struo_memory = \"distributed\"")]
+    var words: logic [128];
 
     always_ff (clk) {
         if write_enable {
@@ -3193,6 +3356,25 @@ module WideLiteralTop (
     }
 
     #[test]
+    fn block_memory_policy_selects_block_ram() {
+        let source = MEMORY_SOURCE.replace(
+            "    var words: logic<8> [16];",
+            "    #[sv(\"struo_memory = \\\"block\\\"\")]\n    var words: logic<8> [16];",
+        );
+        let design = analyze_and_lower(&source, "block_memory", "MemoryTop").unwrap();
+        let memory = &design.top_module().unwrap().memories()[0];
+        assert_eq!(memory.style, struo_rtl::MemoryStyle::Block);
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        assert!(
+            mapped
+                .to_nextpnr_json()
+                .unwrap()
+                .contains("\"type\": \"DP16KD\"")
+        );
+    }
+
+    #[test]
     fn required_memory_policy_reports_why_inference_failed() {
         let error = analyze_and_lower(
             REQUIRED_ASYNC_MEMORY_SOURCE,
@@ -3209,8 +3391,60 @@ module WideLiteralTop (
         ));
         assert_eq!(
             error.to_string(),
-            "block-memory inference was required for `words`, but failed: no supported synchronous read port was found"
+            "memory inference was required for `words`, but failed: no supported synchronous read port was found"
         );
+    }
+
+    #[test]
+    fn maps_one_bit_by_128_distributed_ram() {
+        let design = analyze_and_lower(
+            DISTRIBUTED_MEMORY_SOURCE,
+            "distributed_memory",
+            "DistributedMemoryTop",
+        )
+        .unwrap();
+        let memory = &design.top_module().unwrap().memories()[0];
+        assert_eq!(memory.style, struo_rtl::MemoryStyle::Distributed);
+        assert_eq!(memory.read_latency, 0);
+
+        let synthesized = synthesize(&design).unwrap();
+        let memory = &synthesized.netlist.memories()[0];
+        assert_eq!(memory.read_latency(), 0);
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        assert_eq!(
+            mapped
+                .cells()
+                .iter()
+                .filter(|cell| matches!(
+                    cell,
+                    Ecp5Cell::BlockRam {
+                        implementation: Ecp5MemoryImplementation::Distributed,
+                        ..
+                    }
+                ))
+                .count(),
+            8
+        );
+        let json = mapped.to_nextpnr_json().unwrap();
+        assert_eq!(json.matches("\"type\": \"TRELLIS_DPR16X4\"").count(), 8);
+        assert!(!json.contains("\"type\": \"DP16KD\""));
+
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        set(&mut simulator, "write_enable", 1);
+        for address in [0_u8, 15, 16, 31, 64, 127] {
+            set(&mut simulator, "write_address", address);
+            set(&mut simulator, "write_data", 1);
+            tick(&mut simulator);
+        }
+        set(&mut simulator, "write_enable", 0);
+        for address in [0_u8, 15, 16, 31, 64, 127] {
+            set(&mut simulator, "read_address", address);
+            assert_value(&mut simulator, "read_data", 1);
+        }
+        for address in [1_u8, 14, 17, 63, 65, 126] {
+            set(&mut simulator, "read_address", address);
+            assert_value(&mut simulator, "read_data", 0);
+        }
     }
 
     #[test]

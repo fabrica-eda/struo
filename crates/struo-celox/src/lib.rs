@@ -14,7 +14,9 @@ use celox::frontend_sdk::{
 };
 use celox::{Simulator, SimulatorBuilder};
 use struo_ir::{ActiveLevel, ClockEdge};
-use struo_target_ecp5::{Bit, Control, Ecp5Cell, Ecp5Netlist, MappedPortDirection, Reset};
+use struo_target_ecp5::{
+    Bit, Control, Ecp5Cell, Ecp5MemoryImplementation, Ecp5Netlist, MappedPortDirection, Reset,
+};
 
 /// Converts the exact ECP5 target object into Celox's external-frontend format.
 ///
@@ -347,6 +349,7 @@ fn emit_cell(
         Ecp5Cell::FlipFlop { .. } => Ok(()),
         Ecp5Cell::BlockRam {
             name,
+            implementation,
             depth,
             word_width,
             physical_width,
@@ -360,23 +363,38 @@ fn emit_cell(
             edge,
             second_port: _,
             clock_enable: _,
-        } => emit_block_ram(
-            builder,
-            wires,
-            constants,
-            name,
-            *depth,
-            *word_width,
-            *physical_width,
-            **write_address,
-            write_data,
-            *write_enable,
-            **read_address,
-            read_data,
-            *read_enable,
-            *clock,
-            *edge,
-        ),
+        } => match implementation {
+            Ecp5MemoryImplementation::Block => emit_block_ram(
+                builder,
+                wires,
+                constants,
+                name,
+                *depth,
+                *word_width,
+                *physical_width,
+                **write_address,
+                write_data,
+                *write_enable,
+                **read_address,
+                read_data,
+                *read_enable,
+                *clock,
+                *edge,
+            ),
+            Ecp5MemoryImplementation::Distributed => emit_distributed_ram(
+                builder,
+                wires,
+                constants,
+                name,
+                **write_address,
+                write_data,
+                *write_enable,
+                **read_address,
+                read_data,
+                *clock,
+                *edge,
+            ),
+        },
         Ecp5Cell::TrellisIo {
             pad,
             fabric_output,
@@ -955,6 +973,65 @@ fn emit_block_ram(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_distributed_ram(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    name: &str,
+    write_address: [Bit; 14],
+    write_data: &[Bit],
+    write_enable: Control,
+    read_address: [Bit; 14],
+    read_data: &[u32],
+    clock: Bit,
+    edge: ClockEdge,
+) -> Result<(), CeloxAdapterError> {
+    let write_address = bits_expression(builder, wires, constants, &write_address[..4])?;
+    let read_address = bits_expression(builder, wires, constants, &read_address[..4])?;
+    let write_data = bits_expression(builder, wires, constants, &write_data[..4])?;
+    let write_asserted = asserted_expression(builder, wires, constants, write_enable)?;
+    let word_type = ValueType::bits(4)?;
+    let one_bit = ValueType::bits(1)?;
+    let clock = bit_signal(wires, constants, clock)?;
+    let edge = match edge {
+        ClockEdge::Rising => Edge::Posedge,
+        ClockEdge::Falling => Edge::Negedge,
+    };
+    let zero_word = Constant::two_state(0u8, 4)?;
+    let mut words = Vec::with_capacity(16);
+    for index in 0..16u32 {
+        let signal = builder.internal(format!("__struo_{name}_word_{index}"), word_type)?;
+        builder.set_initial(signal, zero_word.clone())?;
+        let current = builder.read(signal)?;
+        let address_constant = builder.constant(Constant::two_state(index, 4)?);
+        let selected = builder.binary(
+            CeloxBinaryOp::Equal,
+            write_address,
+            address_constant,
+            one_bit,
+        )?;
+        let write = builder.binary(CeloxBinaryOp::LogicAnd, write_asserted, selected, one_bit)?;
+        let next = builder.mux(write, write_data, current)?;
+        builder.register(builder.whole(signal)?, next, clock, edge, None, None)?;
+        words.push(current);
+    }
+    let mut selected = builder.constant(zero_word);
+    for (index, word) in (0..16u32).zip(words) {
+        let address_constant = builder.constant(Constant::two_state(index, 4)?);
+        let matches = builder.binary(
+            CeloxBinaryOp::Equal,
+            read_address,
+            address_constant,
+            one_bit,
+        )?;
+        selected = builder.mux(matches, word, selected)?;
+    }
+    let output = wire_ref(wires, read_data[0])?.signal;
+    builder.assign(builder.whole(output)?, selected)?;
+    Ok(())
+}
+
 /// Failure while converting a mapped target object into a Celox artifact.
 #[derive(Debug)]
 pub enum CeloxAdapterError {
@@ -1471,6 +1548,7 @@ mod tests {
             name: "words".into(),
             word: bits(8),
             depth: 16,
+            style: struo_rtl::MemoryStyle::Auto,
             read_latency: 1,
             read_address,
             read_data,

@@ -4,14 +4,15 @@ mod mapped;
 mod physical;
 
 pub use mapped::{
-    ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
-    MappedPort, MappingError, MappingOptions, MulticyclePathConstraint, NextpnrJsonError,
-    OocClockConstraint, OocPortConstraint, OocTimingConstraints, OpenDrainIo, PllBinding,
-    PllOutput, PortDirection as MappedPortDirection, RegisterEnableFanoutConstraint,
-    RegisterEnableFanoutError, RegisterEnableFanoutReport, Reset, RetimingSelection,
-    TimingClockConstraint, TimingConstraints, TimingPathConstraint, map_to_ecp5, map_to_ecp5_ooc,
-    map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
-    map_to_ecp5_with_options, map_to_ecp5_with_pll, map_to_ecp5_with_timing_constraints,
+    ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5MemoryImplementation, Ecp5Netlist,
+    IoTimingConstraints, JtaggBinding, MappedPort, MappingError, MappingOptions,
+    MulticyclePathConstraint, NextpnrJsonError, OocClockConstraint, OocPortConstraint,
+    OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput, PortDirection as MappedPortDirection,
+    RegisterEnableFanoutConstraint, RegisterEnableFanoutError, RegisterEnableFanoutReport, Reset,
+    RetimingSelection, TimingClockConstraint, TimingConstraints, TimingPathConstraint, map_to_ecp5,
+    map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
+    map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
+    map_to_ecp5_with_timing_constraints,
 };
 pub use physical::{
     PhysicalCriticalPath, PhysicalFeedback, PhysicalLocation, PhysicalNetTiming,

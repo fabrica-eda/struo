@@ -7,8 +7,8 @@ use std::num::NonZeroU32;
 
 use struo_ir::{
     ActiveLevel, ArithmeticOp, ClockEdge as IrClockEdge, ComparisonOp, EnableControl, MemoryCell,
-    MemoryPort as IrMemoryPort, NetId, Netlist, NodeKind, RegisterCell, ResetControl,
-    ValidationError,
+    MemoryPort as IrMemoryPort, MemoryStyle as IrMemoryStyle, NetId, Netlist, NodeKind,
+    RegisterCell, ResetControl, ValidationError,
 };
 use struo_rtl::{
     BinaryOp, ClockEdge, Design, ExprId, ExprKind, Module, Polarity, PortDirection, ResetMode,
@@ -306,7 +306,13 @@ impl<'a> Lowering<'a> {
                     ClockEdge::Rising => IrClockEdge::Rising,
                     ClockEdge::Falling => IrClockEdge::Falling,
                 },
-            );
+            )
+            .with_read_latency(memory.read_latency)
+            .with_style(match memory.style {
+                struo_rtl::MemoryStyle::Auto => IrMemoryStyle::Auto,
+                struo_rtl::MemoryStyle::Block => IrMemoryStyle::Block,
+                struo_rtl::MemoryStyle::Distributed => IrMemoryStyle::Distributed,
+            });
             if let Some(port) = &memory.second_port {
                 let read_data = self.signal_bits[port.read_data.index() as usize]
                     .iter()
@@ -1460,6 +1466,7 @@ mod tests {
             name: "words".into(),
             word: bits(8),
             depth: 256,
+            style: struo_rtl::MemoryStyle::Auto,
             read_latency: 1,
             read_address,
             read_data,
