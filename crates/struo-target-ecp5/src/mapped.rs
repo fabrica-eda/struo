@@ -12,8 +12,8 @@ use struo_formal::{
     RetimingVertex, derive_retimed_graph, verify_retiming_certificate,
 };
 use struo_ir::{
-    ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, ComparisonCell, MemoryCell, NetId,
-    Netlist, NodeKind, PortDirection as IrPortDirection, ValidationError,
+    ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, ComparisonCell, MemoryCell, MemoryStyle,
+    NetId, Netlist, NodeKind, PortDirection as IrPortDirection, ValidationError,
 };
 
 use crate::physical::{PhysicalFeedback, PhysicalLocation};
@@ -784,15 +784,17 @@ pub enum Ecp5Cell {
         /// Optional local set/reset.
         reset: Option<Reset>,
     },
-    /// One ECP5 18-Kibit embedded block RAM.
+    /// One ECP5 physical RAM tile (`DP16KD` or `TRELLIS_DPR16X4`).
     BlockRam {
         /// Stable cell name.
         name: String,
-        /// Logical number of words represented by the cell.
+        /// Physical RAM primitive family.
+        implementation: Ecp5MemoryImplementation,
+        /// Logical number of words represented by this physical tile.
         depth: u32,
         /// Logical word width.
         word_width: u8,
-        /// Configured DP16KD port width (1, 2, 4, 9, or 18).
+        /// Configured physical port width.
         physical_width: u8,
         /// Fourteen physical write-address pins.
         write_address: Box<[Bit; 14]>,
@@ -877,6 +879,15 @@ pub enum Ecp5Cell {
         /// Raw primitive attributes.
         attributes: BTreeMap<String, String>,
     },
+}
+
+/// Physical ECP5 memory primitive selected by mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ecp5MemoryImplementation {
+    /// Embedded 18-Kibit `DP16KD` block RAM.
+    Block,
+    /// LUT-based `TRELLIS_DPR16X4` distributed RAM.
+    Distributed,
 }
 
 /// Connections for a second true-dual-port ECP5 block-RAM port.
@@ -1783,7 +1794,14 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
     match cell {
         Ecp5Cell::Lut4 { .. } => bel.contains(".K"),
         Ecp5Cell::FlipFlop { .. } => bel.contains(".FF"),
-        Ecp5Cell::BlockRam { .. } => bel.contains("DP16KD") || bel.contains("/EBR"),
+        Ecp5Cell::BlockRam {
+            implementation: Ecp5MemoryImplementation::Block,
+            ..
+        } => bel.contains("DP16KD") || bel.contains("/EBR"),
+        Ecp5Cell::BlockRam {
+            implementation: Ecp5MemoryImplementation::Distributed,
+            ..
+        } => true,
         Ecp5Cell::TrellisIo { .. } => bel.contains("PIO"),
         Ecp5Cell::Jtagg { .. } => bel.contains("JTAGG"),
         Ecp5Cell::Pll { .. } => bel.contains("PLL"),
@@ -4057,6 +4075,7 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
                 depths.insert(*output, 0);
             }
             Ecp5Cell::BlockRam {
+                implementation: Ecp5MemoryImplementation::Block,
                 read_data,
                 second_port,
                 ..
@@ -4066,6 +4085,15 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
                     .chain(second_port.iter().flat_map(|port| &port.read_data))
                 {
                     depths.insert(*output, 0);
+                }
+            }
+            Ecp5Cell::BlockRam {
+                implementation: Ecp5MemoryImplementation::Distributed,
+                read_data,
+                ..
+            } => {
+                for output in read_data {
+                    depths.insert(*output, 1);
                 }
             }
             Ecp5Cell::Lut4 { .. }
@@ -4146,8 +4174,24 @@ fn update_mapped_cell_depth(cell: &Ecp5Cell, depths: &mut WireMap<usize>) -> boo
             }
             progress
         }
+        Ecp5Cell::BlockRam {
+            implementation: Ecp5MemoryImplementation::Distributed,
+            read_address,
+            read_data,
+            ..
+        } => {
+            let inputs = read_address[..4].iter().collect::<Vec<_>>();
+            let mut progress = false;
+            for output in read_data {
+                progress = update(&inputs, *output, depths) || progress;
+            }
+            progress
+        }
         Ecp5Cell::FlipFlop { .. }
-        | Ecp5Cell::BlockRam { .. }
+        | Ecp5Cell::BlockRam {
+            implementation: Ecp5MemoryImplementation::Block,
+            ..
+        }
         | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
         | Ecp5Cell::Pll { .. } => false,
@@ -4187,6 +4231,7 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                 arrivals.insert(*output, FLIP_FLOP_CLOCK_TO_OUTPUT_PS);
             }
             Ecp5Cell::BlockRam {
+                implementation: Ecp5MemoryImplementation::Block,
                 read_data,
                 second_port,
                 ..
@@ -4196,6 +4241,15 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                     .chain(second_port.iter().flat_map(|port| &port.read_data))
                 {
                     arrivals.insert(*output, BRAM_CLOCK_TO_OUTPUT_PS);
+                }
+            }
+            Ecp5Cell::BlockRam {
+                implementation: Ecp5MemoryImplementation::Distributed,
+                read_data,
+                ..
+            } => {
+                for output in read_data {
+                    arrivals.insert(*output, LUT_DELAY_PS);
                 }
             }
             Ecp5Cell::Lut4 { .. }
@@ -4295,8 +4349,28 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                             != Some(carry_out_arrival);
                     }
                 }
+                Ecp5Cell::BlockRam {
+                    implementation: Ecp5MemoryImplementation::Distributed,
+                    read_address,
+                    read_data,
+                    ..
+                } => {
+                    let arrival = read_address[..4]
+                        .iter()
+                        .filter_map(|input| mapped_routed_arrival(*input, &arrivals, &fanouts))
+                        .max()
+                        .map(|arrival| arrival.saturating_add(LUT_DELAY_PS));
+                    if let Some(arrival) = arrival {
+                        for output in read_data {
+                            progress |= arrivals.insert(*output, arrival) != Some(arrival);
+                        }
+                    }
+                }
                 Ecp5Cell::FlipFlop { .. }
-                | Ecp5Cell::BlockRam { .. }
+                | Ecp5Cell::BlockRam {
+                    implementation: Ecp5MemoryImplementation::Block,
+                    ..
+                }
                 | Ecp5Cell::TrellisIo { .. }
                 | Ecp5Cell::Jtagg { .. }
                 | Ecp5Cell::Pll { .. } => {}
@@ -6718,6 +6792,19 @@ fn map_memory(
     cells: &mut Vec<Ecp5Cell>,
     next_wire: &mut u32,
 ) -> Result<(), MappingError> {
+    match (memory.style(), memory.read_latency()) {
+        (MemoryStyle::Distributed | MemoryStyle::Auto, 0) => {
+            return map_distributed_memory(memory, bits, cells, next_wire);
+        }
+        (MemoryStyle::Block | MemoryStyle::Auto, 1) => {}
+        _ => {
+            return Err(MappingError::UnsupportedMemoryStyle {
+                memory: memory.name().into(),
+                style: memory.style(),
+                read_latency: memory.read_latency(),
+            });
+        }
+    }
     if let Some(second_port) = memory.second_port() {
         if memory.read_address() != memory.write_address() {
             return Err(MappingError::UnsupportedTrueDualPortAddresses {
@@ -6819,6 +6906,7 @@ fn map_memory(
         });
         cells.push(Ecp5Cell::BlockRam {
             name,
+            implementation: Ecp5MemoryImplementation::Block,
             depth: memory.depth(),
             word_width,
             physical_width,
@@ -6842,6 +6930,189 @@ fn map_memory(
         });
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn map_distributed_memory(
+    memory: &MemoryCell,
+    bits: &[Option<Bit>],
+    cells: &mut Vec<Ecp5Cell>,
+    next_wire: &mut u32,
+) -> Result<(), MappingError> {
+    if memory.second_port().is_some()
+        || memory.read_enable().is_some()
+        || memory.depth() > 128
+        || memory.write_data().is_empty()
+    {
+        return Err(MappingError::UnsupportedDistributedMemoryGeometry {
+            memory: memory.name().into(),
+            depth: memory.depth(),
+            width: memory.write_data().len(),
+        });
+    }
+    let bank_count = usize::try_from(memory.depth().div_ceil(16)).expect("depth is at most 128");
+    let chunk_count = memory.write_data().len().div_ceil(4);
+    let write_enable = Control {
+        signal: mapped_bit(bits, memory.write_enable().signal),
+        active: memory.write_enable().active,
+    };
+    let write_low = distributed_address(bits, memory.write_address());
+    let read_low = distributed_address(bits, memory.read_address());
+    let mut bank_outputs = vec![vec![Vec::<u32>::new(); chunk_count]; bank_count];
+
+    for (bank, bank_chunks) in bank_outputs.iter_mut().enumerate() {
+        let bank_enable = distributed_bank_enable(
+            memory.name(),
+            bank,
+            bank_count,
+            write_enable,
+            bits,
+            memory.write_address(),
+            cells,
+            next_wire,
+        );
+        for (chunk, chunk_outputs) in bank_chunks.iter_mut().enumerate() {
+            let start = chunk * 4;
+            let used = (memory.write_data().len() - start).min(4);
+            let mut outputs = Vec::with_capacity(4);
+            for bit in 0..4 {
+                if bank_count == 1 && bit < used {
+                    outputs.push(wire_number(memory.read_data()[start + bit]));
+                } else {
+                    outputs.push(fresh_mapped_wire(next_wire));
+                }
+            }
+            chunk_outputs.clone_from(&outputs);
+            cells.push(Ecp5Cell::BlockRam {
+                name: format!("dpram_{}_b{bank}_c{chunk}", memory.name()),
+                implementation: Ecp5MemoryImplementation::Distributed,
+                depth: 16,
+                word_width: 4,
+                physical_width: 4,
+                write_address: Box::new(write_low),
+                write_data: (0..4)
+                    .map(|bit| {
+                        memory
+                            .write_data()
+                            .get(start + bit)
+                            .map_or(Bit::Zero, |net| mapped_bit(bits, *net))
+                    })
+                    .collect(),
+                write_enable: bank_enable,
+                read_address: Box::new(read_low),
+                read_data: outputs,
+                read_enable: None,
+                clock_enable: None,
+                clock: mapped_bit(bits, memory.clock()),
+                edge: memory.edge(),
+                second_port: None,
+            });
+        }
+    }
+
+    if bank_count > 1 {
+        for chunk in 0..chunk_count {
+            let used = (memory.read_data().len() - chunk * 4).min(4);
+            for bit in 0..used {
+                let mut level = bank_outputs
+                    .iter()
+                    .map(|bank| Bit::Wire(bank[chunk][bit]))
+                    .collect::<Vec<_>>();
+                let mut select_bit = 4usize;
+                while level.len() > 1 {
+                    let select = memory
+                        .read_address()
+                        .get(select_bit)
+                        .map_or(Bit::Zero, |net| mapped_bit(bits, *net));
+                    let pairs = level.len().div_ceil(2);
+                    let mut next = Vec::with_capacity(pairs);
+                    for pair in 0..pairs {
+                        let zero = level[pair * 2];
+                        let one = level.get(pair * 2 + 1).copied().unwrap_or(Bit::Zero);
+                        let final_output = pairs == 1;
+                        let output = if final_output {
+                            wire_number(memory.read_data()[chunk * 4 + bit])
+                        } else {
+                            fresh_mapped_wire(next_wire)
+                        };
+                        cells.push(Ecp5Cell::Lut4 {
+                            name: format!(
+                                "dpram_{}_read_c{chunk}_d{bit}_s{select_bit}_p{pair}",
+                                memory.name()
+                            ),
+                            inputs: [zero, one, select, Bit::Zero],
+                            output,
+                            init: 0xcaca,
+                        });
+                        next.push(Bit::Wire(output));
+                    }
+                    level = next;
+                    select_bit += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn distributed_address(bits: &[Option<Bit>], address: &[NetId]) -> [Bit; 14] {
+    let mut result = [Bit::Zero; 14];
+    for (target, net) in result.iter_mut().take(4).zip(address) {
+        *target = mapped_bit(bits, *net);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn distributed_bank_enable(
+    memory: &str,
+    bank: usize,
+    bank_count: usize,
+    enable: Control,
+    bits: &[Option<Bit>],
+    address: &[NetId],
+    cells: &mut Vec<Ecp5Cell>,
+    next_wire: &mut u32,
+) -> Control {
+    if bank_count == 1 {
+        return enable;
+    }
+    let inputs = [
+        enable.signal,
+        address
+            .get(4)
+            .map_or(Bit::Zero, |net| mapped_bit(bits, *net)),
+        address
+            .get(5)
+            .map_or(Bit::Zero, |net| mapped_bit(bits, *net)),
+        address
+            .get(6)
+            .map_or(Bit::Zero, |net| mapped_bit(bits, *net)),
+    ];
+    let init = (0..16).fold(0u16, |init, assignment| {
+        let enabled = (assignment & 1 != 0) == (enable.active == ActiveLevel::High);
+        let selected = ((assignment >> 1) & 0b111) == bank;
+        init | (u16::from(enabled && selected) << assignment)
+    });
+    let output = fresh_mapped_wire(next_wire);
+    cells.push(Ecp5Cell::Lut4 {
+        name: format!("dpram_{memory}_write_bank_{bank}"),
+        inputs,
+        output,
+        init,
+    });
+    Control {
+        signal: Bit::Wire(output),
+        active: ActiveLevel::High,
+    }
+}
+
+fn fresh_mapped_wire(next_wire: &mut u32) -> u32 {
+    let wire = *next_wire;
+    *next_wire = next_wire
+        .checked_add(1)
+        .expect("mapped netlist exceeds the Yosys JSON range");
+    wire
 }
 
 fn materialize_memory_clock_enable(
@@ -7042,6 +7313,24 @@ pub enum MappingError {
         /// Requested word width.
         width: usize,
     },
+    /// A memory style and read latency cannot be implemented together.
+    UnsupportedMemoryStyle {
+        /// Memory name.
+        memory: String,
+        /// Requested implementation.
+        style: MemoryStyle,
+        /// Requested read latency.
+        read_latency: u8,
+    },
+    /// A logical memory cannot be tiled into `TRELLIS_DPR16X4` primitives.
+    UnsupportedDistributedMemoryGeometry {
+        /// Memory name.
+        memory: String,
+        /// Requested word count.
+        depth: u32,
+        /// Requested word width.
+        width: usize,
+    },
     /// A true-dual-port DP16KD port was given separate read and write addresses.
     UnsupportedTrueDualPortAddresses {
         /// Memory name.
@@ -7156,6 +7445,22 @@ impl Display for MappingError {
                 formatter,
                 "memory {memory} ({depth}x{width}) cannot be mapped to ECP5 DP16KD primitives"
             ),
+            Self::UnsupportedMemoryStyle {
+                memory,
+                style,
+                read_latency,
+            } => write!(
+                formatter,
+                "memory {memory} requests {style:?} RAM with unsupported read latency {read_latency}"
+            ),
+            Self::UnsupportedDistributedMemoryGeometry {
+                memory,
+                depth,
+                width,
+            } => write!(
+                formatter,
+                "memory {memory} ({depth}x{width}) cannot be mapped to ECP5 TRELLIS_DPR16X4 primitives"
+            ),
             Self::UnsupportedTrueDualPortAddresses { memory, port } => write!(
                 formatter,
                 "true-dual-port memory {memory} uses different read and write addresses on DP16KD port {port}"
@@ -7249,6 +7554,8 @@ impl Error for MappingError {
         match self {
             Self::InvalidNetlist(error) => Some(error),
             Self::UnsupportedMemoryGeometry { .. }
+            | Self::UnsupportedMemoryStyle { .. }
+            | Self::UnsupportedDistributedMemoryGeometry { .. }
             | Self::UnsupportedTrueDualPortAddresses { .. }
             | Self::InvalidTimingConstraint(_)
             | Self::InvalidOocConstraint(_)
@@ -7480,6 +7787,7 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
         ),
         Ecp5Cell::BlockRam {
             name,
+            implementation,
             physical_width,
             write_address,
             write_data,
@@ -7492,22 +7800,33 @@ fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
             edge,
             second_port,
             ..
-        } => (
-            name.clone(),
-            json_block_ram(
-                *physical_width,
-                **write_address,
-                write_data,
-                *write_enable,
-                **read_address,
-                read_data,
-                *read_enable,
-                *clock_enable,
-                *clock,
-                *edge,
-                second_port.as_ref(),
-            ),
-        ),
+        } => {
+            let cell = match implementation {
+                Ecp5MemoryImplementation::Block => json_block_ram(
+                    *physical_width,
+                    **write_address,
+                    write_data,
+                    *write_enable,
+                    **read_address,
+                    read_data,
+                    *read_enable,
+                    *clock_enable,
+                    *clock,
+                    *edge,
+                    second_port.as_ref(),
+                ),
+                Ecp5MemoryImplementation::Distributed => json_distributed_ram(
+                    **write_address,
+                    write_data,
+                    *write_enable,
+                    **read_address,
+                    read_data,
+                    *clock,
+                    *edge,
+                ),
+            };
+            (name.clone(), cell)
+        }
         Ecp5Cell::TrellisIo {
             name,
             pad,
@@ -8070,6 +8389,74 @@ fn json_block_ram(
         attributes: BTreeMap::new(),
         port_directions,
         connections,
+    }
+}
+
+fn json_distributed_ram(
+    write_address: [Bit; 14],
+    write_data: &[Bit],
+    write_enable: Control,
+    read_address: [Bit; 14],
+    read_data: &[u32],
+    clock: Bit,
+    edge: ClockEdge,
+) -> JsonCell {
+    JsonCell {
+        hide_name: 0,
+        r#type: "TRELLIS_DPR16X4",
+        parameters: [
+            (
+                "WCKMUX".into(),
+                if edge == ClockEdge::Rising {
+                    "WCK"
+                } else {
+                    "INV"
+                }
+                .into(),
+            ),
+            (
+                "WREMUX".into(),
+                match write_enable.active {
+                    ActiveLevel::High => "WRE",
+                    ActiveLevel::Low => "INV",
+                }
+                .into(),
+            ),
+            ("INITVAL".into(), format!("{:064b}", 0)),
+        ]
+        .into_iter()
+        .collect(),
+        attributes: BTreeMap::new(),
+        port_directions: [
+            ("DI".into(), "input"),
+            ("WAD".into(), "input"),
+            ("WRE".into(), "input"),
+            ("WCK".into(), "input"),
+            ("RAD".into(), "input"),
+            ("DO".into(), "output"),
+        ]
+        .into_iter()
+        .collect(),
+        connections: [
+            (
+                "DI".into(),
+                (0..4)
+                    .map(|index| write_data.get(index).copied().unwrap_or(Bit::Zero))
+                    .collect(),
+            ),
+            ("WAD".into(), write_address[..4].to_vec()),
+            ("WRE".into(), vec![write_enable.signal]),
+            ("WCK".into(), vec![clock]),
+            ("RAD".into(), read_address[..4].to_vec()),
+            (
+                "DO".into(),
+                (0..4)
+                    .map(|index| read_data.get(index).copied().map_or(Bit::Zero, Bit::Wire))
+                    .collect(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
     }
 }
 

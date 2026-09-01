@@ -163,8 +163,8 @@ pub const SUPPORTED_VERYL_VERSION: &str = "0.20.3";
 ///
 /// Veryl 0.20.3 does not accept tool-defined attribute names, so source code
 /// selects this policy through its portable `SystemVerilog` attribute escape:
-/// `#[sv("struo_memory = \"required\"")]`. The other accepted values are
-/// `preferred` and `forbidden`.
+/// `#[sv("struo_memory = \"distributed\"")]`. The accepted values are
+/// `preferred`, `required`, `forbidden`, `block`, and `distributed`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MemoryInferencePolicy {
     /// Infer a memory when the access pattern is recognized.
@@ -172,6 +172,10 @@ pub enum MemoryInferencePolicy {
     Preferred,
     /// Reject the design unless the array is inferred as a memory.
     Required,
+    /// Require embedded block RAM and its synchronous read shape.
+    Block,
+    /// Require LUT-based distributed RAM with an asynchronous read.
+    Distributed,
     /// Keep the array in ordinary logic and never infer a memory.
     Forbidden,
 }
@@ -384,7 +388,7 @@ impl Display for ImportError {
             }
             Self::InvalidMemoryInferencePolicy { memory, value } => write!(
                 formatter,
-                "memory `{memory}` has invalid `struo_memory` policy `{value}`; expected `preferred`, `required`, or `forbidden`"
+                "memory `{memory}` has invalid `struo_memory` policy `{value}`; expected `preferred`, `required`, `forbidden`, `block`, or `distributed`"
             ),
             Self::ConflictingMemoryInferencePolicies(memory) => write!(
                 formatter,
@@ -392,7 +396,7 @@ impl Display for ImportError {
             ),
             Self::RequiredMemoryInferenceFailed { memory, reason } => write!(
                 formatter,
-                "block-memory inference was required for `{memory}`, but failed: {reason}"
+                "memory inference was required for `{memory}`, but failed: {reason}"
             ),
             Self::MissingTop(top) => write!(formatter, "Veryl top module `{top}` was not found"),
             Self::AnalysisFailed(diagnostic) => {

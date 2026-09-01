@@ -443,7 +443,19 @@ pub struct MemoryPort {
     pub edge: ClockEdge,
 }
 
-/// A memory that should remain recognizable for block-RAM inference.
+/// Requested physical implementation of a retained memory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MemoryStyle {
+    /// Let the target choose an implementation.
+    #[default]
+    Auto,
+    /// Require embedded block RAM.
+    Block,
+    /// Require LUT-based distributed RAM.
+    Distributed,
+}
+
+/// A memory that should remain recognizable for target memory mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Memory {
     /// Memory name.
@@ -452,6 +464,8 @@ pub struct Memory {
     pub word: ValueType,
     /// Number of addressable words.
     pub depth: u32,
+    /// Requested physical memory implementation.
+    pub style: MemoryStyle,
     /// Registered read latency in cycles.
     pub read_latency: u8,
     /// Address sampled by the synchronous read port.
@@ -943,7 +957,7 @@ impl Module {
             if memory.depth == 0 {
                 return Err(RtlError::ZeroDepth(memory.name.clone()));
             }
-            if memory.read_latency != 1 {
+            if memory.read_latency > 1 {
                 return Err(RtlError::UnsupportedMemoryReadLatency {
                     memory: memory.name.clone(),
                     latency: memory.read_latency,

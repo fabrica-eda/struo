@@ -394,17 +394,32 @@ impl MemoryPort {
     }
 }
 
-/// One synchronous memory retained for block-RAM mapping.
+/// Requested physical implementation of a retained memory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MemoryStyle {
+    /// Let the target choose an implementation.
+    #[default]
+    Auto,
+    /// Require embedded block RAM.
+    Block,
+    /// Require LUT-based distributed RAM.
+    Distributed,
+}
+
+/// One memory retained for target-specific mapping.
 ///
 /// Addresses and words are stored least-significant bit first. The read and
-/// write operations within each port share a clock and edge. A read samples
-/// its address on the active edge and updates `read_data` one cycle later. An
-/// optional second port has its own clock and edge. Simultaneous accesses to
-/// the same address have target-specific collision behavior.
+/// write operations within each port share a clock and edge. A latency-one
+/// read samples its address on the active edge; a latency-zero read is
+/// asynchronous. An optional second port has its own clock and edge.
+/// Simultaneous accesses to the same address have target-specific collision
+/// behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryCell {
     name: String,
     depth: u32,
+    style: MemoryStyle,
+    read_latency: u8,
     read_address: Vec<NetId>,
     read_data: Vec<NetId>,
     read_enable: Option<EnableControl>,
@@ -435,6 +450,8 @@ impl MemoryCell {
         Self {
             name: name.into(),
             depth,
+            style: MemoryStyle::Auto,
+            read_latency: 1,
             read_address,
             read_data,
             read_enable,
@@ -445,6 +462,20 @@ impl MemoryCell {
             edge,
             second_port: None,
         }
+    }
+
+    /// Selects the requested physical memory implementation.
+    #[must_use]
+    pub const fn with_style(mut self, style: MemoryStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Selects the read latency in cycles (zero for an asynchronous read).
+    #[must_use]
+    pub const fn with_read_latency(mut self, read_latency: u8) -> Self {
+        self.read_latency = read_latency;
+        self
     }
 
     /// Adds a second independently clocked read/write port.
@@ -464,6 +495,18 @@ impl MemoryCell {
     #[must_use]
     pub const fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// Returns the requested physical implementation.
+    #[must_use]
+    pub const fn style(&self) -> MemoryStyle {
+        self.style
+    }
+
+    /// Returns the read latency in cycles.
+    #[must_use]
+    pub const fn read_latency(&self) -> u8 {
+        self.read_latency
     }
 
     /// Returns read-address bits least-significant first.
