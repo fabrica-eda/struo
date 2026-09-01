@@ -30,6 +30,12 @@ struct LoweredExpr {
     signed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum LoweredArrayIndex {
+    Static(usize),
+    Dynamic(LoweredExpr),
+}
+
 struct ModuleLowerer<'a> {
     source: &'a Module,
     rtl: RtlModule,
@@ -68,7 +74,7 @@ struct PartialMemoryPattern {
 /// Lowers analyzed Veryl AIR into Struo RTL without generated Verilog.
 ///
 /// The current semantic boundary supports scalar packed variables, statically
-/// indexed unpacked arrays, recursively flattened module instances,
+/// and dynamically indexed unpacked arrays, recursively flattened module instances,
 /// analyzer-expanded interface/modport connections, combinational and
 /// sequential assignments, compile-time constants, static packed selects,
 /// dynamic packed bit selects, packed struct constructors and member accesses,
@@ -923,13 +929,11 @@ impl<'a> ModuleLowerer<'a> {
                     ));
                 }
                 let destination = &assign.dst[0];
-                let key = self.destination_key(destination)?;
                 // Reads observe the pre-edge register value, but a partial
                 // write composes over the value already scheduled for this
                 // edge (later writes win per bit).
                 let value = self.lower_expression(&assign.expr, reads)?;
-                self.assign_env(destination, value, writes)?;
-                Ok(BTreeSet::from([key]))
+                self.assign_destination(destination, value, reads, writes)
             }
             Statement::If(branch) => {
                 let condition = self.lower_expression(&branch.cond, reads)?;
@@ -1281,15 +1285,20 @@ impl<'a> ModuleLowerer<'a> {
     fn lower_factor(&mut self, factor: &Factor, env: &Env) -> Result<LoweredExpr, ImportError> {
         match factor {
             Factor::Variable(id, index, select, comptime) => {
-                let key = self.key_from_index(*id, index)?;
-                let Some(source) = env.get(&key).copied() else {
-                    if comptime.is_const {
-                        return self.lower_comptime(comptime, "constant variable");
-                    }
-                    return Err(ImportError::UnsupportedBehavior(format!(
-                        "reference to non-runtime variable {}",
-                        self.signal_name(&key)
-                    )));
+                let source = if has_dynamic_array_index(index) {
+                    self.lower_dynamic_array_read(*id, index, env)?
+                } else {
+                    let key = self.key_from_index(*id, index)?;
+                    let Some(source) = env.get(&key).copied() else {
+                        if comptime.is_const {
+                            return self.lower_comptime(comptime, "constant variable");
+                        }
+                        return Err(ImportError::UnsupportedBehavior(format!(
+                            "reference to non-runtime variable {}",
+                            self.signal_name(&key)
+                        )));
+                    };
+                    source
                 };
                 if select.0.len() == 1
                     && select.1.is_none()
@@ -1359,21 +1368,81 @@ impl<'a> ModuleLowerer<'a> {
         })
     }
 
-    fn assign_env(
+    fn lower_dynamic_array_read(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let elements = self.lower_array_elements(id, index, env)?;
+        let first = &elements[0].0;
+        let width = self.width(first)?;
+        let signed = self.is_signed(first);
+        let mut result = self.constant(width, 0);
+        result.signed = signed;
+        for (key, condition) in elements.into_iter().rev() {
+            let value = env.get(&key).copied().ok_or_else(|| {
+                ImportError::UnsupportedBehavior(format!(
+                    "reference to non-runtime variable {}",
+                    self.signal_name(&key)
+                ))
+            })?;
+            result = LoweredExpr {
+                id: self.rtl.mux(condition.id, value.id, result.id)?,
+                width,
+                signed,
+            };
+        }
+        Ok(result)
+    }
+
+    fn assign_destination(
         &mut self,
         destination: &AssignDestination,
         value: LoweredExpr,
+        reads: &Env,
+        writes: &mut Env,
+    ) -> Result<BTreeSet<SignalKey>, ImportError> {
+        if !has_dynamic_array_index(&destination.index) {
+            let key = self.destination_key(destination)?;
+            self.assign_key(&key, &destination.select, value, writes)?;
+            return Ok(BTreeSet::from([key]));
+        }
+
+        let elements = self.lower_array_elements(destination.id, &destination.index, reads)?;
+        let mut changed = BTreeSet::new();
+        for (key, condition) in elements {
+            let current = writes[&key];
+            self.assign_key(&key, &destination.select, value, writes)?;
+            let assigned = writes[&key];
+            writes.insert(
+                key.clone(),
+                LoweredExpr {
+                    id: self.rtl.mux(condition.id, assigned.id, current.id)?,
+                    width: current.width,
+                    signed: current.signed,
+                },
+            );
+            changed.insert(key);
+        }
+        Ok(changed)
+    }
+
+    fn assign_key(
+        &mut self,
+        key: &SignalKey,
+        select: &VarSelect,
+        value: LoweredExpr,
         env: &mut Env,
     ) -> Result<(), ImportError> {
-        let key = self.destination_key(destination)?;
-        let total_width = self.width(&key)?;
-        let (lsb, width) = static_select(&destination.select, total_width)?;
-        let value = self.resize(value, width, self.is_signed(&key))?;
+        let total_width = self.width(key)?;
+        let (lsb, width) = static_select(select, total_width)?;
+        let value = self.resize(value, width, self.is_signed(key))?;
         if lsb == 0 && width == total_width {
-            env.insert(key, value);
+            env.insert(key.clone(), value);
             return Ok(());
         }
-        let current = env[&key];
+        let current = env[key];
         let mut parts = Vec::new();
         let high_lsb = lsb + width;
         if high_lsb < total_width {
@@ -1395,7 +1464,7 @@ impl<'a> ModuleLowerer<'a> {
             LoweredExpr {
                 id: self.rtl.concat(parts)?,
                 width: total_width,
-                signed: self.is_signed(&key),
+                signed: self.is_signed(key),
             },
         );
         Ok(())
@@ -1541,6 +1610,97 @@ impl<'a> ModuleLowerer<'a> {
             .collect()
     }
 
+    fn lower_array_elements(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        env: &Env,
+    ) -> Result<Vec<(SignalKey, LoweredExpr)>, ImportError> {
+        let variable = self
+            .source
+            .variables
+            .get(&id)
+            .ok_or_else(|| ImportError::MissingVariable(self.variable_name(id)))?;
+        let dimensions = variable
+            .r#type
+            .array
+            .iter()
+            .map(|dimension| {
+                dimension.ok_or_else(|| ImportError::NonConcreteWidth(self.variable_name(id)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if index.0.len() != dimensions.len() {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "whole or partially indexed unpacked array {}",
+                self.variable_name(id)
+            )));
+        }
+
+        let mut indices = Vec::with_capacity(index.0.len());
+        for (expression, dimension) in index.0.iter().zip(&dimensions) {
+            if let Some(value) = evaluated_u64(expression) {
+                let value = usize::try_from(value).map_err(|_| {
+                    ImportError::UnsupportedBehavior("unpacked array index overflow".into())
+                })?;
+                if value >= *dimension {
+                    return Err(ImportError::UnsupportedBehavior(format!(
+                        "unpacked array index {value} exceeds dimension {dimension} of {}",
+                        self.variable_name(id)
+                    )));
+                }
+                indices.push(LoweredArrayIndex::Static(value));
+            } else {
+                indices.push(LoweredArrayIndex::Dynamic(
+                    self.lower_expression(expression, env)?,
+                ));
+            }
+        }
+
+        let mut elements = Vec::new();
+        for key in self.keys_for_id(id) {
+            let mut condition = None;
+            let mut matches = true;
+            for (index, candidate) in indices.iter().zip(&key.index) {
+                match index {
+                    LoweredArrayIndex::Static(value) => matches &= value == candidate,
+                    LoweredArrayIndex::Dynamic(value) => {
+                        let candidate = u64::try_from(*candidate).map_err(|_| {
+                            ImportError::UnsupportedBehavior("unpacked array index overflow".into())
+                        })?;
+                        if value.width < u64::BITS && candidate >= (1_u64 << value.width) {
+                            matches = false;
+                            break;
+                        }
+                        let candidate = self.constant(value.width, candidate);
+                        let equals = self.lower_binary(Op::Eq, *value, candidate, 1, false)?;
+                        condition = Some(match condition {
+                            Some(previous) => {
+                                self.lower_binary(Op::LogicAnd, previous, equals, 1, false)?
+                            }
+                            None => equals,
+                        });
+                    }
+                }
+                if !matches {
+                    break;
+                }
+            }
+            if matches {
+                elements.push((
+                    key,
+                    condition.expect("dynamic array access has a dynamic index"),
+                ));
+            }
+        }
+        if elements.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "unpacked array {} has no runtime elements selectable by its index",
+                self.variable_name(id)
+            )));
+        }
+        Ok(elements)
+    }
+
     fn key_from_index(&self, id: VarId, index: &VarIndex) -> Result<SignalKey, ImportError> {
         let variable = self
             .source
@@ -1624,29 +1784,38 @@ fn memory_candidates(
         .iter()
         .filter_map(|(id, policy)| (*policy == MemoryInferencePolicy::Required).then_some(*id))
         .collect::<HashSet<_>>();
+    let mut accesses = HashMap::<VarId, (bool, bool, bool)>::new();
     for declaration in &source.declarations {
         let Declaration::Ff(ff) = declaration else {
             continue;
         };
         for statement in &ff.statements {
             for pattern in memory_statement_patterns(statement, &arrays) {
-                let (memory, address) = match &pattern {
+                let (memory, address, write) = match &pattern {
                     MemoryStatementPattern::Write {
                         memory, address, ..
-                    }
-                    | MemoryStatementPattern::Read {
+                    } => (*memory, address, true),
+                    MemoryStatementPattern::Read {
                         memory, address, ..
-                    } => (*memory, address),
+                    } => (*memory, address, false),
                 };
-                if static_array_index(address).is_err()
-                    && policies.get(&memory).copied().unwrap_or_default()
-                        != MemoryInferencePolicy::Forbidden
-                {
-                    candidates.insert(memory);
-                }
+                let access = accesses.entry(memory).or_default();
+                access.0 |= write;
+                access.1 |= !write;
+                access.2 |= static_array_index(address).is_err();
             }
         }
     }
+    candidates.extend(accesses.into_iter().filter_map(
+        |(memory, (has_write, has_read, has_dynamic_address))| {
+            (has_write
+                && has_read
+                && has_dynamic_address
+                && policies.get(&memory).copied().unwrap_or_default()
+                    != MemoryInferencePolicy::Forbidden)
+                .then_some(memory)
+        },
+    ));
     candidates
 }
 
@@ -1943,6 +2112,10 @@ fn constant_value(expression: &Expression) -> Result<u64, ImportError> {
 fn static_array_index(expression: &Expression) -> Result<u64, ImportError> {
     evaluated_u64(expression)
         .ok_or_else(|| ImportError::UnsupportedBehavior("dynamic unpacked array index".into()))
+}
+
+fn has_dynamic_array_index(index: &VarIndex) -> bool {
+    index.0.iter().any(|index| evaluated_u64(index).is_none())
 }
 
 fn evaluated_u64(expression: &Expression) -> Option<u64> {
@@ -2920,6 +3093,34 @@ module WideLiteralTop (
     }
 
     #[test]
+    fn lowers_dynamic_register_array_indices() {
+        let source = REQUIRED_ASYNC_MEMORY_SOURCE
+            .replace("    #[sv(\"struo_memory = \\\"required\\\"\")]\n", "");
+        let design = analyze_and_lower(
+            &source,
+            "dynamic_register_array_index_lowering",
+            "RequiredAsyncMemoryTop",
+        )
+        .unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        assert!(synthesized.netlist.memories().is_empty());
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "write_enable", 1);
+        for address in 0_u8..16 {
+            set(&mut simulator, "write_address", address);
+            set(&mut simulator, "write_data", 0x40 + address);
+            tick(&mut simulator);
+        }
+        set(&mut simulator, "write_enable", 0);
+        for address in 0_u8..16 {
+            set(&mut simulator, "read_address", address);
+            assert_value(&mut simulator, "read_data", u64::from(0x40 + address));
+        }
+    }
+
+    #[test]
     fn infers_veryl_array_as_mapped_block_ram() {
         let design = analyze_and_lower(MEMORY_SOURCE, "memory_lowering", "MemoryTop").unwrap();
         let top = design.top_module().unwrap();
@@ -3014,16 +3215,30 @@ module WideLiteralTop (
 
     #[test]
     fn forbidden_memory_policy_disables_inference() {
-        let error = analyze_and_lower(
+        let design = analyze_and_lower(
             FORBIDDEN_MEMORY_SOURCE,
             "forbidden_memory",
             "ForbiddenMemoryTop",
         )
-        .unwrap_err();
+        .unwrap();
+        assert!(design.top_module().unwrap().memories().is_empty());
+        let synthesized = synthesize(&design).unwrap();
+        assert!(synthesized.netlist.memories().is_empty());
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
 
-        assert!(error.to_string().contains(
-            "dynamic access to unpacked array words cannot be lowered because block-memory inference is forbidden"
-        ));
+        set(&mut simulator, "write_enable", 1);
+        for address in 0_u8..16 {
+            set(&mut simulator, "write_address", address);
+            set(&mut simulator, "write_data", 0x60 + address);
+            tick(&mut simulator);
+        }
+        set(&mut simulator, "write_enable", 0);
+        for address in 0_u8..16 {
+            set(&mut simulator, "read_address", address);
+            tick(&mut simulator);
+            assert_value(&mut simulator, "read_data", u64::from(0x60 + address));
+        }
     }
 
     #[test]

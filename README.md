@@ -74,11 +74,12 @@ Crate responsibilities:
 
 `struo-frontend-veryl` lowers analyzed Veryl `Comb`, `Ff`, and `Inst`
 declarations, including recursively flattened hierarchy, analyzer-expanded
-interface/modport connections, statically indexed unpacked and interface arrays
-across module boundaries, parameter-bounded generate-for instances, procedural
-conditionals, static packed selects, packed struct constructors and member
-accesses, procedural case statements with value or range arms, arithmetic,
-comparisons, shifts, concatenations, and synchronous or asynchronous resets.
+interface/modport connections, unpacked and interface arrays across module
+boundaries, dynamic unpacked-array reads and writes, parameter-bounded
+generate-for instances, procedural conditionals, static packed selects, packed
+struct constructors and member accesses, procedural case statements with value
+or range arms, arithmetic, comparisons, shifts, concatenations, and synchronous
+or asynchronous resets.
 One-dimensional dynamically indexed arrays with one or two synchronous
 read/write ports are inferred as block memories. The two-port form may use
 independent clocks and edges. Other unsupported constructs fail explicitly.
