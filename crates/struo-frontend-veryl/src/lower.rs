@@ -1344,13 +1344,16 @@ impl<'a> ModuleLowerer<'a> {
             )));
         };
         let width = concrete_width(&comptime.r#type, context)?;
-        let value = value.to_u64().ok_or_else(|| {
-            ImportError::UnsupportedBehavior(format!("{context} wider than 64 value bits"))
-        })?;
+        if value.is_xz() {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "unknown or four-state compile-time {context}"
+            )));
+        }
+        let words = value.payload().to_u64_digits();
         Ok(LoweredExpr {
             id: self
                 .rtl
-                .constant(Constant::from_u64(BitWidth::new(width)?, value)),
+                .constant(Constant::new(BitWidth::new(width)?, words)),
             width,
             signed: comptime.r#type.signed,
         })
@@ -2004,6 +2007,7 @@ fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), Im
 mod tests {
     use celox::{NativeBackend, Simulator};
     use struo_celox::ecp5_simulator;
+    use struo_rtl::ExprKind;
     use struo_synth::synthesize;
     use struo_target_ecp5::{JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg};
 
@@ -2515,6 +2519,74 @@ module StructInstanceTop (
     }
 }
 ";
+
+    const WIDE_LITERAL_SOURCE: &str = r"
+module WideLiteralTop (
+    zero108: output logic<108>,
+    zero128: output logic<128>,
+    value108: output logic<108>,
+    value128: output logic<128>,
+    value192: output logic<192>,
+) {
+    always_comb {
+        zero108 = 108'd0;
+        zero128 = 128'd0;
+        value108 = 108'h800000000000000000000000001;
+        value128 = 128'hfedcba98765432100123456789abcdef;
+        value192 = 192'h0123456789abcdef_fedcba9876543210_8000000000000001;
+    }
+}
+";
+
+    #[test]
+    fn lowers_wide_literals() {
+        let design = analyze_and_lower(
+            WIDE_LITERAL_SOURCE,
+            "wide_literal_lowering",
+            "WideLiteralTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+
+        for expected_width in [108, 128] {
+            assert!(top.expressions().iter().any(|expression| {
+                matches!(
+                    expression.kind(),
+                    ExprKind::Constant(value)
+                        if value.width().get() == expected_width
+                            && (0..expected_width).all(|bit| !value.bit(bit))
+                )
+            }));
+        }
+
+        let expected_values: &[(u32, &[u64])] = &[
+            (108, &[1, 1 << 43]),
+            (128, &[0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]),
+            (
+                192,
+                &[
+                    0x8000_0000_0000_0001,
+                    0xfedc_ba98_7654_3210,
+                    0x0123_4567_89ab_cdef,
+                ],
+            ),
+        ];
+        for &(expected_width, expected_words) in expected_values {
+            assert!(top.expressions().iter().any(|expression| {
+                matches!(
+                    expression.kind(),
+                    ExprKind::Constant(value)
+                        if value.width().get() == expected_width
+                            && (0..expected_width).all(|bit| {
+                                value.bit(bit)
+                                    == (((expected_words[bit as usize / 64] >> (bit % 64)) & 1)
+                                        != 0)
+                            })
+                )
+            }));
+        }
+        synthesize(&design).unwrap();
+    }
 
     #[test]
     fn lowers_analyzed_comb_and_ff_through_ecp5_and_celox() {
