@@ -612,7 +612,13 @@ impl<'a> ModuleLowerer<'a> {
                         {
                             continue;
                         }
-                        changed.extend(self.lower_statement(statement, &initial, &mut env, false)?);
+                        // Blocking assignments make each following statement
+                        // observe the writes already made in this block.  Keep
+                        // the memory-pattern filter local without bypassing
+                        // the snapshot semantics used by `lower_statements`.
+                        let snapshot = env.clone();
+                        changed
+                            .extend(self.lower_statement(statement, &snapshot, &mut env, false)?);
                     }
                     for key in changed {
                         if !driven_comb.insert(key.clone()) || driven_ff.contains(&key) {
@@ -2772,6 +2778,26 @@ module PartialMuxTop (
 }
 ";
 
+    const BLOCKING_COMB_SOURCE: &str = r"
+module BlockingCombTop (
+    seed  : input  logic<8>,
+    enable: input  logic,
+    result: output logic<8>,
+) {
+    var value     : logic<8>;
+    var set_upper : logic;
+
+    always_comb {
+        value = seed;
+        set_upper = enable && !value[7];
+        if set_upper {
+            value[7] = 1'b1;
+        }
+        result = value;
+    }
+}
+";
+
     const STRUCT_SOURCE: &str = r"
 module StructTop (
     header          : input  logic<3>,
@@ -3072,6 +3098,27 @@ module WideLiteralTop (
         assert_value(&mut simulator, "result", 0b1101_0010);
         set(&mut simulator, "reverse", 1);
         assert_value(&mut simulator, "result", 0b0100_1011);
+    }
+
+    #[test]
+    fn combinational_top_level_statements_observe_previous_blocking_writes() {
+        let design = analyze_and_lower(
+            BLOCKING_COMB_SOURCE,
+            "blocking_comb_lowering",
+            "BlockingCombTop",
+        )
+        .unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "enable", 0);
+        set(&mut simulator, "seed", 0x25);
+        assert_value(&mut simulator, "result", 0x25);
+        set(&mut simulator, "enable", 1);
+        assert_value(&mut simulator, "result", 0xa5);
+        set(&mut simulator, "seed", 0xc3);
+        assert_value(&mut simulator, "result", 0xc3);
     }
 
     #[test]
