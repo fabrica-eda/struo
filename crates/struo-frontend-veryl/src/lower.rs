@@ -1393,9 +1393,10 @@ impl<'a> ModuleLowerer<'a> {
         let Reverse((optimized_depth, _, optimized_plan)) =
             pending.pop().expect("a logical chain produces one result");
 
-        // Keep an already depth-optimal source tree intact. Besides avoiding
-        // pointless churn, this preserves its mapper sharing and cut choices.
-        let selected_plan = if optimized_depth < source_depth {
+        // Keep an already depth-optimal or marginally deeper source tree intact.
+        // Reassociating for a single level perturbs mapper sharing and fanout
+        // without enough structural improvement to justify the churn.
+        let selected_plan = if source_depth.saturating_sub(optimized_depth) >= 2 {
             optimized_plan
         } else {
             source_plan
@@ -2589,16 +2590,19 @@ module AssociativeLogicTop (
     all_result: output logic,
     any_result: output logic,
     skewed_result: output logic,
+    marginal_result: output logic,
 ) {
     var data_q: logic<16>;
     var all_q : logic;
     var any_q : logic;
     var skewed_q: logic;
+    var marginal_q: logic;
 
     always_comb {
         all_result = all_q;
         any_result = any_q;
         skewed_result = skewed_q;
+        marginal_result = marginal_q;
     }
 
     always_ff (clk) {
@@ -2615,6 +2619,7 @@ module AssociativeLogicTop (
             && data_q[4] && data_q[5] && data_q[6]
             && (data_q[8] || data_q[9] || data_q[10] || data_q[11]
                 || data_q[12] || data_q[13] || data_q[14] || data_q[15]);
+        marginal_q = data_q[0] && data_q[1] && data_q[2] && data_q[3];
     }
 }
 ";
@@ -3283,6 +3288,12 @@ module WideLiteralTop (
             .find(|register| register.name == "skewed_q")
             .unwrap();
         assert_eq!(logic_depth(top, skewed.next), 4);
+        let marginal = top
+            .registers()
+            .iter()
+            .find(|register| register.name == "marginal_q")
+            .unwrap();
+        assert_eq!(associative_depth(top, marginal.next, BinaryOp::And), 3);
 
         let synthesized = synthesize(&design).unwrap();
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
