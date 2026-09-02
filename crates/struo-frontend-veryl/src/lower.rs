@@ -1253,17 +1253,7 @@ impl<'a> ModuleLowerer<'a> {
                     comptime.r#type.signed,
                 )
             }
-            Expression::Binary(lhs, op, rhs, comptime) => {
-                if *op == Op::As {
-                    let lhs = self.lower_expression(lhs, env)?;
-                    let width = concrete_width(&comptime.r#type, "cast expression")?;
-                    return self.resize(lhs, width, comptime.r#type.signed);
-                }
-                let lhs = self.lower_expression(lhs, env)?;
-                let rhs = self.lower_expression(rhs, env)?;
-                let result_width = binary_width(*op, comptime)?;
-                self.lower_binary(*op, lhs, rhs, result_width, comptime.r#type.signed)
-            }
+            Expression::Binary(..) => self.lower_binary_expression(expression, env),
             Expression::Ternary(condition, then_expr, else_expr, comptime) => {
                 let condition = self.lower_expression(condition, env)?;
                 let condition = self.boolean(condition)?;
@@ -1306,6 +1296,67 @@ impl<'a> ModuleLowerer<'a> {
                 "array literal expression".into(),
             )),
         }
+    }
+
+    fn lower_binary_expression(
+        &mut self,
+        expression: &Expression,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let Expression::Binary(lhs, op, rhs, comptime) = expression else {
+            unreachable!("called with a non-binary expression")
+        };
+        if *op == Op::As {
+            let lhs = self.lower_expression(lhs, env)?;
+            let width = concrete_width(&comptime.r#type, "cast expression")?;
+            return self.resize(lhs, width, comptime.r#type.signed);
+        }
+        if matches!(op, Op::LogicAnd | Op::LogicOr) {
+            return self.lower_associative_logic(expression, *op, env);
+        }
+        let lhs = self.lower_expression(lhs, env)?;
+        let rhs = self.lower_expression(rhs, env)?;
+        let result_width = binary_width(*op, comptime)?;
+        self.lower_binary(*op, lhs, rhs, result_width, comptime.r#type.signed)
+    }
+
+    fn lower_associative_logic(
+        &mut self,
+        expression: &Expression,
+        op: Op,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut operands = Vec::new();
+        collect_associative_operands(expression, op, &mut operands);
+
+        let mut level = Vec::with_capacity(operands.len());
+        for operand in operands {
+            let lowered = self.lower_expression(operand, env)?;
+            level.push(self.boolean(lowered)?.id);
+        }
+
+        let binary_op = if op == Op::LogicAnd {
+            BinaryOp::And
+        } else {
+            BinaryOp::Or
+        };
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                if let [lhs, rhs] = pair {
+                    next.push(self.rtl.binary(binary_op, *lhs, *rhs)?);
+                } else {
+                    next.push(pair[0]);
+                }
+            }
+            level = next;
+        }
+
+        Ok(LoweredExpr {
+            id: level[0],
+            width: 1,
+            signed: false,
+        })
     }
 
     fn lower_struct_constructor(
@@ -1903,6 +1954,21 @@ impl<'a> ModuleLowerer<'a> {
     }
 }
 
+fn collect_associative_operands<'a>(
+    expression: &'a Expression,
+    op: Op,
+    operands: &mut Vec<&'a Expression>,
+) {
+    if let Expression::Binary(lhs, nested_op, rhs, _) = expression
+        && *nested_op == op
+    {
+        collect_associative_operands(lhs, op, operands);
+        collect_associative_operands(rhs, op, operands);
+    } else {
+        operands.push(expression);
+    }
+}
+
 fn memory_candidates(
     source: &Module,
     policies: &HashMap<VarId, MemoryInferencePolicy>,
@@ -2323,7 +2389,7 @@ fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), Im
 mod tests {
     use celox::{NativeBackend, Simulator};
     use struo_celox::ecp5_simulator;
-    use struo_rtl::ExprKind;
+    use struo_rtl::{BinaryOp, ExprId, ExprKind, Module as RtlModule};
     use struo_synth::synthesize;
     use struo_target_ecp5::{
         Ecp5Cell, Ecp5MemoryImplementation, JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg,
@@ -2388,6 +2454,36 @@ module ShiftContext (
         left             = value << amount;
         logical_right    = signed_value >> amount;
         arithmetic_right = signed_value >>> amount;
+    }
+}
+";
+
+    const ASSOCIATIVE_LOGIC_SOURCE: &str = r"
+module AssociativeLogicTop (
+    clk       : input  clock,
+    data      : input  logic<16>,
+    all_result: output logic,
+    any_result: output logic,
+) {
+    var data_q: logic<16>;
+    var all_q : logic;
+    var any_q : logic;
+
+    always_comb {
+        all_result = all_q;
+        any_result = any_q;
+    }
+
+    always_ff (clk) {
+        data_q = data;
+        all_q = data_q[0] && data_q[1] && data_q[2] && data_q[3]
+            && data_q[4] && data_q[5] && data_q[6] && data_q[7]
+            && data_q[8] && data_q[9] && data_q[10] && data_q[11]
+            && data_q[12] && data_q[13] && data_q[14] && data_q[15];
+        any_q = data_q[0] || data_q[1] || data_q[2] || data_q[3]
+            || data_q[4] || data_q[5] || data_q[6] || data_q[7]
+            || data_q[8] || data_q[9] || data_q[10] || data_q[11]
+            || data_q[12] || data_q[13] || data_q[14] || data_q[15];
     }
 }
 ";
@@ -3007,6 +3103,52 @@ module WideLiteralTop (
         assert_value(&mut simulator, "left", 0x0002);
         assert_value(&mut simulator, "logical_right", 0x7fc0);
         assert_value(&mut simulator, "arithmetic_right", 0xffc0);
+    }
+
+    fn associative_depth(module: &RtlModule, id: ExprId, operation: BinaryOp) -> usize {
+        let expression = &module.expressions()[id.index() as usize];
+        match expression.kind() {
+            ExprKind::Binary { op, lhs, rhs } if *op == operation => {
+                1 + associative_depth(module, *lhs, operation)
+                    .max(associative_depth(module, *rhs, operation))
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn balances_associative_logical_chains() {
+        let design = analyze_and_lower(
+            ASSOCIATIVE_LOGIC_SOURCE,
+            "associative_logic_lowering",
+            "AssociativeLogicTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+
+        for (register_name, operation) in [("all_q", BinaryOp::And), ("any_q", BinaryOp::Or)] {
+            let register = top
+                .registers()
+                .iter()
+                .find(|register| register.name == register_name)
+                .unwrap();
+            assert_eq!(associative_depth(top, register.next, operation), 4);
+        }
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let data = simulator.signal("data");
+        let mut cases = vec![(0_u16, false, false), (u16::MAX, true, true)];
+        cases.extend((0..16).map(|bit| (1_u16 << bit, false, true)));
+        cases.extend((0..16).map(|bit| (!(1_u16 << bit), false, true)));
+        for (value, all, any) in cases {
+            simulator.modify(|io| io.set(data, value)).unwrap();
+            tick(&mut simulator);
+            tick(&mut simulator);
+            assert_value(&mut simulator, "all_result", u64::from(all));
+            assert_value(&mut simulator, "any_result", u64::from(any));
+        }
     }
 
     #[test]
