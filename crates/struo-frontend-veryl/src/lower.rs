@@ -30,6 +30,19 @@ struct LoweredExpr {
     signed: bool,
 }
 
+struct CaseMatchTree {
+    any_match: LoweredExpr,
+    kind: CaseMatchTreeKind,
+}
+
+enum CaseMatchTreeKind {
+    Arm(usize),
+    Branch {
+        left: Box<CaseMatchTree>,
+        right: Box<CaseMatchTree>,
+    },
+}
+
 #[derive(Clone, Copy)]
 enum LoweredArrayIndex {
     Static(usize),
@@ -1141,34 +1154,141 @@ impl<'a> ModuleLowerer<'a> {
         let mut changed =
             self.lower_statements(&statement.default, reads, &mut else_env, sequential)?;
 
+        // A balanced first-match tree does not reduce the mux depth below four
+        // arms: the final default selection replaces the level saved in the
+        // matched-value tree.  Keep the established priority chain for these
+        // small cases so equivalent source does not needlessly perturb packing
+        // and placement.
+        if statement.arms.len() < 4 {
+            for arm in statement.arms.iter().rev() {
+                let mut then_env = base.clone();
+                let arm_changed =
+                    self.lower_statements(&arm.body, reads, &mut then_env, sequential)?;
+                let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
+                let mut merged_changed = changed.clone();
+                merged_changed.extend(arm_changed);
+                let mut merged_env = base.clone();
+                for key in &merged_changed {
+                    let width = self.width(key)?;
+                    let signed = self.is_signed(key);
+                    let then_value = self.resize(then_env[key], width, signed)?;
+                    let else_value = self.resize(else_env[key], width, signed)?;
+                    let value = self.rtl.mux(condition.id, then_value.id, else_value.id)?;
+                    merged_env.insert(
+                        key.clone(),
+                        LoweredExpr {
+                            id: value,
+                            width,
+                            signed,
+                        },
+                    );
+                }
+                else_env = merged_env;
+                changed = merged_changed;
+            }
+
+            *writes = else_env;
+            return Ok(changed);
+        }
+
+        // Preserve the existing body-lowering order and environment: each arm
+        // starts from the pre-case writes, and the default is lowered first.
+        // The vector is reversed afterwards so index zero is the highest-priority
+        // source arm.
+        let mut lowered_arms = Vec::with_capacity(statement.arms.len());
+
         for arm in statement.arms.iter().rev() {
             let mut then_env = base.clone();
             let arm_changed = self.lower_statements(&arm.body, reads, &mut then_env, sequential)?;
             let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
-            let mut merged_changed = changed.clone();
-            merged_changed.extend(arm_changed);
-            let mut merged_env = base.clone();
-            for key in &merged_changed {
-                let width = self.width(key)?;
-                let signed = self.is_signed(key);
-                let then_value = self.resize(then_env[key], width, signed)?;
-                let else_value = self.resize(else_env[key], width, signed)?;
-                let value = self.rtl.mux(condition.id, then_value.id, else_value.id)?;
-                merged_env.insert(
-                    key.clone(),
-                    LoweredExpr {
-                        id: value,
-                        width,
-                        signed,
-                    },
-                );
-            }
-            else_env = merged_env;
-            changed = merged_changed;
+            changed.extend(arm_changed);
+            lowered_arms.push((condition, then_env));
+        }
+        lowered_arms.reverse();
+
+        if lowered_arms.is_empty() {
+            *writes = else_env;
+            return Ok(changed);
         }
 
-        *writes = else_env;
+        let conditions = lowered_arms
+            .iter()
+            .map(|(condition, _)| *condition)
+            .collect::<Vec<_>>();
+        let match_tree = self.lower_case_match_tree(&conditions, 0)?;
+        let mut merged_env = base;
+        for key in &changed {
+            let width = self.width(key)?;
+            let signed = self.is_signed(key);
+            let matched_value =
+                self.lower_case_value_tree(&match_tree, &lowered_arms, key, width, signed)?;
+            let default_value = self.resize(else_env[key], width, signed)?;
+            let value =
+                self.rtl
+                    .mux(match_tree.any_match.id, matched_value.id, default_value.id)?;
+            merged_env.insert(
+                key.clone(),
+                LoweredExpr {
+                    id: value,
+                    width,
+                    signed,
+                },
+            );
+        }
+
+        *writes = merged_env;
         Ok(changed)
+    }
+
+    fn lower_case_match_tree(
+        &mut self,
+        conditions: &[LoweredExpr],
+        first_arm: usize,
+    ) -> Result<CaseMatchTree, ImportError> {
+        debug_assert!(!conditions.is_empty());
+        if conditions.len() == 1 {
+            return Ok(CaseMatchTree {
+                any_match: conditions[0],
+                kind: CaseMatchTreeKind::Arm(first_arm),
+            });
+        }
+
+        let split = conditions.len() / 2;
+        let left = self.lower_case_match_tree(&conditions[..split], first_arm)?;
+        let right = self.lower_case_match_tree(&conditions[split..], first_arm + split)?;
+        let any_match =
+            self.lower_binary(Op::LogicOr, left.any_match, right.any_match, 1, false)?;
+        Ok(CaseMatchTree {
+            any_match,
+            kind: CaseMatchTreeKind::Branch {
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+        })
+    }
+
+    fn lower_case_value_tree(
+        &mut self,
+        tree: &CaseMatchTree,
+        arms: &[(LoweredExpr, Env)],
+        key: &SignalKey,
+        width: u32,
+        signed: bool,
+    ) -> Result<LoweredExpr, ImportError> {
+        match &tree.kind {
+            CaseMatchTreeKind::Arm(index) => self.resize(arms[*index].1[key], width, signed),
+            CaseMatchTreeKind::Branch { left, right } => {
+                let left_value = self.lower_case_value_tree(left, arms, key, width, signed)?;
+                let right_value = self.lower_case_value_tree(right, arms, key, width, signed)?;
+                Ok(LoweredExpr {
+                    id: self
+                        .rtl
+                        .mux(left.any_match.id, left_value.id, right_value.id)?,
+                    width,
+                    signed,
+                })
+            }
+        }
     }
 
     fn lower_case_patterns(
@@ -2323,7 +2443,7 @@ fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), Im
 mod tests {
     use celox::{NativeBackend, Simulator};
     use struo_celox::ecp5_simulator;
-    use struo_rtl::ExprKind;
+    use struo_rtl::{ExprId, ExprKind, Module as RtlModule};
     use struo_synth::synthesize;
     use struo_target_ecp5::{
         Ecp5Cell, Ecp5MemoryImplementation, JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg,
@@ -2442,6 +2562,69 @@ module CaseTop (
             3'd0, 3'd2: decoded = value;
             3'd3..=3'd5: decoded = value + 8'h01;
             default: decoded = 8'hff;
+        }
+    }
+}
+";
+
+    const CASE_FIRST_MATCH_SOURCE: &str = r"
+module CaseFirstMatchTop (
+    select : input  logic<4>,
+    base   : input  logic<8>,
+    decoded: output logic<8>,
+    side   : output logic,
+) {
+    always_comb {
+        decoded = base;
+        side    = 1'b0;
+        case select {
+            4'd3, 4'd7: decoded = 8'h11;
+            4'd3: {
+                decoded = 8'h22;
+                side    = 1'b1;
+            }
+            4'd4..=4'd8: {
+                decoded = 8'h33;
+                side    = 1'b1;
+            }
+            4'd5: {
+                decoded = 8'h44;
+                side    = 1'b0;
+            }
+            default: {
+                decoded = 8'hee;
+                side    = 1'b1;
+            }
+        }
+    }
+}
+";
+
+    const BALANCED_CASE_SOURCE: &str = r"
+module BalancedCaseTop (
+    select : input  logic<5>,
+    values : input  logic<17>,
+    decoded: output logic,
+) {
+    always_comb {
+        case select {
+            5'd0 : decoded = values[0];
+            5'd1 : decoded = values[1];
+            5'd2 : decoded = values[2];
+            5'd3 : decoded = values[3];
+            5'd4 : decoded = values[4];
+            5'd5 : decoded = values[5];
+            5'd6 : decoded = values[6];
+            5'd7 : decoded = values[7];
+            5'd8 : decoded = values[8];
+            5'd9 : decoded = values[9];
+            5'd10: decoded = values[10];
+            5'd11: decoded = values[11];
+            5'd12: decoded = values[12];
+            5'd13: decoded = values[13];
+            5'd14: decoded = values[14];
+            5'd15: decoded = values[15];
+            default: decoded = values[16];
         }
     }
 }
@@ -3052,6 +3235,61 @@ module WideLiteralTop (
     }
 
     #[test]
+    fn case_duplicate_patterns_keep_the_first_matching_arm() {
+        let design = analyze_and_lower(
+            CASE_FIRST_MATCH_SOURCE,
+            "case_first_match_lowering",
+            "CaseFirstMatchTop",
+        )
+        .unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        set(&mut simulator, "base", 0x5a);
+        for (select, decoded, side) in [(3, 0x11, 0), (7, 0x11, 0), (5, 0x33, 1), (2, 0xee, 1)] {
+            set(&mut simulator, "select", select);
+            assert_value(&mut simulator, "decoded", decoded);
+            assert_value(&mut simulator, "side", side);
+        }
+    }
+
+    #[test]
+    fn sixteen_arm_case_has_logarithmic_match_and_data_depth() {
+        let design = analyze_and_lower(
+            BALANCED_CASE_SOURCE,
+            "balanced_case_lowering",
+            "BalancedCaseTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+        let decoded = top
+            .signals()
+            .iter()
+            .find(|signal| signal.name() == "decoded")
+            .unwrap()
+            .id();
+        let value = top
+            .assignments()
+            .iter()
+            .find(|assignment| assignment.target.signal == decoded)
+            .unwrap()
+            .value;
+
+        let ExprKind::Mux { condition, .. } = top.expressions()[value.index() as usize].kind()
+        else {
+            panic!("case result is not selected against its default")
+        };
+
+        // The match side is one equality plus four balanced OR levels. The
+        // value side has four balanced first-match levels plus the final mux
+        // selecting the default. A linear priority chain has sixteen data mux
+        // levels (seventeen operations including its leaf equality) here.
+        assert_eq!(expression_depth(top, *condition), 5);
+        assert_eq!(case_data_mux_depth(top, value), 5);
+    }
+
+    #[test]
     fn sequential_reads_observe_previous_register_values() {
         let design = analyze_and_lower(NBA_SOURCE, "nba_lowering", "NbaTop").unwrap();
         let synthesized = synthesize(&design).unwrap();
@@ -3578,6 +3816,59 @@ module DebugTop (
                 .unwrap()
                 .contains("\"type\": \"JTAGG\"")
         );
+    }
+
+    fn case_data_mux_depth(module: &RtlModule, id: ExprId) -> usize {
+        match module.expressions()[id.index() as usize].kind() {
+            ExprKind::Signal(_) | ExprKind::Constant(_) => 0,
+            ExprKind::Unary { input, .. } | ExprKind::Slice { input, .. } => {
+                case_data_mux_depth(module, *input)
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                case_data_mux_depth(module, *lhs).max(case_data_mux_depth(module, *rhs))
+            }
+            ExprKind::Mux {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                1 + case_data_mux_depth(module, *then_expr)
+                    .max(case_data_mux_depth(module, *else_expr))
+            }
+            ExprKind::Concat(parts) => parts
+                .iter()
+                .map(|part| case_data_mux_depth(module, *part))
+                .max()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn expression_depth(module: &RtlModule, id: ExprId) -> usize {
+        match module.expressions()[id.index() as usize].kind() {
+            ExprKind::Signal(_) | ExprKind::Constant(_) => 0,
+            ExprKind::Unary { input, .. } | ExprKind::Slice { input, .. } => {
+                1 + expression_depth(module, *input)
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                1 + expression_depth(module, *lhs).max(expression_depth(module, *rhs))
+            }
+            ExprKind::Mux {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                1 + expression_depth(module, *condition)
+                    .max(expression_depth(module, *then_expr))
+                    .max(expression_depth(module, *else_expr))
+            }
+            ExprKind::Concat(parts) => {
+                1 + parts
+                    .iter()
+                    .map(|part| expression_depth(module, *part))
+                    .max()
+                    .unwrap_or_default()
+            }
+        }
     }
 
     fn reset(simulator: &mut Simulator<NativeBackend>) {
