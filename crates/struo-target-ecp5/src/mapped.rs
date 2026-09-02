@@ -2610,12 +2610,15 @@ fn map_to_ecp5_with_period(
     // is often smaller for mux-heavy logic. Keep both candidates: the mapped
     // timing/area model, rather than syntax alone, decides which survives.
     let (mut wide, _) = map_once_with_period(netlist, options, period_ps, io_timing)?;
+    cleanup_lut4_dynamic_inputs(&mut wide);
     split_branched_carry_outs(&mut wide);
-    let (narrow, _) =
+    let (mut narrow, _) =
         map_once_with_period_and_lut_inputs(netlist, options, period_ps, io_timing, 4)?;
+    cleanup_lut4_dynamic_inputs(&mut narrow);
     let mut conservative = narrow.clone();
     split_branched_carry_outs(&mut conservative);
     map_dedicated_wide_muxes(&mut conservative);
+    cleanup_lut4_dynamic_inputs(&mut conservative);
     let wide_profile = mapped_lut_profile(&wide);
     let conservative_profile = mapped_lut_profile(&conservative);
     let wide_score = mapping_candidate_score(&wide, &wide_profile);
@@ -2665,8 +2668,10 @@ fn map_to_ecp5_with_period(
     )
     .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
     {
+        cleanup_lut4_dynamic_inputs(&mut retimed);
         split_branched_carry_outs(&mut retimed);
         map_dedicated_wide_muxes(&mut retimed);
+        cleanup_lut4_dynamic_inputs(&mut retimed);
         let retimed_profile = mapped_lut_profile(&retimed);
         let retimed_score = mapping_candidate_score(&retimed, &retimed_profile);
         let selected_profile = mapped_lut_profile(&selected);
@@ -2688,6 +2693,10 @@ fn map_to_ecp5_with_period(
             applied = true;
         }
     }
+    // This is the last mapped-netlist normalization point.  Keep it before
+    // the final depth/timing/fanout profile and before serialization so the
+    // same physical object drives QoR scoring and nextpnr JSON.
+    cleanup_lut4_dynamic_inputs(&mut selected);
     let mapped_selected_profile = mapped_lut_profile(&selected);
     let equivalence_signed_off = verify_mapped_equivalence_proof(&selected, applied);
     selected.retiming = RetimingSelection {
@@ -2919,6 +2928,7 @@ fn map_dedicated_wide_muxes(netlist: &mut Ecp5Netlist) {
     }
 
     map_l6_muxes(netlist);
+    cleanup_lut4_dynamic_inputs(netlist);
 }
 
 type WideMuxCandidate = (usize, usize, usize, usize, Bit, Bit, Bit, u32);
@@ -3539,6 +3549,44 @@ fn mapped_emitted_comb_count(netlist: &Ecp5Netlist) -> usize {
         .count()
 }
 
+/// Removes routed inputs from LUT4 pins which do not affect the LUT truth
+/// table.  ECP5 numbers the LUT INIT address with A as bit zero, followed by
+/// B, C, and D, so a pin is unused when every pair of INIT entries that only
+/// differs in that address bit is equal.
+///
+/// This is deliberately limited to ordinary [`Ecp5Cell::Lut4`] cells.  The
+/// input fields on PFUMX/L6MUX21 and CCU2C have different physical semantics,
+/// and treating those fields as generic LUT pins could break dedicated mux or
+/// carry routing.  The rewrite is representation-preserving: the INIT is
+/// retained, while the now-unobservable routed input is canonicalized to zero.
+fn cleanup_lut4_dynamic_inputs(netlist: &mut Ecp5Netlist) -> usize {
+    let mut cleaned = 0;
+    for cell in &mut netlist.cells {
+        let Ecp5Cell::Lut4 { inputs, init, .. } = cell else {
+            continue;
+        };
+        for (pin, input) in inputs.iter_mut().enumerate() {
+            if matches!(input, Bit::Wire(_)) && lut4_input_is_independent(*init, pin) {
+                *input = Bit::Zero;
+                cleaned += 1;
+            }
+        }
+    }
+    cleaned
+}
+
+fn lut4_input_is_independent(init: u16, pin: usize) -> bool {
+    debug_assert!(pin < 4);
+    let mask = 1usize << pin;
+    (0..16)
+        .filter(|assignment| assignment & mask == 0)
+        .all(|assignment| {
+            let cofactor_zero = (init >> assignment) & 1;
+            let cofactor_one = (init >> (assignment | mask)) & 1;
+            cofactor_zero == cofactor_one
+        })
+}
+
 fn mapped_register_count(netlist: &Ecp5Netlist) -> usize {
     netlist
         .cells
@@ -3668,6 +3716,7 @@ fn replicate_high_fanout_enable_luts(netlist: &Ecp5Netlist, max_fanout: usize) -
             candidate.equivalence_proof.equivalent_logic_replications += 1;
         }
     }
+    cleanup_lut4_dynamic_inputs(&mut candidate);
     candidate
 }
 
@@ -3946,6 +3995,7 @@ fn replicate_physically_critical_cells(
         replicas += 1;
         rewires += clone_rewires;
     }
+    cleanup_lut4_dynamic_inputs(netlist);
     (replicas, rewires)
 }
 
@@ -4769,6 +4819,7 @@ fn backward_retime_lut(netlist: &Ecp5Netlist, register_index: usize) -> Option<E
         candidate.cells.push(retimed_lut);
     }
     prune_unobservable_retiming_cells(&mut candidate);
+    cleanup_lut4_dynamic_inputs(&mut candidate);
     Some(candidate)
 }
 
@@ -4916,6 +4967,7 @@ fn forward_retime_lut(netlist: &Ecp5Netlist, lut_index: usize) -> Option<Ecp5Net
         }),
     });
     prune_unobservable_retiming_cells(&mut candidate);
+    cleanup_lut4_dynamic_inputs(&mut candidate);
     Some(candidate)
 }
 
@@ -6073,6 +6125,7 @@ fn insert_register_enable_fanout_branches(
             inserted += 1;
         }
     }
+    cleanup_lut4_dynamic_inputs(candidate);
     Ok((rewired, inserted))
 }
 
@@ -6714,40 +6767,42 @@ fn map_once_with_period_and_lut_inputs(
         .collect::<Vec<_>>();
     let io_timing = resolve_io_timing(&ports, io_timing);
 
-    Ok((
-        Ecp5Netlist {
-            name: netlist.name().into(),
-            ports,
-            cells,
-            retiming: RetimingSelection {
-                applied: false,
-                original_lut_depth: 0,
-                selected_lut_depth: 0,
-                original_critical_registers: 0,
-                selected_critical_registers: 0,
-                original_period_ps: quality.period_ps,
-                selected_period_ps: quality.period_ps,
-                original_overall_period_ps: quality.period_ps,
-                selected_overall_period_ps: quality.period_ps,
-                original_registers: netlist.registers().len(),
-                selected_registers: netlist.registers().len(),
-                certified_primitive_moves: 0,
-                equivalent_register_merges: 0,
-                equivalent_logic_replications: 0,
-                equivalent_physical_rewires: 0,
-                unobservable_cells_removed: 0,
-                equivalence_signed_off: true,
-            },
-            equivalence_proof: MappedEquivalenceProof {
-                valid: true,
-                ..MappedEquivalenceProof::default()
-            },
-            placement_hints: BTreeMap::new(),
-            io_timing,
-            timing_constraints: ResolvedTimingConstraints::default(),
+    let mut mapped = Ecp5Netlist {
+        name: netlist.name().into(),
+        ports,
+        cells,
+        retiming: RetimingSelection {
+            applied: false,
+            original_lut_depth: 0,
+            selected_lut_depth: 0,
+            original_critical_registers: 0,
+            selected_critical_registers: 0,
+            original_period_ps: quality.period_ps,
+            selected_period_ps: quality.period_ps,
+            original_overall_period_ps: quality.period_ps,
+            selected_overall_period_ps: quality.period_ps,
+            original_registers: netlist.registers().len(),
+            selected_registers: netlist.registers().len(),
+            certified_primitive_moves: 0,
+            equivalent_register_merges: 0,
+            equivalent_logic_replications: 0,
+            equivalent_physical_rewires: 0,
+            unobservable_cells_removed: 0,
+            equivalence_signed_off: true,
         },
-        quality,
-    ))
+        equivalence_proof: MappedEquivalenceProof {
+            valid: true,
+            ..MappedEquivalenceProof::default()
+        },
+        placement_hints: BTreeMap::new(),
+        io_timing,
+        timing_constraints: ResolvedTimingConstraints::default(),
+    };
+    // Memory lowering and boundary materialization append LUT4 cells after
+    // the emitter has finished.  Run the cleanup only once the complete
+    // mapped object exists so those cells receive the same canonicalization.
+    cleanup_lut4_dynamic_inputs(&mut mapped);
+    Ok((mapped, quality))
 }
 
 const CCU2C_ARITH_INIT: u16 = 0x96aa;
@@ -8776,15 +8831,16 @@ mod tests {
         MappedLutProfile, MappedPort, MappingCandidateScore, MappingOptions, NextpnrJsonError,
         OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput, PortDirection,
         RegisterEnableFanoutConstraint, RegisterEnableFanoutError, RegisterEnableFanoutReport,
-        ResolvedIoTiming, TimingClockConstraint, TimingConstraints, TimingPathConstraint,
-        backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names,
-        forward_retime_ccu2c, forward_retime_lut, map_dedicated_wide_muxes, map_once, map_to_ecp5,
-        map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
-        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
-        map_to_ecp5_with_timing_constraints, mapped_cell_name, mapped_emitted_comb_count,
-        mapped_logic_slice_count, mapped_wire_fanout, mapping_candidate_is_better,
-        mapping_candidate_is_selected, mapping_growth_is_bounded, merge_equivalent_flip_flops,
-        physical_bel_is_compatible, physical_feedback_matches_netlist,
+        ResolvedIoTiming, ResolvedTimingConstraints, TimingClockConstraint, TimingConstraints,
+        TimingPathConstraint, backward_retime_ccu2c, backward_retime_lut,
+        carry_outs_are_point_to_point, ccu_chain_names, cleanup_lut4_dynamic_inputs,
+        forward_retime_ccu2c, forward_retime_lut, lut4_input_is_independent,
+        map_dedicated_wide_muxes, map_once, map_to_ecp5, map_to_ecp5_ooc,
+        map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
+        map_to_ecp5_with_options, map_to_ecp5_with_pll, map_to_ecp5_with_timing_constraints,
+        mapped_cell_name, mapped_emitted_comb_count, mapped_logic_slice_count, mapped_wire_fanout,
+        mapping_candidate_is_better, mapping_candidate_is_selected, mapping_growth_is_bounded,
+        merge_equivalent_flip_flops, physical_bel_is_compatible, physical_feedback_matches_netlist,
         replicate_high_fanout_enable_luts, retiming_score, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
@@ -11028,6 +11084,91 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(truth_tables, [0x8888, 0xeeee, 0x6666, 0x5555, 0xd8d8]);
+    }
+
+    fn direct_lut_fixture(init: u16) -> Ecp5Netlist {
+        let (mut mapped, _) = map_once(
+            &arithmetic_netlist(2, ArithmeticOp::Add),
+            MappingOptions::default(),
+            &IoTimingConstraints::new(),
+        )
+        .unwrap();
+        mapped.name = "lut_cleanup_fixture".into();
+        mapped.ports = (10..14)
+            .map(|wire| MappedPort {
+                name: format!("i{wire}"),
+                direction: PortDirection::Input,
+                bits: vec![Bit::Wire(wire)],
+            })
+            .chain([MappedPort {
+                name: "y".into(),
+                direction: PortDirection::Output,
+                bits: vec![Bit::Wire(20)],
+            }])
+            .collect();
+        mapped.cells = vec![Ecp5Cell::Lut4 {
+            name: "fixture_lut".into(),
+            inputs: [Bit::Wire(10), Bit::Wire(11), Bit::Wire(12), Bit::Wire(13)],
+            output: 20,
+            init,
+        }];
+        mapped.io_timing = ResolvedIoTiming::default();
+        mapped.timing_constraints = ResolvedTimingConstraints::default();
+        mapped
+    }
+
+    #[test]
+    fn lut4_cleanup_removes_dead_dynamic_pins_without_changing_truth_table() {
+        let mut mapped = direct_lut_fixture(0xa000);
+        assert_eq!(mapped_wire_fanout(&mapped, 11), 2);
+        assert_eq!(cleanup_lut4_dynamic_inputs(&mut mapped), 1);
+        assert_eq!(mapped_wire_fanout(&mapped, 11), 1);
+
+        let Ecp5Cell::Lut4 { inputs, init, .. } = &mapped.cells[0] else {
+            unreachable!("fixture contains one LUT4");
+        };
+        assert_eq!(inputs[0], Bit::Wire(10));
+        assert_eq!(inputs[1], Bit::Zero);
+        assert_eq!(inputs[2], Bit::Wire(12));
+        assert_eq!(inputs[3], Bit::Wire(13));
+        assert_eq!(*init, 0xa000);
+
+        for assignment in 0..16usize {
+            let original = (0xa000 >> assignment) & 1;
+            let cleaned_assignment = assignment & !(1usize << 1);
+            let cleaned = (*init >> cleaned_assignment) & 1;
+            assert_eq!(original, cleaned, "assignment {assignment:04b}");
+        }
+
+        let mut control = direct_lut_fixture(0xcccc);
+        assert_eq!(cleanup_lut4_dynamic_inputs(&mut control), 3);
+        let Ecp5Cell::Lut4 { inputs, .. } = &control.cells[0] else {
+            unreachable!("fixture contains one LUT4");
+        };
+        assert_eq!(
+            inputs[1],
+            Bit::Wire(11),
+            "B-sensitive control must remain routed"
+        );
+        assert!(inputs[0] == Bit::Zero && inputs[2] == Bit::Zero && inputs[3] == Bit::Zero);
+    }
+
+    #[test]
+    fn final_map_has_no_functionally_dead_dynamic_lut4_pins() {
+        let mapped = map_to_ecp5(&combinational_io_netlist()).unwrap();
+        assert!(mapped.cells().iter().all(|cell| match cell {
+            Ecp5Cell::Lut4 { inputs, init, .. } => inputs.iter().enumerate().all(|(pin, input)| {
+                !matches!(input, Bit::Wire(_)) || !lut4_input_is_independent(*init, pin)
+            }),
+            Ecp5Cell::PfuMux { .. }
+            | Ecp5Cell::L6Mux21 { .. }
+            | Ecp5Cell::Ccu2c { .. }
+            | Ecp5Cell::FlipFlop { .. }
+            | Ecp5Cell::BlockRam { .. }
+            | Ecp5Cell::TrellisIo { .. }
+            | Ecp5Cell::Jtagg { .. }
+            | Ecp5Cell::Pll { .. } => true,
+        }));
     }
 
     #[test]
