@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory, MemoryPort,
@@ -23,11 +23,102 @@ struct SignalKey {
 
 type Env = HashMap<SignalKey, LoweredExpr>;
 
+#[derive(Clone, Debug, Default)]
+struct DrivenBits {
+    // Static packed writes are kept as normalized, non-overlapping ranges.
+    // SignalKey intentionally continues to identify the unpacked element so
+    // expression environments can compose partial writes over a whole value.
+    ranges: BTreeMap<SignalKey, Vec<BitRange>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BitRange {
+    start: u32,
+    end: u32,
+}
+
+impl DrivenBits {
+    fn insert_range(&mut self, key: SignalKey, lsb: u32, width: u32) {
+        let ranges = self.ranges.entry(key).or_default();
+        let mut merged = BitRange {
+            start: lsb,
+            end: lsb + width,
+        };
+        let mut index = 0;
+        while index < ranges.len() && ranges[index].end < merged.start {
+            index += 1;
+        }
+        while index < ranges.len() && ranges[index].start <= merged.end {
+            let range = ranges.remove(index);
+            merged.start = merged.start.min(range.start);
+            merged.end = merged.end.max(range.end);
+        }
+        ranges.insert(index, merged);
+    }
+
+    fn extend(&mut self, other: Self) {
+        for (key, ranges) in other.ranges {
+            for range in ranges {
+                self.insert_range(key.clone(), range.start, range.end - range.start);
+            }
+        }
+    }
+
+    fn extend_from(&mut self, other: &Self) {
+        for (key, ranges) in &other.ranges {
+            for range in ranges {
+                self.insert_range(key.clone(), range.start, range.end - range.start);
+            }
+        }
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &SignalKey> {
+        self.ranges.keys()
+    }
+
+    fn contains_key(&self, key: &SignalKey) -> bool {
+        self.ranges.contains_key(key)
+    }
+
+    fn first_overlap(&self, other: &Self) -> Option<&SignalKey> {
+        self.ranges.iter().find_map(|(key, ranges)| {
+            let other_ranges = other.ranges.get(key)?;
+            ranges
+                .iter()
+                .any(|range| {
+                    other_ranges
+                        .iter()
+                        .any(|other| range.start < other.end && other.start < range.end)
+                })
+                .then_some(key)
+        })
+    }
+
+    fn ranges(&self, key: &SignalKey) -> Vec<(u32, u32)> {
+        self.ranges.get(key).map_or_else(Vec::new, |ranges| {
+            ranges
+                .iter()
+                .map(|range| (range.start, range.end - range.start))
+                .collect()
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LoweredExpr {
     id: ExprId,
     width: u32,
     signed: bool,
+}
+
+struct LoweredFf {
+    clock: SignalId,
+    edge: ClockEdge,
+    initial: Env,
+    next: Env,
+    reset_values: Option<Env>,
+    reset_control: Option<(SignalId, ResetMode, Polarity)>,
+    changed: DrivenBits,
 }
 
 struct CaseMatchTree {
@@ -613,13 +704,14 @@ impl<'a> ModuleLowerer<'a> {
     fn lower_declarations(&mut self) -> Result<(), ImportError> {
         self.infer_memories()?;
         let mut driven_comb = BTreeSet::new();
-        let mut driven_ff = BTreeSet::new();
+        let mut driven_ff = DrivenBits::default();
+        let mut lowered_ff = Vec::new();
         for declaration in &self.source.declarations {
             match declaration {
                 Declaration::Comb(comb) => {
                     let initial = self.read_env()?;
                     let mut env = initial.clone();
-                    let mut changed = BTreeSet::new();
+                    let mut changed = DrivenBits::default();
                     for statement in &comb.statements {
                         if !memory_statement_patterns(statement, &self.inferred_memories).is_empty()
                         {
@@ -633,28 +725,36 @@ impl<'a> ModuleLowerer<'a> {
                         changed
                             .extend(self.lower_statement(statement, &snapshot, &mut env, false)?);
                     }
-                    for key in changed {
-                        if !driven_comb.insert(key.clone()) || driven_ff.contains(&key) {
+                    for key in changed.keys() {
+                        if !driven_comb.insert(key.clone()) || driven_ff.contains_key(key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
                                 "multiple procedural drivers for {}",
-                                self.signal_name(&key)
+                                self.signal_name(key)
                             )));
                         }
-                        let signal = self.signal(&key)?;
-                        let value = env[&key];
+                        let signal = self.signal(key)?;
+                        let value = env[key];
                         self.rtl.assign(self.rtl.whole(signal)?, value.id)?;
                     }
                 }
                 Declaration::Ff(ff) => {
-                    let changed = self.lower_ff(ff)?;
-                    for key in changed {
-                        if !driven_ff.insert(key.clone()) || driven_comb.contains(&key) {
+                    let block = self.lower_ff(ff)?;
+                    for key in block.changed.keys() {
+                        if driven_comb.contains(key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
                                 "multiple procedural drivers for {}",
-                                self.signal_name(&key)
+                                self.signal_name(key)
                             )));
                         }
                     }
+                    if let Some(key) = driven_ff.first_overlap(&block.changed) {
+                        return Err(ImportError::UnsupportedBehavior(format!(
+                            "multiple procedural drivers for {}",
+                            self.signal_name(key)
+                        )));
+                    }
+                    driven_ff.extend_from(&block.changed);
+                    lowered_ff.push(block);
                 }
                 Declaration::Null => {}
                 Declaration::Inst(instance) => self.lower_instance(instance)?,
@@ -674,6 +774,16 @@ impl<'a> ModuleLowerer<'a> {
                     ));
                 }
             }
+        }
+
+        let mut owners = BTreeMap::<SignalKey, usize>::new();
+        for block in &lowered_ff {
+            for key in block.changed.keys() {
+                *owners.entry(key.clone()).or_default() += 1;
+            }
+        }
+        for block in &lowered_ff {
+            self.materialize_ff(block, &owners)?;
         }
         Ok(())
     }
@@ -948,13 +1058,13 @@ impl<'a> ModuleLowerer<'a> {
         Ok(self.rtl.slice(signal, lsb, BitWidth::new(width)?)?)
     }
 
-    fn lower_ff(&mut self, ff: &FfDeclaration) -> Result<BTreeSet<SignalKey>, ImportError> {
+    fn lower_ff(&mut self, ff: &FfDeclaration) -> Result<LoweredFf, ImportError> {
         let (clock_key, edge) = self.source_clock(ff)?;
         let clock = self.signal(&clock_key)?;
         let initial = self.read_env()?;
         let mut next = initial.clone();
         let mut reset_values = None;
-        let mut changed = BTreeSet::new();
+        let mut changed = DrivenBits::default();
 
         for statement in &ff.statements {
             if !memory_statement_patterns(statement, &self.inferred_memories).is_empty() {
@@ -999,39 +1109,114 @@ impl<'a> ModuleLowerer<'a> {
             None
         };
 
-        for key in &changed {
+        Ok(LoweredFf {
+            clock,
+            edge,
+            initial,
+            next,
+            reset_values,
+            reset_control,
+            changed,
+        })
+    }
+
+    fn materialize_ff(
+        &mut self,
+        block: &LoweredFf,
+        owners: &BTreeMap<SignalKey, usize>,
+    ) -> Result<(), ImportError> {
+        for key in block.changed.keys() {
             let signal = self.signal(key)?;
-            let reset = if let (Some(values), Some((reset_signal, mode, polarity))) =
-                (&reset_values, reset_control)
-            {
-                let value = values.get(key).copied().unwrap_or(initial[key]);
-                Some(Reset {
-                    signal: reset_signal,
-                    mode,
-                    polarity,
-                    value: value.id,
-                })
-            } else {
-                None
-            };
-            self.rtl.add_register(Register {
-                name: self.signal_name(key),
-                target: signal,
-                next: next.get(key).copied().unwrap_or(initial[key]).id,
-                clock,
-                edge,
-                enable: None,
-                reset,
-            })?;
+            let initial = block.initial[key];
+            let next = block.next.get(key).copied().unwrap_or(initial);
+            let reset_value = block
+                .reset_values
+                .as_ref()
+                .map(|values| values.get(key).copied().unwrap_or(initial));
+
+            // Preserve the established whole-register representation whenever
+            // one block owns the signal.  Only split an aggregate when distinct
+            // always_ff blocks need independent clock/reset semantics.
+            if owners.get(key).copied().unwrap_or_default() == 1 {
+                let reset = if let (Some(value), Some((reset_signal, mode, polarity))) =
+                    (reset_value, block.reset_control)
+                {
+                    Some(Reset {
+                        signal: reset_signal,
+                        mode,
+                        polarity,
+                        value: value.id,
+                    })
+                } else {
+                    None
+                };
+                self.rtl.add_register(Register {
+                    name: self.signal_name(key),
+                    target: signal,
+                    next: next.id,
+                    clock: block.clock,
+                    edge: block.edge,
+                    enable: None,
+                    reset,
+                })?;
+                continue;
+            }
+
+            // Register targets in Struo RTL are whole signals.  Proxy signals
+            // let each source block own exactly its packed ranges, which are
+            // then projected back into the original aggregate with assignments.
+            let signal_type = self.rtl.signals()[signal.index() as usize].r#type();
+            for (lsb, width) in block.changed.ranges(key) {
+                let width = BitWidth::new(width)?;
+                let name = format!(
+                    "__struo_ff_slice_{}_{}_{}",
+                    signal.index(),
+                    lsb,
+                    width.get()
+                );
+                let slice_signal = self.rtl.add_signal(
+                    name.clone(),
+                    ValueType {
+                        width,
+                        signed: false,
+                        state: signal_type.state,
+                    },
+                );
+                let next = self.rtl.expression_slice(next.id, lsb, width)?;
+                let reset = if let (Some(value), Some((reset_signal, mode, polarity))) =
+                    (reset_value, block.reset_control)
+                {
+                    Some(Reset {
+                        signal: reset_signal,
+                        mode,
+                        polarity,
+                        value: self.rtl.expression_slice(value.id, lsb, width)?,
+                    })
+                } else {
+                    None
+                };
+                self.rtl.add_register(Register {
+                    name,
+                    target: slice_signal,
+                    next,
+                    clock: block.clock,
+                    edge: block.edge,
+                    enable: None,
+                    reset,
+                })?;
+                let value = self.rtl.read(slice_signal)?;
+                let target = self.rtl.slice(signal, lsb, width)?;
+                self.rtl.assign(target, value)?;
+            }
         }
-        Ok(changed)
+        Ok(())
     }
 
     fn lower_if_reset(
         &mut self,
         branch: &IfResetStatement,
         initial: &Env,
-    ) -> Result<(Env, Env, BTreeSet<SignalKey>), ImportError> {
+    ) -> Result<(Env, Env, DrivenBits), ImportError> {
         let mut reset = initial.clone();
         let mut next = initial.clone();
         let mut changed = self.lower_statements(&branch.true_side, initial, &mut reset, true)?;
@@ -1045,8 +1230,8 @@ impl<'a> ModuleLowerer<'a> {
         reads: &Env,
         writes: &mut Env,
         sequential: bool,
-    ) -> Result<BTreeSet<SignalKey>, ImportError> {
-        let mut changed = BTreeSet::new();
+    ) -> Result<DrivenBits, ImportError> {
+        let mut changed = DrivenBits::default();
         for statement in statements {
             if sequential {
                 changed.extend(self.lower_statement(statement, reads, writes, true)?);
@@ -1066,7 +1251,7 @@ impl<'a> ModuleLowerer<'a> {
         reads: &Env,
         writes: &mut Env,
         sequential: bool,
-    ) -> Result<BTreeSet<SignalKey>, ImportError> {
+    ) -> Result<DrivenBits, ImportError> {
         match statement {
             Statement::Assign(assign) => {
                 if assign.dst.len() != 1 {
@@ -1095,7 +1280,7 @@ impl<'a> ModuleLowerer<'a> {
                     &mut false_env,
                     sequential,
                 )?);
-                for key in &changed {
+                for key in changed.keys() {
                     let then_value = true_env[key];
                     let else_value = false_env[key];
                     let width = self.width(key)?;
@@ -1116,7 +1301,7 @@ impl<'a> ModuleLowerer<'a> {
             Statement::IfReset(_) if sequential => Err(ImportError::UnsupportedBehavior(
                 "nested if_reset statements".into(),
             )),
-            Statement::Null => Ok(BTreeSet::new()),
+            Statement::Null => Ok(DrivenBits::default()),
             Statement::Case(case_statement) => {
                 self.lower_case(case_statement, reads, writes, sequential)
             }
@@ -1147,7 +1332,7 @@ impl<'a> ModuleLowerer<'a> {
         reads: &Env,
         writes: &mut Env,
         sequential: bool,
-    ) -> Result<BTreeSet<SignalKey>, ImportError> {
+    ) -> Result<DrivenBits, ImportError> {
         let target = self.lower_expression(&statement.case_target, reads)?;
         let base = writes.clone();
         let mut else_env = base.clone();
@@ -1168,7 +1353,7 @@ impl<'a> ModuleLowerer<'a> {
                 let mut merged_changed = changed.clone();
                 merged_changed.extend(arm_changed);
                 let mut merged_env = base.clone();
-                for key in &merged_changed {
+                for key in merged_changed.keys() {
                     let width = self.width(key)?;
                     let signed = self.is_signed(key);
                     let then_value = self.resize(then_env[key], width, signed)?;
@@ -1217,7 +1402,7 @@ impl<'a> ModuleLowerer<'a> {
             .collect::<Vec<_>>();
         let match_tree = self.lower_case_match_tree(&conditions, 0)?;
         let mut merged_env = base;
-        for key in &changed {
+        for key in changed.keys() {
             let width = self.width(key)?;
             let signed = self.is_signed(key);
             let matched_value =
@@ -1655,16 +1840,20 @@ impl<'a> ModuleLowerer<'a> {
         value: LoweredExpr,
         reads: &Env,
         writes: &mut Env,
-    ) -> Result<BTreeSet<SignalKey>, ImportError> {
+    ) -> Result<DrivenBits, ImportError> {
         if !has_dynamic_array_index(&destination.index) {
             let key = self.destination_key(destination)?;
+            let (lsb, width) = static_select(&destination.select, self.width(&key)?)?;
             self.assign_key(&key, &destination.select, value, writes)?;
-            return Ok(BTreeSet::from([key]));
+            let mut changed = DrivenBits::default();
+            changed.insert_range(key, lsb, width);
+            return Ok(changed);
         }
 
         let elements = self.lower_array_elements(destination.id, &destination.index, reads)?;
-        let mut changed = BTreeSet::new();
+        let mut changed = DrivenBits::default();
         for (key, condition) in elements {
+            let (lsb, width) = static_select(&destination.select, self.width(&key)?)?;
             let current = writes[&key];
             self.assign_key(&key, &destination.select, value, writes)?;
             let assigned = writes[&key];
@@ -1676,7 +1865,7 @@ impl<'a> ModuleLowerer<'a> {
                     signed: current.signed,
                 },
             );
-            changed.insert(key);
+            changed.insert_range(key, lsb, width);
         }
         Ok(changed)
     }
@@ -3065,6 +3254,66 @@ module StructInstanceTop (
 }
 ";
 
+    const DISJOINT_STRUCT_FF_SOURCE: &str = r"
+module DisjointStructFfTop (
+    clk      : input  clock_posedge,
+    rst_n    : input  reset_async_low,
+    load     : input  logic,
+    set_valid: input  logic,
+    data     : input  logic<8>,
+    payload  : output logic<8>,
+    valid    : output logic,
+) {
+    struct Packet {
+        payload: logic<8>,
+        valid  : logic,
+    }
+
+    var packet_q: Packet;
+
+    always_ff (clk) {
+        if load {
+            packet_q.payload = data;
+        }
+    }
+
+    always_ff (clk, rst_n) {
+        if_reset {
+            packet_q.valid = 1'b0;
+        } else if set_valid {
+            packet_q.valid = 1'b1;
+        }
+    }
+
+    always_comb {
+        payload = packet_q.payload;
+        valid = packet_q.valid;
+    }
+}
+";
+
+    const OVERLAPPING_STRUCT_FF_SOURCE: &str = r"
+module OverlappingStructFfTop (
+    clk : input clock_posedge,
+    data: input logic<8>,
+) {
+    struct Packet {
+        payload: logic<8>,
+        valid  : logic,
+    }
+
+    var packet_q: Packet;
+
+    always_ff (clk) {
+        packet_q.payload = data;
+    }
+
+    always_ff (clk) {
+        packet_q.payload = data + 8'h01;
+    }
+}
+";
+
     const WIDE_LITERAL_SOURCE: &str = r"
 module WideLiteralTop (
     zero108: output logic<108>,
@@ -3400,6 +3649,67 @@ module WideLiteralTop (
         set(&mut simulator, "lower_in", 0x5c);
         assert_value(&mut simulator, "upper_out", 0xa);
         assert_value(&mut simulator, "lower_out", 0x5c);
+    }
+
+    #[test]
+    fn lowers_disjoint_struct_fields_from_separate_ff_blocks() {
+        let design = analyze_and_lower(
+            DISJOINT_STRUCT_FF_SOURCE,
+            "disjoint_struct_ff_lowering",
+            "DisjointStructFfTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+        let mut register_widths = top
+            .registers()
+            .iter()
+            .map(|register| {
+                top.signals()[register.target.index() as usize]
+                    .r#type()
+                    .width
+                    .get()
+            })
+            .collect::<Vec<_>>();
+        register_widths.sort_unstable();
+        assert_eq!(register_widths, [1, 8]);
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+
+        reset(&mut simulator);
+        set(&mut simulator, "load", 1);
+        set(&mut simulator, "data", 0xa5);
+        tick(&mut simulator);
+        set(&mut simulator, "load", 0);
+        set(&mut simulator, "set_valid", 1);
+        tick(&mut simulator);
+        assert_value(&mut simulator, "payload", 0xa5);
+        assert_value(&mut simulator, "valid", 1);
+
+        set(&mut simulator, "rst_n", 0);
+        tick(&mut simulator);
+        set(&mut simulator, "rst_n", 1);
+        assert_value(&mut simulator, "payload", 0xa5);
+        assert_value(&mut simulator, "valid", 0);
+    }
+
+    #[test]
+    fn rejects_overlapping_struct_fields_from_separate_ff_blocks() {
+        let error = analyze_and_lower(
+            OVERLAPPING_STRUCT_FF_SOURCE,
+            "overlapping_struct_ff_lowering",
+            "OverlappingStructFfTop",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ImportError::AnalysisFailed(message)
+                    if message.contains("MultipleAssignment") && message.contains("packet_q")
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
