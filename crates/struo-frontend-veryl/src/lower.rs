@@ -701,11 +701,93 @@ impl<'a> ModuleLowerer<'a> {
         Ok(signal)
     }
 
+    fn ff_owners(&self) -> Result<BTreeMap<SignalKey, usize>, ImportError> {
+        let mut owners = BTreeMap::new();
+        for declaration in &self.source.declarations {
+            let Declaration::Ff(ff) = declaration else {
+                continue;
+            };
+            let mut changed = DrivenBits::default();
+            for statement in &ff.statements {
+                if memory_statement_patterns(statement, &self.inferred_memories).is_empty() {
+                    self.collect_statement_destinations(statement, &mut changed)?;
+                }
+            }
+            for key in changed.keys() {
+                *owners.entry(key.clone()).or_default() += 1;
+            }
+        }
+        Ok(owners)
+    }
+
+    fn collect_statement_destinations(
+        &self,
+        statement: &Statement,
+        changed: &mut DrivenBits,
+    ) -> Result<(), ImportError> {
+        match statement {
+            Statement::Assign(assign) => {
+                if assign.dst.len() != 1 {
+                    return Err(ImportError::UnsupportedBehavior(
+                        "concatenated assignment destinations".into(),
+                    ));
+                }
+                let destination = &assign.dst[0];
+                for key in self.destination_candidates(destination)? {
+                    let (lsb, width) = static_select(&destination.select, self.width(&key)?)?;
+                    changed.insert_range(key, lsb, width);
+                }
+            }
+            Statement::If(branch) => {
+                for statement in branch.true_side.iter().chain(&branch.false_side) {
+                    self.collect_statement_destinations(statement, changed)?;
+                }
+            }
+            Statement::IfReset(branch) => {
+                for statement in branch.true_side.iter().chain(&branch.false_side) {
+                    self.collect_statement_destinations(statement, changed)?;
+                }
+            }
+            Statement::Case(case_statement) => {
+                for statement in &case_statement.default {
+                    self.collect_statement_destinations(statement, changed)?;
+                }
+                for arm in &case_statement.arms {
+                    for statement in &arm.body {
+                        self.collect_statement_destinations(statement, changed)?;
+                    }
+                }
+            }
+            Statement::Null
+            | Statement::For(_)
+            | Statement::FunctionCall(_)
+            | Statement::SystemFunctionCall(_)
+            | Statement::TbMethodCall(_)
+            | Statement::Break
+            | Statement::Unsupported(_) => {}
+        }
+        Ok(())
+    }
+
+    fn destination_candidates(
+        &self,
+        destination: &AssignDestination,
+    ) -> Result<Vec<SignalKey>, ImportError> {
+        if has_dynamic_array_index(&destination.index) {
+            self.array_candidate_keys(destination.id, &destination.index)
+        } else {
+            Ok(vec![self.destination_key(destination)?])
+        }
+    }
+
     fn lower_declarations(&mut self) -> Result<(), ImportError> {
         self.infer_memories()?;
+        // Discover multi-owner aggregates without lowering expressions.  The
+        // real pass can then emit every ordinary register at its original
+        // declaration position, preserving stable IDs and mapped QoR.
+        let owners = self.ff_owners()?;
         let mut driven_comb = BTreeSet::new();
         let mut driven_ff = DrivenBits::default();
-        let mut lowered_ff = Vec::new();
         for declaration in &self.source.declarations {
             match declaration {
                 Declaration::Comb(comb) => {
@@ -754,7 +836,7 @@ impl<'a> ModuleLowerer<'a> {
                         )));
                     }
                     driven_ff.extend_from(&block.changed);
-                    lowered_ff.push(block);
+                    self.materialize_ff(&block, &owners)?;
                 }
                 Declaration::Null => {}
                 Declaration::Inst(instance) => self.lower_instance(instance)?,
@@ -774,16 +856,6 @@ impl<'a> ModuleLowerer<'a> {
                     ));
                 }
             }
-        }
-
-        let mut owners = BTreeMap::<SignalKey, usize>::new();
-        for block in &lowered_ff {
-            for key in block.changed.keys() {
-                *owners.entry(key.clone()).or_default() += 1;
-            }
-        }
-        for block in &lowered_ff {
-            self.materialize_ff(block, &owners)?;
         }
         Ok(())
     }
@@ -2050,6 +2122,68 @@ impl<'a> ModuleLowerer<'a> {
             .filter(|key| key.id == id)
             .cloned()
             .collect()
+    }
+
+    fn array_candidate_keys(
+        &self,
+        id: VarId,
+        index: &VarIndex,
+    ) -> Result<Vec<SignalKey>, ImportError> {
+        let variable = self
+            .source
+            .variables
+            .get(&id)
+            .ok_or_else(|| ImportError::MissingVariable(self.variable_name(id)))?;
+        let dimensions = variable
+            .r#type
+            .array
+            .iter()
+            .map(|dimension| {
+                dimension.ok_or_else(|| ImportError::NonConcreteWidth(self.variable_name(id)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if index.0.len() != dimensions.len() {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "whole or partially indexed unpacked array {}",
+                self.variable_name(id)
+            )));
+        }
+
+        let mut static_indices = Vec::with_capacity(index.0.len());
+        for (expression, dimension) in index.0.iter().zip(dimensions) {
+            let Some(value) = evaluated_u64(expression) else {
+                static_indices.push(None);
+                continue;
+            };
+            let value = usize::try_from(value).map_err(|_| {
+                ImportError::UnsupportedBehavior("unpacked array index overflow".into())
+            })?;
+            if value >= dimension {
+                return Err(ImportError::UnsupportedBehavior(format!(
+                    "unpacked array index {value} exceeds dimension {dimension} of {}",
+                    self.variable_name(id)
+                )));
+            }
+            static_indices.push(Some(value));
+        }
+
+        let candidates = self
+            .keys_for_id(id)
+            .into_iter()
+            .filter(|key| {
+                static_indices
+                    .iter()
+                    .zip(&key.index)
+                    .all(|(expected, actual)| expected.is_none_or(|expected| expected == *actual))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(format!(
+                "unpacked array {} has no runtime elements selectable by its index",
+                self.variable_name(id)
+            )));
+        }
+        Ok(candidates)
     }
 
     fn lower_array_elements(
