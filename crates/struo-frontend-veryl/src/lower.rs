@@ -32,6 +32,12 @@ struct LoweredExpr {
 }
 
 #[derive(Clone, Copy)]
+enum AssociativePlan {
+    Leaf(ExprId),
+    Combine { lhs: usize, rhs: usize },
+}
+
+#[derive(Clone, Copy)]
 enum LoweredArrayIndex {
     Static(usize),
     Dynamic(LoweredExpr),
@@ -1331,12 +1337,13 @@ impl<'a> ModuleLowerer<'a> {
         collect_associative_operands(expression, op, &mut operands);
 
         let mut depth_memo = HashMap::new();
-        let mut pending = BinaryHeap::new();
-        for (order, operand) in operands.into_iter().enumerate() {
+        let mut leaves = Vec::with_capacity(operands.len());
+        let mut leaf_depths = Vec::with_capacity(operands.len());
+        for operand in operands {
             let lowered = self.lower_expression(operand, env)?;
             let id = self.boolean(lowered)?.id;
-            let depth = rtl_expression_depth(&self.rtl, id, &mut depth_memo);
-            pending.push(Reverse((depth, order, id)));
+            leaf_depths.push(rtl_expression_depth(&self.rtl, id, &mut depth_memo));
+            leaves.push(id);
         }
 
         let binary_op = if op == Op::LogicAnd {
@@ -1344,31 +1351,78 @@ impl<'a> ModuleLowerer<'a> {
         } else {
             BinaryOp::Or
         };
+        let mut plans = leaves
+            .iter()
+            .copied()
+            .map(AssociativePlan::Leaf)
+            .collect::<Vec<_>>();
+        let mut source_leaf = 0;
+        let (source_plan, source_depth) = build_associative_source_plan(
+            expression,
+            op,
+            &leaf_depths,
+            &mut source_leaf,
+            &mut plans,
+        );
+
         // Pairing by source position still buries an already deep predicate under
         // every tree level. Merge the shallowest partial trees first so that
         // equal-depth leaves remain balanced while deep leaves stay near the root.
+        let mut pending = leaf_depths
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(order, depth)| Reverse((depth, order, order)))
+            .collect::<BinaryHeap<_>>();
         let mut order = pending.len();
         while pending.len() > 1 {
-            let Reverse((lhs_depth, _, lhs)) = pending
+            let Reverse((lhs_depth, _, lhs_plan)) = pending
                 .pop()
                 .expect("a logical chain has at least two operands");
-            let Reverse((rhs_depth, _, rhs)) = pending
+            let Reverse((rhs_depth, _, rhs_plan)) = pending
                 .pop()
                 .expect("a logical chain has a second pending operand");
-            let id = self.rtl.binary(binary_op, lhs, rhs)?;
-            pending.push(Reverse((lhs_depth.max(rhs_depth) + 1, order, id)));
+            let plan = plans.len();
+            plans.push(AssociativePlan::Combine {
+                lhs: lhs_plan,
+                rhs: rhs_plan,
+            });
+            pending.push(Reverse((lhs_depth.max(rhs_depth) + 1, order, plan)));
             order += 1;
         }
+        let Reverse((optimized_depth, _, optimized_plan)) =
+            pending.pop().expect("a logical chain produces one result");
+
+        // Keep an already depth-optimal source tree intact. Besides avoiding
+        // pointless churn, this preserves its mapper sharing and cut choices.
+        let selected_plan = if optimized_depth < source_depth {
+            optimized_plan
+        } else {
+            source_plan
+        };
+        let id = self.materialize_associative_plan(&plans, selected_plan, binary_op)?;
 
         Ok(LoweredExpr {
-            id: pending
-                .pop()
-                .expect("a logical chain produces one result")
-                .0
-                .2,
+            id,
             width: 1,
             signed: false,
         })
+    }
+
+    fn materialize_associative_plan(
+        &mut self,
+        plans: &[AssociativePlan],
+        plan: usize,
+        op: BinaryOp,
+    ) -> Result<ExprId, ImportError> {
+        match plans[plan] {
+            AssociativePlan::Leaf(id) => Ok(id),
+            AssociativePlan::Combine { lhs, rhs } => {
+                let lhs = self.materialize_associative_plan(plans, lhs, op)?;
+                let rhs = self.materialize_associative_plan(plans, rhs, op)?;
+                Ok(self.rtl.binary(op, lhs, rhs)?)
+            }
+        }
     }
 
     fn lower_struct_constructor(
@@ -1978,6 +2032,28 @@ fn collect_associative_operands<'a>(
         collect_associative_operands(rhs, op, operands);
     } else {
         operands.push(expression);
+    }
+}
+
+fn build_associative_source_plan(
+    expression: &Expression,
+    op: Op,
+    leaf_depths: &[usize],
+    leaf: &mut usize,
+    plans: &mut Vec<AssociativePlan>,
+) -> (usize, usize) {
+    if let Expression::Binary(lhs, nested_op, rhs, _) = expression
+        && *nested_op == op
+    {
+        let (lhs, lhs_depth) = build_associative_source_plan(lhs, op, leaf_depths, leaf, plans);
+        let (rhs, rhs_depth) = build_associative_source_plan(rhs, op, leaf_depths, leaf, plans);
+        let plan = plans.len();
+        plans.push(AssociativePlan::Combine { lhs, rhs });
+        (plan, lhs_depth.max(rhs_depth) + 1)
+    } else {
+        let plan = *leaf;
+        *leaf += 1;
+        (plan, leaf_depths[plan])
     }
 }
 
