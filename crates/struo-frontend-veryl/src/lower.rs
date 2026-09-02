@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory, MemoryPort,
@@ -28,6 +29,12 @@ struct LoweredExpr {
     id: ExprId,
     width: u32,
     signed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AssociativePlan {
+    Leaf(ExprId),
+    Combine { lhs: usize, rhs: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -1253,17 +1260,7 @@ impl<'a> ModuleLowerer<'a> {
                     comptime.r#type.signed,
                 )
             }
-            Expression::Binary(lhs, op, rhs, comptime) => {
-                if *op == Op::As {
-                    let lhs = self.lower_expression(lhs, env)?;
-                    let width = concrete_width(&comptime.r#type, "cast expression")?;
-                    return self.resize(lhs, width, comptime.r#type.signed);
-                }
-                let lhs = self.lower_expression(lhs, env)?;
-                let rhs = self.lower_expression(rhs, env)?;
-                let result_width = binary_width(*op, comptime)?;
-                self.lower_binary(*op, lhs, rhs, result_width, comptime.r#type.signed)
-            }
+            Expression::Binary(..) => self.lower_binary_expression(expression, env),
             Expression::Ternary(condition, then_expr, else_expr, comptime) => {
                 let condition = self.lower_expression(condition, env)?;
                 let condition = self.boolean(condition)?;
@@ -1305,6 +1302,126 @@ impl<'a> ModuleLowerer<'a> {
             Expression::ArrayLiteral(_, _) => Err(ImportError::UnsupportedBehavior(
                 "array literal expression".into(),
             )),
+        }
+    }
+
+    fn lower_binary_expression(
+        &mut self,
+        expression: &Expression,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let Expression::Binary(lhs, op, rhs, comptime) = expression else {
+            unreachable!("called with a non-binary expression")
+        };
+        if *op == Op::As {
+            let lhs = self.lower_expression(lhs, env)?;
+            let width = concrete_width(&comptime.r#type, "cast expression")?;
+            return self.resize(lhs, width, comptime.r#type.signed);
+        }
+        if matches!(op, Op::LogicAnd | Op::LogicOr) {
+            return self.lower_associative_logic(expression, *op, env);
+        }
+        let lhs = self.lower_expression(lhs, env)?;
+        let rhs = self.lower_expression(rhs, env)?;
+        let result_width = binary_width(*op, comptime)?;
+        self.lower_binary(*op, lhs, rhs, result_width, comptime.r#type.signed)
+    }
+
+    fn lower_associative_logic(
+        &mut self,
+        expression: &Expression,
+        op: Op,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut operands = Vec::new();
+        collect_associative_operands(expression, op, &mut operands);
+
+        let mut depth_memo = HashMap::new();
+        let mut leaves = Vec::with_capacity(operands.len());
+        let mut leaf_depths = Vec::with_capacity(operands.len());
+        for operand in operands {
+            let lowered = self.lower_expression(operand, env)?;
+            let id = self.boolean(lowered)?.id;
+            leaf_depths.push(rtl_expression_depth(&self.rtl, id, &mut depth_memo));
+            leaves.push(id);
+        }
+
+        let binary_op = if op == Op::LogicAnd {
+            BinaryOp::And
+        } else {
+            BinaryOp::Or
+        };
+        let mut plans = leaves
+            .iter()
+            .copied()
+            .map(AssociativePlan::Leaf)
+            .collect::<Vec<_>>();
+        let mut source_leaf = 0;
+        let (source_plan, source_depth) = build_associative_source_plan(
+            expression,
+            op,
+            &leaf_depths,
+            &mut source_leaf,
+            &mut plans,
+        );
+
+        // Pairing by source position still buries an already deep predicate under
+        // every tree level. Merge the shallowest partial trees first so that
+        // equal-depth leaves remain balanced while deep leaves stay near the root.
+        let mut pending = leaf_depths
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(order, depth)| Reverse((depth, order, order)))
+            .collect::<BinaryHeap<_>>();
+        let mut order = pending.len();
+        while pending.len() > 1 {
+            let Reverse((lhs_depth, _, lhs_plan)) = pending
+                .pop()
+                .expect("a logical chain has at least two operands");
+            let Reverse((rhs_depth, _, rhs_plan)) = pending
+                .pop()
+                .expect("a logical chain has a second pending operand");
+            let plan = plans.len();
+            plans.push(AssociativePlan::Combine {
+                lhs: lhs_plan,
+                rhs: rhs_plan,
+            });
+            pending.push(Reverse((lhs_depth.max(rhs_depth) + 1, order, plan)));
+            order += 1;
+        }
+        let Reverse((optimized_depth, _, optimized_plan)) =
+            pending.pop().expect("a logical chain produces one result");
+
+        // Keep an already depth-optimal source tree intact. Besides avoiding
+        // pointless churn, this preserves its mapper sharing and cut choices.
+        let selected_plan = if optimized_depth < source_depth {
+            optimized_plan
+        } else {
+            source_plan
+        };
+        let id = self.materialize_associative_plan(&plans, selected_plan, binary_op)?;
+
+        Ok(LoweredExpr {
+            id,
+            width: 1,
+            signed: false,
+        })
+    }
+
+    fn materialize_associative_plan(
+        &mut self,
+        plans: &[AssociativePlan],
+        plan: usize,
+        op: BinaryOp,
+    ) -> Result<ExprId, ImportError> {
+        match plans[plan] {
+            AssociativePlan::Leaf(id) => Ok(id),
+            AssociativePlan::Combine { lhs, rhs } => {
+                let lhs = self.materialize_associative_plan(plans, lhs, op)?;
+                let rhs = self.materialize_associative_plan(plans, rhs, op)?;
+                Ok(self.rtl.binary(op, lhs, rhs)?)
+            }
         }
     }
 
@@ -1903,6 +2020,79 @@ impl<'a> ModuleLowerer<'a> {
     }
 }
 
+fn collect_associative_operands<'a>(
+    expression: &'a Expression,
+    op: Op,
+    operands: &mut Vec<&'a Expression>,
+) {
+    if let Expression::Binary(lhs, nested_op, rhs, _) = expression
+        && *nested_op == op
+    {
+        collect_associative_operands(lhs, op, operands);
+        collect_associative_operands(rhs, op, operands);
+    } else {
+        operands.push(expression);
+    }
+}
+
+fn build_associative_source_plan(
+    expression: &Expression,
+    op: Op,
+    leaf_depths: &[usize],
+    leaf: &mut usize,
+    plans: &mut Vec<AssociativePlan>,
+) -> (usize, usize) {
+    if let Expression::Binary(lhs, nested_op, rhs, _) = expression
+        && *nested_op == op
+    {
+        let (lhs, lhs_depth) = build_associative_source_plan(lhs, op, leaf_depths, leaf, plans);
+        let (rhs, rhs_depth) = build_associative_source_plan(rhs, op, leaf_depths, leaf, plans);
+        let plan = plans.len();
+        plans.push(AssociativePlan::Combine { lhs, rhs });
+        (plan, lhs_depth.max(rhs_depth) + 1)
+    } else {
+        let plan = *leaf;
+        *leaf += 1;
+        (plan, leaf_depths[plan])
+    }
+}
+
+fn rtl_expression_depth(
+    module: &RtlModule,
+    id: ExprId,
+    memo: &mut HashMap<ExprId, usize>,
+) -> usize {
+    if let Some(depth) = memo.get(&id) {
+        return *depth;
+    }
+    let depth = match module.expressions()[id.index() as usize].kind() {
+        ExprKind::Signal(_) | ExprKind::Constant(_) => 0,
+        ExprKind::Unary { input, .. } => rtl_expression_depth(module, *input, memo) + 1,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            rtl_expression_depth(module, *lhs, memo).max(rtl_expression_depth(module, *rhs, memo))
+                + 1
+        }
+        ExprKind::Mux {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            rtl_expression_depth(module, *condition, memo)
+                .max(rtl_expression_depth(module, *then_expr, memo))
+                .max(rtl_expression_depth(module, *else_expr, memo))
+                + 1
+        }
+        ExprKind::Concat(parts) => parts
+            .iter()
+            .map(|part| rtl_expression_depth(module, *part, memo))
+            .max()
+            .unwrap_or_default(),
+        ExprKind::Slice { input, .. } => rtl_expression_depth(module, *input, memo),
+    };
+    memo.insert(id, depth);
+    depth
+}
+
 fn memory_candidates(
     source: &Module,
     policies: &HashMap<VarId, MemoryInferencePolicy>,
@@ -2323,7 +2513,7 @@ fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), Im
 mod tests {
     use celox::{NativeBackend, Simulator};
     use struo_celox::ecp5_simulator;
-    use struo_rtl::ExprKind;
+    use struo_rtl::{BinaryOp, ExprId, ExprKind, Module as RtlModule};
     use struo_synth::synthesize;
     use struo_target_ecp5::{
         Ecp5Cell, Ecp5MemoryImplementation, JtaggBinding, map_to_ecp5, map_to_ecp5_with_jtagg,
@@ -2388,6 +2578,43 @@ module ShiftContext (
         left             = value << amount;
         logical_right    = signed_value >> amount;
         arithmetic_right = signed_value >>> amount;
+    }
+}
+";
+
+    const ASSOCIATIVE_LOGIC_SOURCE: &str = r"
+module AssociativeLogicTop (
+    clk       : input  clock,
+    data      : input  logic<16>,
+    all_result: output logic,
+    any_result: output logic,
+    skewed_result: output logic,
+) {
+    var data_q: logic<16>;
+    var all_q : logic;
+    var any_q : logic;
+    var skewed_q: logic;
+
+    always_comb {
+        all_result = all_q;
+        any_result = any_q;
+        skewed_result = skewed_q;
+    }
+
+    always_ff (clk) {
+        data_q = data;
+        all_q = data_q[0] && data_q[1] && data_q[2] && data_q[3]
+            && data_q[4] && data_q[5] && data_q[6] && data_q[7]
+            && data_q[8] && data_q[9] && data_q[10] && data_q[11]
+            && data_q[12] && data_q[13] && data_q[14] && data_q[15];
+        any_q = data_q[0] || data_q[1] || data_q[2] || data_q[3]
+            || data_q[4] || data_q[5] || data_q[6] || data_q[7]
+            || data_q[8] || data_q[9] || data_q[10] || data_q[11]
+            || data_q[12] || data_q[13] || data_q[14] || data_q[15];
+        skewed_q = data_q[0] && data_q[1] && data_q[2] && data_q[3]
+            && data_q[4] && data_q[5] && data_q[6]
+            && (data_q[8] || data_q[9] || data_q[10] || data_q[11]
+                || data_q[12] || data_q[13] || data_q[14] || data_q[15]);
     }
 }
 ";
@@ -3007,6 +3234,70 @@ module WideLiteralTop (
         assert_value(&mut simulator, "left", 0x0002);
         assert_value(&mut simulator, "logical_right", 0x7fc0);
         assert_value(&mut simulator, "arithmetic_right", 0xffc0);
+    }
+
+    fn associative_depth(module: &RtlModule, id: ExprId, operation: BinaryOp) -> usize {
+        let expression = &module.expressions()[id.index() as usize];
+        match expression.kind() {
+            ExprKind::Binary { op, lhs, rhs } if *op == operation => {
+                1 + associative_depth(module, *lhs, operation)
+                    .max(associative_depth(module, *rhs, operation))
+            }
+            _ => 0,
+        }
+    }
+
+    fn logic_depth(module: &RtlModule, id: ExprId) -> usize {
+        let expression = &module.expressions()[id.index() as usize];
+        match expression.kind() {
+            ExprKind::Binary {
+                op: BinaryOp::And | BinaryOp::Or,
+                lhs,
+                rhs,
+            } => 1 + logic_depth(module, *lhs).max(logic_depth(module, *rhs)),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn balances_associative_logical_chains() {
+        let design = analyze_and_lower(
+            ASSOCIATIVE_LOGIC_SOURCE,
+            "associative_logic_lowering",
+            "AssociativeLogicTop",
+        )
+        .unwrap();
+        let top = design.top_module().unwrap();
+
+        for (register_name, operation) in [("all_q", BinaryOp::And), ("any_q", BinaryOp::Or)] {
+            let register = top
+                .registers()
+                .iter()
+                .find(|register| register.name == register_name)
+                .unwrap();
+            assert_eq!(associative_depth(top, register.next, operation), 4);
+        }
+        let skewed = top
+            .registers()
+            .iter()
+            .find(|register| register.name == "skewed_q")
+            .unwrap();
+        assert_eq!(logic_depth(top, skewed.next), 4);
+
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let data = simulator.signal("data");
+        let mut cases = vec![(0_u16, false, false), (u16::MAX, true, true)];
+        cases.extend((0..16).map(|bit| (1_u16 << bit, false, true)));
+        cases.extend((0..16).map(|bit| (!(1_u16 << bit), false, true)));
+        for (value, all, any) in cases {
+            simulator.modify(|io| io.set(data, value)).unwrap();
+            tick(&mut simulator);
+            tick(&mut simulator);
+            assert_value(&mut simulator, "all_result", u64::from(all));
+            assert_value(&mut simulator, "any_result", u64::from(any));
+        }
     }
 
     #[test]
