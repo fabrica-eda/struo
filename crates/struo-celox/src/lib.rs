@@ -29,6 +29,10 @@ use struo_target_ecp5::{
 /// A bound `EHXPLLL` uses a cycle-level model which forwards the reference
 /// clock to its clock outputs and holds `LOCK` asserted; implementation timing
 /// remains responsible for the configured physical frequencies.
+/// Same-clock, same-edge true-dual-port block RAMs are modeled with registered
+/// read-before-write outputs. When both ports write the same word on one edge,
+/// port B wins deterministically; physical same-address collision behavior is
+/// target-specific and must not be inferred from that simulation convention.
 ///
 /// # Errors
 ///
@@ -40,12 +44,17 @@ pub fn ecp5_frontend_artifact(
     if let Some(name) = netlist.cells().iter().find_map(|cell| match cell {
         Ecp5Cell::BlockRam {
             name,
-            second_port: Some(_),
+            implementation: Ecp5MemoryImplementation::Block,
+            clock,
+            edge,
+            second_port: Some(second_port),
             ..
-        } => Some(name.clone()),
+        } if *clock != second_port.clock || *edge != second_port.edge => Some(name.clone()),
         _ => None,
     }) {
-        return Err(CeloxAdapterError::UnsupportedTrueDualPortMemory(name));
+        return Err(CeloxAdapterError::UnsupportedTrueDualPortMemoryClocking(
+            name,
+        ));
     }
     let bit_type = ValueType::bits(1)?;
     let mut builder = ModuleBuilder::new(netlist.name())?;
@@ -166,22 +175,14 @@ fn reserve_cell_output(
             None
         }
         Ecp5Cell::BlockRam {
-            name, read_data, ..
+            name,
+            read_data,
+            second_port,
+            ..
         } => {
-            let signal = builder.internal(
-                format!("__struo_{name}_read"),
-                ValueType::bits(read_data.len())?,
-            )?;
-            for (lsb, wire) in read_data.iter().enumerate() {
-                insert_wire(
-                    wires,
-                    Bit::Wire(*wire),
-                    WireRef {
-                        signal,
-                        lsb,
-                        signal_width: read_data.len(),
-                    },
-                )?;
+            reserve_block_ram_read_output(builder, wires, name, "a", read_data)?;
+            if let Some(second_port) = second_port {
+                reserve_block_ram_read_output(builder, wires, name, "b", &second_port.read_data)?;
             }
             None
         }
@@ -259,6 +260,31 @@ fn reserve_cell_output(
     };
     if let Some((wire, name)) = scalar {
         reserve_scalar(builder, wires, wire, name, bit_type)?;
+    }
+    Ok(())
+}
+
+fn reserve_block_ram_read_output(
+    builder: &mut ModuleBuilder,
+    wires: &mut BTreeMap<u32, WireRef>,
+    name: &str,
+    port: &str,
+    read_data: &[u32],
+) -> Result<(), CeloxAdapterError> {
+    let signal = builder.internal(
+        format!("__struo_{name}_read_{port}"),
+        ValueType::bits(read_data.len())?,
+    )?;
+    for (lsb, wire) in read_data.iter().enumerate() {
+        insert_wire(
+            wires,
+            Bit::Wire(*wire),
+            WireRef {
+                signal,
+                lsb,
+                signal_width: read_data.len(),
+            },
+        )?;
     }
     Ok(())
 }
@@ -361,39 +387,56 @@ fn emit_cell(
             read_enable,
             clock,
             edge,
-            second_port: _,
+            second_port,
             clock_enable: _,
         } => match implementation {
-            Ecp5MemoryImplementation::Block => emit_block_ram(
-                builder,
-                wires,
-                constants,
-                name,
-                *depth,
-                *word_width,
-                *physical_width,
-                **write_address,
-                write_data,
-                *write_enable,
-                **read_address,
-                read_data,
-                *read_enable,
-                *clock,
-                *edge,
-            ),
-            Ecp5MemoryImplementation::Distributed => emit_distributed_ram(
-                builder,
-                wires,
-                constants,
-                name,
-                **write_address,
-                write_data,
-                *write_enable,
-                **read_address,
-                read_data,
-                *clock,
-                *edge,
-            ),
+            Ecp5MemoryImplementation::Block => {
+                let second_port = second_port.as_ref().map(|port| BlockRamSecondPort {
+                    address: *port.address,
+                    write_data: &port.write_data,
+                    write_enable: port.write_enable,
+                    read_data: &port.read_data,
+                    read_enable: port.read_enable,
+                });
+                emit_block_ram(
+                    builder,
+                    wires,
+                    constants,
+                    name,
+                    *depth,
+                    *word_width,
+                    *physical_width,
+                    **write_address,
+                    write_data,
+                    *write_enable,
+                    **read_address,
+                    read_data,
+                    *read_enable,
+                    *clock,
+                    *edge,
+                    second_port,
+                )
+            }
+            Ecp5MemoryImplementation::Distributed => {
+                if second_port.is_some() {
+                    return Err(CeloxAdapterError::UnsupportedTrueDualPortMemory(
+                        name.clone(),
+                    ));
+                }
+                emit_distributed_ram(
+                    builder,
+                    wires,
+                    constants,
+                    name,
+                    **write_address,
+                    write_data,
+                    *write_enable,
+                    **read_address,
+                    read_data,
+                    *clock,
+                    *edge,
+                )
+            }
         },
         Ecp5Cell::TrellisIo {
             pad,
@@ -883,7 +926,7 @@ fn bits_expression(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn emit_block_ram(
     builder: &mut ModuleBuilder,
     wires: &BTreeMap<u32, WireRef>,
@@ -900,6 +943,7 @@ fn emit_block_ram(
     read_enable: Option<Control>,
     clock: Bit,
     edge: ClockEdge,
+    second_port: Option<BlockRamSecondPort<'_>>,
 ) -> Result<(), CeloxAdapterError> {
     let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1) as usize;
     let shift = match physical_width {
@@ -924,6 +968,34 @@ fn emit_block_ram(
     )?;
     let write_data = bits_expression(builder, wires, constants, write_data)?;
     let write_asserted = asserted_expression(builder, wires, constants, write_enable)?;
+    let second_port = second_port
+        .map(|port| {
+            let address = bits_expression(
+                builder,
+                wires,
+                constants,
+                &port.address[shift..shift + address_width],
+            )?;
+            let write_data = bits_expression(builder, wires, constants, port.write_data)?;
+            let write_asserted = asserted_expression(builder, wires, constants, port.write_enable)?;
+            Ok::<_, CeloxAdapterError>(BlockRamPortExpressions {
+                write_address: address,
+                write_data,
+                write_asserted,
+                read_address: address,
+                read_data: port.read_data,
+                read_enable: port.read_enable,
+            })
+        })
+        .transpose()?;
+    let first_port = BlockRamPortExpressions {
+        write_address,
+        write_data,
+        write_asserted,
+        read_address,
+        read_data,
+        read_enable,
+    };
     let word_type = ValueType::bits(usize::from(word_width))?;
     let one_bit = ValueType::bits(1)?;
     let clock = bit_signal(wires, constants, clock)?;
@@ -933,37 +1005,133 @@ fn emit_block_ram(
     };
     let zero_word = Constant::two_state(0u8, usize::from(word_width))?;
     let mut words = Vec::with_capacity(depth as usize);
+    let mut word_updates = Vec::with_capacity(depth as usize);
 
     for index in 0..depth {
         let signal = builder.internal(format!("__struo_{name}_word_{index}"), word_type)?;
         builder.set_initial(signal, zero_word.clone())?;
         let current = builder.read(signal)?;
         let address_constant = builder.constant(Constant::two_state(index, address_width)?);
-        let selected = builder.binary(
+        let selected_a = builder.binary(
             CeloxBinaryOp::Equal,
-            write_address,
+            first_port.write_address,
             address_constant,
             one_bit,
         )?;
-        let write = builder.binary(CeloxBinaryOp::LogicAnd, write_asserted, selected, one_bit)?;
-        let next = builder.mux(write, write_data, current)?;
-        builder.register(builder.whole(signal)?, next, clock, edge, None, None)?;
+        let write_a = builder.binary(
+            CeloxBinaryOp::LogicAnd,
+            first_port.write_asserted,
+            selected_a,
+            one_bit,
+        )?;
+        let mut next = builder.mux(write_a, first_port.write_data, current)?;
+        if let Some(second_port) = &second_port {
+            let address_constant = builder.constant(Constant::two_state(index, address_width)?);
+            let selected_b = builder.binary(
+                CeloxBinaryOp::Equal,
+                second_port.write_address,
+                address_constant,
+                one_bit,
+            )?;
+            let write_b = builder.binary(
+                CeloxBinaryOp::LogicAnd,
+                second_port.write_asserted,
+                selected_b,
+                one_bit,
+            )?;
+            // One register owns each word. Applying B last gives a stable
+            // simulation result for an otherwise target-specific collision.
+            next = builder.mux(write_b, second_port.write_data, next)?;
+        }
         words.push(current);
+        word_updates.push((signal, next));
     }
 
-    let mut selected = builder.constant(zero_word);
-    for (index, word) in (0..depth).zip(words) {
+    emit_block_ram_read_port(
+        builder,
+        wires,
+        constants,
+        &first_port,
+        &words,
+        depth,
+        address_width,
+        clock,
+        edge,
+        &zero_word,
+    )?;
+    if let Some(second_port) = &second_port {
+        emit_block_ram_read_port(
+            builder,
+            wires,
+            constants,
+            second_port,
+            &words,
+            depth,
+            address_width,
+            clock,
+            edge,
+            &zero_word,
+        )?;
+    }
+    // Celox SDK registers sharing an event are separate processes. Emit the
+    // read registers before the backing words so they sample the pre-edge word
+    // values, matching the DP16KD read-before-write contract modeled here.
+    for (signal, next) in word_updates {
+        builder.register(builder.whole(signal)?, next, clock, edge, None, None)?;
+    }
+    Ok(())
+}
+
+struct BlockRamSecondPort<'a> {
+    address: [Bit; 14],
+    write_data: &'a [Bit],
+    write_enable: Control,
+    read_data: &'a [u32],
+    read_enable: Option<Control>,
+}
+
+struct BlockRamPortExpressions<'a> {
+    write_address: ExprId,
+    write_data: ExprId,
+    write_asserted: ExprId,
+    read_address: ExprId,
+    read_data: &'a [u32],
+    read_enable: Option<Control>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_block_ram_read_port(
+    builder: &mut ModuleBuilder,
+    wires: &BTreeMap<u32, WireRef>,
+    constants: Constants,
+    port: &BlockRamPortExpressions<'_>,
+    words: &[ExprId],
+    depth: u32,
+    address_width: usize,
+    clock: SignalId,
+    edge: Edge,
+    zero_word: &Constant,
+) -> Result<(), CeloxAdapterError> {
+    let one_bit = ValueType::bits(1)?;
+    let zero = builder.constant(zero_word.clone());
+    let mut candidates = Vec::with_capacity(depth as usize);
+    for (index, word) in (0..depth).zip(words.iter().copied()) {
         let address_constant = builder.constant(Constant::two_state(index, address_width)?);
         let matches = builder.binary(
             CeloxBinaryOp::Equal,
-            read_address,
+            port.read_address,
             address_constant,
             one_bit,
         )?;
-        selected = builder.mux(matches, word, selected)?;
+        candidates.push(AddressMuxNode {
+            matched: matches,
+            value: word,
+        });
     }
-    let output = wire_ref(wires, read_data[0])?.signal;
-    let enable = read_enable
+    let selected = balanced_address_mux(builder, candidates, zero, one_bit)?;
+    let output = wire_ref(wires, port.read_data[0])?.signal;
+    let enable = port
+        .read_enable
         .map(|enable| {
             bit_signal(wires, constants, enable.signal)
                 .and_then(|signal| Ok(builder.enable(signal, active_level(enable.active))?))
@@ -971,6 +1139,41 @@ fn emit_block_ram(
         .transpose()?;
     builder.register(builder.whole(output)?, selected, clock, edge, None, enable)?;
     Ok(())
+}
+
+struct AddressMuxNode {
+    matched: ExprId,
+    value: ExprId,
+}
+
+fn balanced_address_mux(
+    builder: &mut ModuleBuilder,
+    mut level: Vec<AddressMuxNode>,
+    zero: ExprId,
+    one_bit: ValueType,
+) -> Result<ExprId, CeloxAdapterError> {
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut nodes = level.into_iter();
+        while let Some(left) = nodes.next() {
+            let Some(right) = nodes.next() else {
+                next.push(left);
+                break;
+            };
+            let matched =
+                builder.binary(CeloxBinaryOp::LogicOr, left.matched, right.matched, one_bit)?;
+            // The original linear chain gave the later address candidate
+            // priority. Retain that deterministic behavior if malformed
+            // inputs ever make two mutually-exclusive address matches true.
+            let value = builder.mux(right.matched, right.value, left.value)?;
+            next.push(AddressMuxNode { matched, value });
+        }
+        level = next;
+    }
+    let Some(root) = level.pop() else {
+        return Ok(zero);
+    };
+    Ok(builder.mux(root.matched, root.value, zero)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1043,8 +1246,11 @@ pub enum CeloxAdapterError {
     MissingWire(u32),
     /// A register control references one bit within a vector signal.
     NonScalarControl(u32),
-    /// The cycle-level Celox adapter cannot represent two independent clocks.
+    /// A true-dual-port shape cannot be represented by this adapter.
     UnsupportedTrueDualPortMemory(String),
+    /// The cycle-level Celox adapter cannot represent two independent clocks
+    /// or active edges for one memory.
+    UnsupportedTrueDualPortMemoryClocking(String),
 }
 
 impl Display for CeloxAdapterError {
@@ -1063,6 +1269,10 @@ impl Display for CeloxAdapterError {
                 formatter,
                 "mapped true-dual-port memory `{memory}` is not supported by the Celox adapter"
             ),
+            Self::UnsupportedTrueDualPortMemoryClocking(memory) => write!(
+                formatter,
+                "mapped true-dual-port memory `{memory}` uses independent clocks or active edges; the Celox adapter requires one shared clock and edge"
+            ),
         }
     }
 }
@@ -1074,7 +1284,8 @@ impl Error for CeloxAdapterError {
             Self::DuplicateWire(_)
             | Self::MissingWire(_)
             | Self::NonScalarControl(_)
-            | Self::UnsupportedTrueDualPortMemory(_) => None,
+            | Self::UnsupportedTrueDualPortMemory(_)
+            | Self::UnsupportedTrueDualPortMemoryClocking(_) => None,
         }
     }
 }
@@ -1099,8 +1310,8 @@ mod tests {
     };
     use struo_synth::synthesize;
     use struo_target_ecp5::{
-        ArithmeticMapping, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding, PllOutput,
-        map_to_ecp5, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
+        ArithmeticMapping, Ecp5Netlist, JtaggBinding, MappingOptions, OpenDrainIo, PllBinding,
+        PllOutput, map_to_ecp5, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
         map_to_ecp5_with_options, map_to_ecp5_with_pll,
     };
 
@@ -1112,6 +1323,57 @@ mod tests {
             signed: false,
             state: StateDomain::TwoState,
         }
+    }
+
+    fn mapped_same_clock_true_dual_port_block_ram(depth: u32, word_width: u32) -> Ecp5Netlist {
+        let mut source = Netlist::new("true_dual_port");
+        let clock = source.add_input("clock");
+        let read_enable_a = source.add_input("read_enable_a");
+        let read_enable_b = source.add_input("read_enable_b");
+        let write_enable_a = source.add_input("write_enable_a");
+        let write_enable_b = source.add_input("write_enable_b");
+        let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1);
+        let address_a = source.add_input_port("address_a", NonZeroU32::new(address_width).unwrap());
+        let address_b = source.add_input_port("address_b", NonZeroU32::new(address_width).unwrap());
+        let write_a = source.add_input_port("write_a", NonZeroU32::new(word_width).unwrap());
+        let write_b = source.add_input_port("write_b", NonZeroU32::new(word_width).unwrap());
+        let read_a = (0..word_width)
+            .map(|bit| source.add_memory_output(format!("read_a_{bit}")))
+            .collect::<Vec<_>>();
+        let read_b = (0..word_width)
+            .map(|bit| source.add_memory_output(format!("read_b_{bit}")))
+            .collect::<Vec<_>>();
+        let active_high = |signal| EnableControl {
+            signal,
+            active: ActiveLevel::High,
+        };
+        source.add_memory(
+            MemoryCell::new(
+                "words",
+                depth,
+                address_a.clone(),
+                read_a.clone(),
+                Some(active_high(read_enable_a)),
+                address_a,
+                write_a,
+                active_high(write_enable_a),
+                clock,
+                ClockEdge::Rising,
+            )
+            .with_second_port(MemoryPort::new(
+                address_b.clone(),
+                read_b.clone(),
+                Some(active_high(read_enable_b)),
+                address_b,
+                write_b,
+                active_high(write_enable_b),
+                clock,
+                ClockEdge::Rising,
+            )),
+        );
+        source.add_output_port("read_a", &read_a).unwrap();
+        source.add_output_port("read_b", &read_b).unwrap();
+        map_to_ecp5(&source).unwrap()
     }
 
     #[test]
@@ -1596,6 +1858,142 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn simulates_same_clock_true_dual_port_block_ram() {
+        let mapped = mapped_same_clock_true_dual_port_block_ram(4, 8);
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        let clock = simulator.event("clock");
+        let read_enable_a = simulator.signal("read_enable_a");
+        let read_enable_b = simulator.signal("read_enable_b");
+        let write_enable_a = simulator.signal("write_enable_a");
+        let write_enable_b = simulator.signal("write_enable_b");
+        let address_a = simulator.signal("address_a");
+        let address_b = simulator.signal("address_b");
+        let write_a = simulator.signal("write_a");
+        let write_b = simulator.signal("write_b");
+        let read_a = simulator.signal("read_a");
+        let read_b = simulator.signal("read_b");
+
+        simulator
+            .modify(|io| {
+                io.set(read_enable_a, 1u8);
+                io.set(read_enable_b, 1u8);
+                io.set(write_enable_a, 1u8);
+                io.set(write_enable_b, 1u8);
+                io.set(address_a, 1u8);
+                io.set(address_b, 2u8);
+                io.set(write_a, 0x11u8);
+                io.set(write_b, 0x22u8);
+            })
+            .unwrap();
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(read_a), 0u8.into());
+        assert_eq!(simulator.get(read_b), 0u8.into());
+
+        simulator
+            .modify(|io| {
+                io.set(write_enable_a, 0u8);
+                io.set(write_enable_b, 0u8);
+            })
+            .unwrap();
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(read_a), 0x11u8.into());
+        assert_eq!(simulator.get(read_b), 0x22u8.into());
+
+        simulator
+            .modify(|io| {
+                io.set(read_enable_a, 0u8);
+                io.set(read_enable_b, 1u8);
+                io.set(address_a, 0u8);
+                io.set(address_b, 0u8);
+            })
+            .unwrap();
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(read_a), 0x11u8.into());
+        assert_eq!(simulator.get(read_b), 0u8.into());
+
+        simulator
+            .modify(|io| {
+                io.set(read_enable_a, 1u8);
+                io.set(read_enable_b, 1u8);
+                io.set(write_enable_a, 1u8);
+                io.set(write_enable_b, 1u8);
+                io.set(address_a, 3u8);
+                io.set(address_b, 3u8);
+                io.set(write_a, 0x33u8);
+                io.set(write_b, 0x44u8);
+            })
+            .unwrap();
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(read_a), 0u8.into());
+        assert_eq!(simulator.get(read_b), 0u8.into());
+
+        simulator
+            .modify(|io| {
+                io.set(write_enable_a, 0u8);
+                io.set(write_enable_b, 0u8);
+            })
+            .unwrap();
+        simulator.tick(clock).unwrap();
+        assert_eq!(simulator.get(read_a), 0x44u8.into());
+        assert_eq!(simulator.get(read_b), 0x44u8.into());
+    }
+
+    #[test]
+    fn simulates_512_by_16_same_clock_true_dual_port_block_ram() {
+        // The former 512-deep linear read mux overflowed this deliberately
+        // bounded stack during Celox optimization. Keep the scale test on the
+        // same explicit budget so a linear-chain regression fails directly.
+        std::thread::Builder::new()
+            .name("celox-tdp-512-regression".into())
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mapped = mapped_same_clock_true_dual_port_block_ram(512, 16);
+                let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+                let clock = simulator.event("clock");
+                let read_enable_a = simulator.signal("read_enable_a");
+                let read_enable_b = simulator.signal("read_enable_b");
+                let write_enable_a = simulator.signal("write_enable_a");
+                let write_enable_b = simulator.signal("write_enable_b");
+                let address_a = simulator.signal("address_a");
+                let address_b = simulator.signal("address_b");
+                let write_a = simulator.signal("write_a");
+                let write_b = simulator.signal("write_b");
+                let read_a = simulator.signal("read_a");
+                let read_b = simulator.signal("read_b");
+
+                simulator
+                    .modify(|io| {
+                        io.set(read_enable_a, 1u8);
+                        io.set(read_enable_b, 1u8);
+                        io.set(write_enable_a, 1u8);
+                        io.set(write_enable_b, 1u8);
+                        io.set(address_a, 7u16);
+                        io.set(address_b, 511u16);
+                        io.set(write_a, 0x1234u16);
+                        io.set(write_b, 0xabcdu16);
+                    })
+                    .unwrap();
+                simulator.tick(clock).unwrap();
+                assert_eq!(simulator.get(read_a), 0u16.into());
+                assert_eq!(simulator.get(read_b), 0u16.into());
+
+                simulator
+                    .modify(|io| {
+                        io.set(write_enable_a, 0u8);
+                        io.set(write_enable_b, 0u8);
+                    })
+                    .unwrap();
+                simulator.tick(clock).unwrap();
+                assert_eq!(simulator.get(read_a), 0x1234u16.into());
+                assert_eq!(simulator.get(read_b), 0xabcdu16.into());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn emits_trellis_ff_with_async_reset() {
         let mut source = Netlist::new("state_bit");
         let clock = source.add_input("clock");
@@ -1757,7 +2155,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_true_dual_port_memory_instead_of_ignoring_its_second_port() {
+    fn rejects_independently_clocked_true_dual_port_memory() {
         let mut source = Netlist::new("true_dual_port");
         let clock_a = source.add_input("clock_a");
         let clock_b = source.add_input("clock_b");
@@ -1794,6 +2192,57 @@ mod tests {
                 write_b,
                 active_high(enable_b),
                 clock_b,
+                ClockEdge::Rising,
+            )),
+        );
+        source.add_output_port("read_a", &read_a).unwrap();
+        source.add_output_port("read_b", &read_b).unwrap();
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        assert!(matches!(
+            ecp5_frontend_artifact(&mapped),
+            Err(CeloxAdapterError::UnsupportedTrueDualPortMemoryClocking(memory))
+                if memory == "bram_words"
+        ));
+    }
+
+    #[test]
+    fn rejects_opposite_edge_true_dual_port_memory() {
+        let mut source = Netlist::new("true_dual_port");
+        let clock = source.add_input("clock");
+        let enable_a = source.add_input("enable_a");
+        let enable_b = source.add_input("enable_b");
+        let address_a = vec![source.add_input("address_a")];
+        let address_b = vec![source.add_input("address_b")];
+        let write_a = vec![source.add_input("write_a")];
+        let write_b = vec![source.add_input("write_b")];
+        let read_a = vec![source.add_memory_output("read_a")];
+        let read_b = vec![source.add_memory_output("read_b")];
+        let active_high = |signal| EnableControl {
+            signal,
+            active: ActiveLevel::High,
+        };
+        source.add_memory(
+            MemoryCell::new(
+                "words",
+                2,
+                address_a.clone(),
+                read_a.clone(),
+                None,
+                address_a,
+                write_a,
+                active_high(enable_a),
+                clock,
+                ClockEdge::Rising,
+            )
+            .with_second_port(MemoryPort::new(
+                address_b.clone(),
+                read_b.clone(),
+                None,
+                address_b,
+                write_b,
+                active_high(enable_b),
+                clock,
                 ClockEdge::Falling,
             )),
         );
@@ -1803,7 +2252,7 @@ mod tests {
         let mapped = map_to_ecp5(&source).unwrap();
         assert!(matches!(
             ecp5_frontend_artifact(&mapped),
-            Err(CeloxAdapterError::UnsupportedTrueDualPortMemory(memory))
+            Err(CeloxAdapterError::UnsupportedTrueDualPortMemoryClocking(memory))
                 if memory == "bram_words"
         ));
     }
