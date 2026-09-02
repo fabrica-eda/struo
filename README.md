@@ -542,9 +542,13 @@ chunks, so `logic [128]` maps to eight distributed-RAM primitives instead of
 
 Memory reset, initial contents, byte enables, unsupported port shapes, and
 defined same-address collision behavior remain unsupported and fail instead of
-silently changing the requested memory type. The post-map Celox adapter
-currently rejects independently clocked true-dual-port block memories; the ECP5
-nextpnr exporter supports them directly.
+silently changing the requested memory type. The post-map Celox adapter models
+true-dual-port block memories when both ports share one clock and active edge.
+Its registered outputs use read-before-write behavior, and port B wins a
+simultaneous same-word write collision deterministically; this is a simulation
+convention, not a hardware guarantee. Independently clocked or opposite-edge
+ports remain unsupported by Celox, while the ECP5 nextpnr exporter supports
+them directly.
 
 Inference intent can be attached to an unpacked array with Veryl's portable
 SystemVerilog-attribute escape. `block` and `distributed` select a physical
