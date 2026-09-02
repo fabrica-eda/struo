@@ -2617,37 +2617,72 @@ fn map_to_ecp5_with_period(
     map_dedicated_wide_muxes(&mut conservative);
     let wide_profile = mapped_lut_profile(&wide);
     let conservative_profile = mapped_lut_profile(&conservative);
-    let (mut selected, mapped_original_profile, retime_conservative) =
-        if mapping_profile_key(&conservative, &conservative_profile)
-            < mapping_profile_key(&wide, &wide_profile)
-        {
-            (conservative, conservative_profile, true)
-        } else {
-            (wide, wide_profile, false)
-        };
-    let original_registers = netlist.registers().len();
+    let wide_score = mapping_candidate_score(&wide, &wide_profile);
+    let conservative_score = mapping_candidate_score(&conservative, &conservative_profile);
+    // The conservative cover is the resource reference for every alternative.
+    // A timing-goal boundary must not turn an otherwise identical request into
+    // an arbitrarily larger netlist, so even the sole goal-closing candidate
+    // remains subject to the same explicit growth envelope.
+    let select_wide = mapping_candidate_is_selected(
+        wide_score,
+        conservative_score,
+        conservative_score,
+        period_ps,
+    );
+    let (
+        mut selected,
+        mut mapped_original_profile,
+        mut mapped_original_registers,
+        mut selected_registers,
+    ) = if select_wide {
+        (
+            wide,
+            wide_profile,
+            wide_score.registers,
+            wide_score.registers,
+        )
+    } else {
+        (
+            conservative,
+            conservative_profile.clone(),
+            conservative_score.registers,
+            conservative_score.registers,
+        )
+    };
+    let retiming_original_registers = mapped_register_count(&narrow);
     let original_cells = narrow.cells.len();
-    let mut selected_registers = original_registers;
     let mut applied = false;
-    if let Some(mut retimed) = retime_conservative
-        .then(|| {
-            automatically_retime_mapped_luts(
-                &narrow,
-                original_cells,
-                original_registers,
-                retiming_target_period_ps,
-            )
-        })
-        .flatten()
-        .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
+    // The retimed conservative cover is a third mapping candidate, not a
+    // follow-up available only when the unretimed conservative cover already
+    // won.  Otherwise a one-picosecond wide-cover advantage can suppress a
+    // smaller retimed candidate before it is even evaluated.
+    if let Some(mut retimed) = automatically_retime_mapped_luts(
+        &narrow,
+        original_cells,
+        retiming_original_registers,
+        retiming_target_period_ps,
+    )
+    .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
     {
         split_branched_carry_outs(&mut retimed);
         map_dedicated_wide_muxes(&mut retimed);
         let retimed_profile = mapped_lut_profile(&retimed);
-        if mapping_profile_key(&retimed, &retimed_profile)
-            < mapping_profile_key(&selected, &mapped_original_profile)
-        {
-            selected_registers = mapped_register_count(&retimed);
+        let retimed_score = mapping_candidate_score(&retimed, &retimed_profile);
+        let selected_profile = mapped_lut_profile(&selected);
+        let selected_score = mapping_candidate_score(&selected, &selected_profile);
+        if mapping_candidate_is_selected(
+            retimed_score,
+            selected_score,
+            conservative_score,
+            period_ps,
+        ) {
+            selected_registers = retimed_score.registers;
+            // The transformation certificate and move counters describe a
+            // retiming trajectory rooted in the conservative narrow cover.
+            // Report that same cover as the pre-retiming timing baseline even
+            // when the wide cover happened to win the initial comparison.
+            mapped_original_profile = conservative_profile;
+            mapped_original_registers = conservative_score.registers;
             selected = retimed;
             applied = true;
         }
@@ -2664,7 +2699,7 @@ fn map_to_ecp5_with_period(
         selected_period_ps: mapped_selected_profile.data_period_ps,
         original_overall_period_ps: mapped_original_profile.overall_period_ps,
         selected_overall_period_ps: mapped_selected_profile.overall_period_ps,
-        original_registers,
+        original_registers: mapped_original_registers,
         selected_registers,
         certified_primitive_moves: selected.equivalence_proof.certified_primitive_moves,
         equivalent_register_merges: selected.equivalence_proof.equivalent_register_merges,
@@ -2678,12 +2713,109 @@ fn map_to_ecp5_with_period(
     Ok(selected)
 }
 
-fn mapping_profile_key(netlist: &Ecp5Netlist, profile: &MappedLutProfile) -> (u32, u32, usize) {
-    (
-        profile.overall_period_ps,
-        profile.data_period_ps,
-        mapped_comb_count(netlist),
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MappingCandidateScore {
+    overall_period_ps: u32,
+    data_period_ps: u32,
+    logic_slices: usize,
+    registers: usize,
+    emitted_comb: usize,
+    cells: usize,
+}
+
+impl MappingCandidateScore {
+    fn meets(self, target_period_ps: u32) -> bool {
+        self.overall_period_ps <= target_period_ps
+    }
+
+    fn area_key(self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.logic_slices.saturating_add(self.registers),
+            self.emitted_comb,
+            self.cells,
+            self.logic_slices.max(self.registers),
+            self.logic_slices,
+            self.registers,
+        )
+    }
+}
+
+fn mapping_candidate_score(
+    netlist: &Ecp5Netlist,
+    profile: &MappedLutProfile,
+) -> MappingCandidateScore {
+    MappingCandidateScore {
+        overall_period_ps: profile.overall_period_ps,
+        data_period_ps: profile.data_period_ps,
+        logic_slices: mapped_logic_slice_count(netlist),
+        registers: mapped_register_count(netlist),
+        emitted_comb: mapped_emitted_comb_count(netlist),
+        cells: netlist.cells.len(),
+    }
+}
+
+fn mapping_candidate_is_better(
+    candidate: MappingCandidateScore,
+    incumbent: MappingCandidateScore,
+    target_period_ps: u32,
+) -> bool {
+    match (
+        candidate.meets(target_period_ps),
+        incumbent.meets(target_period_ps),
+    ) {
+        (true, false) => true,
+        (false, true) => false,
+        // Once both covers close the requested period, spend no additional
+        // area merely to accumulate mapper-estimated slack.
+        (true, true) => {
+            (
+                candidate.area_key(),
+                candidate.overall_period_ps,
+                candidate.data_period_ps,
+            ) < (
+                incumbent.area_key(),
+                incumbent.overall_period_ps,
+                incumbent.data_period_ps,
+            )
+        }
+        // If neither closes, timing remains the primary objective after the
+        // caller has enforced the bounded-growth admission rule.
+        (false, false) => {
+            (
+                candidate.overall_period_ps,
+                candidate.data_period_ps,
+                candidate.area_key(),
+            ) < (
+                incumbent.overall_period_ps,
+                incumbent.data_period_ps,
+                incumbent.area_key(),
+            )
+        }
+    }
+}
+
+fn mapping_growth_limit(count: usize) -> usize {
+    count + count.div_ceil(4) + 32
+}
+
+fn mapping_growth_is_bounded(
+    reference: MappingCandidateScore,
+    candidate: MappingCandidateScore,
+) -> bool {
+    candidate.logic_slices <= mapping_growth_limit(reference.logic_slices)
+        && candidate.registers <= mapping_growth_limit(reference.registers)
+        && candidate.emitted_comb <= mapping_growth_limit(reference.emitted_comb)
+        && candidate.cells <= mapping_growth_limit(reference.cells)
+}
+
+fn mapping_candidate_is_selected(
+    candidate: MappingCandidateScore,
+    incumbent: MappingCandidateScore,
+    resource_reference: MappingCandidateScore,
+    target_period_ps: u32,
+) -> bool {
+    mapping_growth_is_bounded(resource_reference, candidate)
+        && mapping_candidate_is_better(candidate, incumbent, target_period_ps)
 }
 
 /// Replace LUT4s which are exactly 2:1 muxes with the ECP5 hard wide-LUT
@@ -2982,8 +3114,10 @@ fn automatically_retime_mapped_luts(
     // grow LUTs enormously while keeping cells and registers inside their
     // caps, and the routing-burden term alone does not catch that (splitting
     // one loaded net into many cheap ones lowers the burden).
-    let original_comb = mapped_comb_count(original);
-    let comb_limit = original_comb + original_comb.div_ceil(4) + 32;
+    let original_comb = mapped_logic_slice_count(original);
+    let comb_limit = mapping_growth_limit(original_comb);
+    let original_emitted_comb = mapped_emitted_comb_count(original);
+    let emitted_comb_limit = mapping_growth_limit(original_emitted_comb);
     let mut control_candidate =
         replicate_high_fanout_enable_luts(original, MAX_ENABLE_FANOUT_PER_REPLICA);
     split_branched_carry_outs(&mut control_candidate);
@@ -2995,7 +3129,8 @@ fn automatically_retime_mapped_luts(
         maximum_replicable_enable_fanout(&control_candidate, MAX_ENABLE_FANOUT_PER_REPLICA);
     let use_control = control_candidate.cells.len() <= cell_limit
         && control_registers <= register_limit
-        && mapped_comb_count(&control_candidate) <= comb_limit
+        && mapped_logic_slice_count(&control_candidate) <= comb_limit
+        && mapped_emitted_comb_count(&control_candidate) <= emitted_comb_limit
         && adjusted_overall(&control_profile, &control_candidate)
             <= original_profile.overall_period_ps
         && (retiming_score(
@@ -3022,7 +3157,8 @@ fn automatically_retime_mapped_luts(
     let forward_registers = mapped_register_count(&forward_candidate);
     let use_forward = forward_candidate.cells.len() <= cell_limit
         && forward_registers <= register_limit
-        && mapped_comb_count(&forward_candidate) <= comb_limit
+        && mapped_logic_slice_count(&forward_candidate) <= comb_limit
+        && mapped_emitted_comb_count(&forward_candidate) <= emitted_comb_limit
         && adjusted_overall(&forward_profile, &forward_candidate)
             <= original_profile.overall_period_ps
         && retiming_score(
@@ -3091,7 +3227,8 @@ fn automatically_retime_mapped_luts(
                     || candidate_overall > original_profile.overall_period_ps
                     || candidate.cells.len() > cell_limit
                     || candidate_registers > register_limit
-                    || mapped_comb_count(&candidate) > comb_limit
+                    || mapped_logic_slice_count(&candidate) > comb_limit
+                    || mapped_emitted_comb_count(&candidate) > emitted_comb_limit
                 {
                     continue;
                 }
@@ -3148,6 +3285,8 @@ fn automatically_retime_mapped_luts(
                 && candidate_profile.overall_period_ps <= original_profile.overall_period_ps
                 && candidate.cells.len() <= cell_limit
                 && candidate_registers <= register_limit
+                && mapped_logic_slice_count(&candidate) <= comb_limit
+                && mapped_emitted_comb_count(&candidate) <= emitted_comb_limit
                 && carry_outs_are_point_to_point(&candidate)
             {
                 batch = candidate;
@@ -3195,6 +3334,8 @@ fn automatically_retime_mapped_luts(
                         <= original_profile.overall_period_ps
                         && candidate.cells.len() <= cell_limit
                         && candidate_registers <= register_limit
+                        && mapped_logic_slice_count(&candidate) <= comb_limit
+                        && mapped_emitted_comb_count(&candidate) <= emitted_comb_limit
                     {
                         ccu_batch = candidate;
                         ccu_moves += 1;
@@ -3287,6 +3428,8 @@ fn automatically_retime_mapped_luts(
     let best_profile = mapped_lut_profile(&best_seen);
     let replicated_profile = mapped_lut_profile(&replicated);
     if replicated.cells.len() <= cell_limit
+        && mapped_logic_slice_count(&replicated) <= comb_limit
+        && mapped_emitted_comb_count(&replicated) <= emitted_comb_limit
         && mapped_register_count(&replicated) <= register_limit
         && replicated_profile.overall_period_ps <= best_profile.overall_period_ps
         && maximum_replicable_enable_fanout(&replicated, MAX_ENABLE_FANOUT_PER_REPLICA)
@@ -3365,11 +3508,33 @@ fn retiming_score(
     }
 }
 
-fn mapped_comb_count(netlist: &Ecp5Netlist) -> usize {
+fn mapped_logic_slice_count(netlist: &Ecp5Netlist) -> usize {
     netlist
         .cells
         .iter()
-        .filter(|cell| matches!(cell, Ecp5Cell::Lut4 { .. } | Ecp5Cell::Ccu2c { .. }))
+        .map(|cell| match cell {
+            Ecp5Cell::Lut4 { .. } => 1,
+            // CCU2C contains two LUT/carry slices and therefore consumes two
+            // logic-function slots even though it is one emitted primitive.
+            Ecp5Cell::Ccu2c { .. } => 2,
+            _ => 0,
+        })
+        .sum()
+}
+
+fn mapped_emitted_comb_count(netlist: &Ecp5Netlist) -> usize {
+    netlist
+        .cells
+        .iter()
+        .filter(|cell| {
+            matches!(
+                cell,
+                Ecp5Cell::Lut4 { .. }
+                    | Ecp5Cell::PfuMux { .. }
+                    | Ecp5Cell::L6Mux21 { .. }
+                    | Ecp5Cell::Ccu2c { .. }
+            )
+        })
         .count()
 }
 
@@ -3914,6 +4079,7 @@ fn register_data_is_driven_by_ccu(netlist: &Ecp5Netlist, register_index: usize) 
         .any(|cell| matches!(cell, Ecp5Cell::Ccu2c { .. }) && cell_output_bits(cell).contains(data))
 }
 
+#[derive(Clone)]
 struct MappedLutProfile {
     data_depth: usize,
     critical_depth: Vec<usize>,
@@ -8550,20 +8716,157 @@ mod tests {
 
     use super::{
         ArithmeticMapping, Bit, Ecp5Cell, Ecp5Netlist, IoTimingConstraints, JtaggBinding,
-        MappedLutProfile, MappedPort, MappingOptions, NextpnrJsonError, OocTimingConstraints,
-        OpenDrainIo, PllBinding, PllOutput, PortDirection, RegisterEnableFanoutConstraint,
-        RegisterEnableFanoutError, RegisterEnableFanoutReport, ResolvedIoTiming,
-        TimingClockConstraint, TimingConstraints, TimingPathConstraint, backward_retime_ccu2c,
-        backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names, forward_retime_ccu2c,
-        forward_retime_lut, map_dedicated_wide_muxes, map_once, map_to_ecp5, map_to_ecp5_ooc,
-        map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg, map_to_ecp5_with_open_drain_ios,
-        map_to_ecp5_with_options, map_to_ecp5_with_pll, map_to_ecp5_with_timing_constraints,
-        mapped_cell_name, mapped_wire_fanout, merge_equivalent_flip_flops,
+        MappedLutProfile, MappedPort, MappingCandidateScore, MappingOptions, NextpnrJsonError,
+        OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput, PortDirection,
+        RegisterEnableFanoutConstraint, RegisterEnableFanoutError, RegisterEnableFanoutReport,
+        ResolvedIoTiming, TimingClockConstraint, TimingConstraints, TimingPathConstraint,
+        backward_retime_ccu2c, backward_retime_lut, carry_outs_are_point_to_point, ccu_chain_names,
+        forward_retime_ccu2c, forward_retime_lut, map_dedicated_wide_muxes, map_once, map_to_ecp5,
+        map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
+        map_to_ecp5_with_open_drain_ios, map_to_ecp5_with_options, map_to_ecp5_with_pll,
+        map_to_ecp5_with_timing_constraints, mapped_cell_name, mapped_emitted_comb_count,
+        mapped_logic_slice_count, mapped_wire_fanout, mapping_candidate_is_better,
+        mapping_candidate_is_selected, mapping_growth_is_bounded, merge_equivalent_flip_flops,
         physical_bel_is_compatible, physical_feedback_matches_netlist,
         replicate_high_fanout_enable_luts, retiming_score, split_branched_carry_outs,
         verify_mapped_equivalence_proof,
     };
     use crate::{PhysicalFeedback, PhysicalLocation, PhysicalNetTiming, PhysicalTimingEndpoint};
+
+    #[test]
+    fn mapping_candidate_rejects_unbounded_one_picosecond_wide_win() {
+        let conservative = MappingCandidateScore {
+            overall_period_ps: 8_501,
+            data_period_ps: 8_501,
+            logic_slices: 10_000,
+            registers: 4_000,
+            emitted_comb: 12_000,
+            cells: 18_000,
+        };
+        let wide = MappingCandidateScore {
+            overall_period_ps: 8_500,
+            data_period_ps: 8_500,
+            logic_slices: 35_000,
+            registers: 4_000,
+            emitted_comb: 60_000,
+            cells: 65_000,
+        };
+
+        assert!(mapping_candidate_is_better(wide, conservative, 8_000));
+        assert!(!mapping_growth_is_bounded(conservative, wide));
+        assert!(!mapping_candidate_is_selected(
+            wide,
+            conservative,
+            conservative,
+            8_000
+        ));
+    }
+
+    #[test]
+    fn sole_goal_closing_candidate_still_respects_growth_bound() {
+        let conservative = MappingCandidateScore {
+            overall_period_ps: 8_001,
+            data_period_ps: 8_001,
+            logic_slices: 10_000,
+            registers: 4_000,
+            emitted_comb: 12_000,
+            cells: 18_000,
+        };
+        let wide = MappingCandidateScore {
+            overall_period_ps: 8_000,
+            data_period_ps: 8_000,
+            logic_slices: 35_000,
+            registers: 4_000,
+            emitted_comb: 60_000,
+            cells: 65_000,
+        };
+
+        assert!(mapping_candidate_is_better(wide, conservative, 8_000));
+        assert!(!mapping_growth_is_bounded(conservative, wide));
+        assert!(wide.meets(8_000));
+        assert!(!conservative.meets(8_000));
+        assert!(!mapping_candidate_is_selected(
+            wide,
+            conservative,
+            conservative,
+            8_000
+        ));
+    }
+
+    #[test]
+    fn bounded_goal_closing_candidate_keeps_timing_priority() {
+        let conservative = MappingCandidateScore {
+            overall_period_ps: 8_001,
+            data_period_ps: 8_001,
+            logic_slices: 10_000,
+            registers: 4_000,
+            emitted_comb: 12_000,
+            cells: 18_000,
+        };
+        let candidate = MappingCandidateScore {
+            overall_period_ps: 8_000,
+            data_period_ps: 8_000,
+            logic_slices: 12_000,
+            registers: 4_500,
+            emitted_comb: 14_000,
+            cells: 22_000,
+        };
+
+        assert!(mapping_growth_is_bounded(conservative, candidate));
+        assert!(mapping_candidate_is_selected(
+            candidate,
+            conservative,
+            conservative,
+            8_000
+        ));
+    }
+
+    #[test]
+    fn closed_candidates_prefer_area_over_unused_slack() {
+        let conservative = MappingCandidateScore {
+            overall_period_ps: 7_900,
+            data_period_ps: 7_900,
+            logic_slices: 10_000,
+            registers: 4_000,
+            emitted_comb: 12_000,
+            cells: 18_000,
+        };
+        let wide = MappingCandidateScore {
+            overall_period_ps: 7_500,
+            data_period_ps: 7_500,
+            logic_slices: 11_000,
+            registers: 4_000,
+            emitted_comb: 15_000,
+            cells: 22_000,
+        };
+
+        assert!(!mapping_candidate_is_better(wide, conservative, 8_000));
+        assert!(mapping_candidate_is_better(conservative, wide, 8_000));
+    }
+
+    #[test]
+    fn closed_candidates_do_not_trade_many_registers_for_one_lut() {
+        let conservative = MappingCandidateScore {
+            overall_period_ps: 7_900,
+            data_period_ps: 7_900,
+            logic_slices: 10_000,
+            registers: 4_000,
+            emitted_comb: 12_000,
+            cells: 18_000,
+        };
+        let retimed = MappingCandidateScore {
+            overall_period_ps: 7_500,
+            data_period_ps: 7_500,
+            logic_slices: 9_999,
+            registers: 4_800,
+            emitted_comb: 11_999,
+            cells: 18_799,
+        };
+
+        assert!(mapping_growth_is_bounded(conservative, retimed));
+        assert!(!mapping_candidate_is_better(retimed, conservative, 8_000));
+        assert!(mapping_candidate_is_better(conservative, retimed, 8_000));
+    }
 
     fn arithmetic_netlist(width: u32, operation: ArithmeticOp) -> Netlist {
         let mut source = Netlist::new("arithmetic");
@@ -8892,7 +9195,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_lut_cover_can_make_retiming_unnecessary() {
+    fn closed_mapping_keeps_the_smaller_unretimed_cover() {
         let mut source = Netlist::new("retimed_lut_chain");
         let clock = source.add_input("clock");
         let reset = source.add_input("reset");
@@ -8942,8 +9245,8 @@ mod tests {
 
         assert!(!mapped.retiming().applied, "{:?}", mapped.retiming());
         assert!(mapped.retiming().equivalence_signed_off);
-        assert_eq!(mapped.retiming().original_lut_depth, 2);
-        assert_eq!(mapped.retiming().selected_lut_depth, 2);
+        assert_eq!(mapped.retiming().original_lut_depth, 3);
+        assert_eq!(mapped.retiming().selected_lut_depth, 3);
     }
 
     #[test]
@@ -9279,6 +9582,94 @@ mod tests {
             };
             mapped_wire_fanout(&replicated, wire) <= 5
         }));
+    }
+
+    #[test]
+    fn selected_control_retiming_reports_its_mapped_baseline() {
+        let mut source = Netlist::new("selected_control_retiming");
+        let clock = source.add_input("clock");
+        let reset = source.add_input("reset");
+        let enable_lhs = source.add_input("enable_lhs");
+        let enable_rhs = source.add_input("enable_rhs");
+        let data = source.add_constant(true);
+        let reset_control = ResetControl {
+            signal: reset,
+            active: ActiveLevel::High,
+            asynchronous: true,
+            value: false,
+        };
+        let register_input = |source: &mut Netlist, name: &str, input| {
+            let output = source.add_register_output(name);
+            source.add_register(RegisterCell::new(
+                name,
+                output,
+                input,
+                clock,
+                ClockEdge::Rising,
+                None,
+                Some(reset_control),
+            ));
+            output
+        };
+        let left_q = register_input(&mut source, "enable_lhs_q", enable_lhs);
+        let right_q = register_input(&mut source, "enable_rhs_q", enable_rhs);
+        for (name, input) in [
+            ("enable_lhs_tap0", left_q),
+            ("enable_lhs_tap1", left_q),
+            ("enable_rhs_tap0", right_q),
+            ("enable_rhs_tap1", right_q),
+        ] {
+            let output = register_input(&mut source, name, input);
+            source.add_output(name, output);
+        }
+        let enable = source.add_and(left_q, right_q);
+        for index in 0..32 {
+            let name = format!("value{index}");
+            let output = source.add_register_output(&name);
+            source.add_register(RegisterCell::new(
+                name,
+                output,
+                data,
+                clock,
+                ClockEdge::Rising,
+                Some(EnableControl {
+                    signal: enable,
+                    active: ActiveLevel::High,
+                }),
+                Some(reset_control),
+            ));
+            source.add_output(format!("output{index}"), output);
+        }
+        // This source register is folded by GSR-aware mapping.  The report
+        // must therefore use the mapped baseline count, not the source count.
+        let zero = source.add_constant(false);
+        let constant_q = source.add_register_output("constant_q");
+        source.add_register(RegisterCell::new(
+            "constant_q",
+            constant_q,
+            zero,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("constant", constant_q);
+
+        let options = MappingOptions {
+            timing_goal_mhz: 667,
+            ..MappingOptions::default()
+        };
+        let mapped = map_to_ecp5_with_options(&source, options).unwrap();
+
+        assert!(mapped.retiming().applied, "{:?}", mapped.retiming());
+        assert!(mapped.retiming().equivalence_signed_off);
+        assert!(mapped.retiming().equivalent_logic_replications > 0);
+        assert_eq!(mapped.retiming().original_registers, 38);
+        assert_eq!(mapped.retiming().selected_registers, 38);
+        assert!(
+            mapped.retiming().selected_overall_period_ps
+                < mapped.retiming().original_overall_period_ps
+        );
     }
 
     #[test]
@@ -10441,6 +10832,8 @@ mod tests {
             .filter(|cell| matches!(cell, Ecp5Cell::Ccu2c { .. }))
             .count();
         assert_eq!(carries, 4);
+        assert_eq!(mapped_emitted_comb_count(&mapped), 4);
+        assert_eq!(mapped_logic_slice_count(&mapped), 8);
         assert!(mapped.cells().iter().all(|cell| {
             matches!(
                 cell,
@@ -10717,6 +11110,8 @@ mod tests {
                 .count(),
             3
         );
+        assert_eq!(mapped_emitted_comb_count(&mapped), 15);
+        assert_eq!(mapped_logic_slice_count(&mapped), 8);
         assert!(verify_mapped_equivalence_proof(&mapped, false));
     }
 
