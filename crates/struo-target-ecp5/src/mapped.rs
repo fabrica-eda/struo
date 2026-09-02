@@ -12,8 +12,9 @@ use struo_formal::{
     RetimingVertex, derive_retimed_graph, verify_retiming_certificate,
 };
 use struo_ir::{
-    ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, ComparisonCell, MemoryCell, MemoryStyle,
-    NetId, Netlist, NodeKind, PortDirection as IrPortDirection, ValidationError,
+    ActiveLevel, ArithmeticCell, ArithmeticOp, ClockEdge, ComparisonCell, EnableControl,
+    MemoryCell, MemoryStyle, NetId, Netlist, NodeKind, PortDirection as IrPortDirection,
+    ValidationError,
 };
 
 use crate::physical::{PhysicalFeedback, PhysicalLocation};
@@ -6692,7 +6693,7 @@ fn map_once_with_period_and_lut_inputs(
     }
 
     for memory in netlist.memories() {
-        map_memory(memory, &bits, &mut cells, &mut next_wire)?;
+        map_memory(netlist, memory, &bits, &mut cells, &mut next_wire)?;
     }
 
     let ports = netlist
@@ -6953,6 +6954,7 @@ fn node_for(netlist: &Netlist, net: NetId) -> &struo_ir::Node {
 
 #[allow(clippy::too_many_lines)]
 fn map_memory(
+    netlist: &Netlist,
     memory: &MemoryCell,
     bits: &[Option<Bit>],
     cells: &mut Vec<Ecp5Cell>,
@@ -7022,10 +7024,13 @@ fn map_memory(
             active: enable.active,
         });
         let clock_enable = memory.second_port().and_then(|_| {
+            let source_read_enable = memory.read_enable()?;
             materialize_memory_clock_enable(
                 &format!("{name}_cea"),
                 write_enable,
                 read_enable,
+                control_implies(netlist, memory.write_enable(), source_read_enable),
+                control_implies(netlist, source_read_enable, memory.write_enable()),
                 cells,
                 next_wire,
             )
@@ -7050,6 +7055,10 @@ fn map_memory(
                 &format!("{name}_ceb"),
                 write_enable,
                 read_enable,
+                port.read_enable()
+                    .is_some_and(|read| control_implies(netlist, port.write_enable(), read)),
+                port.read_enable()
+                    .is_some_and(|read| control_implies(netlist, read, port.write_enable())),
                 cells,
                 next_wire,
             );
@@ -7285,10 +7294,24 @@ fn materialize_memory_clock_enable(
     name: &str,
     write_enable: Control,
     read_enable: Option<Control>,
+    write_implies_read: bool,
+    read_implies_write: bool,
     cells: &mut Vec<Ecp5Cell>,
     next_wire: &mut u32,
 ) -> Option<Control> {
     let read_enable = read_enable?;
+    // The canonical `if enable { if write { ... } else { read } }` memory
+    // process lowers to `write_enable = enable && write` and
+    // `read_enable = enable`. The physical clock enable is therefore just
+    // `read_enable`; adding `write_enable || read_enable` after LUT mapping
+    // otherwise leaves an unoptimizable, redundant LUT on every BRAM CE.
+    // Only elide the OR when the source netlist proves the implication.
+    if write_implies_read {
+        return Some(read_enable);
+    }
+    if read_implies_write {
+        return Some(write_enable);
+    }
     let output = *next_wire;
     *next_wire = next_wire
         .checked_add(1)
@@ -7315,6 +7338,40 @@ fn materialize_memory_clock_enable(
         signal: Bit::Wire(output),
         active: ActiveLevel::High,
     })
+}
+
+fn control_implies(
+    netlist: &Netlist,
+    antecedent: EnableControl,
+    consequent: EnableControl,
+) -> bool {
+    if antecedent == consequent {
+        return true;
+    }
+    if matches!(
+        node_for(netlist, antecedent.signal).kind(),
+        NodeKind::Constant(value) if *value != (antecedent.active == ActiveLevel::High)
+    ) || matches!(
+        node_for(netlist, consequent.signal).kind(),
+        NodeKind::Constant(value) if *value == (consequent.active == ActiveLevel::High)
+    ) {
+        return true;
+    }
+    antecedent.active == ActiveLevel::High
+        && consequent.active == ActiveLevel::High
+        && net_contains_conjunct(netlist, antecedent.signal, consequent.signal)
+}
+
+fn net_contains_conjunct(netlist: &Netlist, expression: NetId, conjunct: NetId) -> bool {
+    if expression == conjunct {
+        return true;
+    }
+    let node = node_for(netlist, expression);
+    matches!(node.kind(), NodeKind::And)
+        && node
+            .inputs()
+            .iter()
+            .any(|input| net_contains_conjunct(netlist, *input, conjunct))
 }
 
 impl From<bool> for Bit {
@@ -11826,6 +11883,93 @@ mod tests {
                 serde_json::json!([module["ports"]["address_b"]["bits"][bit]])
             );
         }
+    }
+
+    #[test]
+    fn reuses_read_enable_when_write_enable_implies_it() {
+        let mut source = Netlist::new("qualified_true_dual_port");
+        let clock = source.add_input("clock");
+        let read_enable_a = source.add_input("read_enable_a");
+        let read_enable_b = source.add_input("read_enable_b");
+        let write_select_a = source.add_input("write_select_a");
+        let write_select_b = source.add_input("write_select_b");
+        let write_enable_a = source.add_and(read_enable_a, write_select_a);
+        let write_enable_b = source.add_and(read_enable_b, write_select_b);
+        let address_a = source.add_input_port("address_a", NonZeroU32::new(8).unwrap());
+        let address_b = source.add_input_port("address_b", NonZeroU32::new(8).unwrap());
+        let write_a = source.add_input_port("write_a", NonZeroU32::new(8).unwrap());
+        let write_b = source.add_input_port("write_b", NonZeroU32::new(8).unwrap());
+        let read_a = (0..8)
+            .map(|bit| source.add_memory_output(format!("read_a[{bit}]")))
+            .collect::<Vec<_>>();
+        let read_b = (0..8)
+            .map(|bit| source.add_memory_output(format!("read_b[{bit}]")))
+            .collect::<Vec<_>>();
+        let active_high = |signal| EnableControl {
+            signal,
+            active: ActiveLevel::High,
+        };
+        source.add_memory(
+            MemoryCell::new(
+                "words",
+                256,
+                address_a.clone(),
+                read_a.clone(),
+                Some(active_high(read_enable_a)),
+                address_a.clone(),
+                write_a,
+                active_high(write_enable_a),
+                clock,
+                ClockEdge::Rising,
+            )
+            .with_second_port(MemoryPort::new(
+                address_b.clone(),
+                read_b.clone(),
+                Some(active_high(read_enable_b)),
+                address_b,
+                write_b,
+                active_high(write_enable_b),
+                clock,
+                ClockEdge::Rising,
+            )),
+        );
+        source.add_output_port("read_a", &read_a).unwrap();
+        source.add_output_port("read_b", &read_b).unwrap();
+
+        let mapped = map_to_ecp5(&source).unwrap();
+        let Ecp5Cell::BlockRam {
+            read_enable: Some(read_enable_a),
+            clock_enable: Some(clock_enable_a),
+            second_port: Some(second_port),
+            ..
+        } = mapped
+            .cells()
+            .iter()
+            .find(|cell| matches!(cell, Ecp5Cell::BlockRam { name, .. } if name == "bram_words"))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(clock_enable_a, read_enable_a);
+        assert_eq!(second_port.clock_enable, second_port.read_enable);
+        assert!(!mapped.cells().iter().any(|cell| {
+            matches!(cell, Ecp5Cell::Lut4 { name, .. } if name == "bram_words_cea" || name == "bram_words_ceb")
+        }));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let module = &json["modules"]["qualified_true_dual_port"];
+        let cell = &module["cells"]["bram_words"];
+        assert_eq!(
+            cell["connections"]["CEA"],
+            module["ports"]["read_enable_a"]["bits"]
+        );
+        assert_eq!(
+            cell["connections"]["CEB"],
+            module["ports"]["read_enable_b"]["bits"]
+        );
+        assert!(module["cells"].get("bram_words_cea").is_none());
+        assert!(module["cells"].get("bram_words_ceb").is_none());
     }
 
     #[test]
