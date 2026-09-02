@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory, MemoryPort,
@@ -1329,10 +1330,13 @@ impl<'a> ModuleLowerer<'a> {
         let mut operands = Vec::new();
         collect_associative_operands(expression, op, &mut operands);
 
-        let mut level = Vec::with_capacity(operands.len());
-        for operand in operands {
+        let mut depth_memo = HashMap::new();
+        let mut pending = BinaryHeap::new();
+        for (order, operand) in operands.into_iter().enumerate() {
             let lowered = self.lower_expression(operand, env)?;
-            level.push(self.boolean(lowered)?.id);
+            let id = self.boolean(lowered)?.id;
+            let depth = rtl_expression_depth(&self.rtl, id, &mut depth_memo);
+            pending.push(Reverse((depth, order, id)));
         }
 
         let binary_op = if op == Op::LogicAnd {
@@ -1340,20 +1344,28 @@ impl<'a> ModuleLowerer<'a> {
         } else {
             BinaryOp::Or
         };
-        while level.len() > 1 {
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            for pair in level.chunks(2) {
-                if let [lhs, rhs] = pair {
-                    next.push(self.rtl.binary(binary_op, *lhs, *rhs)?);
-                } else {
-                    next.push(pair[0]);
-                }
-            }
-            level = next;
+        // Pairing by source position still buries an already deep predicate under
+        // every tree level. Merge the shallowest partial trees first so that
+        // equal-depth leaves remain balanced while deep leaves stay near the root.
+        let mut order = pending.len();
+        while pending.len() > 1 {
+            let Reverse((lhs_depth, _, lhs)) = pending
+                .pop()
+                .expect("a logical chain has at least two operands");
+            let Reverse((rhs_depth, _, rhs)) = pending
+                .pop()
+                .expect("a logical chain has a second pending operand");
+            let id = self.rtl.binary(binary_op, lhs, rhs)?;
+            pending.push(Reverse((lhs_depth.max(rhs_depth) + 1, order, id)));
+            order += 1;
         }
 
         Ok(LoweredExpr {
-            id: level[0],
+            id: pending
+                .pop()
+                .expect("a logical chain produces one result")
+                .0
+                .2,
             width: 1,
             signed: false,
         })
@@ -1969,6 +1981,42 @@ fn collect_associative_operands<'a>(
     }
 }
 
+fn rtl_expression_depth(
+    module: &RtlModule,
+    id: ExprId,
+    memo: &mut HashMap<ExprId, usize>,
+) -> usize {
+    if let Some(depth) = memo.get(&id) {
+        return *depth;
+    }
+    let depth = match module.expressions()[id.index() as usize].kind() {
+        ExprKind::Signal(_) | ExprKind::Constant(_) => 0,
+        ExprKind::Unary { input, .. } => rtl_expression_depth(module, *input, memo) + 1,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            rtl_expression_depth(module, *lhs, memo).max(rtl_expression_depth(module, *rhs, memo))
+                + 1
+        }
+        ExprKind::Mux {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            rtl_expression_depth(module, *condition, memo)
+                .max(rtl_expression_depth(module, *then_expr, memo))
+                .max(rtl_expression_depth(module, *else_expr, memo))
+                + 1
+        }
+        ExprKind::Concat(parts) => parts
+            .iter()
+            .map(|part| rtl_expression_depth(module, *part, memo))
+            .max()
+            .unwrap_or_default(),
+        ExprKind::Slice { input, .. } => rtl_expression_depth(module, *input, memo),
+    };
+    memo.insert(id, depth);
+    depth
+}
+
 fn memory_candidates(
     source: &Module,
     policies: &HashMap<VarId, MemoryInferencePolicy>,
@@ -2464,14 +2512,17 @@ module AssociativeLogicTop (
     data      : input  logic<16>,
     all_result: output logic,
     any_result: output logic,
+    skewed_result: output logic,
 ) {
     var data_q: logic<16>;
     var all_q : logic;
     var any_q : logic;
+    var skewed_q: logic;
 
     always_comb {
         all_result = all_q;
         any_result = any_q;
+        skewed_result = skewed_q;
     }
 
     always_ff (clk) {
@@ -2484,6 +2535,10 @@ module AssociativeLogicTop (
             || data_q[4] || data_q[5] || data_q[6] || data_q[7]
             || data_q[8] || data_q[9] || data_q[10] || data_q[11]
             || data_q[12] || data_q[13] || data_q[14] || data_q[15];
+        skewed_q = data_q[0] && data_q[1] && data_q[2] && data_q[3]
+            && data_q[4] && data_q[5] && data_q[6]
+            && (data_q[8] || data_q[9] || data_q[10] || data_q[11]
+                || data_q[12] || data_q[13] || data_q[14] || data_q[15]);
     }
 }
 ";
@@ -3116,6 +3171,18 @@ module WideLiteralTop (
         }
     }
 
+    fn logic_depth(module: &RtlModule, id: ExprId) -> usize {
+        let expression = &module.expressions()[id.index() as usize];
+        match expression.kind() {
+            ExprKind::Binary {
+                op: BinaryOp::And | BinaryOp::Or,
+                lhs,
+                rhs,
+            } => 1 + logic_depth(module, *lhs).max(logic_depth(module, *rhs)),
+            _ => 0,
+        }
+    }
+
     #[test]
     fn balances_associative_logical_chains() {
         let design = analyze_and_lower(
@@ -3134,6 +3201,12 @@ module WideLiteralTop (
                 .unwrap();
             assert_eq!(associative_depth(top, register.next, operation), 4);
         }
+        let skewed = top
+            .registers()
+            .iter()
+            .find(|register| register.name == "skewed_q")
+            .unwrap();
+        assert_eq!(logic_depth(top, skewed.next), 4);
 
         let synthesized = synthesize(&design).unwrap();
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
