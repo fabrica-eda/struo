@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use struo_rtl::{BitWidth, Design, Module, Port, PortDirection, RtlError, StateDomain, ValueType};
 use veryl_analyzer::ir::{Component, Declaration, Ir, VarKind};
-use veryl_analyzer::{Analyzer, AnalyzerError, Context};
+use veryl_analyzer::{Analyzer, Context};
 use veryl_metadata::Metadata;
 use veryl_parser::{Parser, resource_table};
 
@@ -123,29 +123,6 @@ fn analyze_parsed_and_lower(
         context.set_project_name(project);
         pass2.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
     }
-    // Veryl normally rejects every variable driven by more than one
-    // procedural block. True-dual-port memories are the deliberate exception:
-    // each unpacked array is validated again by Struo's memory inference and
-    // must lower to at most two complete synchronous ports, so no ordinary
-    // multi-driven logic can pass through this waiver.
-    let unpacked_arrays = ir
-        .components
-        .iter()
-        .filter_map(|component| match component {
-            Component::Module(module) => Some(module),
-            _ => None,
-        })
-        .flat_map(|module| module.variables.values())
-        .filter(|variable| !variable.r#type.array.is_empty())
-        .map(|variable| variable.path.to_string())
-        .collect::<std::collections::HashSet<_>>();
-    pass2.retain(|error| {
-        !matches!(
-            error,
-            AnalyzerError::MultipleAssignment { identifier, .. }
-                if unpacked_arrays.contains(identifier)
-        )
-    });
     if !pass2.is_empty() {
         return Err(ImportError::AnalysisFailed(format!("{pass2:?}")));
     }
@@ -157,11 +134,11 @@ fn analyze_parsed_and_lower(
 }
 
 /// Exact Veryl analyzer release supported by this adapter.
-pub const SUPPORTED_VERYL_VERSION: &str = "0.20.3";
+pub const SUPPORTED_VERYL_VERSION: &str = "0.21.0";
 
 /// Requested treatment of an unpacked Veryl array during memory inference.
 ///
-/// Veryl 0.20.3 does not accept tool-defined attribute names, so source code
+/// Veryl 0.21.0 does not accept tool-defined attribute names, so source code
 /// selects this policy through its portable `SystemVerilog` attribute escape:
 /// `#[sv("struo_memory = \"distributed\"")]`. The accepted values are
 /// `preferred`, `required`, `forbidden`, `block`, and `distributed`.
@@ -434,7 +411,7 @@ mod tests {
     fn empty_analyzer_ir_is_not_silently_made_valid() {
         let imported = import_analyzed_shell(&Ir::default(), "Top").unwrap();
 
-        assert_eq!(SUPPORTED_VERYL_VERSION, "0.20.3");
+        assert_eq!(SUPPORTED_VERYL_VERSION, "0.21.0");
         assert!(imported.design.validate().is_err());
     }
 

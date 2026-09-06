@@ -15,9 +15,9 @@ categories.workspace = true
 
 [dependencies]
 struo-rtl.workspace = true
-veryl-analyzer = "=0.20.3"
-veryl-metadata = "=0.20.3"
-veryl-parser = { version = "=0.20.3", default-features = false }
+veryl-analyzer = "=0.21.0"
+veryl-metadata = "=0.21.0"
+veryl-parser = { version = "=0.21.0", default-features = false }
 
 [dev-dependencies]
 celox = "=0.3.1"

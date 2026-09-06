@@ -894,7 +894,7 @@ impl<'a> ModuleLowerer<'a> {
         let mut input_elements = HashMap::new();
 
         for input in &instance.inputs {
-            if let Some(parent_id) = whole_array_variable(&input.expr) {
+            if let Some(parent_id) = input.single().and_then(whole_array_variable) {
                 let child_keys = child.keys_for_id(input.id);
                 let parent_keys = self.keys_for_id(parent_id);
                 if child_keys.len() > 1 || parent_keys.len() > 1 {
@@ -918,15 +918,17 @@ impl<'a> ModuleLowerer<'a> {
                     continue;
                 }
             }
-            let element = input_elements.entry(input.id).or_insert(0);
-            let child_key = child.port_element_key(input.id, *element)?;
-            *element += 1;
-            let child_signal = child.signal(&child_key)?;
-            let target = inline_signals[&child_signal];
-            let width = child.width(&child_key)?;
-            let value = self.lower_expression(&input.expr, parent_env)?;
-            let value = self.resize(value, width, child.is_signed(&child_key))?;
-            self.rtl.assign(self.rtl.whole(target)?, value.id)?;
+            for expression in &input.exprs {
+                let element = input_elements.entry(input.id).or_insert(0);
+                let child_key = child.port_element_key(input.id, *element)?;
+                *element += 1;
+                let child_signal = child.signal(&child_key)?;
+                let target = inline_signals[&child_signal];
+                let width = child.width(&child_key)?;
+                let value = self.lower_expression(expression, parent_env)?;
+                let value = self.resize(value, width, child.is_signed(&child_key))?;
+                self.rtl.assign(self.rtl.whole(target)?, value.id)?;
+            }
         }
         Ok(())
     }
@@ -3090,6 +3092,7 @@ module TrueDualPortMemoryTop (
     read_a: output 'a logic<8>,
     read_b: output 'a logic<8>,
 ) {
+    #[allow(multiple_assign)]
     #[sv("struo_memory = \"required\"")]
     var words: 'a logic<8> [16];
 
@@ -3985,6 +3988,35 @@ module WideLiteralTop (
     }
 
     #[test]
+    fn flattens_unpacked_array_slices_in_instance_inputs() {
+        let source = UNPACKED_ARRAY_INSTANCE_SOURCE
+            .replace(
+                "values : input  logic<8> [4]",
+                "values : input  logic<8> [6]",
+            )
+            .replace("values : values ,", "values : values[1+:4],");
+        let design = analyze_and_lower(
+            &source,
+            "unpacked_array_slice_instance_lowering",
+            "UnpackedArrayInstanceTop",
+        )
+        .unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        for lane in 0_u8..6 {
+            set(&mut simulator, &format!("values[{lane}]"), 0x20 + lane);
+        }
+        for lane in 0_u8..4 {
+            assert_value(
+                &mut simulator,
+                &format!("results[{lane}]"),
+                0x22 + u64::from(lane),
+            );
+        }
+    }
+
+    #[test]
     fn lowers_dynamic_register_array_indices() {
         let source = REQUIRED_ASYNC_MEMORY_SOURCE
             .replace("    #[sv(\"struo_memory = \\\"required\\\"\")]\n", "");
@@ -4063,6 +4095,40 @@ module WideLiteralTop (
         assert!(json.contains("\"DOB0\""));
         assert!(json.contains("\"CEAMUX\": \"CEA\""));
         assert!(json.contains("\"CEBMUX\": \"CEB\""));
+    }
+
+    #[test]
+    fn true_dual_port_memory_requires_multiple_assign_opt_in() {
+        let source = TRUE_DUAL_PORT_MEMORY_SOURCE.replace("#[allow(multiple_assign)]", "");
+        let error = analyze_and_lower(
+            &source,
+            "true_dual_port_memory_without_opt_in",
+            "TrueDualPortMemoryTop",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, ImportError::AnalysisFailed(message)
+                if message.contains("MultipleAssignment")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn multiple_assign_opt_in_does_not_allow_multiple_drivers_in_logic() {
+        let source = TRUE_DUAL_PORT_MEMORY_SOURCE.replace("required", "forbidden");
+        let error = analyze_and_lower(
+            &source,
+            "multiple_assign_without_memory_inference",
+            "TrueDualPortMemoryTop",
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, ImportError::UnsupportedBehavior(message)
+                if message.contains("multiple procedural drivers for words")),
+            "{error}"
+        );
     }
 
     #[test]
