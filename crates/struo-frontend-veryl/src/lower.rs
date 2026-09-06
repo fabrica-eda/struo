@@ -1641,7 +1641,8 @@ impl<'a> ModuleLowerer<'a> {
                 let lhs = self.lower_expression(lhs, env)?;
                 let rhs = self.lower_expression(rhs, env)?;
                 let result_width = binary_width(*op, comptime)?;
-                self.lower_binary(*op, lhs, rhs, result_width, comptime.r#type.signed)
+                let signed = binary_signed(*op, comptime);
+                self.lower_binary(*op, lhs, rhs, result_width, signed)
             }
             Expression::Ternary(condition, then_expr, else_expr, comptime) => {
                 let condition = self.lower_expression(condition, env)?;
@@ -1763,13 +1764,36 @@ impl<'a> ModuleLowerer<'a> {
             op,
             Op::Eq | Op::Ne | Op::Less | Op::LessEq | Op::Greater | Op::GreaterEq
         );
-        let operand_width = lhs.width.max(rhs.width);
-        let signed_compare = lhs.signed && rhs.signed;
+        // Multiplication must retain the context-sized product before truncation.
+        // Extending a narrow product afterwards irretrievably loses its high bits.
+        let operand_width = if op == Op::Mul {
+            lhs.width.max(rhs.width).max(result_width)
+        } else {
+            lhs.width.max(rhs.width)
+        };
+        let signed_compare = lhs.signed && rhs.signed && (op != Op::Mul || result_signed);
+        // A mixed signed/unsigned multiplication is unsigned before widening.
+        // resize otherwise extends according to the original operand's sign.
+        let (lhs, rhs) = if op == Op::Mul {
+            (
+                LoweredExpr {
+                    signed: signed_compare,
+                    ..lhs
+                },
+                LoweredExpr {
+                    signed: signed_compare,
+                    ..rhs
+                },
+            )
+        } else {
+            (lhs, rhs)
+        };
         let lhs = self.resize(lhs, operand_width, signed_compare)?;
         let rhs = self.resize(rhs, operand_width, signed_compare)?;
         let operation = match op {
             Op::Add => BinaryOp::Add,
             Op::Sub => BinaryOp::Sub,
+            Op::Mul => BinaryOp::Mul,
             Op::BitAnd => BinaryOp::And,
             Op::BitOr => BinaryOp::Or,
             Op::BitXor => BinaryOp::Xor,
@@ -2675,21 +2699,29 @@ fn concrete_width(r#type: &Type, name: &str) -> Result<u32, ImportError> {
     u32::try_from(width).map_err(|_| ImportError::WidthTooLarge(name.into()))
 }
 
-// Shift result types retain the left operand's intrinsic width in AIR, while
+// Shift and multiply types retain the operands' intrinsic width in AIR, while
 // the assignment or parent expression width is carried separately as context.
+fn binary_signed(op: Op, comptime: &Comptime) -> bool {
+    if op == Op::Mul {
+        comptime.expr_context.signed
+    } else {
+        comptime.r#type.signed
+    }
+}
+
 fn binary_width(op: Op, comptime: &Comptime) -> Result<u32, ImportError> {
     if !matches!(
         op,
-        Op::LogicShiftL | Op::ArithShiftL | Op::LogicShiftR | Op::ArithShiftR
+        Op::LogicShiftL | Op::ArithShiftL | Op::LogicShiftR | Op::ArithShiftR | Op::Mul
     ) {
         return concrete_width(&comptime.r#type, "binary expression");
     }
     let width = comptime
         .r#type
         .total_width()
-        .ok_or_else(|| ImportError::NonConcreteWidth("shift expression".into()))?
+        .ok_or_else(|| ImportError::NonConcreteWidth("context-sized expression".into()))?
         .max(comptime.expr_context.width);
-    u32::try_from(width).map_err(|_| ImportError::WidthTooLarge("shift expression".into()))
+    u32::try_from(width).map_err(|_| ImportError::WidthTooLarge("context-sized expression".into()))
 }
 
 fn constant_value(expression: &Expression) -> Result<u64, ImportError> {

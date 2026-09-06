@@ -319,6 +319,17 @@ fn lower_arithmetic(
     rhs: &[Literal],
     carry_in: Option<Literal>,
 ) -> Vec<Literal> {
+    if operation == ArithmeticOp::Multiply {
+        let mut product = vec![Literal::FALSE; lhs.len()];
+        for (shift, bit) in rhs.iter().copied().enumerate() {
+            let mut partial = vec![Literal::FALSE; lhs.len()];
+            for index in shift..lhs.len() {
+                partial[index] = aig.and(lhs[index - shift], bit);
+            }
+            product = lower_arithmetic(aig, ArithmeticOp::Add, &product, &partial, None);
+        }
+        return product;
+    }
     let mut carry = if operation == ArithmeticOp::Subtract {
         Literal::TRUE
     } else {
@@ -446,6 +457,9 @@ mod tests {
         let difference = design
             .add_arithmetic(ArithmeticOp::Subtract, &lhs, &rhs)
             .unwrap();
+        let product = design
+            .add_arithmetic(ArithmeticOp::Multiply, &lhs, &rhs)
+            .unwrap();
         let unsigned_less = design
             .add_comparison(ComparisonOp::LessThanUnsigned, &lhs, &rhs)
             .unwrap();
@@ -457,6 +471,7 @@ mod tests {
             .add_output_port("sum_with_carry", &sum_with_carry)
             .unwrap();
         design.add_output_port("difference", &difference).unwrap();
+        design.add_output_port("product", &product).unwrap();
         design.add_output("unsigned_less", unsigned_less);
         design.add_output("signed_less", signed_less);
         let system = TransitionSystem::from_netlist(&design).unwrap();
@@ -471,6 +486,7 @@ mod tests {
                             lhs.wrapping_add(rhs).wrapping_add(carry) & 0xf,
                         ),
                         ("difference", lhs.wrapping_sub(rhs) & 0xf),
+                        ("product", lhs.wrapping_mul(rhs) & 0xf),
                     ];
                     let mut mismatch = Literal::FALSE;
                     let mut aig = system.aig.clone();

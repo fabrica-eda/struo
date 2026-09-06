@@ -213,7 +213,7 @@ Struo resolves every configured source, the standard library, and locked
 dependencies before running the analyzer.
 
 The implemented synthesis subset includes bitwise logic, reductions, wrapping
-addition and subtraction, signed and unsigned comparisons, variable logical
+addition, subtraction and multiplication, signed and unsigned comparisons, variable logical
 and arithmetic shifts, muxes, concatenation, static slicing, dynamic packed
 bit selection, module constants, registers, enables, and synchronous or
 asynchronous constant resets. It performs constant folding and structural
@@ -226,6 +226,16 @@ hold muxes on timing-critical paths. Addition and subtraction remain
 word-level cells until technology mapping. ECP5 maps operations wider than
 four bits to `CCU2C` carry chains by default; explicit carry-chain and
 LUT-ripple modes are also available for regression tests and A/B measurements.
+Multiplication retains the expression context width before truncation. The
+ECP5 mapper decomposes it into unsigned 18-bit partial products using
+`MULT18X18D` and a balanced `CCU2C` reduction. Signed extension happens before
+decomposition. A 16-by-16 product assigned to 32 bits uses one DSP; a wide
+product may use several DSPs and carry chains. The initial DSP mode is
+combinational, without internal registers or cascade. Pipeline registers
+remain ordinary `TRELLIS_FF` cells. Formal bit blasting, native mapped
+simulation and nextpnr JSON support the same wrapping multiplication.
+Physical timing must include the selected speed grade's DSP and route delays;
+the mapper's pre-route estimate is not a timing-closure result.
 For physical QoR experiments, pass `--no-infer-register-enables` to retain
 self-hold muxes or `--no-relax-qualified-register-enables` to retain qualified
 payload enables. Library callers can make the same choices with

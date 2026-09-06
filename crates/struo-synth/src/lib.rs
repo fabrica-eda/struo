@@ -640,6 +640,10 @@ impl<'a> Lowering<'a> {
                 .netlist
                 .add_arithmetic(ArithmeticOp::Subtract, lhs, rhs)
                 .expect("validated RTL arithmetic has equal, non-zero widths"),
+            BinaryOp::Mul => self
+                .netlist
+                .add_arithmetic(ArithmeticOp::Multiply, lhs, rhs)
+                .expect("validated RTL multiplication has equal, non-zero widths"),
             BinaryOp::Equal => vec![self.equal_words(lhs, rhs)],
             BinaryOp::NotEqual => {
                 let equal = self.equal_words(lhs, rhs);
@@ -2300,6 +2304,7 @@ mod tests {
                                 .is_some_and(|carry| values[carry.index() as usize]),
                         )),
                         ArithmeticOp::Subtract => lhs.wrapping_sub(rhs),
+                        ArithmeticOp::Multiply => lhs.wrapping_mul(rhs),
                     } & mask;
                     result & (1 << bit) != 0
                 }

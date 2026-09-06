@@ -19,6 +19,8 @@ struo-ir.workspace = true
 struo-target-ecp5.workspace = true
 
 [dev-dependencies]
+serde_json = "1"
+struo-frontend-veryl.workspace = true
 struo-rtl.workspace = true
 struo-synth.workspace = true
 

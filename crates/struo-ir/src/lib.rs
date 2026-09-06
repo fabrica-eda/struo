@@ -193,6 +193,8 @@ pub enum ArithmeticOp {
     Add,
     /// Wrapping two's-complement subtraction.
     Subtract,
+    /// Wrapping multiplication (signed and unsigned agree at this width).
+    Multiply,
 }
 
 /// One combinational word-level arithmetic cell.

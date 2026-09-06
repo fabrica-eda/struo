@@ -20,6 +20,8 @@ use struo_ir::{
 use crate::physical::{PhysicalFeedback, PhysicalLocation};
 
 mod lut;
+mod multiply;
+use multiply::map_multiply;
 
 use lut::{
     BRAM_CLOCK_TO_OUTPUT_PS, CCU_CARRY_PS, CCU_INPUT_PS, CCU_SUM_PS, CutDatabase,
@@ -42,6 +44,9 @@ const PHYSICAL_RETIME_MODEL_BRIDGE_PS: u32 = 400;
 // the hard mux itself and intentionally leave sign-off to nextpnr.
 const PFU_MUX_DELAY_PS: u32 = 100;
 const L6_MUX_DELAY_PS: u32 = 100;
+// Pre-route estimate from Trellis speed 8_5G, MULT18X18D:REGS=NONE A/B -> P.
+// Physical STA uses the selected speed grade and actual routing delays.
+const MULTIPLIER_DELAY_PS: u32 = 2538;
 
 // These maps only contain trusted internal u32 wire IDs. Avoid the randomized
 // string-oriented hashing cost in the timing model's repeated fixed-point scans.
@@ -767,6 +772,18 @@ pub enum Ecp5Cell {
         init: [u16; 2],
         /// Whether each slice suppresses its incoming carry.
         inject: [bool; 2],
+    },
+    /// Unsigned combinational 18-by-18 hard DSP multiplier.
+    /// Internal registers and cascade ports are disabled.
+    Multiplier {
+        /// Stable cell name.
+        name: String,
+        /// Operand bits, least-significant first.
+        lhs: Box<[Bit; 18]>,
+        /// Operand bits, least-significant first.
+        rhs: Box<[Bit; 18]>,
+        /// Full product wires, least-significant first.
+        product: Box<[u32; 36]>,
     },
     /// ECP5 slice flip-flop.
     FlipFlop {
@@ -1806,6 +1823,7 @@ fn physical_bel_is_compatible(cell: &Ecp5Cell, bel: &str) -> bool {
         Ecp5Cell::TrellisIo { .. } => bel.contains("PIO"),
         Ecp5Cell::Jtagg { .. } => bel.contains("JTAGG"),
         Ecp5Cell::Pll { .. } => bel.contains("PLL"),
+        Ecp5Cell::Multiplier { .. } => bel.contains("/MULT18_"),
         Ecp5Cell::PfuMux { .. } | Ecp5Cell::L6Mux21 { .. } | Ecp5Cell::Ccu2c { .. } => false,
     }
 }
@@ -3002,7 +3020,8 @@ fn map_l6_muxes(netlist: &mut Ecp5Netlist) {
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
-            | Ecp5Cell::Pll { .. } => {}
+            | Ecp5Cell::Pll { .. }
+            | Ecp5Cell::Multiplier { .. } => {}
         }
     }
     let depths = mapped_lut_depths(netlist);
@@ -3734,7 +3753,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
-            | Ecp5Cell::Pll { .. } => None,
+            | Ecp5Cell::Pll { .. }
+            | Ecp5Cell::Multiplier { .. } => None,
         })
         .collect::<HashSet<_>>();
     netlist
@@ -3759,7 +3779,8 @@ fn maximum_replicable_enable_fanout(netlist: &Ecp5Netlist, max_fanout: usize) ->
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
-            | Ecp5Cell::Pll { .. } => None,
+            | Ecp5Cell::Pll { .. }
+            | Ecp5Cell::Multiplier { .. } => None,
         })
         .max()
         .unwrap_or(0)
@@ -4009,6 +4030,11 @@ fn replace_wire_in_cell_inputs(cell: &mut Ecp5Cell, from: u32, to: u32) -> usize
         }
     };
     match cell {
+        Ecp5Cell::Multiplier { lhs, rhs, .. } => {
+            for input in lhs.iter_mut().chain(rhs.iter_mut()) {
+                replace(input);
+            }
+        }
         Ecp5Cell::Lut4 { inputs, .. } => {
             for input in inputs {
                 replace(input);
@@ -4184,7 +4210,8 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         | Ecp5Cell::Ccu2c { .. }
         | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
-        | Ecp5Cell::Pll { .. } => None,
+        | Ecp5Cell::Pll { .. }
+        | Ecp5Cell::Multiplier { .. } => None,
     });
     let output_depths = netlist
         .io_timing
@@ -4249,7 +4276,8 @@ fn mapped_lut_profile(netlist: &Ecp5Netlist) -> MappedLutProfile {
         | Ecp5Cell::Ccu2c { .. }
         | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
-        | Ecp5Cell::Pll { .. } => None,
+        | Ecp5Cell::Pll { .. }
+        | Ecp5Cell::Multiplier { .. } => None,
     });
     let output_periods = netlist
         .io_timing
@@ -4319,7 +4347,8 @@ fn mapped_lut_depths(netlist: &Ecp5Netlist) -> WireMap<usize> {
             | Ecp5Cell::Ccu2c { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
-            | Ecp5Cell::Pll { .. } => {}
+            | Ecp5Cell::Pll { .. }
+            | Ecp5Cell::Multiplier { .. } => {}
         }
     }
     // Retimed cells need not remain in producer-before-consumer order. Iterate
@@ -4349,6 +4378,16 @@ fn update_mapped_cell_depth(cell: &Ecp5Cell, depths: &mut WireMap<usize>) -> boo
         depth.is_some_and(|depth| depths.insert(output, depth) != Some(depth))
     };
     match cell {
+        Ecp5Cell::Multiplier {
+            lhs, rhs, product, ..
+        } => {
+            let inputs = lhs.iter().chain(rhs.iter()).collect::<Vec<_>>();
+            let mut progress = false;
+            for output in product.iter() {
+                progress = update(&inputs, *output, depths) || progress;
+            }
+            progress
+        }
         Ecp5Cell::Lut4 { inputs, output, .. } => {
             update(&inputs.iter().collect::<Vec<_>>(), *output, depths)
         }
@@ -4475,13 +4514,29 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
             | Ecp5Cell::Ccu2c { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
-            | Ecp5Cell::Pll { .. } => {}
+            | Ecp5Cell::Pll { .. }
+            | Ecp5Cell::Multiplier { .. } => {}
         }
     }
     for _ in 0..netlist.cells.len() {
         let mut progress = false;
         for cell in &netlist.cells {
             match cell {
+                Ecp5Cell::Multiplier {
+                    lhs, rhs, product, ..
+                } => {
+                    let arrival = lhs
+                        .iter()
+                        .chain(rhs.iter())
+                        .filter_map(|input| mapped_routed_arrival(*input, &arrivals, &fanouts))
+                        .max()
+                        .map(|arrival| arrival.saturating_add(MULTIPLIER_DELAY_PS));
+                    if let Some(arrival) = arrival {
+                        for output in product.iter() {
+                            progress |= arrivals.insert(*output, arrival) != Some(arrival);
+                        }
+                    }
+                }
                 Ecp5Cell::Lut4 { inputs, output, .. } => {
                     let arrival = inputs
                         .iter()
@@ -5085,7 +5140,8 @@ fn ccu_chain_names(netlist: &Ecp5Netlist) -> Vec<Vec<String>> {
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
-            | Ecp5Cell::Pll { .. } => None,
+            | Ecp5Cell::Pll { .. }
+            | Ecp5Cell::Multiplier { .. } => None,
         })
         .collect::<Vec<_>>();
     let carry_producers = ccus
@@ -5210,7 +5266,8 @@ fn forward_retime_ccu2c(netlist: &Ecp5Netlist, ccu_index: usize) -> Option<Ecp5N
                     | Ecp5Cell::BlockRam { .. }
                     | Ecp5Cell::TrellisIo { .. }
                     | Ecp5Cell::Jtagg { .. }
-                    | Ecp5Cell::Pll { .. } => None,
+                    | Ecp5Cell::Pll { .. }
+                    | Ecp5Cell::Multiplier { .. } => None,
                 })?;
         if let Some((domain_clock, domain_edge, domain_enable, domain_reset)) = domain {
             if (clock, edge, enable) != (domain_clock, domain_edge, domain_enable)
@@ -5452,7 +5509,8 @@ fn backward_retime_ccu2c(netlist: &Ecp5Netlist, register_index: usize) -> Option
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
-            | Ecp5Cell::Pll { .. } => None,
+            | Ecp5Cell::Pll { .. }
+            | Ecp5Cell::Multiplier { .. } => None,
         })?;
 
     let mut vertices = Vec::new();
@@ -5872,6 +5930,11 @@ fn replace_mapped_cell_wire_uses(cell: &mut Ecp5Cell, from: u32, to: u32) {
         }
     };
     match cell {
+        Ecp5Cell::Multiplier { lhs, rhs, .. } => {
+            for bit in lhs.iter_mut().chain(rhs.iter_mut()) {
+                replace(bit);
+            }
+        }
         Ecp5Cell::Lut4 { inputs, .. } => {
             for bit in inputs {
                 replace(bit);
@@ -5997,7 +6060,8 @@ fn mapped_cell_name(cell: &Ecp5Cell) -> &str {
         | Ecp5Cell::BlockRam { name, .. }
         | Ecp5Cell::TrellisIo { name, .. }
         | Ecp5Cell::Jtagg { name, .. }
-        | Ecp5Cell::Pll { name, .. } => name,
+        | Ecp5Cell::Pll { name, .. }
+        | Ecp5Cell::Multiplier { name, .. } => name,
     }
 }
 
@@ -6187,7 +6251,8 @@ fn mapped_wire_is_clock_or_reset(netlist: &Ecp5Netlist, wire: u32) -> bool {
         | Ecp5Cell::Ccu2c { .. }
         | Ecp5Cell::TrellisIo { .. }
         | Ecp5Cell::Jtagg { .. }
-        | Ecp5Cell::Pll { .. } => false,
+        | Ecp5Cell::Pll { .. }
+        | Ecp5Cell::Multiplier { .. } => false,
     })
 }
 
@@ -6260,6 +6325,11 @@ fn cell_input_bits(cell: &Ecp5Cell) -> Vec<Bit> {
 #[allow(clippy::too_many_lines)]
 fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
     match cell {
+        Ecp5Cell::Multiplier { lhs, rhs, .. } => {
+            for bit in lhs.iter().chain(rhs.iter()) {
+                visit(*bit);
+            }
+        }
         Ecp5Cell::Lut4 { inputs, .. } => {
             for bit in inputs {
                 visit(*bit);
@@ -6365,6 +6435,7 @@ fn for_each_cell_input_bit(cell: &Ecp5Cell, mut visit: impl FnMut(Bit)) {
 
 fn cell_output_bits(cell: &Ecp5Cell) -> Vec<Bit> {
     match cell {
+        Ecp5Cell::Multiplier { product, .. } => product.iter().copied().map(Bit::Wire).collect(),
         Ecp5Cell::Lut4 { output, .. }
         | Ecp5Cell::PfuMux { output, .. }
         | Ecp5Cell::L6Mux21 { output, .. }
@@ -6824,6 +6895,10 @@ fn map_retained_cells(netlist: &Netlist, options: MappingOptions, emitter: &mut 
     for cell in retained {
         match cell {
             RetainedCell::Arithmetic(arithmetic) => {
+                if arithmetic.operation() == ArithmeticOp::Multiply {
+                    map_multiply(arithmetic, emitter);
+                    continue;
+                }
                 let use_carry = match options.arithmetic {
                     ArithmeticMapping::Auto => arithmetic.outputs().len() > 4,
                     ArithmeticMapping::CarryChain => true,
@@ -8013,6 +8088,12 @@ impl From<&Ecp5Netlist> for JsonDesign {
 #[allow(clippy::too_many_lines)]
 fn json_cell(cell: &Ecp5Cell) -> (String, JsonCell) {
     match cell {
+        Ecp5Cell::Multiplier {
+            name,
+            lhs,
+            rhs,
+            product,
+        } => (name.clone(), json_multiplier(lhs, rhs, product)),
         Ecp5Cell::Lut4 {
             name,
             inputs,
@@ -8814,6 +8895,43 @@ fn block_ram_parameters(
         );
     }
     parameters
+}
+
+fn json_multiplier(lhs: &[Bit; 18], rhs: &[Bit; 18], product: &[u32; 36]) -> JsonCell {
+    let mut cell = JsonCell {
+        hide_name: 0,
+        r#type: "MULT18X18D",
+        parameters: [
+            "REG_INPUTA_CLK",
+            "REG_INPUTB_CLK",
+            "REG_INPUTC_CLK",
+            "REG_PIPELINE_CLK",
+            "REG_OUTPUT_CLK",
+        ]
+        .into_iter()
+        .map(|name| (name.into(), "NONE".into()))
+        .collect(),
+        attributes: BTreeMap::new(),
+        port_directions: BTreeMap::new(),
+        connections: BTreeMap::new(),
+    };
+    for (port, bits) in [("A", lhs.as_slice()), ("B", rhs.as_slice())] {
+        for (index, bit) in bits.iter().enumerate() {
+            let pin = format!("{port}{index}");
+            cell.port_directions.insert(pin.clone(), "input");
+            cell.connections.insert(pin, vec![*bit]);
+        }
+    }
+    for (index, wire) in product.iter().enumerate() {
+        let pin = format!("P{index}");
+        cell.port_directions.insert(pin.clone(), "output");
+        cell.connections.insert(pin, vec![Bit::Wire(*wire)]);
+    }
+    for pin in ["SIGNEDA", "SIGNEDB", "SOURCEA", "SOURCEB"] {
+        cell.port_directions.insert(pin.into(), "input");
+        cell.connections.insert(pin.into(), vec![Bit::Zero]);
+    }
+    cell
 }
 
 #[cfg(test)]
@@ -10445,7 +10563,8 @@ mod tests {
                     | Ecp5Cell::BlockRam { .. }
                     | Ecp5Cell::TrellisIo { .. }
                     | Ecp5Cell::Jtagg { .. }
-                    | Ecp5Cell::Pll { .. } => unreachable!(),
+                    | Ecp5Cell::Pll { .. }
+                    | Ecp5Cell::Multiplier { .. } => unreachable!(),
                 };
                 format!(
                     r#""{}":{{"attributes":{{"NEXTPNR_BEL":"{bel}"}}}}"#,
@@ -11080,7 +11199,8 @@ mod tests {
                 | Ecp5Cell::BlockRam { .. }
                 | Ecp5Cell::TrellisIo { .. }
                 | Ecp5Cell::Jtagg { .. }
-                | Ecp5Cell::Pll { .. } => None,
+                | Ecp5Cell::Pll { .. }
+                | Ecp5Cell::Multiplier { .. } => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(truth_tables, [0x8888, 0xeeee, 0x6666, 0x5555, 0xd8d8]);
@@ -11167,7 +11287,8 @@ mod tests {
             | Ecp5Cell::BlockRam { .. }
             | Ecp5Cell::TrellisIo { .. }
             | Ecp5Cell::Jtagg { .. }
-            | Ecp5Cell::Pll { .. } => true,
+            | Ecp5Cell::Pll { .. }
+            | Ecp5Cell::Multiplier { .. } => true,
         }));
     }
 
@@ -11196,7 +11317,8 @@ mod tests {
                 | Ecp5Cell::BlockRam { .. }
                 | Ecp5Cell::TrellisIo { .. }
                 | Ecp5Cell::Jtagg { .. }
-                | Ecp5Cell::Pll { .. } => None,
+                | Ecp5Cell::Pll { .. }
+                | Ecp5Cell::Multiplier { .. } => None,
             })
             .collect::<Vec<_>>();
 
