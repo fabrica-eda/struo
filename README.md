@@ -43,7 +43,7 @@ core `rtl`, `ir`, `synth`, `formal`, and `sim` modules are always available.
 Veryl source
     │
     ▼
-veryl-analyzer 0.20.3
+veryl-analyzer 0.21.0
     │  struo-frontend-veryl
     ▼
 struo-rtl              module / type / clock / reset / register / memory
@@ -534,6 +534,23 @@ Each physical ECP5 port has one shared read/write address; the two-port Veryl
 form therefore uses a conditional write with the read in its `else` branch and
 the same indexed address expression.
 
+True-dual-port arrays require Veryl's explicit opt-in on the declaration:
+
+```veryl
+#[allow(multiple_assign)]
+#[sv("struo_memory = \"required\"")]
+var words: logic<32> [1024];
+```
+
+Struo preserves Veryl's diagnostics and validates the allowed array's port
+shape during memory inference. When a dependency uses this attribute, the
+consuming project's `Veryl.toml` must also permit it:
+
+```toml
+[lint.portability]
+allow_in_dependencies = ["multiple_assign"]
+```
+
 `distributed` uses ECP5 `TRELLIS_DPR16X4` LUT RAM. It accepts one synchronous
 whole-word write and one asynchronous read, currently up to 128 words and any
 positive word width. Depth is tiled in 16-word banks and width in four-bit
@@ -565,7 +582,7 @@ var words: logic<32> [1024];
 var flags: logic [128];
 ```
 
-Veryl 0.20.3 rejects tool-defined attribute names, which is why this uses
+Veryl 0.21.0 rejects tool-defined attribute names, which is why this uses
 `sv(...)` instead of a Struo-specific attribute namespace. Struo consumes only
 the `struo_memory` key and ignores unrelated `sv` attributes. An explicitly
 typed array that violates its contract reports the array name and the first
