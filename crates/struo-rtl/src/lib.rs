@@ -221,6 +221,8 @@ pub enum BinaryOp {
     Add,
     /// Wrapping subtraction at the declared result width.
     Sub,
+    /// Wrapping multiplication at the declared result width.
+    Mul,
     /// Equality comparison, producing one bit.
     Equal,
     /// Inequality comparison, producing one bit.

@@ -147,6 +147,10 @@ fn reserve_cell_output(
     bit_type: ValueType,
 ) -> Result<(), CeloxAdapterError> {
     let scalar = match cell {
+        Ecp5Cell::Multiplier { name, product, .. } => {
+            reserve_block_ram_read_output(builder, wires, name, "product", product.as_slice())?;
+            None
+        }
         Ecp5Cell::Lut4 { name, output, .. } => {
             Some((*output, format!("__struo_lut_{name}_{output}")))
         }
@@ -316,6 +320,20 @@ fn emit_cell(
     cell: &Ecp5Cell,
 ) -> Result<(), CeloxAdapterError> {
     match cell {
+        Ecp5Cell::Multiplier {
+            lhs, rhs, product, ..
+        } => {
+            let mut a = lhs.to_vec();
+            a.resize(36, Bit::Zero);
+            let mut b = rhs.to_vec();
+            b.resize(36, Bit::Zero);
+            let a = bits_expression(builder, wires, constants, &a)?;
+            let b = bits_expression(builder, wires, constants, &b)?;
+            let value = builder.binary(CeloxBinaryOp::Mul, a, b, ValueType::bits(36)?)?;
+            let target = builder.whole(wire_ref(wires, product[0])?.signal)?;
+            builder.assign(target, value)?;
+            Ok(())
+        }
         Ecp5Cell::Lut4 {
             inputs,
             output,
@@ -1430,6 +1448,7 @@ mod tests {
                         let expected = match operation {
                             ArithmeticOp::Add => lhs_value.wrapping_add(rhs_value),
                             ArithmeticOp::Subtract => lhs_value.wrapping_sub(rhs_value),
+                            ArithmeticOp::Multiply => lhs_value.wrapping_mul(rhs_value),
                         } & 0x1f;
                         assert_eq!(simulator.get(result), expected.into());
                     }

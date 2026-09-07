@@ -1,0 +1,59 @@
+/// Unsigned 64 x 64 product with seven external register stages.
+/// Sixteen 16 x 16 products map to MULT18X18D without internal registers.
+/// The reduction uses at most a 65-bit carry chain per stage. Payload runs
+/// continuously; MulDivUnit owns validity and waits for all seven stages.
+module MultiplyPipeline (
+    clk    : input  clock       ,
+    a      : input  logic<64>   ,
+    b      : input  logic<64>   ,
+    product: output logic<128> ,
+) {
+    var partial_q : logic<32>[16];
+    var pairs_q   : logic<48>[8] ;
+    var rows_q    : logic<80>[4] ;
+    var half_sum_q: logic<65>[2] ;
+    var half_top_q: logic<16>[2] ;
+    var half_low_q: logic<16>[2] ;
+    var halves_q  : logic<96>[2] ;
+    var final_sum_q: logic<65>   ;
+    var final_top_q: logic<32>   ;
+    var final_low_q: logic<32>   ;
+
+    for row in 0..4 :g_row {
+        for column in 0..4 :g_partial {
+            always_ff (clk) {
+                partial_q[row * 4 + column] = a[column * 16 +: 16] * b[row * 16 +: 16];
+            }
+        }
+        for pair in 0..2 :g_pair {
+            always_ff (clk) {
+                pairs_q[row * 2 + pair] = {16'd0, partial_q[row * 4 + pair * 2]}
+                    + {partial_q[row * 4 + pair * 2 + 1], 16'd0};
+            }
+        }
+        var upper: logic<48>;
+        assign upper = pairs_q[row * 2 + 1] + {32'd0, pairs_q[row * 2][47:32]};
+        always_ff (clk) {
+            rows_q[row] = {upper, pairs_q[row * 2][31:0]};
+        }
+    }
+    for half in 0..2 :g_half {
+        var upper: logic<16>;
+        assign upper = half_top_q[half] + {15'd0, half_sum_q[half][64]};
+        always_ff (clk) {
+            half_sum_q[half] = {1'b0, rows_q[half * 2 + 1][63:0]}
+                + {1'b0, rows_q[half * 2][79:16]};
+            half_top_q[half] = rows_q[half * 2 + 1][79:64];
+            half_low_q[half] = rows_q[half * 2][15:0];
+            halves_q[half]   = {upper, half_sum_q[half][63:0], half_low_q[half]};
+        }
+    }
+    var final_upper: logic<32>;
+    assign final_upper = final_top_q + {31'd0, final_sum_q[64]};
+    always_ff (clk) {
+        final_sum_q = {1'b0, halves_q[1][63:0]} + {1'b0, halves_q[0][95:32]};
+        final_top_q = halves_q[1][95:64];
+        final_low_q = halves_q[0][31:0];
+        product     = {final_upper, final_sum_q[63:0], final_low_q};
+    }
+}

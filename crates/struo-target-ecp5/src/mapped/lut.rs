@@ -432,6 +432,22 @@ fn arithmetic_arc_ps(
     mapping: ArithmeticMapping,
 ) -> u32 {
     debug_assert!(input_bit <= output_bit);
+    if arithmetic.operation() == struo_ir::ArithmeticOp::Multiply {
+        // The hard multiplier estimate uses the characterized ECP5-5G speed-8
+        // unregistered maximum. Wider words add a conservative carry-tree cost.
+        let chunks = arithmetic.outputs().len().div_ceil(18);
+        let levels = usize::BITS
+            - chunks
+                .saturating_mul(chunks)
+                .saturating_sub(1)
+                .leading_zeros();
+        let width = u32::try_from(arithmetic.outputs().len()).unwrap_or(u32::MAX);
+        let adder = CCU_INPUT_PS
+            .saturating_add(CCU_CARRY_PS.saturating_mul(width))
+            .saturating_add(CCU_SUM_PS);
+        return super::MULTIPLIER_DELAY_PS.saturating_add(levels.saturating_mul(adder));
+    }
+
     if arithmetic_uses_carry(arithmetic, mapping) {
         CCU_INPUT_PS + CCU_CARRY_PS * u32::try_from(output_bit - input_bit).unwrap() + CCU_SUM_PS
     } else {
