@@ -132,3 +132,86 @@ fn multiplier_pipeline_reads_pre_edge_operands() {
         previous = Some((u32::from(x) * u32::from(y)).into());
     }
 }
+
+// This reduction pipeline caught a Celox SplitCoalescedStores ordering bug:
+// a store fragment must not cross a preceding load of the same FF state.
+fn wide_pipeline() -> struo_target_ecp5::Ecp5Netlist {
+    let rtl = analyze_and_lower(
+        include_str!("fixtures/multiply_pipeline.veryl"),
+        "dsp_test",
+        "MultiplyPipeline",
+    )
+    .unwrap();
+    map_to_ecp5(&synthesize(&rtl).unwrap().netlist).unwrap()
+}
+
+fn check_wide_pipeline<B: celox::SimBackend>(mut sim: celox::Simulator<B>) {
+    use std::collections::VecDeque;
+    let a = sim.signal("a");
+    let b = sim.signal("b");
+    let product = sim.signal("product");
+    let clk = sim.event("clk");
+    let edge = [
+        0,
+        1,
+        u64::MAX,
+        u64::MAX - 1,
+        1 << 63,
+        (1 << 32) - 1,
+        0x1234_5678_9abc_def0,
+    ];
+    let mut vectors = edge
+        .iter()
+        .flat_map(|&x| edge.map(|y| (x, y)))
+        .collect::<Vec<_>>();
+    let mut random = 0xf053_4321_8834_934a_u64;
+    for _ in 0..128 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let x = random;
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        vectors.push((x, random));
+    }
+    vectors.extend([(0, 0); 6]);
+    let mut pending = VecDeque::new();
+    for (cycle, (x, y)) in vectors.into_iter().enumerate() {
+        sim.modify(|io| {
+            io.set(a, x);
+            io.set(b, y);
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+        pending.push_back(u128::from(x) * u128::from(y));
+        if pending.len() == 7 {
+            let words = sim.get(product).to_u64_digits();
+            let got = u128::from(words.first().copied().unwrap_or(0))
+                | (u128::from(words.get(1).copied().unwrap_or(0)) << 64);
+            assert_eq!(
+                got,
+                pending.pop_front().unwrap(),
+                "cycle={cycle}, current a={x:016x}, b={y:016x}, got={got:032x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn wide_pipeline_preserves_cycle_alignment_native() {
+    let mapped = wide_pipeline();
+    check_wide_pipeline(ecp5_simulator(&mapped).unwrap().build_native().unwrap());
+}
+
+#[test]
+fn wide_pipeline_preserves_cycle_alignment_cranelift() {
+    let mapped = wide_pipeline();
+    check_wide_pipeline(ecp5_simulator(&mapped).unwrap().build_cranelift().unwrap());
+}
+
+#[test]
+fn wide_pipeline_preserves_cycle_alignment_wasm() {
+    let mapped = wide_pipeline();
+    check_wide_pipeline(ecp5_simulator(&mapped).unwrap().build_wasm().unwrap());
+}
