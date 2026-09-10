@@ -335,6 +335,12 @@ pub struct MappingOptions {
     pub arithmetic: ArithmeticMapping,
     /// Clock frequency used by timing-driven LUT covering.
     pub timing_goal_mhz: u32,
+    /// Allow automatic retiming to replace the unretimed mapping candidate.
+    ///
+    /// Defaults to true. Disable this when comparing physical implementations
+    /// that preserve the source register boundaries. Mapping equivalence is
+    /// still checked, and combinational mapping remains timing driven.
+    pub retiming: bool,
 }
 
 /// Per-register control of the physical fanout seen at the ECP5 clock-enable
@@ -374,6 +380,7 @@ impl Default for MappingOptions {
         Self {
             arithmetic: ArithmeticMapping::Auto,
             timing_goal_mhz: crate::ECP5_QOR_TARGET_MHZ,
+            retiming: true,
         }
     }
 }
@@ -2678,13 +2685,14 @@ fn map_to_ecp5_with_period(
     // follow-up available only when the unretimed conservative cover already
     // won.  Otherwise a one-picosecond wide-cover advantage can suppress a
     // smaller retimed candidate before it is even evaluated.
-    if let Some(mut retimed) = automatically_retime_mapped_luts(
-        &narrow,
-        original_cells,
-        retiming_original_registers,
-        retiming_target_period_ps,
-    )
-    .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
+    if options.retiming
+        && let Some(mut retimed) = automatically_retime_mapped_luts(
+            &narrow,
+            original_cells,
+            retiming_original_registers,
+            retiming_target_period_ps,
+        )
+        .filter(|retimed| verify_mapped_equivalence_proof(retimed, true))
     {
         cleanup_lut4_dynamic_inputs(&mut retimed);
         split_branched_carry_outs(&mut retimed);
@@ -9901,6 +9909,21 @@ mod tests {
             mapped.retiming().selected_overall_period_ps
                 < mapped.retiming().original_overall_period_ps
         );
+
+        let unretimed = map_to_ecp5_with_options(
+            &source,
+            MappingOptions {
+                retiming: false,
+                ..options
+            },
+        )
+        .unwrap();
+        assert!(!unretimed.retiming().applied);
+        assert!(unretimed.retiming().equivalence_signed_off);
+        assert_eq!(unretimed.retiming().certified_primitive_moves, 0);
+        assert_eq!(unretimed.retiming().equivalent_logic_replications, 0);
+        assert_eq!(unretimed.retiming().original_registers, 38);
+        assert_eq!(unretimed.retiming().selected_registers, 38);
     }
 
     #[test]
