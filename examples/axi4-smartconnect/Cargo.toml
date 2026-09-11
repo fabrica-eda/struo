@@ -12,7 +12,7 @@ authors.workspace = true
 struo.workspace = true
 
 [dev-dependencies]
-celox = { git = "https://github.com/celox-sim/celox.git", rev = "7ff0dd2b8c4a92efd9a1aabe376240c6dff3f9c9" }
+celox.workspace = true
 
 [lints]
 workspace = true
