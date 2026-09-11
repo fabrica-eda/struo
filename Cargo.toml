@@ -28,6 +28,8 @@ keywords = ["fpga", "hdl", "synthesis", "veryl", "ecp5"]
 categories = ["compilers", "development-tools"]
 
 [workspace.dependencies]
+# 0.4.7 with upstream parameter typing fix #787 (after the v0.4.7 tag).
+celox = { version = "=0.4.7", git = "https://github.com/celox-sim/celox.git", rev = "ab63d6cf16ce702be7feed1c197808c30aad690d" }
 struo = { version = "=0.1.1", path = "crates/struo" } # x-release-please-version
 struo-celox = { version = "=0.1.1", path = "crates/struo-celox" } # x-release-please-version
 struo-formal = { version = "=0.1.1", path = "crates/struo-formal" } # x-release-please-version
