@@ -796,7 +796,7 @@ impl Netlist {
         self.memories.push(memory);
     }
 
-    /// Adds a wrapping word-level arithmetic operation.
+    /// Adds a wrapping word-level arithmetic operation, folding constant operands.
     ///
     /// Operands and result bits are stored least-significant first and must
     /// have the same non-zero width.
@@ -814,6 +814,7 @@ impl Netlist {
     }
 
     /// Adds a wrapping word-level addition with a one-bit carry input.
+    /// Fully constant operands and carry are folded without creating a cell.
     ///
     /// Operands and result bits are stored least-significant first and must
     /// have the same non-zero width.
@@ -843,6 +844,9 @@ impl Netlist {
         }
         let width =
             u32::try_from(lhs.len()).map_err(|_| ValidationError::ArithmeticWidth(name.clone()))?;
+        if let Some(bits) = self.fold_constant_arithmetic(operation, lhs, rhs, carry_in) {
+            return Ok(bits.into_iter().map(|bit| self.add_constant(bit)).collect());
+        }
         let outputs = (0..width)
             .map(|bit| {
                 self.add_node(
@@ -860,6 +864,46 @@ impl Netlist {
             outputs: outputs.clone(),
         });
         Ok(outputs)
+    }
+
+    fn fold_constant_arithmetic(
+        &self,
+        operation: ArithmeticOp,
+        lhs: &[NetId],
+        rhs: &[NetId],
+        carry_in: Option<NetId>,
+    ) -> Option<Vec<bool>> {
+        // Check the carry as well: constant operands with a dynamic carry must
+        // remain a word cell. Bit vectors preserve wrapping at any IR width.
+        let carry = match carry_in {
+            Some(net) => self.constant_value(net)?,
+            None => false,
+        };
+        let lhs = lhs
+            .iter()
+            .map(|net| self.constant_value(*net))
+            .collect::<Option<Vec<_>>>()?;
+        let rhs = rhs
+            .iter()
+            .map(|net| self.constant_value(*net))
+            .collect::<Option<Vec<_>>>()?;
+        let mut result = lhs;
+        match operation {
+            ArithmeticOp::Add => add_constant_bits(&mut result, rhs, carry),
+            ArithmeticOp::Subtract => {
+                add_constant_bits(&mut result, rhs.into_iter().map(|bit| !bit), true);
+            }
+            ArithmeticOp::Multiply => {
+                let lhs = result;
+                result = vec![false; lhs.len()];
+                for (shift, bit) in rhs.into_iter().enumerate() {
+                    if bit {
+                        add_constant_bits(&mut result[shift..], lhs.iter().copied(), false);
+                    }
+                }
+            }
+        }
+        Some(result)
     }
 
     /// Adds a word-level comparison and returns its one-bit result.
@@ -1537,6 +1581,15 @@ impl Display for ValidationError {
 
 impl Error for ValidationError {}
 
+// Little-endian addition, discarding carry beyond the destination width.
+fn add_constant_bits(lhs: &mut [bool], rhs: impl IntoIterator<Item = bool>, mut carry: bool) {
+    for (a, b) in lhs.iter_mut().zip(rhs) {
+        let sum = *a ^ b ^ carry;
+        carry = (*a && b) || ((*a ^ b) && carry);
+        *a = sum;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ArithmeticOp, ClockEdge, ComparisonOp, Netlist, NodeKind, RegisterCell};
@@ -1610,6 +1663,136 @@ mod tests {
             design.nodes()[result[0].index() as usize].kind(),
             NodeKind::ArithmeticOutput(_)
         ));
+    }
+
+    fn constant_word(design: &mut Netlist, value: u64, width: u32) -> Vec<super::NetId> {
+        (0..width)
+            .map(|bit| design.add_constant(value & (1 << bit) != 0))
+            .collect()
+    }
+
+    #[test]
+    fn constant_arithmetic_matches_exhaustive_small_integer_oracle() {
+        for width in 1..=5 {
+            let limit = 1_u64 << width;
+            for lhs in 0..limit {
+                for rhs in 0..limit {
+                    for operation in [
+                        ArithmeticOp::Add,
+                        ArithmeticOp::Subtract,
+                        ArithmeticOp::Multiply,
+                    ] {
+                        let mut design = Netlist::new("constant_arithmetic");
+                        let a = constant_word(&mut design, lhs, width);
+                        let b = constant_word(&mut design, rhs, width);
+                        let expected = match operation {
+                            ArithmeticOp::Add => lhs.wrapping_add(rhs),
+                            ArithmeticOp::Subtract => lhs.wrapping_sub(rhs),
+                            ArithmeticOp::Multiply => lhs.wrapping_mul(rhs),
+                        };
+                        let result = design.add_arithmetic(operation, &a, &b).unwrap();
+                        assert_eq!(result, constant_word(&mut design, expected, width));
+                        for carry in [false, true] {
+                            let carry_net = design.add_constant(carry);
+                            let result =
+                                design.add_arithmetic_with_carry(&a, &b, carry_net).unwrap();
+                            assert_eq!(
+                                result,
+                                constant_word(&mut design, lhs + rhs + u64::from(carry), width)
+                            );
+                        }
+                        assert!(design.arithmetic().is_empty());
+                        assert_eq!(design.validate(), Ok(()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constant_arithmetic_wraps_beyond_host_integer_width() {
+        for width in [65, 128, 129, 257] {
+            let mut design = Netlist::new("wide_constants");
+            let zero = design.add_constant(false);
+            let one = design.add_constant(true);
+            let zeros = vec![zero; width];
+            let ones = vec![one; width];
+            let mut unit = zeros.clone();
+            unit[0] = one;
+            assert_eq!(
+                design
+                    .add_arithmetic(ArithmeticOp::Add, &ones, &unit)
+                    .unwrap(),
+                zeros
+            );
+            assert_eq!(
+                design
+                    .add_arithmetic_with_carry(&ones, &zeros, one)
+                    .unwrap(),
+                zeros
+            );
+            assert_eq!(
+                design
+                    .add_arithmetic(ArithmeticOp::Subtract, &zeros, &unit)
+                    .unwrap(),
+                ones
+            );
+            assert_eq!(
+                design
+                    .add_arithmetic(ArithmeticOp::Multiply, &ones, &ones)
+                    .unwrap(),
+                unit
+            );
+            let mut high = zeros.clone();
+            high[width - 1] = one;
+            let mut two = zeros.clone();
+            two[1] = one;
+            assert_eq!(
+                design
+                    .add_arithmetic(ArithmeticOp::Multiply, &high, &two)
+                    .unwrap(),
+                zeros
+            );
+            assert!(design.arithmetic().is_empty());
+            assert_eq!(design.nodes().len(), 2);
+            assert_eq!(design.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn nonconstant_arithmetic_and_carry_remain_word_cells() {
+        let mut design = Netlist::new("dynamic");
+        let zero = design.add_constant(false);
+        let input = design.add_input("input");
+        for operation in [
+            ArithmeticOp::Add,
+            ArithmeticOp::Subtract,
+            ArithmeticOp::Multiply,
+        ] {
+            for (lhs, rhs) in [
+                (vec![input, zero], vec![zero, zero]),
+                (vec![zero, zero], vec![zero, input]),
+            ] {
+                let result = design.add_arithmetic(operation, &lhs, &rhs).unwrap();
+                assert!(
+                    result
+                        .iter()
+                        .all(|net| design.constant_value(*net).is_none())
+                );
+            }
+        }
+        let result = design
+            .add_arithmetic_with_carry(&[zero], &[zero], input)
+            .unwrap();
+        assert_eq!(design.arithmetic().len(), 7);
+        assert_eq!(design.arithmetic().last().unwrap().outputs(), result);
+        assert_eq!(design.validate(), Ok(()));
+        assert!(design.add_arithmetic(ArithmeticOp::Add, &[], &[]).is_err());
+        assert!(
+            design
+                .add_arithmetic(ArithmeticOp::Add, &[zero], &[])
+                .is_err()
+        );
     }
 
     #[test]

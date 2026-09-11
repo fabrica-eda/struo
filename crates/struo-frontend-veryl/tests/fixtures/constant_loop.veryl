@@ -1,0 +1,10 @@
+module Procedural (
+    sp: input logic<3>,
+    slots: output logic<8>,
+) {
+    always_comb {
+        for i in 0..8 {
+            slots[i] = sp == (i + 1) as 3;
+        }
+    }
+}
