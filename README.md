@@ -686,3 +686,29 @@ ecppack --svf build/axi4-self-test/design.svf \
 
 Licensed under either [Apache License 2.0](LICENSE-APACHE) or
 [MIT](LICENSE-MIT), at your option.
+
+## Nix development environment
+
+On x86_64 or aarch64 Linux (including WSL2), enter the pinned development shell:
+
+```sh
+nix develop
+cargo --version
+mbx --version
+cargo test --workspace --locked
+```
+
+Enable Nix flakes and `nix-command` if your installation does not already do so.
+The shell supplies Rust, rustfmt, Clippy, rust-analyzer, C/C++ compilers, CMake,
+pkg-config, OpenSSL, Python and mbx. Rust follows `rust-toolchain.toml`. Plain `cargo`
+commands automatically run through mbx's shared build cache; no global Cargo
+configuration or `mbx setup` is required. The mbx package comes from
+[tignear/nix-packages](https://github.com/tignear/nix-packages), pinned in
+`flake.lock`. Existing mbx user configuration is respected.
+
+For automatic activation, install direnv, enable its shell hook, then run
+`direnv allow` in this repository. FPGA target packs, released Fabrica tools,
+and board programming tools still follow the project-specific instructions above.
+
+Update the shared cache package with `nix flake update nix-packages`, or all
+pinned development dependencies with `nix flake update`.
