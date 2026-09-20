@@ -8,3 +8,8 @@
 bench/**/.build/
 bench/**/build/
 bench/designs/*/Veryl.lock
+
+# Local Nix/direnv environment
+/.direnv/
+/result
+/result-*/
