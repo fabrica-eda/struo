@@ -1,0 +1,23 @@
+module NestedEnable #(
+    param ENABLE_M: bit = 1,
+) (
+    clk: input clock, rst_n: input reset_async_low,
+    muldiv_wait: input logic, pmp_wait: input logic, backend_wait: input logic,
+    is_csr: input logic,
+    muldiv_result: input logic<64>, csr_data: input logic<64>, arithmetic: input logic<64>,
+    result: output logic<64>,
+) {
+    always_ff (clk, rst_n) {
+        if_reset {
+            result = 64'd0;
+        } else if ENABLE_M && muldiv_wait {
+            result = muldiv_result;
+        } else if (ENABLE_M && !pmp_wait) || !backend_wait {
+            if is_csr {
+                result = csr_data;
+            } else {
+                result = arithmetic;
+            }
+        }
+    }
+}

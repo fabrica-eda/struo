@@ -40,7 +40,7 @@ pub struct SynthesisResult {
 /// callers to reimplement RTL lowering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SynthesisOptions {
-    /// Replace direct register self-hold muxes with clock enables.
+    /// Replace register self-holds in mux trees with clock enables.
     pub infer_register_enables: bool,
     /// Remove enables from payload registers proven unobservable while invalid.
     pub relax_qualified_register_enables: bool,
@@ -877,8 +877,202 @@ pub fn pipeline_with_options(options: SynthesisOptions) -> Pipeline {
     pipeline
 }
 
-/// Replaces a direct register self-hold mux with the equivalent clock enable.
+/// Replaces register self-holds in mux trees with equivalent clock enables.
+///
+/// Existing direct-hold enables retain their original shape. For nested holds,
+/// set/reset-only state bits and guards depending on the destination state keep
+/// their data feedback: splitting those cones can worsen control-path timing.
+/// Feedback used in the update value alone does not prevent enable inference.
 pub struct InferRegisterEnables;
+
+#[derive(Clone, Copy)]
+enum MuxUpdate {
+    Hold,
+    Write {
+        data: NetId,
+        enable: Option<EnableControl>,
+    },
+}
+
+fn active_enable(design: &mut Netlist, enable: Option<EnableControl>) -> NetId {
+    match enable {
+        None => design.add_constant(true),
+        Some(EnableControl {
+            signal,
+            active: ActiveLevel::High,
+        }) => signal,
+        Some(EnableControl {
+            signal,
+            active: ActiveLevel::Low,
+        }) => design.add_not(signal),
+    }
+}
+
+fn combine_mux_updates(
+    design: &mut Netlist,
+    net: NetId,
+    condition: NetId,
+    then_update: MuxUpdate,
+    else_update: MuxUpdate,
+) -> MuxUpdate {
+    match (then_update, else_update) {
+        (MuxUpdate::Hold, MuxUpdate::Hold) => MuxUpdate::Hold,
+        (MuxUpdate::Write { data, enable }, MuxUpdate::Hold)
+        | (MuxUpdate::Hold, MuxUpdate::Write { data, enable }) => {
+            let active = if matches!(else_update, MuxUpdate::Hold) {
+                ActiveLevel::High
+            } else {
+                ActiveLevel::Low
+            };
+            let mut selected = EnableControl {
+                signal: condition,
+                active,
+            };
+            if enable.is_some() {
+                let select_net = active_enable(design, Some(selected));
+                let write_net = active_enable(design, enable);
+                selected = EnableControl {
+                    signal: design.add_and(select_net, write_net),
+                    active: ActiveLevel::High,
+                };
+            }
+            MuxUpdate::Write {
+                data,
+                enable: Some(selected),
+            }
+        }
+        (
+            MuxUpdate::Write {
+                data: then_data,
+                enable: then_enable,
+            },
+            MuxUpdate::Write {
+                data: else_data,
+                enable: else_enable,
+            },
+        ) => {
+            if then_enable.is_none() && else_enable.is_none() {
+                MuxUpdate::Write {
+                    data: net,
+                    enable: None,
+                }
+            } else {
+                let then_active = active_enable(design, then_enable);
+                let else_active = active_enable(design, else_enable);
+                // Canonical OR guards reuse existing update predicates rather
+                // than introducing mux(condition, 1, enable) control cones.
+                let signal = if then_enable.is_none() {
+                    design.add_or(condition, else_active)
+                } else if else_enable.is_none() {
+                    let not_condition = design.add_not(condition);
+                    design.add_or(not_condition, then_active)
+                } else {
+                    design.add_mux(condition, then_active, else_active)
+                };
+                MuxUpdate::Write {
+                    data: design.add_mux(condition, then_data, else_data),
+                    enable: Some(EnableControl {
+                        signal,
+                        active: ActiveLevel::High,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+// A set/reset-only state bit is already a compact Boolean feedback function.
+// Extracting both CE and a condition-dependent constant D creates two control
+// cones instead of one. Keep that form; a single constant write still benefits
+// from enable inference, as do payload updates with nonconstant data.
+fn is_set_reset_mux(design: &Netlist, root: NetId, state: NetId) -> bool {
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    let mut constants = 0;
+    while let Some(net) = pending.pop() {
+        if net == state || !seen.insert(net) {
+            continue;
+        }
+        let node = &design.nodes()[net.index() as usize];
+        match node.kind() {
+            NodeKind::Constant(value) => constants |= 1 << u8::from(*value),
+            NodeKind::Mux => pending.extend_from_slice(&node.inputs()[1..]),
+            _ => return false,
+        }
+    }
+    constants == 3
+}
+
+// Keep state-dependent update guards in the data cone. Moving a counter's
+// terminal-count feedback onto CE can introduce a new control critical path.
+fn enable_depends_on_state(
+    design: &Netlist,
+    root: NetId,
+    state: NetId,
+    cell_inputs: &HashMap<NetId, Vec<NetId>>,
+) -> bool {
+    let mut pending = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(net) = pending.pop() {
+        if net == state {
+            return true;
+        }
+        if !seen.insert(net) {
+            continue;
+        }
+        let node = &design.nodes()[net.index() as usize];
+        pending.extend_from_slice(node.inputs());
+        if let Some(inputs) = cell_inputs.get(&net) {
+            pending.extend_from_slice(inputs);
+        }
+    }
+    false
+}
+
+// Only mux data arms represent conditional assignments. A Q inside arithmetic,
+// a selector, or another logic operation remains an ordinary data dependency.
+// Memoized postorder traversal handles shared mux DAGs without exponential work
+// or recursion proportional to the depth of a generated priority chain.
+fn mux_update(design: &mut Netlist, root: NetId, state: NetId) -> MuxUpdate {
+    let mut updates = HashMap::new();
+    let mut pending = vec![(root, false)];
+    while let Some((net, visited)) = pending.pop() {
+        if updates.contains_key(&net) {
+            continue;
+        }
+        if net == state {
+            updates.insert(net, MuxUpdate::Hold);
+            continue;
+        }
+        let node = &design.nodes()[net.index() as usize];
+        if node.output() != net || !matches!(node.kind(), NodeKind::Mux) {
+            updates.insert(
+                net,
+                MuxUpdate::Write {
+                    data: net,
+                    enable: None,
+                },
+            );
+            continue;
+        }
+        let [condition, then_net, else_net] = *node.inputs() else {
+            unreachable!("validated mux nodes have three inputs");
+        };
+        if !visited {
+            pending.extend([(net, true), (else_net, false), (then_net, false)]);
+            continue;
+        }
+        let update = combine_mux_updates(
+            design,
+            net,
+            condition,
+            updates[&then_net],
+            updates[&else_net],
+        );
+        updates.insert(net, update);
+    }
+    updates[&root]
+}
 
 impl Pass for InferRegisterEnables {
     fn name(&self) -> &'static str {
@@ -886,53 +1080,59 @@ impl Pass for InferRegisterEnables {
     }
 
     fn run(&self, design: &mut Netlist) -> Result<PassReport, SynthesisError> {
-        let rewrites = design
-            .registers()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, register)| {
-                if register.enable().is_some() {
-                    return None;
-                }
-                let node = design.nodes().get(register.data().index() as usize)?;
-                if node.output() != register.data() || !matches!(node.kind(), NodeKind::Mux) {
-                    return None;
-                }
-                let [condition, then_net, else_net] = node.inputs() else {
+        let mut converted = 0;
+        let cell_inputs = retained_cell_inputs(design);
+        for index in 0..design.registers().len() {
+            let register = &design.registers()[index];
+            if register.enable().is_some() {
+                continue;
+            }
+            let (data, state) = (register.data(), register.output());
+            // Preserve the established direct-hold mapping. Strengthening an
+            // already available enable with inner holds can put a later data
+            // predicate on CE and change the physical critical path.
+            let node = &design.nodes()[data.index() as usize];
+            if matches!(node.kind(), NodeKind::Mux) {
+                let [condition, then_net, else_net] = *node.inputs() else {
                     unreachable!("validated mux nodes have three inputs");
                 };
-                if *else_net == register.output() {
-                    Some((
-                        index,
-                        *then_net,
-                        EnableControl {
-                            signal: *condition,
-                            active: ActiveLevel::High,
-                        },
-                    ))
-                } else if *then_net == register.output() {
-                    Some((
-                        index,
-                        *else_net,
-                        EnableControl {
-                            signal: *condition,
-                            active: ActiveLevel::Low,
-                        },
-                    ))
+                let direct = if else_net == state {
+                    Some((then_net, ActiveLevel::High))
+                } else if then_net == state {
+                    Some((else_net, ActiveLevel::Low))
                 } else {
                     None
+                };
+                if let Some((data, active)) = direct {
+                    design.registers_mut()[index].set_data_and_enable(
+                        data,
+                        Some(EnableControl {
+                            signal: condition,
+                            active,
+                        }),
+                    );
+                    converted += 1;
+                    continue;
                 }
-            })
-            .collect::<Vec<_>>();
-        for (index, data, enable) in &rewrites {
-            design.registers_mut()[*index].set_data_and_enable(*data, Some(*enable));
+            }
+            if is_set_reset_mux(design, data, state) {
+                continue;
+            }
+            if let MuxUpdate::Write {
+                data,
+                enable: Some(enable),
+            } = mux_update(design, data, state)
+            {
+                if enable_depends_on_state(design, enable.signal, state, &cell_inputs) {
+                    continue;
+                }
+                design.registers_mut()[index].set_data_and_enable(data, Some(enable));
+                converted += 1;
+            }
         }
         Ok(PassReport {
             pass: self.name(),
-            message: format!(
-                "converted {} register feedback muxes to clock enables",
-                rewrites.len()
-            ),
+            message: format!("converted {converted} register feedback muxes to clock enables"),
         })
     }
 }
@@ -1115,11 +1315,7 @@ fn net_is_tainted(influence: &[Influence], net: NetId) -> bool {
     influence[net.index() as usize].tainted
 }
 
-fn influence_with_qualifier_low(
-    design: &Netlist,
-    payload: NetId,
-    qualifier: NetId,
-) -> Vec<Influence> {
+fn retained_cell_inputs(design: &Netlist) -> HashMap<NetId, Vec<NetId>> {
     let mut cell_inputs = HashMap::<NetId, Vec<NetId>>::new();
     for cell in design.arithmetic() {
         let inputs = cell
@@ -1139,6 +1335,16 @@ fn influence_with_qualifier_low(
             cell.lhs().iter().chain(cell.rhs()).copied().collect(),
         );
     }
+
+    cell_inputs
+}
+
+fn influence_with_qualifier_low(
+    design: &Netlist,
+    payload: NetId,
+    qualifier: NetId,
+) -> Vec<Influence> {
+    let cell_inputs = retained_cell_inputs(design);
 
     let mut result = vec![Influence::default(); design.nodes().len()];
     for node in design.nodes() {
