@@ -40,7 +40,7 @@ pub struct SynthesisResult {
 /// callers to reimplement RTL lowering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SynthesisOptions {
-    /// Replace direct register self-hold muxes with clock enables.
+    /// Replace register self-holds in mux trees with clock enables.
     pub infer_register_enables: bool,
     /// Remove enables from payload registers proven unobservable while invalid.
     pub relax_qualified_register_enables: bool,
@@ -877,8 +877,139 @@ pub fn pipeline_with_options(options: SynthesisOptions) -> Pipeline {
     pipeline
 }
 
-/// Replaces a direct register self-hold mux with the equivalent clock enable.
+/// Replaces register self-holds in mux trees with equivalent clock enables.
 pub struct InferRegisterEnables;
+
+#[derive(Clone, Copy)]
+enum MuxUpdate {
+    Hold,
+    Write {
+        data: NetId,
+        enable: Option<EnableControl>,
+    },
+}
+
+fn active_enable(design: &mut Netlist, enable: Option<EnableControl>) -> NetId {
+    match enable {
+        None => design.add_constant(true),
+        Some(EnableControl {
+            signal,
+            active: ActiveLevel::High,
+        }) => signal,
+        Some(EnableControl {
+            signal,
+            active: ActiveLevel::Low,
+        }) => design.add_not(signal),
+    }
+}
+
+fn combine_mux_updates(
+    design: &mut Netlist,
+    net: NetId,
+    condition: NetId,
+    then_update: MuxUpdate,
+    else_update: MuxUpdate,
+) -> MuxUpdate {
+    match (then_update, else_update) {
+        (MuxUpdate::Hold, MuxUpdate::Hold) => MuxUpdate::Hold,
+        (MuxUpdate::Write { data, enable }, MuxUpdate::Hold)
+        | (MuxUpdate::Hold, MuxUpdate::Write { data, enable }) => {
+            let active = if matches!(else_update, MuxUpdate::Hold) {
+                ActiveLevel::High
+            } else {
+                ActiveLevel::Low
+            };
+            let mut selected = EnableControl {
+                signal: condition,
+                active,
+            };
+            if enable.is_some() {
+                let select_net = active_enable(design, Some(selected));
+                let write_net = active_enable(design, enable);
+                selected = EnableControl {
+                    signal: design.add_and(select_net, write_net),
+                    active: ActiveLevel::High,
+                };
+            }
+            MuxUpdate::Write {
+                data,
+                enable: Some(selected),
+            }
+        }
+        (
+            MuxUpdate::Write {
+                data: then_data,
+                enable: then_enable,
+            },
+            MuxUpdate::Write {
+                data: else_data,
+                enable: else_enable,
+            },
+        ) => {
+            if then_enable.is_none() && else_enable.is_none() {
+                MuxUpdate::Write {
+                    data: net,
+                    enable: None,
+                }
+            } else {
+                let then_active = active_enable(design, then_enable);
+                let else_active = active_enable(design, else_enable);
+                MuxUpdate::Write {
+                    data: design.add_mux(condition, then_data, else_data),
+                    enable: Some(EnableControl {
+                        signal: design.add_mux(condition, then_active, else_active),
+                        active: ActiveLevel::High,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+// Only mux data arms represent conditional assignments. A Q inside arithmetic,
+// a selector, or another logic operation remains an ordinary data dependency.
+// Memoized postorder traversal handles shared mux DAGs without exponential work
+// or recursion proportional to the depth of a generated priority chain.
+fn mux_update(design: &mut Netlist, root: NetId, state: NetId) -> MuxUpdate {
+    let mut updates = HashMap::new();
+    let mut pending = vec![(root, false)];
+    while let Some((net, visited)) = pending.pop() {
+        if updates.contains_key(&net) {
+            continue;
+        }
+        if net == state {
+            updates.insert(net, MuxUpdate::Hold);
+            continue;
+        }
+        let node = &design.nodes()[net.index() as usize];
+        if node.output() != net || !matches!(node.kind(), NodeKind::Mux) {
+            updates.insert(
+                net,
+                MuxUpdate::Write {
+                    data: net,
+                    enable: None,
+                },
+            );
+            continue;
+        }
+        let [condition, then_net, else_net] = *node.inputs() else {
+            unreachable!("validated mux nodes have three inputs");
+        };
+        if !visited {
+            pending.extend([(net, true), (else_net, false), (then_net, false)]);
+            continue;
+        }
+        let update = combine_mux_updates(
+            design,
+            net,
+            condition,
+            updates[&then_net],
+            updates[&else_net],
+        );
+        updates.insert(net, update);
+    }
+    updates[&root]
+}
 
 impl Pass for InferRegisterEnables {
     fn name(&self) -> &'static str {
@@ -886,53 +1017,25 @@ impl Pass for InferRegisterEnables {
     }
 
     fn run(&self, design: &mut Netlist) -> Result<PassReport, SynthesisError> {
-        let rewrites = design
-            .registers()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, register)| {
-                if register.enable().is_some() {
-                    return None;
-                }
-                let node = design.nodes().get(register.data().index() as usize)?;
-                if node.output() != register.data() || !matches!(node.kind(), NodeKind::Mux) {
-                    return None;
-                }
-                let [condition, then_net, else_net] = node.inputs() else {
-                    unreachable!("validated mux nodes have three inputs");
-                };
-                if *else_net == register.output() {
-                    Some((
-                        index,
-                        *then_net,
-                        EnableControl {
-                            signal: *condition,
-                            active: ActiveLevel::High,
-                        },
-                    ))
-                } else if *then_net == register.output() {
-                    Some((
-                        index,
-                        *else_net,
-                        EnableControl {
-                            signal: *condition,
-                            active: ActiveLevel::Low,
-                        },
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        for (index, data, enable) in &rewrites {
-            design.registers_mut()[*index].set_data_and_enable(*data, Some(*enable));
+        let mut converted = 0;
+        for index in 0..design.registers().len() {
+            let register = &design.registers()[index];
+            if register.enable().is_some() {
+                continue;
+            }
+            let (data, state) = (register.data(), register.output());
+            if let MuxUpdate::Write {
+                data,
+                enable: Some(enable),
+            } = mux_update(design, data, state)
+            {
+                design.registers_mut()[index].set_data_and_enable(data, Some(enable));
+                converted += 1;
+            }
         }
         Ok(PassReport {
             pass: self.name(),
-            message: format!(
-                "converted {} register feedback muxes to clock enables",
-                rewrites.len()
-            ),
+            message: format!("converted {converted} register feedback muxes to clock enables"),
         })
     }
 }
