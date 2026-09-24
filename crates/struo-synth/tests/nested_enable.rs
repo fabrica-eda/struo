@@ -1,7 +1,7 @@
 //! Regression tests for clock enables inferred from nested priority updates.
 
 use std::collections::HashMap;
-use struo_ir::{ActiveLevel, ClockEdge, NetId, Netlist, NodeKind, RegisterCell};
+use struo_ir::{ActiveLevel, ClockEdge, ComparisonOp, NetId, Netlist, NodeKind, RegisterCell};
 use struo_synth::{InferRegisterEnables, Pass};
 
 fn values(design: &Netlist, inputs: &HashMap<String, bool>) -> Vec<bool> {
@@ -46,12 +46,14 @@ fn priority_updates_infer_enable_and_preserve_all_transitions() {
     let other_data = design.add_input("other_data");
     let state = design.add_register_output("state");
     // if select_a { state=input_data; } else if select_b { state=other_data; } else { hold; }
+    let update_predicate = design.add_or(select_a, select_b);
     let inner = design.add_mux(select_b, other_data, state);
     let next_data = design.add_mux(select_a, input_data, inner);
     add_register(&mut design, state, next_data, clk);
     InferRegisterEnables.run(&mut design).unwrap();
     let register = &design.registers()[0];
     let enable = register.enable().expect("nested self-hold must infer CE");
+    assert_eq!(enable.signal, update_predicate);
     for pattern in 0..32 {
         let mut inputs = HashMap::from([("clk".into(), false)]);
         for (bit, name) in ["select_a", "select_b", "input_data", "other_data", "state"]
@@ -170,4 +172,84 @@ fn deep_shared_mux_dags_are_processed_without_recursive_or_exponential_growth() 
     assert!(design.registers()[0].enable().is_some());
     assert!(design.nodes().len() < before * 3);
     design.validate().unwrap();
+}
+
+#[test]
+fn direct_hold_preserves_the_existing_outer_enable_and_inner_data_mux() {
+    let mut design = Netlist::new("direct");
+    let clk = design.add_input("clk");
+    let outer = design.add_input("outer");
+    let inner = design.add_input("inner");
+    let data = design.add_input("data");
+    let state = design.add_register_output("state");
+    let inner_mux = design.add_mux(inner, data, state);
+    let next_data = design.add_mux(outer, inner_mux, state);
+    add_register(&mut design, state, next_data, clk);
+    InferRegisterEnables.run(&mut design).unwrap();
+    let register = &design.registers()[0];
+    let enable = register.enable().unwrap();
+    assert_eq!(enable.signal, outer);
+    assert_eq!(enable.active, ActiveLevel::High);
+    assert_eq!(register.data(), inner_mux);
+}
+
+#[test]
+fn nested_set_reset_preserves_the_compact_feedback_function() {
+    let mut design = Netlist::new("set_reset");
+    let clk = design.add_input("clk");
+    let set = design.add_input("set");
+    let reset = design.add_input("reset");
+    let state = design.add_register_output("state");
+    let zero = design.add_constant(false);
+    let one = design.add_constant(true);
+    let set_mux = design.add_mux(set, one, state);
+    let next = design.add_mux(reset, zero, set_mux);
+    add_register(&mut design, state, next, clk);
+    let before = design.clone();
+    InferRegisterEnables.run(&mut design).unwrap();
+    assert_eq!(design, before);
+}
+
+#[test]
+fn multiple_writers_of_the_same_constant_still_infer_an_enable() {
+    let mut design = Netlist::new("constant_update");
+    let clk = design.add_input("clk");
+    let first = design.add_input("first");
+    let second = design.add_input("second");
+    let state = design.add_register_output("state");
+    let one = design.add_constant(true);
+    let inner = design.add_mux(second, one, state);
+    let next = design.add_mux(first, one, inner);
+    add_register(&mut design, state, next, clk);
+    InferRegisterEnables.run(&mut design).unwrap();
+    assert!(design.registers()[0].enable().is_some());
+    assert_eq!(design.registers()[0].data(), one);
+}
+
+#[test]
+fn nested_state_dependent_guards_keep_feedback_in_the_data_cone() {
+    for retained in 0..3 {
+        let mut design = Netlist::new("state_guard");
+        let clk = design.add_input("clk");
+        let select = design.add_input("select");
+        let payload = design.add_input("payload");
+        let other = design.add_input("other");
+        let state = design.add_register_output("state");
+        let guard = match retained {
+            0 => design.add_xor(state, other),
+            1 => design
+                .add_comparison(ComparisonOp::LessThanUnsigned, &[state], &[other])
+                .unwrap(),
+            _ => design
+                .add_arithmetic_with_carry(&[payload], &[other], state)
+                .unwrap()[0],
+        };
+        let inner = design.add_mux(guard, payload, state);
+        let next = design.add_mux(select, other, inner);
+        add_register(&mut design, state, next, clk);
+        let original = design.registers()[0].clone();
+        InferRegisterEnables.run(&mut design).unwrap();
+        assert_eq!(design.registers()[0], original);
+        design.validate().unwrap();
+    }
 }
