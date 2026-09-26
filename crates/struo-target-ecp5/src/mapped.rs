@@ -1474,6 +1474,21 @@ impl Ecp5Netlist {
     ///
     /// Returns an error if two cells share a name or JSON serialization fails.
     pub fn to_nextpnr_json(&self) -> Result<String, NextpnrJsonError> {
+        self.validate_export_names()?;
+        serde_json::to_string_pretty(&JsonDesign::from(self))
+            .map_err(NextpnrJsonError::Serialization)
+    }
+
+    /// Streams the mapped netlist to a checksummed compressed binary artifact.
+    ///
+    /// # Errors
+    /// Reports duplicate cell names, serialization or filesystem errors.
+    pub fn write_artifact(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.validate_export_names()?;
+        crate::write_artifact_binary(path, &JsonDesign::from(self))
+    }
+
+    fn validate_export_names(&self) -> Result<(), NextpnrJsonError> {
         let mut seen = HashSet::new();
         if let Some(duplicate) = self
             .cells
@@ -1485,8 +1500,7 @@ impl Ecp5Netlist {
                 name: duplicate.to_owned(),
             });
         }
-        serde_json::to_string_pretty(&JsonDesign::from(self))
-            .map_err(NextpnrJsonError::Serialization)
+        Ok(())
     }
 
     /// Applies equivalent local rewrites using locations and routed timing
@@ -11740,6 +11754,32 @@ mod tests {
         let connections = &json["modules"]["counter_bit"]["cells"]["ff_state"]["connections"];
         assert!(connections.get("DI").is_some());
         assert!(connections.get("M").is_none());
+    }
+
+    #[test]
+    fn binary_artifact_preserves_mapped_cells_ports_and_parameters() {
+        let mut source = Netlist::new("artifact_register");
+        let clock = source.add_input("clk");
+        let input = source.add_input("d");
+        let output = source.add_register_output("state");
+        source.add_register(RegisterCell::new(
+            "state",
+            output,
+            input,
+            clock,
+            ClockEdge::Rising,
+            None,
+            None,
+        ));
+        source.add_output("q", output);
+        let mapped = map_to_ecp5(&source).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(&mapped.to_nextpnr_json().unwrap()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.stnet");
+        mapped.write_artifact(&path).unwrap();
+        let actual: serde_json::Value = crate::read_artifact(&path).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
