@@ -698,6 +698,12 @@ mbx --version
 cargo test --workspace --locked
 ```
 
+The independent Veryl corpus audit is available with
+`python3 scripts/check-veryl-suite.py`. See the
+[CI execution and reproduction instructions](crates/struo-frontend-veryl/tests/README.md)
+for known unsupported features and behavioral discrepancies. Known failures have explicit ignore reasons; unexpected failures make CI fail.
+Use `--include-ignored` to execute the excluded cases too.
+
 Enable Nix flakes and `nix-command` if your installation does not already do so.
 The shell supplies Rust, rustfmt, Clippy, rust-analyzer, C/C++ compilers, CMake,
 pkg-config, OpenSSL, Python and mbx. Rust follows `rust-toolchain.toml`. Plain `cargo`

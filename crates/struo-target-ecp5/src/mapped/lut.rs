@@ -1020,12 +1020,13 @@ fn plan_for_cut(
         });
     }
     let root_area = wide_lut_area(leaves.len());
-    let area = root_area
-        + leaves
-            .iter()
-            .filter_map(|leaf| plans[leaf.index() as usize].as_ref())
-            .map(|plan| plan.area)
-            .sum::<usize>();
+    // This is a tree-area estimate, so reconvergent cones are counted more
+    // than once and can grow exponentially even for a small DAG. Saturation
+    // keeps an expensive cut expensive instead of wrapping (or panicking).
+    let area = leaves
+        .iter()
+        .filter_map(|leaf| plans[leaf.index() as usize].as_ref())
+        .fold(root_area, |area, plan| area.saturating_add(plan.area));
     let arrival_ps = leaves
         .iter()
         .enumerate()
@@ -1279,6 +1280,26 @@ mod tests {
         assert_eq!(plan.leaves[5], inputs[1]);
         assert_eq!(plan.leaves[6], inputs[0]);
         assert_eq!(plan.root_area, 8);
+    }
+
+    #[test]
+    fn reconvergent_area_estimates_saturate_without_wrapping() {
+        let mut netlist = Netlist::new("reconvergent_area");
+        let a = netlist.add_input("a");
+        let b = netlist.add_input("b");
+        let cut = Cut { leaves: vec![a, b] };
+        let mut plans = vec![None; netlist.nodes().len()];
+        let arrivals = vec![Some(0); plans.len()];
+        let fanouts = vec![2; plans.len()];
+        let mut previous = 0;
+        for _ in 0..=usize::BITS {
+            let plan = plan_for_cut(&plans, &arrivals, &fanouts, &cut);
+            assert!(plan.area >= previous);
+            previous = plan.area;
+            plans[a.index() as usize] = Some(plan.clone());
+            plans[b.index() as usize] = Some(plan);
+        }
+        assert_eq!(previous, usize::MAX);
     }
 
     #[test]

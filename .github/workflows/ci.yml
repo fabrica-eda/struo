@@ -307,10 +307,73 @@ jobs:
             build/qor-ci/axi4/report.json
           if-no-files-found: warn
 
+  veryl-corpus:
+    name: Veryl corpus (Celox 0.8.0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_OPT_LEVEL: 1
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal
+
+      - name: Cache Cargo data
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-veryl-corpus-v1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-veryl-corpus-v1-
+
+      - name: Run Veryl corpus with explicit known-case ignores
+        run: python3 scripts/check-veryl-suite.py --jobs 4 --timeout 60 --report target/veryl-corpus/results.json
+
+      - name: Summarize corpus results
+        if: ${{ always() }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path("target/veryl-corpus/results.json")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("### Veryl corpus results\n\n")
+              if report.exists():
+                  data = json.loads(report.read_text())
+                  summary.write("| Outcome | Cases |\n| --- | ---: |\n")
+                  for status, count in sorted(data["counts"].items()):
+                      summary.write(f"| `{status}` | {count} |\n")
+                  summary.write(f"| Total | {len(data['cases'])} |\n\n")
+                  summary.write("Per-case diagnostics are in the veryl-corpus-results artifact.\n")
+              else:
+                  summary.write("The runner did not produce a report; inspect the build/run logs.\n")
+          PYTHON
+
+      - name: Upload corpus results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: veryl-corpus-results
+          path: target/veryl-corpus/results.json
+          retention-days: 14
+          if-no-files-found: warn
+
   required:
     # Branch protection requires this stable check name.
     name: Required CI
-    needs: validate
+    needs: [validate, veryl-corpus]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 1
@@ -319,4 +382,7 @@ jobs:
       - name: Require successful validation
         env:
           VALIDATE_RESULT: ${{ needs.validate.result }}
-        run: test "$VALIDATE_RESULT" = success
+          CORPUS_RESULT: ${{ needs.veryl-corpus.result }}
+        run: |
+          test "$VALIDATE_RESULT" = success
+          test "$CORPUS_RESULT" = success

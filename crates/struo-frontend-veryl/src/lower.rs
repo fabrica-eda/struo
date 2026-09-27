@@ -22,6 +22,8 @@ struct SignalKey {
 }
 
 type Env = HashMap<SignalKey, LoweredExpr>;
+type FunctionOutputs = Vec<(Vec<AssignDestination>, LoweredExpr)>;
+type FunctionResult = (Option<LoweredExpr>, FunctionOutputs);
 
 #[derive(Clone, Debug, Default)]
 struct DrivenBits {
@@ -142,6 +144,7 @@ enum LoweredArrayIndex {
 
 struct ModuleLowerer<'a> {
     source: &'a Module,
+    call_depth: usize,
     rtl: RtlModule,
     signals: HashMap<SignalKey, SignalId>,
     signal_order: Vec<SignalKey>,
@@ -235,6 +238,9 @@ impl<'a> ModuleLowerer<'a> {
                 .variables
                 .get(id)
                 .ok_or_else(|| ImportError::MissingVariable(path.to_string()))?;
+            if variable.affiliation == veryl_analyzer::symbol::Affiliation::Function {
+                continue;
+            }
             let direction = match variable.kind {
                 VarKind::Input => PortDirection::Input,
                 VarKind::Output => PortDirection::Output,
@@ -261,7 +267,9 @@ impl<'a> ModuleLowerer<'a> {
             .variables
             .values()
             .filter(|variable| {
-                variable.kind == VarKind::Variable && !inferred_memories.contains(&variable.id)
+                matches!(variable.kind, VarKind::Variable | VarKind::Let)
+                    && variable.affiliation != veryl_analyzer::symbol::Affiliation::Function
+                    && !inferred_memories.contains(&variable.id)
             })
             .collect::<Vec<_>>();
         internals.sort_by_key(|variable| variable.path.to_string());
@@ -283,6 +291,7 @@ impl<'a> ModuleLowerer<'a> {
 
         Ok(Self {
             source,
+            call_depth: 0,
             rtl,
             signals,
             signal_order,
@@ -727,15 +736,11 @@ impl<'a> ModuleLowerer<'a> {
     ) -> Result<(), ImportError> {
         match statement {
             Statement::Assign(assign) => {
-                if assign.dst.len() != 1 {
-                    return Err(ImportError::UnsupportedBehavior(
-                        "concatenated assignment destinations".into(),
-                    ));
-                }
-                let destination = &assign.dst[0];
-                for key in self.destination_candidates(destination)? {
-                    let (lsb, width) = static_select(&destination.select, self.width(&key)?)?;
-                    changed.insert_range(key, lsb, width);
+                for destination in &assign.dst {
+                    for key in self.destination_candidates(destination)? {
+                        let (lsb, width) = driven_select(&destination.select, self.width(&key)?)?;
+                        changed.insert_range(key, lsb, width);
+                    }
                 }
             }
             Statement::If(branch) => {
@@ -925,8 +930,12 @@ impl<'a> ModuleLowerer<'a> {
                 let child_signal = child.signal(&child_key)?;
                 let target = inline_signals[&child_signal];
                 let width = child.width(&child_key)?;
-                let value = self.lower_expression(expression, parent_env)?;
-                let value = self.resize(value, width, child.is_signed(&child_key))?;
+                let value = self.lower_assignment_value(
+                    expression,
+                    parent_env,
+                    width,
+                    child.is_signed(&child_key),
+                )?;
                 self.rtl.assign(self.rtl.whole(target)?, value.id)?;
             }
         }
@@ -1183,6 +1192,9 @@ impl<'a> ModuleLowerer<'a> {
             None
         };
 
+        changed
+            .ranges
+            .retain(|key, _| self.source.variables[&key.id].kind != VarKind::Let);
         Ok(LoweredFf {
             clock,
             edge,
@@ -1319,6 +1331,21 @@ impl<'a> ModuleLowerer<'a> {
         Ok(changed)
     }
 
+    fn sequential_reads(&self, reads: &Env, writes: &Env) -> Env {
+        let mut result = reads.clone();
+        for (key, value) in writes {
+            if self
+                .source
+                .variables
+                .get(&key.id)
+                .is_some_and(|v| v.kind == VarKind::Let)
+            {
+                result.insert(key.clone(), *value);
+            }
+        }
+        result
+    }
+
     fn lower_statement(
         &mut self,
         statement: &Statement,
@@ -1326,19 +1353,37 @@ impl<'a> ModuleLowerer<'a> {
         writes: &mut Env,
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
+        let effective_reads;
+        let reads = if sequential {
+            effective_reads = self.sequential_reads(reads, writes);
+            &effective_reads
+        } else {
+            reads
+        };
         match statement {
             Statement::Assign(assign) => {
-                if assign.dst.len() != 1 {
-                    return Err(ImportError::UnsupportedBehavior(
-                        "concatenated assignment destinations".into(),
-                    ));
-                }
-                let destination = &assign.dst[0];
                 // Reads observe the pre-edge register value, but a partial
                 // write composes over the value already scheduled for this
                 // edge (later writes win per bit).
-                let value = self.lower_expression(&assign.expr, reads)?;
-                self.assign_destination(destination, value, reads, writes)
+                let (value, mut changed) = if let Expression::Term(factor) = &assign.expr
+                    && let Factor::FunctionCall(call) = factor.as_ref()
+                {
+                    let (value, outputs) = self.lower_function_call(call, reads)?;
+                    let changed = self.copy_function_outputs(outputs, reads, writes)?;
+                    (
+                        value.ok_or_else(|| {
+                            ImportError::UnsupportedBehavior("void function assignment".into())
+                        })?,
+                        changed,
+                    )
+                } else {
+                    (
+                        self.lower_expression(&assign.expr, reads)?,
+                        DrivenBits::default(),
+                    )
+                };
+                changed.extend(self.assign_destinations(&assign.dst, value, reads, writes)?);
+                Ok(changed)
             }
             Statement::If(branch) => {
                 let condition = self.lower_expression(&branch.cond, reads)?;
@@ -1379,12 +1424,14 @@ impl<'a> ModuleLowerer<'a> {
             Statement::Case(case_statement) => {
                 self.lower_case(case_statement, reads, writes, sequential)
             }
-            Statement::For(_) => Err(ImportError::UnsupportedBehavior(
-                "runtime and unrolled for statements are not lowered yet".into(),
+            Statement::For(statement) => self.lower_for(statement, reads, writes, sequential),
+            Statement::FunctionCall(call) => {
+                let (_, outputs) = self.lower_function_call(call, reads)?;
+                self.copy_function_outputs(outputs, reads, writes)
+            }
+            Statement::SystemFunctionCall(_) => Err(ImportError::UnsupportedBehavior(
+                "statement-level function calls".into(),
             )),
-            Statement::FunctionCall(_) | Statement::SystemFunctionCall(_) => Err(
-                ImportError::UnsupportedBehavior("statement-level function calls".into()),
-            ),
             Statement::TbMethodCall(_) => Err(ImportError::UnsupportedBehavior(
                 "testbench method calls are not synthesizable".into(),
             )),
@@ -1398,6 +1445,105 @@ impl<'a> ModuleLowerer<'a> {
                 "if_reset outside always_ff".into(),
             )),
         }
+    }
+
+    fn lower_for(
+        &mut self,
+        statement: &veryl_analyzer::ir::ForStatement,
+        reads: &Env,
+        writes: &mut Env,
+        sequential: bool,
+    ) -> Result<DrivenBits, ImportError> {
+        let mut context = veryl_analyzer::Context::default();
+        let iterations = statement.range.eval_iter(&mut context).ok_or_else(|| {
+            ImportError::UnsupportedBehavior(
+                "loop bounds are dynamic or exceed the static unroll limit".into(),
+            )
+        })?;
+        let mut changed = DrivenBits::default();
+        let mut stopped = self.constant(1, 0);
+        for iteration in iterations {
+            let mut body = statement.body.clone();
+            substitute_statements(&mut body, statement.var_id, iteration)?;
+            let before = writes.clone();
+            let (written, stop) = self.lower_loop_body(&body, reads, writes, sequential)?;
+            *writes = self.merge_values(stopped, &before, writes)?;
+            stopped = self.lower_binary(Op::LogicOr, stopped, stop, 1, false)?;
+            changed.extend(written);
+        }
+        Ok(changed)
+    }
+
+    fn lower_loop_body(
+        &mut self,
+        statements: &[Statement],
+        reads: &Env,
+        writes: &mut Env,
+        sequential: bool,
+    ) -> Result<(DrivenBits, LoweredExpr), ImportError> {
+        let mut changed = DrivenBits::default();
+        let mut stopped = self.constant(1, 0);
+        for statement in statements {
+            let before = writes.clone();
+            let snapshot = if sequential {
+                self.sequential_reads(reads, writes)
+            } else {
+                before.clone()
+            };
+            let (written, stop) = match statement {
+                Statement::Break => (DrivenBits::default(), self.constant(1, 1)),
+                Statement::If(branch) => {
+                    let condition = self.lower_expression(&branch.cond, &snapshot)?;
+                    let condition = self.boolean(condition)?;
+                    let mut yes = before.clone();
+                    let mut no = before.clone();
+                    let (mut written, yes_stop) =
+                        self.lower_loop_body(&branch.true_side, reads, &mut yes, sequential)?;
+                    let (no_written, no_stop) =
+                        self.lower_loop_body(&branch.false_side, reads, &mut no, sequential)?;
+                    written.extend(no_written);
+                    *writes = self.merge_values(condition, &yes, &no)?;
+                    (
+                        written,
+                        LoweredExpr {
+                            id: self.rtl.mux(condition.id, yes_stop.id, no_stop.id)?,
+                            width: 1,
+                            signed: false,
+                        },
+                    )
+                }
+                Statement::Case(case) => {
+                    let target = self.lower_expression(&case.case_target, &snapshot)?;
+                    let mut result = before.clone();
+                    let (mut written, mut stop) =
+                        self.lower_loop_body(&case.default, reads, &mut result, sequential)?;
+                    for arm in case.arms.iter().rev() {
+                        let condition =
+                            self.lower_case_patterns(target, &arm.patterns, &snapshot)?;
+                        let mut yes = before.clone();
+                        let (yes_written, yes_stop) =
+                            self.lower_loop_body(&arm.body, reads, &mut yes, sequential)?;
+                        written.extend(yes_written);
+                        result = self.merge_values(condition, &yes, &result)?;
+                        stop = LoweredExpr {
+                            id: self.rtl.mux(condition.id, yes_stop.id, stop.id)?,
+                            width: 1,
+                            signed: false,
+                        };
+                    }
+                    *writes = result;
+                    (written, stop)
+                }
+                _ => (
+                    self.lower_statement(statement, &snapshot, writes, sequential)?,
+                    self.constant(1, 0),
+                ),
+            };
+            *writes = self.merge_values(stopped, &before, writes)?;
+            stopped = self.lower_binary(Op::LogicOr, stopped, stop, 1, false)?;
+            changed.extend(written);
+        }
+        Ok((changed, stopped))
     }
 
     fn lower_case(
@@ -1581,78 +1727,303 @@ impl<'a> ModuleLowerer<'a> {
             .ok_or_else(|| ImportError::UnsupportedBehavior("case arm without a pattern".into()))
     }
 
+    fn lower_function_call(
+        &mut self,
+        call: &veryl_analyzer::ir::FunctionCall,
+        reads: &Env,
+    ) -> Result<FunctionResult, ImportError> {
+        if self.call_depth >= 64 {
+            return Err(ImportError::UnsupportedBehavior(
+                "recursive function expansion exceeds 64 calls".into(),
+            ));
+        }
+        let function = self
+            .source
+            .functions
+            .get(&call.id)
+            .ok_or_else(|| ImportError::UnsupportedBehavior("missing function body".into()))?;
+        let body = function
+            .get_function(call.index.as_deref().unwrap_or(&[]))
+            .ok_or_else(|| {
+                ImportError::UnsupportedBehavior("unresolved function specialization".into())
+            })?;
+        let mut env = reads.clone();
+        // Function storage is an automatic frame, never a hardware register.
+        let locals = self
+            .source
+            .variables
+            .values()
+            .filter(|v| {
+                v.affiliation == veryl_analyzer::symbol::Affiliation::Function
+                    && !matches!(v.kind, VarKind::Const | VarKind::Param)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for variable in locals {
+            let width = concrete_width(&variable.r#type, "function local")?;
+            for index in array_indices(&variable.r#type, "function local")? {
+                let key = SignalKey {
+                    id: variable.id,
+                    index,
+                };
+                self.widths.insert(key.clone(), width);
+                self.signed.insert(key.clone(), variable.r#type.signed);
+                let mut value = self.constant(width, 0);
+                value.signed = variable.r#type.signed;
+                env.insert(key, value);
+            }
+        }
+        // Freeze every actual in the caller frame before mutating any formal.
+        for (path, expression) in &call.inputs {
+            let id = *body.arg_map.get(path).ok_or_else(|| {
+                ImportError::UnsupportedBehavior("missing function formal".into())
+            })?;
+            let key = self.key_from_index(id, &VarIndex::default())?;
+            let value = self.lower_assignment_value(
+                expression,
+                reads,
+                self.width(&key)?,
+                self.is_signed(&key),
+            )?;
+            env.insert(key, value);
+        }
+        self.call_depth += 1;
+        let result = self.lower_function_statements(&body.statements, &mut env, body.ret);
+        self.call_depth -= 1;
+        result?;
+        let returned = body
+            .ret
+            .map(|id| {
+                let key = self.key_from_index(id, &VarIndex::default())?;
+                env.get(&key)
+                    .copied()
+                    .ok_or_else(|| ImportError::MissingVariable("function return".into()))
+            })
+            .transpose()?;
+        let mut outputs = Vec::new();
+        for (path, destinations) in &call.outputs {
+            let id = *body.arg_map.get(path).ok_or_else(|| {
+                ImportError::UnsupportedBehavior("missing function output".into())
+            })?;
+            let key = self.key_from_index(id, &VarIndex::default())?;
+            outputs.push((destinations.clone(), env[&key]));
+        }
+        Ok((returned, outputs))
+    }
+
+    fn merge_values(
+        &mut self,
+        condition: LoweredExpr,
+        yes: &Env,
+        no: &Env,
+    ) -> Result<Env, ImportError> {
+        let mut merged = no.clone();
+        for (key, value) in yes {
+            let previous = no.get(key).copied().unwrap_or(*value);
+            if value.id != previous.id {
+                merged.insert(
+                    key.clone(),
+                    LoweredExpr {
+                        id: self.rtl.mux(condition.id, value.id, previous.id)?,
+                        ..*value
+                    },
+                );
+            }
+        }
+        Ok(merged)
+    }
+
+    fn lower_function_statements(
+        &mut self,
+        statements: &[Statement],
+        env: &mut Env,
+        ret: Option<VarId>,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut returned = self.constant(1, 0);
+        for statement in statements {
+            let before = env.clone();
+            let this_return = match statement {
+                Statement::If(branch) => {
+                    let condition = self.lower_expression(&branch.cond, &before)?;
+                    let condition = self.boolean(condition)?;
+                    let mut yes = before.clone();
+                    let mut no = before.clone();
+                    let yes_return =
+                        self.lower_function_statements(&branch.true_side, &mut yes, ret)?;
+                    let no_return =
+                        self.lower_function_statements(&branch.false_side, &mut no, ret)?;
+                    *env = self.merge_values(condition, &yes, &no)?;
+                    LoweredExpr {
+                        id: self.rtl.mux(condition.id, yes_return.id, no_return.id)?,
+                        width: 1,
+                        signed: false,
+                    }
+                }
+                Statement::Case(case) => {
+                    let target = self.lower_expression(&case.case_target, &before)?;
+                    let mut result = before.clone();
+                    let mut flag =
+                        self.lower_function_statements(&case.default, &mut result, ret)?;
+                    for arm in case.arms.iter().rev() {
+                        let condition = self.lower_case_patterns(target, &arm.patterns, &before)?;
+                        let mut yes = before.clone();
+                        let yes_return =
+                            self.lower_function_statements(&arm.body, &mut yes, ret)?;
+                        result = self.merge_values(condition, &yes, &result)?;
+                        flag = LoweredExpr {
+                            id: self.rtl.mux(condition.id, yes_return.id, flag.id)?,
+                            width: 1,
+                            signed: false,
+                        };
+                    }
+                    *env = result;
+                    flag
+                }
+                Statement::For(loop_statement)
+                    if ret.is_some_and(|id| contains_destination(&loop_statement.body, id)) =>
+                {
+                    return Err(ImportError::UnsupportedBehavior(
+                        "return inside a retained function loop".into(),
+                    ));
+                }
+                _ => {
+                    self.lower_statement(statement, &before, env, false)?;
+                    self.constant(1, u64::from(matches!(statement, Statement::Assign(a) if a.dst.iter().any(|d| Some(d.id) == ret))))
+                }
+            };
+            // A return in either branch prevents all later side effects on that path.
+            *env = self.merge_values(returned, &before, env)?;
+            returned = self.lower_binary(Op::LogicOr, returned, this_return, 1, false)?;
+        }
+        Ok(returned)
+    }
+
+    fn copy_function_outputs(
+        &mut self,
+        outputs: FunctionOutputs,
+        reads: &Env,
+        writes: &mut Env,
+    ) -> Result<DrivenBits, ImportError> {
+        let mut changed = DrivenBits::default();
+        for (destinations, value) in outputs {
+            changed.extend(self.assign_destinations(&destinations, value, reads, writes)?);
+        }
+        Ok(changed)
+    }
+
+    fn assign_destinations(
+        &mut self,
+        destinations: &[AssignDestination],
+        value: LoweredExpr,
+        reads: &Env,
+        writes: &mut Env,
+    ) -> Result<DrivenBits, ImportError> {
+        if destinations.len() == 1 {
+            return self.assign_destination(&destinations[0], value, reads, writes);
+        }
+        let widths = destinations
+            .iter()
+            .map(|dst| {
+                let width = concrete_width(self.variable_type(dst.id)?, "assignment destination")?;
+                selected_width(&dst.select, width)
+            })
+            .collect::<Result<Vec<_>, ImportError>>()?;
+        let total = widths
+            .iter()
+            .try_fold(0u32, |sum, width| sum.checked_add(*width))
+            .ok_or_else(|| ImportError::WidthTooLarge("concatenated assignment".into()))?;
+        let value = self.resize(value, total, value.signed)?;
+        let mut remaining = total;
+        let mut changed = DrivenBits::default();
+        for (dst, width) in destinations.iter().zip(widths) {
+            remaining -= width;
+            let part = LoweredExpr {
+                id: self
+                    .rtl
+                    .expression_slice(value.id, remaining, BitWidth::new(width)?)?,
+                width,
+                signed: false,
+            };
+            changed.extend(self.assign_destination(dst, part, reads, writes)?);
+        }
+        Ok(changed)
+    }
+
+    fn lower_assignment_value(
+        &mut self,
+        expression: &Expression,
+        env: &Env,
+        width: u32,
+        signed: bool,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut contextual = expression.clone();
+        contextual.comptime_mut().expr_context.width =
+            contextual.comptime().expr_context.width.max(width as usize);
+        let expression = &contextual;
+        let value = self.lower_expression(expression, env)?;
+        self.resize(value, width, signed)
+    }
+
     fn lower_expression(
+        &mut self,
+        expression: &Expression,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut expression = expression.clone();
+        repair_expression_signedness(&mut expression, None);
+        self.lower_prepared_expression(&expression, env)
+    }
+
+    fn lower_prepared_expression(
         &mut self,
         expression: &Expression,
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
         match expression {
             Expression::Term(factor) => self.lower_factor(factor, env),
-            Expression::Unary(op, input, comptime) => {
-                let input = self.lower_expression(input, env)?;
-                let width = concrete_width(&comptime.r#type, "unary expression")?;
-                let input = self.resize(input, input.width.max(width), input.signed)?;
-                let (id, result_width, signed) = match op {
-                    Op::Add => (input.id, input.width, input.signed),
-                    Op::Sub => {
-                        let zero = self.constant(input.width, 0);
-                        (
-                            self.rtl.binary(BinaryOp::Sub, zero.id, input.id)?,
-                            input.width,
-                            input.signed,
-                        )
-                    }
-                    Op::LogicNot => (self.rtl.unary(UnaryOp::LogicNot, input.id)?, 1, false),
-                    Op::BitNot => (
-                        self.rtl.unary(UnaryOp::BitNot, input.id)?,
-                        input.width,
-                        input.signed,
-                    ),
-                    Op::BitAnd => (self.rtl.unary(UnaryOp::ReduceAnd, input.id)?, 1, false),
-                    Op::BitOr => (self.rtl.unary(UnaryOp::ReduceOr, input.id)?, 1, false),
-                    Op::BitXor => (self.rtl.unary(UnaryOp::ReduceXor, input.id)?, 1, false),
-                    Op::BitNand | Op::BitNor | Op::BitXnor => {
-                        let reduction = match op {
-                            Op::BitNand => UnaryOp::ReduceAnd,
-                            Op::BitNor => UnaryOp::ReduceOr,
-                            _ => UnaryOp::ReduceXor,
-                        };
-                        let reduced = self.rtl.unary(reduction, input.id)?;
-                        (self.rtl.unary(UnaryOp::BitNot, reduced)?, 1, false)
-                    }
-                    _ => return Err(Self::unsupported_expression(*op)),
-                };
-                self.resize(
-                    LoweredExpr {
-                        id,
-                        width: result_width,
-                        signed,
-                    },
-                    width,
-                    comptime.r#type.signed,
-                )
-            }
+            Expression::Unary(op, input, comptime) => self.lower_unary(*op, input, comptime, env),
             Expression::Binary(lhs, op, rhs, comptime) => {
                 if *op == Op::As {
-                    let lhs = self.lower_expression(lhs, env)?;
+                    let lhs = self.lower_prepared_expression(lhs, env)?;
                     let width = concrete_width(&comptime.r#type, "cast expression")?;
-                    return self.resize(lhs, width, comptime.r#type.signed);
+                    let signed = if matches!(rhs.comptime().value, ValueVariant::Type(_)) {
+                        comptime.r#type.signed
+                    } else {
+                        lhs.signed
+                    };
+                    return self.resize(lhs, width, signed);
                 }
-                let lhs = self.lower_expression(lhs, env)?;
-                let rhs = self.lower_expression(rhs, env)?;
+                let lhs = self.lower_prepared_expression(lhs, env)?;
+                let rhs = self.lower_prepared_expression(rhs, env)?;
                 let result_width = binary_width(*op, comptime)?;
                 let signed = binary_signed(*op, comptime);
                 self.lower_binary(*op, lhs, rhs, result_width, signed)
             }
             Expression::Ternary(condition, then_expr, else_expr, comptime) => {
-                let condition = self.lower_expression(condition, env)?;
+                let condition = self.lower_prepared_expression(condition, env)?;
                 let condition = self.boolean(condition)?;
-                let width = concrete_width(&comptime.r#type, "ternary expression")?;
-                let signed = comptime.r#type.signed;
-                let then_expr = self.lower_expression(then_expr, env)?;
-                let then_expr = self.resize(then_expr, width, signed)?;
-                let else_expr = self.lower_expression(else_expr, env)?;
-                let else_expr = self.resize(else_expr, width, signed)?;
+                let then_expr = self.lower_prepared_expression(then_expr, env)?;
+                let else_expr = self.lower_prepared_expression(else_expr, env)?;
+                let width = context_width(comptime)?
+                    .max(then_expr.width)
+                    .max(else_expr.width);
+                let signed = comptime.expr_context.signed;
+                let then_expr = self.resize(
+                    LoweredExpr {
+                        signed,
+                        ..then_expr
+                    },
+                    width,
+                    signed,
+                )?;
+                let else_expr = self.resize(
+                    LoweredExpr {
+                        signed,
+                        ..else_expr
+                    },
+                    width,
+                    signed,
+                )?;
                 Ok(LoweredExpr {
                     id: self.rtl.mux(condition.id, then_expr.id, else_expr.id)?,
                     width,
@@ -1662,7 +2033,7 @@ impl<'a> ModuleLowerer<'a> {
             Expression::Concatenation(parts, comptime) => {
                 let mut lowered = Vec::new();
                 for (part, repeat) in parts {
-                    let part = self.lower_expression(part, env)?;
+                    let part = self.lower_prepared_expression(part, env)?;
                     let count = if let Some(repeat) = repeat {
                         constant_value(repeat)?
                     } else {
@@ -1686,6 +2057,67 @@ impl<'a> ModuleLowerer<'a> {
                 "array literal expression".into(),
             )),
         }
+    }
+
+    fn lower_unary(
+        &mut self,
+        op: Op,
+        input: &Expression,
+        comptime: &Comptime,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let input = self.lower_prepared_expression(input, env)?;
+        let sized = matches!(op, Op::Add | Op::Sub | Op::BitNot);
+        let width = if sized { context_width(comptime)? } else { 1 };
+        let signed = sized && comptime.expr_context.signed;
+        let input = if sized {
+            self.resize(
+                LoweredExpr { signed, ..input },
+                input.width.max(width),
+                signed,
+            )?
+        } else {
+            input
+        };
+        let (id, result_width, signed) = match op {
+            Op::Add => (input.id, input.width, input.signed),
+            Op::Sub => {
+                let zero = self.constant(input.width, 0);
+                (
+                    self.rtl.binary(BinaryOp::Sub, zero.id, input.id)?,
+                    input.width,
+                    input.signed,
+                )
+            }
+            Op::LogicNot => (self.rtl.unary(UnaryOp::LogicNot, input.id)?, 1, false),
+            Op::BitNot => (
+                self.rtl.unary(UnaryOp::BitNot, input.id)?,
+                input.width,
+                input.signed,
+            ),
+            Op::BitAnd => (self.rtl.unary(UnaryOp::ReduceAnd, input.id)?, 1, false),
+            Op::BitOr => (self.rtl.unary(UnaryOp::ReduceOr, input.id)?, 1, false),
+            Op::BitXor => (self.rtl.unary(UnaryOp::ReduceXor, input.id)?, 1, false),
+            Op::BitNand | Op::BitNor | Op::BitXnor => {
+                let reduction = match op {
+                    Op::BitNand => UnaryOp::ReduceAnd,
+                    Op::BitNor => UnaryOp::ReduceOr,
+                    _ => UnaryOp::ReduceXor,
+                };
+                let reduced = self.rtl.unary(reduction, input.id)?;
+                (self.rtl.unary(UnaryOp::BitNot, reduced)?, 1, false)
+            }
+            _ => return Err(Self::unsupported_expression(op)),
+        };
+        self.resize(
+            LoweredExpr {
+                id,
+                width: result_width,
+                signed,
+            },
+            width,
+            signed,
+        )
     }
 
     fn lower_struct_constructor(
@@ -1749,8 +2181,8 @@ impl<'a> ModuleLowerer<'a> {
         ) {
             let operation = match op {
                 Op::LogicShiftL | Op::ArithShiftL => BinaryOp::ShiftLeft,
-                Op::LogicShiftR => BinaryOp::ShiftRightLogical,
-                Op::ArithShiftR => BinaryOp::ShiftRightArithmetic,
+                Op::ArithShiftR if lhs.signed && result_signed => BinaryOp::ShiftRightArithmetic,
+                Op::LogicShiftR | Op::ArithShiftR => BinaryOp::ShiftRightLogical,
                 _ => unreachable!(),
             };
             let lhs = self.resize(lhs, result_width, result_signed)?;
@@ -1764,39 +2196,41 @@ impl<'a> ModuleLowerer<'a> {
             op,
             Op::Eq | Op::Ne | Op::Less | Op::LessEq | Op::Greater | Op::GreaterEq
         );
-        // Multiplication must retain the context-sized product before truncation.
-        // Extending a narrow product afterwards irretrievably loses its high bits.
-        let operand_width = if op == Op::Mul {
-            lhs.width.max(rhs.width).max(result_width)
-        } else {
+        // Widen arithmetic operands before evaluation; widening the result
+        // afterwards cannot recover lost carry, borrow or product bits.
+        let operand_width = if comparison {
             lhs.width.max(rhs.width)
-        };
-        let signed_compare = lhs.signed && rhs.signed && (op != Op::Mul || result_signed);
-        // A mixed signed/unsigned multiplication is unsigned before widening.
-        // resize otherwise extends according to the original operand's sign.
-        let (lhs, rhs) = if op == Op::Mul {
-            (
-                LoweredExpr {
-                    signed: signed_compare,
-                    ..lhs
-                },
-                LoweredExpr {
-                    signed: signed_compare,
-                    ..rhs
-                },
-            )
         } else {
-            (lhs, rhs)
+            lhs.width.max(rhs.width).max(result_width)
+        };
+        let signed_compare = if comparison {
+            lhs.signed && rhs.signed
+        } else {
+            result_signed
+        };
+        // Extension follows the common operand type, including comparisons:
+        // an unsigned operand makes both sides unsigned before widening.
+        let lhs = LoweredExpr {
+            signed: signed_compare,
+            ..lhs
+        };
+        let rhs = LoweredExpr {
+            signed: signed_compare,
+            ..rhs
         };
         let lhs = self.resize(lhs, operand_width, signed_compare)?;
         let rhs = self.resize(rhs, operand_width, signed_compare)?;
+        if matches!(op, Op::Div | Op::Rem) {
+            let value = self.lower_div_rem(lhs, rhs, op == Op::Rem, result_signed)?;
+            return self.resize(value, result_width, result_signed);
+        }
         let operation = match op {
             Op::Add => BinaryOp::Add,
             Op::Sub => BinaryOp::Sub,
             Op::Mul => BinaryOp::Mul,
             Op::BitAnd => BinaryOp::And,
             Op::BitOr => BinaryOp::Or,
-            Op::BitXor => BinaryOp::Xor,
+            Op::BitXor | Op::BitXnor => BinaryOp::Xor,
             Op::Eq => BinaryOp::Equal,
             Op::Ne => BinaryOp::NotEqual,
             Op::Less if signed_compare => BinaryOp::LessThanSigned,
@@ -1809,13 +2243,90 @@ impl<'a> ModuleLowerer<'a> {
             Op::GreaterEq => BinaryOp::GreaterOrEqualUnsigned,
             _ => return Err(Self::unsupported_expression(op)),
         };
-        let id = self.rtl.binary(operation, lhs.id, rhs.id)?;
+        let mut id = self.rtl.binary(operation, lhs.id, rhs.id)?;
+        if op == Op::BitXnor {
+            id = self.rtl.unary(UnaryOp::BitNot, id)?;
+        }
         let value = LoweredExpr {
             id,
             width: if comparison { 1 } else { operand_width },
             signed: !comparison && result_signed,
         };
         self.resize(value, result_width, result_signed)
+    }
+
+    // Restoring division uses an extra remainder bit so the trial shift cannot
+    // overflow. Signed division truncates toward zero; remainder follows lhs.
+    fn lower_div_rem(
+        &mut self,
+        lhs: LoweredExpr,
+        rhs: LoweredExpr,
+        remainder: bool,
+        signed: bool,
+    ) -> Result<LoweredExpr, ImportError> {
+        let width = lhs.width;
+        let zero = self.constant(width, 0).id;
+        let lhs_sign = self
+            .rtl
+            .expression_slice(lhs.id, width - 1, BitWidth::new(1)?)?;
+        let rhs_sign = self
+            .rtl
+            .expression_slice(rhs.id, width - 1, BitWidth::new(1)?)?;
+        let (numerator, denominator) = if signed {
+            let neg_lhs = self.rtl.binary(BinaryOp::Sub, zero, lhs.id)?;
+            let neg_rhs = self.rtl.binary(BinaryOp::Sub, zero, rhs.id)?;
+            (
+                self.rtl.mux(lhs_sign, neg_lhs, lhs.id)?,
+                self.rtl.mux(rhs_sign, neg_rhs, rhs.id)?,
+            )
+        } else {
+            (lhs.id, rhs.id)
+        };
+        let denominator = self
+            .resize(
+                LoweredExpr {
+                    id: denominator,
+                    width,
+                    signed: false,
+                },
+                width + 1,
+                false,
+            )?
+            .id;
+        let mut rem = self.constant(width + 1, 0).id;
+        let mut quotient = Vec::with_capacity(width as usize);
+        for bit in (0..width).rev() {
+            let low = self.rtl.expression_slice(rem, 0, BitWidth::new(width)?)?;
+            let next_bit = self
+                .rtl
+                .expression_slice(numerator, bit, BitWidth::new(1)?)?;
+            let shifted = self.rtl.concat(vec![low, next_bit])?;
+            let fits = self
+                .rtl
+                .binary(BinaryOp::GreaterOrEqualUnsigned, shifted, denominator)?;
+            let difference = self.rtl.binary(BinaryOp::Sub, shifted, denominator)?;
+            rem = self.rtl.mux(fits, difference, shifted)?;
+            quotient.push(fits);
+        }
+        let mut id = if remainder {
+            self.rtl.expression_slice(rem, 0, BitWidth::new(width)?)?
+        } else {
+            self.rtl.concat(quotient)?
+        };
+        if signed {
+            let negative = if remainder {
+                lhs_sign
+            } else {
+                self.rtl.binary(BinaryOp::Xor, lhs_sign, rhs_sign)?
+            };
+            let negated = self.rtl.binary(BinaryOp::Sub, zero, id)?;
+            id = self.rtl.mux(negative, negated, id)?;
+        }
+        // Two-state simulation convention: map the all-X zero-divisor result
+        // to zero. This adapter does not implement four-state arithmetic.
+        let divisor_zero = self.rtl.binary(BinaryOp::Equal, rhs.id, zero)?;
+        id = self.rtl.mux(divisor_zero, zero, id)?;
+        Ok(LoweredExpr { id, width, signed })
     }
 
     fn lower_factor(&mut self, factor: &Factor, env: &Env) -> Result<LoweredExpr, ImportError> {
@@ -1825,16 +2336,16 @@ impl<'a> ModuleLowerer<'a> {
                     self.lower_dynamic_array_read(*id, index, env)?
                 } else {
                     let key = self.key_from_index(*id, index)?;
-                    let Some(source) = env.get(&key).copied() else {
-                        if comptime.is_const {
-                            return self.lower_comptime(comptime, "constant variable");
-                        }
+                    if let Some(source) = env.get(&key).copied() {
+                        source
+                    } else if comptime.is_const {
+                        self.lower_comptime(comptime, "constant variable")?
+                    } else {
                         return Err(ImportError::UnsupportedBehavior(format!(
                             "reference to non-runtime variable {}",
                             self.signal_name(&key)
                         )));
-                    };
-                    source
+                    }
                 };
                 if select.0.len() == 1
                     && select.1.is_none()
@@ -1851,15 +2362,28 @@ impl<'a> ModuleLowerer<'a> {
                     });
                 }
                 let (lsb, width) = static_select(select, source.width)?;
+                let signed = if select.is_empty() {
+                    source.signed
+                } else if matches!(
+                    self.variable_type(*id)?.kind,
+                    TypeKind::Bit | TypeKind::Logic
+                ) {
+                    false
+                } else {
+                    match &comptime.value {
+                        ValueVariant::Numeric(value) => value.signed(),
+                        _ => comptime.r#type.signed,
+                    }
+                };
                 if lsb == 0 && width == source.width {
-                    Ok(source)
+                    Ok(LoweredExpr { signed, ..source })
                 } else {
                     Ok(LoweredExpr {
                         id: self
                             .rtl
                             .expression_slice(source.id, lsb, BitWidth::new(width)?)?,
                         width,
-                        signed: comptime.r#type.signed,
+                        signed,
                     })
                 }
             }
@@ -1872,10 +2396,99 @@ impl<'a> ModuleLowerer<'a> {
             Factor::HierVariable(_) => Err(ImportError::UnsupportedBehavior(
                 "hierarchical variable reference".into(),
             )),
-            Factor::FunctionCall(_) | Factor::SystemFunctionCall(_) => Err(
-                ImportError::UnsupportedBehavior("function call expression".into()),
-            ),
+            Factor::FunctionCall(call) => {
+                let (value, outputs) = self.lower_function_call(call, env)?;
+                if !outputs.is_empty() {
+                    return Err(ImportError::UnsupportedBehavior(
+                        "function output inside compound expression".into(),
+                    ));
+                }
+                value.ok_or_else(|| {
+                    ImportError::UnsupportedBehavior("void function expression".into())
+                })
+            }
+            Factor::SystemFunctionCall(call) => self.lower_system_function(call, env),
         }
+    }
+
+    fn lower_system_function(
+        &mut self,
+        call: &veryl_analyzer::ir::SystemFunctionCall,
+        env: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        use veryl_analyzer::ir::SystemFunctionKind;
+        let value = match &call.kind {
+            SystemFunctionKind::Signed(input) | SystemFunctionKind::Unsigned(input) => {
+                let value = self.lower_expression(&input.0, env)?;
+                LoweredExpr {
+                    signed: matches!(call.kind, SystemFunctionKind::Signed(_)),
+                    ..value
+                }
+            }
+            SystemFunctionKind::Bits(input) | SystemFunctionKind::Size(input) => {
+                let comptime = input.0.comptime();
+                let ty = if let ValueVariant::Type(ty) = &comptime.value {
+                    ty
+                } else {
+                    &comptime.r#type
+                };
+                let size = if matches!(call.kind, SystemFunctionKind::Bits(_)) {
+                    ty.total_width().and_then(|width| {
+                        ty.array
+                            .iter()
+                            .try_fold(width, |total, dim| total.checked_mul((*dim)?))
+                    })
+                } else {
+                    ty.array
+                        .first()
+                        .or_else(|| ty.width().first())
+                        .copied()
+                        .flatten()
+                }
+                .ok_or_else(|| ImportError::NonConcreteWidth("system function argument".into()))?;
+                let value = self.constant(32, size as u64);
+                LoweredExpr {
+                    signed: true,
+                    ..value
+                }
+            }
+            SystemFunctionKind::Onehot(input) => {
+                let value = self.lower_expression(&input.0, env)?;
+                let one = self.constant(value.width, 1);
+                let zero = self.constant(value.width, 0);
+                let less = self.rtl.binary(BinaryOp::Sub, value.id, one.id)?;
+                let masked = self.rtl.binary(BinaryOp::And, value.id, less)?;
+                let single = self.rtl.binary(BinaryOp::Equal, masked, zero.id)?;
+                let nonzero = self.rtl.binary(BinaryOp::NotEqual, value.id, zero.id)?;
+                LoweredExpr {
+                    id: self.rtl.binary(BinaryOp::And, single, nonzero)?,
+                    width: 1,
+                    signed: false,
+                }
+            }
+            SystemFunctionKind::Clog2(input) => {
+                let value = self.lower_expression(&input.0, env)?;
+                let one = self.constant(value.width, 1);
+                let zero = self.constant(value.width, 0);
+                let less = self.rtl.binary(BinaryOp::Sub, value.id, one.id)?;
+                let mut result = self.constant(32, 0);
+                for bit in 0..value.width {
+                    let set = self.rtl.expression_slice(less, bit, BitWidth::new(1)?)?;
+                    let count = self.constant(32, u64::from(bit + 1));
+                    result.id = self.rtl.mux(set, count.id, result.id)?;
+                }
+                let is_zero = self.rtl.binary(BinaryOp::Equal, value.id, zero.id)?;
+                let zero_result = self.constant(32, 0);
+                result.id = self.rtl.mux(is_zero, zero_result.id, result.id)?;
+                result
+            }
+            _ => {
+                return Err(ImportError::UnsupportedBehavior(
+                    "system function expression".into(),
+                ));
+            }
+        };
+        self.resize(value, context_width(&call.comptime)?, value.signed)
     }
 
     fn lower_comptime(
@@ -1888,19 +2501,30 @@ impl<'a> ModuleLowerer<'a> {
                 "non-numeric compile-time {context}"
             )));
         };
-        let width = concrete_width(&comptime.r#type, context)?;
+        // Folded system functions can carry TypeKind::Unknown with a valid
+        // numeric width. Interpreting that placeholder type as one bit loses data.
+        let width = if value.width() == 0 {
+            context_width(comptime)?.max(1)
+        } else {
+            u32::try_from(value.width()).map_err(|_| ImportError::WidthTooLarge(context.into()))?
+        };
         if value.is_xz() {
             return Err(ImportError::UnsupportedBehavior(format!(
                 "unknown or four-state compile-time {context}"
             )));
         }
+        let value = value.expand(width as usize, value.signed());
         let words = value.payload().to_u64_digits();
         Ok(LoweredExpr {
             id: self
                 .rtl
                 .constant(Constant::new(BitWidth::new(width)?, words)),
             width,
-            signed: comptime.r#type.signed,
+            signed: if comptime.expr_context.width == 0 {
+                value.signed()
+            } else {
+                comptime.r#type.signed
+            },
         })
     }
 
@@ -1941,8 +2565,8 @@ impl<'a> ModuleLowerer<'a> {
     ) -> Result<DrivenBits, ImportError> {
         if !has_dynamic_array_index(&destination.index) {
             let key = self.destination_key(destination)?;
-            let (lsb, width) = static_select(&destination.select, self.width(&key)?)?;
-            self.assign_key(&key, &destination.select, value, writes)?;
+            let (lsb, width) = driven_select(&destination.select, self.width(&key)?)?;
+            self.assign_key(&key, &destination.select, value, reads, writes)?;
             let mut changed = DrivenBits::default();
             changed.insert_range(key, lsb, width);
             return Ok(changed);
@@ -1951,9 +2575,9 @@ impl<'a> ModuleLowerer<'a> {
         let elements = self.lower_array_elements(destination.id, &destination.index, reads)?;
         let mut changed = DrivenBits::default();
         for (key, condition) in elements {
-            let (lsb, width) = static_select(&destination.select, self.width(&key)?)?;
+            let (lsb, width) = driven_select(&destination.select, self.width(&key)?)?;
             let current = writes[&key];
-            self.assign_key(&key, &destination.select, value, writes)?;
+            self.assign_key(&key, &destination.select, value, reads, writes)?;
             let assigned = writes[&key];
             writes.insert(
                 key.clone(),
@@ -1973,9 +2597,52 @@ impl<'a> ModuleLowerer<'a> {
         key: &SignalKey,
         select: &VarSelect,
         value: LoweredExpr,
+        reads: &Env,
         env: &mut Env,
     ) -> Result<(), ImportError> {
         let total_width = self.width(key)?;
+        if dynamic_packed_select(select) {
+            let width = selected_width(select, total_width)?;
+            let mut index = self.lower_expression(&select.0[0], reads)?;
+            if matches!(select.1, Some((VarSelectOp::Step, _))) {
+                let offset_width = index
+                    .width
+                    .checked_add(u32::BITS - width.leading_zeros())
+                    .ok_or_else(|| ImportError::WidthTooLarge("packed step offset".into()))?;
+                let stride = self.constant(offset_width, u64::from(width));
+                index = self.lower_binary(Op::Mul, index, stride, offset_width, false)?;
+            }
+            let value = self.resize(value, width, false)?;
+            let value = self.resize(
+                LoweredExpr {
+                    signed: false,
+                    ..value
+                },
+                total_width,
+                false,
+            )?;
+            let ones = self.constant(width, 0);
+            let ones = LoweredExpr {
+                id: self.rtl.unary(UnaryOp::BitNot, ones.id)?,
+                width,
+                signed: false,
+            };
+            let ones = self.resize(ones, total_width, false)?;
+            let mask = self.rtl.binary(BinaryOp::ShiftLeft, ones.id, index.id)?;
+            let replacement = self.rtl.binary(BinaryOp::ShiftLeft, value.id, index.id)?;
+            let inverse = self.rtl.unary(UnaryOp::BitNot, mask)?;
+            let held = self.rtl.binary(BinaryOp::And, env[key].id, inverse)?;
+            let value = self.rtl.binary(BinaryOp::Or, held, replacement)?;
+            env.insert(
+                key.clone(),
+                LoweredExpr {
+                    id: value,
+                    width: total_width,
+                    signed: self.is_signed(key),
+                },
+            );
+            return Ok(());
+        }
         let (lsb, width) = static_select(select, total_width)?;
         let value = self.resize(value, width, self.is_signed(key))?;
         if lsb == 0 && width == total_width {
@@ -2102,7 +2769,7 @@ impl<'a> ModuleLowerer<'a> {
 
     fn destination_key(&self, destination: &AssignDestination) -> Result<SignalKey, ImportError> {
         let key = self.key_from_index(destination.id, &destination.index)?;
-        if !self.signals.contains_key(&key) {
+        if !self.signals.contains_key(&key) && !self.widths.contains_key(&key) {
             return Err(ImportError::UnsupportedBehavior(format!(
                 "assignment to non-runtime variable {}",
                 self.signal_name(&key)
@@ -2143,11 +2810,14 @@ impl<'a> ModuleLowerer<'a> {
     }
 
     fn keys_for_id(&self, id: VarId) -> Vec<SignalKey> {
-        self.signal_order
-            .iter()
+        let mut keys = self
+            .widths
+            .keys()
             .filter(|key| key.id == id)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
     }
 
     fn array_candidate_keys(
@@ -2699,29 +3369,319 @@ fn concrete_width(r#type: &Type, name: &str) -> Result<u32, ImportError> {
     u32::try_from(width).map_err(|_| ImportError::WidthTooLarge(name.into()))
 }
 
-// Shift and multiply types retain the operands' intrinsic width in AIR, while
-// the assignment or parent expression width is carried separately as context.
-fn binary_signed(op: Op, comptime: &Comptime) -> bool {
-    if op == Op::Mul {
-        comptime.expr_context.signed
-    } else {
-        comptime.r#type.signed
+// AIR keeps intrinsic types separate from the propagated expression context.
+// IEEE 1800-2023 11.8.2 requires widening operands before applying the operator.
+// Numeric size casts preserve source signedness, which is not reliably
+// reflected in AIR's propagated expression context. Recompute the common
+// type before lowering, including unsigned context inherited from a parent.
+fn expression_signedness(expression: &Expression) -> bool {
+    match expression {
+        Expression::Binary(lhs, Op::As, rhs, comptime) => {
+            if matches!(rhs.comptime().value, ValueVariant::Type(_)) {
+                comptime.r#type.signed
+            } else {
+                expression_signedness(lhs)
+            }
+        }
+        Expression::Binary(_, op, _, _) if is_boolean_operator(*op) => false,
+        Expression::Binary(lhs, op, rhs, _) => {
+            expression_signedness(lhs)
+                && (matches!(
+                    op,
+                    Op::LogicShiftL | Op::LogicShiftR | Op::ArithShiftL | Op::ArithShiftR | Op::Pow
+                ) || expression_signedness(rhs))
+        }
+        Expression::Unary(op, input, _) => {
+            matches!(op, Op::Add | Op::Sub | Op::BitNot) && expression_signedness(input)
+        }
+        Expression::Ternary(_, yes, no, _) => {
+            expression_signedness(yes) && expression_signedness(no)
+        }
+        Expression::Concatenation(..) => false,
+        Expression::Term(factor) => match factor.as_ref() {
+            Factor::SystemFunctionCall(call) => {
+                use veryl_analyzer::ir::SystemFunctionKind;
+                match call.kind {
+                    SystemFunctionKind::Bits(_)
+                    | SystemFunctionKind::Size(_)
+                    | SystemFunctionKind::Clog2(_)
+                    | SystemFunctionKind::Signed(_) => true,
+                    SystemFunctionKind::Unsigned(_) | SystemFunctionKind::Onehot(_) => false,
+                    _ => expression.comptime().r#type.signed,
+                }
+            }
+            Factor::Variable(_, _, select, ct)
+                if !select.is_empty()
+                    && matches!(ct.r#type.kind, TypeKind::Bit | TypeKind::Logic) =>
+            {
+                false
+            }
+            _ => expression.comptime().r#type.signed,
+        },
+        _ => expression.comptime().r#type.signed,
     }
 }
 
-fn binary_width(op: Op, comptime: &Comptime) -> Result<u32, ImportError> {
-    if !matches!(
-        op,
-        Op::LogicShiftL | Op::ArithShiftL | Op::LogicShiftR | Op::ArithShiftR | Op::Mul
-    ) {
-        return concrete_width(&comptime.r#type, "binary expression");
+fn repair_expression_signedness(expression: &mut Expression, inherited: Option<bool>) {
+    let signed = inherited.unwrap_or_else(|| expression_signedness(expression));
+    expression.comptime_mut().expr_context.signed = signed;
+    match expression {
+        Expression::Binary(lhs, Op::As, _, _) => repair_expression_signedness(lhs, None),
+        Expression::Binary(lhs, op, rhs, _) => {
+            if matches!(op, Op::LogicAnd | Op::LogicOr) {
+                repair_expression_signedness(lhs, None);
+                repair_expression_signedness(rhs, None);
+            } else if is_boolean_operator(*op) {
+                let common = expression_signedness(lhs) && expression_signedness(rhs);
+                repair_expression_signedness(lhs, Some(common));
+                repair_expression_signedness(rhs, Some(common));
+            } else {
+                repair_expression_signedness(lhs, Some(signed));
+                let shift = matches!(
+                    op,
+                    Op::LogicShiftL | Op::LogicShiftR | Op::ArithShiftL | Op::ArithShiftR | Op::Pow
+                );
+                repair_expression_signedness(rhs, if shift { None } else { Some(signed) });
+            }
+        }
+        Expression::Unary(op, input, _) => repair_expression_signedness(
+            input,
+            if matches!(op, Op::Add | Op::Sub | Op::BitNot) {
+                Some(signed)
+            } else {
+                None
+            },
+        ),
+        Expression::Concatenation(parts, _) => {
+            for (part, _) in parts {
+                repair_expression_signedness(part, None);
+            }
+        }
+        Expression::Ternary(cond, yes, no, _) => {
+            repair_expression_signedness(cond, None);
+            repair_expression_signedness(yes, Some(signed));
+            repair_expression_signedness(no, Some(signed));
+        }
+        _ => {}
     }
+}
+
+fn binary_signed(op: Op, comptime: &Comptime) -> bool {
+    !is_boolean_operator(op) && comptime.expr_context.signed
+}
+
+fn is_boolean_operator(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Eq
+            | Op::Ne
+            | Op::Less
+            | Op::LessEq
+            | Op::Greater
+            | Op::GreaterEq
+            | Op::LogicAnd
+            | Op::LogicOr
+    )
+}
+
+fn context_width(comptime: &Comptime) -> Result<u32, ImportError> {
     let width = comptime
         .r#type
         .total_width()
         .ok_or_else(|| ImportError::NonConcreteWidth("context-sized expression".into()))?
         .max(comptime.expr_context.width);
     u32::try_from(width).map_err(|_| ImportError::WidthTooLarge("context-sized expression".into()))
+}
+
+fn binary_width(op: Op, comptime: &Comptime) -> Result<u32, ImportError> {
+    if is_boolean_operator(op) {
+        Ok(1)
+    } else {
+        context_width(comptime)
+    }
+}
+
+fn contains_destination(statements: &[Statement], id: VarId) -> bool {
+    statements.iter().any(|statement| match statement {
+        Statement::Assign(assign) => assign.dst.iter().any(|dst| dst.id == id),
+        Statement::If(branch) => {
+            contains_destination(&branch.true_side, id)
+                || contains_destination(&branch.false_side, id)
+        }
+        Statement::Case(case) => {
+            contains_destination(&case.default, id)
+                || case
+                    .arms
+                    .iter()
+                    .any(|arm| contains_destination(&arm.body, id))
+        }
+        Statement::For(statement) => contains_destination(&statement.body, id),
+        _ => false,
+    })
+}
+
+// Substitute a static induction value before lowering each iteration. Recompute
+// index expressions instead of leaving AIR's pre-substitution value cache stale.
+fn substitute_induction(
+    expression: &mut Expression,
+    id: VarId,
+    value: usize,
+) -> Result<(), ImportError> {
+    match expression {
+        Expression::Term(factor) => match factor.as_mut() {
+            Factor::Variable(var, index, select, comptime) => {
+                if *var == id {
+                    if !index.0.is_empty() || !select.is_empty() {
+                        return Err(ImportError::UnsupportedBehavior(
+                            "selected loop induction variable".into(),
+                        ));
+                    }
+                    let mut replacement = comptime.clone();
+                    replacement.value = ValueVariant::Numeric(veryl_analyzer::value::Value::new(
+                        value as u64,
+                        concrete_width(&comptime.r#type, "loop variable")? as usize,
+                        comptime.r#type.signed,
+                    ));
+                    replacement.is_const = true;
+                    **factor = Factor::Value(replacement);
+                } else {
+                    substitute_access(index, select, id, value)?;
+                }
+            }
+            Factor::FunctionCall(call) => substitute_call(call, id, value)?,
+            Factor::SystemFunctionCall(_) => {
+                return Err(ImportError::UnsupportedBehavior(
+                    "system function in unrolled loop".into(),
+                ));
+            }
+            _ => (),
+        },
+        Expression::Unary(_, a, _) => substitute_induction(a, id, value)?,
+        Expression::Binary(a, _, b, _) => {
+            substitute_induction(a, id, value)?;
+            substitute_induction(b, id, value)?;
+        }
+        Expression::Ternary(a, b, c, _) => {
+            substitute_induction(a, id, value)?;
+            substitute_induction(b, id, value)?;
+            substitute_induction(c, id, value)?;
+        }
+        Expression::Concatenation(parts, _) => {
+            for (part, repeat) in parts {
+                substitute_induction(part, id, value)?;
+                if let Some(repeat) = repeat {
+                    substitute_induction(repeat, id, value)?;
+                }
+            }
+        }
+        Expression::StructConstructor(_, fields, _) => {
+            for (_, field) in fields {
+                substitute_induction(field, id, value)?;
+            }
+        }
+        Expression::ArrayLiteral(_, _) => {
+            return Err(ImportError::UnsupportedBehavior(
+                "array literal in unrolled loop".into(),
+            ));
+        }
+    }
+    // eval_value never invents values for unresolved runtime variables. Only
+    // use fully known numbers; keep the original expression otherwise.
+    if let Some(number) = expression.eval_value(&mut veryl_analyzer::Context::default())
+        && !number.is_xz()
+    {
+        expression.comptime_mut().value = ValueVariant::Numeric(number);
+    }
+    Ok(())
+}
+
+fn substitute_access(
+    index: &mut VarIndex,
+    select: &mut VarSelect,
+    id: VarId,
+    value: usize,
+) -> Result<(), ImportError> {
+    for expression in index.0.iter_mut().chain(&mut select.0) {
+        substitute_induction(expression, id, value)?;
+    }
+    if let Some((_, expression)) = &mut select.1 {
+        substitute_induction(expression, id, value)?;
+    }
+    Ok(())
+}
+
+fn substitute_call(
+    call: &mut veryl_analyzer::ir::FunctionCall,
+    id: VarId,
+    value: usize,
+) -> Result<(), ImportError> {
+    for expression in call.inputs.values_mut() {
+        substitute_induction(expression, id, value)?;
+    }
+    for destinations in call.outputs.values_mut() {
+        for dst in destinations {
+            substitute_access(&mut dst.index, &mut dst.select, id, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn substitute_statements(
+    statements: &mut [Statement],
+    id: VarId,
+    value: usize,
+) -> Result<(), ImportError> {
+    for statement in statements {
+        match statement {
+            Statement::Assign(assign) => {
+                substitute_induction(&mut assign.expr, id, value)?;
+                for dst in &mut assign.dst {
+                    substitute_access(&mut dst.index, &mut dst.select, id, value)?;
+                }
+            }
+            Statement::If(branch) => {
+                substitute_induction(&mut branch.cond, id, value)?;
+                substitute_statements(&mut branch.true_side, id, value)?;
+                substitute_statements(&mut branch.false_side, id, value)?;
+            }
+            Statement::Case(case) => {
+                substitute_induction(&mut case.case_target, id, value)?;
+                for arm in &mut case.arms {
+                    for pattern in &mut arm.patterns {
+                        match pattern {
+                            CasePattern::Eq(e) => substitute_induction(e, id, value)?,
+                            CasePattern::Range { lo, hi, .. } => {
+                                substitute_induction(lo, id, value)?;
+                                substitute_induction(hi, id, value)?;
+                            }
+                        }
+                    }
+                    substitute_statements(&mut arm.body, id, value)?;
+                }
+                substitute_statements(&mut case.default, id, value)?;
+            }
+            Statement::For(nested) => {
+                use veryl_analyzer::ir::{ForBound, ForRange};
+                let (ForRange::Forward { start, end, .. }
+                | ForRange::Reverse { start, end, .. }
+                | ForRange::Stepped { start, end, .. }) = &mut nested.range;
+                for bound in [start, end] {
+                    if let ForBound::Expression(e) = bound {
+                        substitute_induction(e, id, value)?;
+                    }
+                }
+                substitute_statements(&mut nested.body, id, value)?;
+            }
+            Statement::FunctionCall(call) => substitute_call(call, id, value)?,
+            Statement::Null | Statement::Break => (),
+            _ => {
+                return Err(ImportError::UnsupportedBehavior(
+                    "unsupported statement in unrolled loop".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn constant_value(expression: &Expression) -> Result<u64, ImportError> {
@@ -2744,6 +3704,39 @@ fn evaluated_u64(expression: &Expression) -> Option<u64> {
         .get_value()
         .ok()
         .and_then(veryl_analyzer::value::Value::to_u64)
+}
+
+fn dynamic_packed_select(select: &VarSelect) -> bool {
+    select.0.len() == 1 && evaluated_u64(&select.0[0]).is_none()
+}
+
+fn selected_width(select: &VarSelect, total: u32) -> Result<u32, ImportError> {
+    if !dynamic_packed_select(select) {
+        return static_select(select, total).map(|(_, width)| width);
+    }
+    match &select.1 {
+        None => Ok(1),
+        Some((VarSelectOp::PlusColon | VarSelectOp::Step, count)) => evaluated_u64(count)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0 && *n <= total)
+            .ok_or_else(|| {
+                ImportError::UnsupportedBehavior(
+                    "dynamic packed select requires a fixed width".into(),
+                )
+            }),
+        _ => Err(ImportError::UnsupportedBehavior(
+            "dynamic packed select direction is not supported".into(),
+        )),
+    }
+}
+
+fn driven_select(select: &VarSelect, total: u32) -> Result<(u32, u32), ImportError> {
+    if dynamic_packed_select(select) {
+        selected_width(select, total)?;
+        Ok((0, total))
+    } else {
+        static_select(select, total)
+    }
 }
 
 fn static_select(select: &VarSelect, source_width: u32) -> Result<(u32, u32), ImportError> {
