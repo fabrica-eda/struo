@@ -1,5 +1,7 @@
 //! Lattice ECP5 target descriptions and reproducible tool recipes.
 
+mod artifact_io;
+pub use artifact_io::{read_artifact, write_artifact_binary};
 mod mapped;
 mod physical;
 

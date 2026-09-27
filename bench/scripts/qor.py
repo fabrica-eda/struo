@@ -136,6 +136,8 @@ def run_struo(design: Design, out_json: Path, goal_mhz: int) -> None:
             design.top,
             "--output",
             str(out_json),
+            "--output-format",
+            "nextpnr-json",
             "--timing-goal-mhz",
             str(goal_mhz),
         ]

@@ -92,6 +92,24 @@ impl PhysicalFeedback {
     ) -> Result<Self, serde_json::Error> {
         let report: NextpnrReport = serde_json::from_str(report_json)?;
         let placed: NextpnrDesign = serde_json::from_str(placed_json)?;
+        Ok(Self::from_records(report, placed))
+    }
+
+    /// Reads compressed Struo artifacts or legacy nextpnr JSON files.
+    ///
+    /// # Errors
+    /// Returns an error for malformed input, corrupt frames or filesystem failures.
+    pub fn from_nextpnr_files(
+        report: &std::path::Path,
+        placed: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self::from_records(
+            crate::read_artifact(report)?,
+            crate::read_artifact(placed)?,
+        ))
+    }
+
+    fn from_records(report: NextpnrReport, placed: NextpnrDesign) -> Self {
         let placed_cells = placed
             .modules
             .into_values()
@@ -159,13 +177,13 @@ impl PhysicalFeedback {
                     .collect(),
             })
             .collect();
-        Ok(Self {
+        Self {
             placements,
             bels,
             net_timings,
             critical_paths,
             clock_fmax_khz,
-        })
+        }
     }
 
     /// Returns the placed location of a stable mapped cell name.
@@ -382,6 +400,28 @@ mod tests {
         }"#;
 
         let feedback = PhysicalFeedback::from_nextpnr_json(report, placed).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let report_path = directory.path().join("report.stnet");
+        let placed_path = directory.path().join("placed.stnet");
+        crate::write_artifact_binary(
+            &report_path,
+            &serde_json::from_str::<serde_json::Value>(report).unwrap(),
+        )
+        .unwrap();
+        crate::write_artifact_binary(
+            &placed_path,
+            &serde_json::from_str::<serde_json::Value>(placed).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            PhysicalFeedback::from_nextpnr_files(&report_path, &placed_path).unwrap(),
+            feedback
+        );
+        std::fs::write(&report_path, report).unwrap();
+        assert_eq!(
+            PhysicalFeedback::from_nextpnr_files(&report_path, &placed_path).unwrap(),
+            feedback
+        );
 
         assert_eq!(
             feedback.location("value_ff"),

@@ -198,7 +198,7 @@ cargo run -p struo-cli --example demo -- /tmp/struo-blinky.nextpnr.json
 cargo run -p struo-cli --example axi4-demo -- /tmp/struo-axi4.nextpnr.json
 cargo run -p struo-cli --example axi4-self-test -- /tmp/struo-axi4-self-test.nextpnr.json
 cargo run -p struo-cli --example carry-benchmark -- /tmp/struo-carry-benchmark
-struo bench/designs/counter32 --top counter32 --output /tmp/struo-counter32.nextpnr.json
+struo bench/designs/counter32 --top counter32 --output /tmp/struo-counter32.nextpnr.json --output-format nextpnr-json
 python3 bench/scripts/qor.py
 (cd examples/axi4-smartconnect && veryl fmt --check && veryl check)
 ```
@@ -246,7 +246,7 @@ level. Repeat `--register-enable-fanout 'CELL=LIMIT'` to select final ECP5 FF
 names with `*` and `?` patterns, for example:
 
 ```sh
-struo project --top Top --output out.json \
+struo project --top Top --output out.json --output-format nextpnr-json \
   --register-enable-fanout 'ff_core.operand_b_q[*]=16' \
   --register-enable-fanout 'ff_core.logic_result_q[*]=8'
 ```
@@ -271,7 +271,7 @@ implementation, pass a shared timing file:
 ```sh
 struo bench/designs/counter32 --top counter32 \
   --timing-constraints timing.json \
-  --output counter32.nextpnr.json
+  --output counter32.nextpnr.json --output-format nextpnr-json
 ```
 
 ```json
@@ -323,7 +323,7 @@ For a reusable registered module, use the stricter out-of-context mode instead:
 ```sh
 struo bench/designs/counter32 --top counter32 \
   --ooc-timing-constraints bench/designs/counter32/ooc-timing.json \
-  --output counter32.ooc.nextpnr.json
+  --output counter32.ooc.nextpnr.json --output-format nextpnr-json
 ```
 
 The OOC JSON owns the clock period, so `--ooc-timing-constraints` cannot be
@@ -391,7 +391,7 @@ let mapped = map_to_ecp5_with_open_drain_ios(&synthesized.netlist, &bindings)?;
 The compiler driver accepts the same binding as a repeatable option:
 
 ```sh
-struo . --top Top --output Top.json \
+struo . --top Top --output Top.json --output-format nextpnr-json \
   --open-drain sda:sda_i:sda_drive_low
 ```
 
@@ -487,7 +487,7 @@ The compiler driver removes `clk_250` and `pll_locked` from the physical pin
 list and connects them to one `EHXPLLL` selected by the user-owned JSON:
 
 ```sh
-struo . --top Top --output build/Top.json \
+struo . --top Top --output build/Top.json --output-format nextpnr-json \
   --pll-binding boards/lfe5um5g-85f-evn/pll-12-to-250.json
 ```
 
@@ -712,3 +712,26 @@ and board programming tools still follow the project-specific instructions above
 
 Update the shared cache package with `nix flake update nix-packages`, or all
 pinned development dependencies with `nix flake update`.
+
+### Compressed mapped artifacts
+
+`struo project --top Top` writes `project/target/struo/Top.stnet` by default.
+`--output design.stnet` selects another destination. The artifact stores the
+mapped netlist as CBOR in a checksummed Zstd frame; the default path never
+constructs or writes a JSON string. Saving uses a synchronized temporary file
+and atomic replacement.
+
+`Ecp5Netlist::write_artifact` is the corresponding library writer.
+`struo::target::ecp5::read_artifact` reads compressed artifacts or legacy JSON
+into a caller-selected Serde type. `PhysicalFeedback::from_nextpnr_files` accepts
+either format for both the timing report and placed design.
+
+External nextpnr still requires JSON. Export it explicitly with
+`--output-format nextpnr-json --output design.json`; a `.json` destination
+without that opt-in is rejected. Existing `to_nextpnr_json` callers remain
+available for this boundary. Timing sidecar files retain their existing format.
+
+The binary container starts with `STRUOA\x01\n` followed by a single checksummed
+Zstd frame containing CBOR. It is distinct from Texo's `.txcp` implementation
+checkpoint, which also carries routed timing and qualification evidence. Texo's
+in-memory Struo import does not change.

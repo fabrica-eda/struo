@@ -4,7 +4,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
@@ -18,6 +18,12 @@ use struo::{
     map_to_ecp5_with_timing_constraints, synthesize_with_options,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Binary,
+    NextpnrJson,
+}
+
 /// Synthesize a Veryl project to an ECP5 netlist.
 #[derive(Parser)]
 #[command(name = "struo", version, about, propagate_version = true)]
@@ -29,9 +35,13 @@ struct Cli {
     #[arg(short, long)]
     top: String,
 
-    /// Write the mapped nextpnr JSON here.
+    /// Mapped artifact destination; defaults to target/struo/<top>.stnet.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Compressed binary by default; select nextpnr-json for external nextpnr.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Binary)]
+    output_format: OutputFormat,
 
     /// Timing goal in MHz (default: 300).
     #[arg(long)]
@@ -135,6 +145,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
     if timing_goal_mhz == 0 {
         return Err("timing goal must be greater than zero".into());
     }
+    let output = mapped_output_path(cli)?;
     let design = load_design(&cli.project, &cli.top)?;
     let io_timing = cli
         .io_timing_constraints
@@ -221,8 +232,37 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
             relax_qualified_register_enables: !cli.no_relax_qualified_register_enables,
         },
         &cli.register_enable_fanout,
-        cli.output.as_deref(),
+        Some(&output),
+        cli.output_format,
     )
+}
+
+fn mapped_output_path(cli: &Cli) -> Result<PathBuf, Box<dyn Error>> {
+    let path = cli.output.clone().unwrap_or_else(|| {
+        let root = if cli
+            .project
+            .file_name()
+            .is_some_and(|name| name == "Veryl.toml")
+        {
+            cli.project.parent().unwrap_or_else(|| Path::new("."))
+        } else {
+            &cli.project
+        };
+        let suffix = match cli.output_format {
+            OutputFormat::Binary => "stnet",
+            OutputFormat::NextpnrJson => "json",
+        };
+        root.join("target/struo")
+            .join(format!("{}.{suffix}", cli.top))
+    });
+    if cli.output_format == OutputFormat::Binary
+        && path.extension().is_some_and(|ext| ext == "json")
+    {
+        return Err(
+            "binary output must not use .json; use .stnet or --output-format nextpnr-json".into(),
+        );
+    }
+    Ok(path)
 }
 
 fn parse_open_drain(value: &str) -> Result<OpenDrainIo, String> {
@@ -281,6 +321,7 @@ fn synthesize_and_map(
     synthesis_options: SynthesisOptions,
     register_enable_fanout: &[RegisterEnableFanoutConstraint],
     mapped_path: Option<&Path>,
+    output_format: OutputFormat,
 ) -> Result<(), Box<dyn Error>> {
     let synthesized = synthesize_with_options(design, synthesis_options)?;
     for report in &synthesized.reports {
@@ -344,7 +385,10 @@ fn synthesize_and_map(
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, mapped.to_nextpnr_json()?)?;
+        match output_format {
+            OutputFormat::Binary => mapped.write_artifact(path)?,
+            OutputFormat::NextpnrJson => std::fs::write(path, mapped.to_nextpnr_json()?)?,
+        }
         let pre_pack = mapped.nextpnr_pre_pack_timing_constraints();
         if !pre_pack.is_empty() {
             let timing_path = path.with_extension("timing.py");
@@ -395,6 +439,35 @@ mod tests {
     use clap::{CommandFactory, Parser as _};
 
     use super::{Cli, load_design};
+
+    #[test]
+    fn compressed_output_is_default_and_json_requires_opt_in() {
+        for project in ["project", "project/Veryl.toml"] {
+            let cli = Cli::try_parse_from(["struo", project, "--top", "Top"]).unwrap();
+            assert_eq!(
+                super::mapped_output_path(&cli).unwrap(),
+                Path::new("project/target/struo/Top.stnet")
+            );
+        }
+        let cli =
+            Cli::try_parse_from(["struo", "project", "--top", "Top", "-o", "old.json"]).unwrap();
+        assert!(super::mapped_output_path(&cli).is_err());
+        let cli = Cli::try_parse_from([
+            "struo",
+            "project",
+            "--top",
+            "Top",
+            "-o",
+            "old.json",
+            "--output-format",
+            "nextpnr-json",
+        ])
+        .unwrap();
+        assert_eq!(
+            super::mapped_output_path(&cli).unwrap(),
+            Path::new("old.json")
+        );
+    }
 
     #[test]
     fn parses_the_documented_invocation_shapes() {

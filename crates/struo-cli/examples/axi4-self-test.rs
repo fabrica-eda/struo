@@ -38,9 +38,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let (mapped, additional_candidates) = match (draft_report, draft_placed_json) {
         (Some(report), Some(placed)) => {
-            let feedback = PhysicalFeedback::from_nextpnr_json(
-                &std::fs::read_to_string(report)?,
-                &std::fs::read_to_string(placed)?,
+            let feedback = PhysicalFeedback::from_nextpnr_files(
+                std::path::Path::new(&report),
+                std::path::Path::new(&placed),
             )?;
             let mut candidates = mapped.physical_feedback_candidates(&feedback).into_iter();
             let refined = candidates.next().unwrap_or_else(|| mapped.clone());
