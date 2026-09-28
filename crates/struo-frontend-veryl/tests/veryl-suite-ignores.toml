@@ -1,9 +1,9 @@
-# Explicit exclusions for celox-test-suite-veryl 0.8.0.
+# Explicit exclusions for celox-test-suite-veryl 0.8.1.
 # These are skipped cases, not passing observations. Remove entries as support is fixed.
 # Recheck with scripts/check-veryl-suite.py --include-ignored --filter <case>.
 
 [[ignore]]
-reason = "Celox 0.8.0 rejects an asynchronous reset shared across distinct clock domains."
+reason = "Celox 0.8.1 rejects an asynchronous reset shared across distinct clock domains."
 cases = [
   "multi_clock::test_clock_domain_crossing_pattern",
   "multi_clock::test_independent_clock_domains",
@@ -51,14 +51,8 @@ cases = [
   "basic::test_mixed_selects_execution",
   "basic::test_statement_call_inputs_follow_output_writeback_order",
   "comb_observer::test_comb_function_array_literal_accepts_array_returning_items",
-  "comb_observer::test_comb_function_array_literal_array_item_preserves_element_type",
-  "comb_observer::test_comb_function_array_literal_converts_scalar_items_per_element",
-  "comb_observer::test_comb_function_direct_array_argument_converts_each_element",
   "comb_observer::test_comb_function_direct_array_return_preserves_all_elements",
-  "comb_observer::test_comb_function_nested_array_literals_preserve_each_dimension_order",
-  "comb_observer::test_comb_function_nested_array_scalar_default_converts_each_element",
   "comb_observer::test_comb_function_packed_array_literal_preserves_source_order",
-  "comb_observer::test_comb_statement_function_direct_array_argument_converts_each_element",
   "comb_observer::test_named_function_inputs_evaluate_in_source_order",
   "data_access::test_dynamic_minus_colon_and_step_read_write",
   "data_access::test_dynamic_slice_bullying",
@@ -69,22 +63,6 @@ cases = [
   "false_loop::test_read_then_overwrite_convergence",
   "ff_event_snapshot::ff_read_part_select_uses_previous_index",
   "flip_flop::test_ff_array_literal_default_expression",
-  "flip_flop::test_ff_function_call_array_literal_default_fill_matches_formal_shape",
-  "flip_flop::test_ff_function_call_array_literal_element_uses_element_width",
-  "flip_flop::test_ff_function_call_array_literal_element_uses_formal_context_width",
-  "flip_flop::test_ff_function_call_array_literal_supports_dynamic_multidim_indexing",
-  "flip_flop::test_ff_function_call_array_literal_view_dominates_conditional_access",
-  "flip_flop::test_ff_function_call_converts_array_literal_view_for_wider_nested_formal",
-  "flip_flop::test_ff_function_call_converts_forwarded_static_array_element",
-  "flip_flop::test_ff_function_call_dynamic_multidim_indexing_accepts_array_valued_items",
-  "flip_flop::test_ff_function_call_forwards_array_literal_view_to_nested_call",
-  "flip_flop::test_ff_function_call_indexed_argument_access",
-  "flip_flop::test_ff_function_call_multidim_array_literal_default_fill_matches_formal_shape",
-  "flip_flop::test_ff_function_call_multidim_array_literal_indexing_preserves_element_order",
-  "flip_flop::test_ff_function_call_nonvariable_argument_uses_formal_shape_for_indexing",
-  "flip_flop::test_ff_function_call_restores_array_literal_view_after_reentrant_call",
-  "flip_flop::test_ff_function_call_restores_initialized_forwarded_alias_view",
-  "flip_flop::test_ff_function_call_restores_nearest_array_view_after_deep_reentrant_call",
   "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
   "flip_flop::test_ff_runtime_for_bitwise_steps",
   "flip_flop::test_ff_runtime_for_bounds",
@@ -261,7 +239,7 @@ cases = [
 [[ignore]]
 reason = "The suite requires zero-start storage; synthesis folds the constant FF. See celox-sim/celox#917."
 cases = [
-  "operators::test_ff_comb_constant_folding_consistency",
+  "operators::test_ff_constant_two_state_initialization",
 ]
 
 [[ignore]]

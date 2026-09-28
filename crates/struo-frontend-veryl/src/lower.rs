@@ -6,9 +6,9 @@ use struo_rtl::{
     SignalId, SignalSlice, StateDomain, UnaryOp, ValueType,
 };
 use veryl_analyzer::ir::{
-    AssignDestination, CasePattern, CaseStatement, Component, Comptime, Declaration, Expression,
-    Factor, FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module, Op, Statement, Type,
-    TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
+    ArrayLiteralItem, AssignDestination, CasePattern, CaseStatement, Component, Comptime,
+    Declaration, Expression, Factor, FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module,
+    Op, Statement, Type, TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
 };
 use veryl_analyzer::{attribute::Attribute as VerylAttribute, attribute_table};
 use veryl_parser::resource_table::StrId;
@@ -1778,14 +1778,26 @@ impl<'a> ModuleLowerer<'a> {
             let id = *body.arg_map.get(path).ok_or_else(|| {
                 ImportError::UnsupportedBehavior("missing function formal".into())
             })?;
-            let key = self.key_from_index(id, &VarIndex::default())?;
-            let value = self.lower_assignment_value(
+            let ty = self.source.variables[&id].r#type.clone();
+            let dimensions = ty
+                .array
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| ImportError::NonConcreteWidth("function argument".into()))?;
+            let values = self.lower_array_argument(
                 expression,
+                &dimensions,
+                concrete_width(&ty, "function argument")?,
+                ty.signed,
                 reads,
-                self.width(&key)?,
-                self.is_signed(&key),
             )?;
-            env.insert(key, value);
+            for (index, value) in array_indices(&ty, "function argument")?
+                .into_iter()
+                .zip(values)
+            {
+                env.insert(SignalKey { id, index }, value);
+            }
         }
         self.call_depth += 1;
         let result = self.lower_function_statements(&body.statements, &mut env, body.ret);
@@ -1947,6 +1959,106 @@ impl<'a> ModuleLowerer<'a> {
             changed.extend(self.assign_destination(dst, part, reads, writes)?);
         }
         Ok(changed)
+    }
+
+    // Array arguments are copied into the automatic frame element by element.
+    // Packed conversion applies to each leaf, not to the aggregate bit stream.
+    fn lower_array_argument(
+        &mut self,
+        expression: &Expression,
+        dimensions: &[usize],
+        width: u32,
+        signed: bool,
+        env: &Env,
+    ) -> Result<Vec<LoweredExpr>, ImportError> {
+        let Some((&length, tail)) = dimensions.split_first() else {
+            return Ok(vec![
+                self.lower_assignment_value(expression, env, width, signed)?,
+            ]);
+        };
+        if let Expression::ArrayLiteral(items, _) = expression {
+            let mut values = Vec::new();
+            let mut count = 0;
+            let mut default = None;
+            for item in items {
+                match item {
+                    ArrayLiteralItem::Value(value, repeat) => {
+                        let repeat = repeat
+                            .as_ref()
+                            .map(|x| constant_value(x))
+                            .transpose()?
+                            .unwrap_or(1);
+                        let repeat = usize::try_from(repeat).map_err(|_| {
+                            ImportError::UnsupportedBehavior("array repetition overflow".into())
+                        })?;
+                        if repeat > length.saturating_sub(count) {
+                            return Err(ImportError::UnsupportedBehavior(
+                                "array literal shape mismatch".into(),
+                            ));
+                        }
+                        for _ in 0..repeat {
+                            values.extend(
+                                self.lower_array_argument(value, tail, width, signed, env)?,
+                            );
+                        }
+                        count += repeat;
+                    }
+                    ArrayLiteralItem::Defaul(value) => default = Some(value),
+                }
+            }
+            if count < length {
+                let default = default.ok_or_else(|| {
+                    ImportError::UnsupportedBehavior("incomplete array literal".into())
+                })?;
+                for _ in count..length {
+                    if !matches!(default.as_ref(), Expression::ArrayLiteral(_, _))
+                        && default.comptime().r#type.array.is_empty()
+                    {
+                        let leaf = self.lower_assignment_value(default, env, width, signed)?;
+                        values.extend(std::iter::repeat_n(leaf, tail.iter().product()));
+                    } else {
+                        values
+                            .extend(self.lower_array_argument(default, tail, width, signed, env)?);
+                    }
+                }
+            }
+            return Ok(values);
+        }
+        if let Expression::Term(factor) = expression
+            && let Factor::Variable(id, prefix, select, comptime) = factor.as_ref()
+        {
+            let ty = &self.source.variables[id].r#type;
+            let shape = dimensions.iter().copied().map(Some).collect::<Vec<_>>();
+            if !select.is_empty()
+                || ty
+                    .array
+                    .iter()
+                    .skip(prefix.0.len())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    != shape
+            {
+                return Err(ImportError::UnsupportedBehavior(
+                    "array argument shape mismatch".into(),
+                ));
+            }
+            let mut values = Vec::new();
+            for flat in 0..dimensions.iter().product() {
+                let mut index = prefix.clone();
+                index.0.extend(
+                    VarIndex::from_index(flat, veryl_analyzer::ir::ShapeRef::new(&shape)).0,
+                );
+                let value = self.lower_factor(
+                    &Factor::Variable(*id, index, select.clone(), comptime.clone()),
+                    env,
+                )?;
+                values.push(self.resize(value, width, signed)?);
+            }
+            return Ok(values);
+        }
+        Err(ImportError::UnsupportedBehavior(
+            "array-valued function argument".into(),
+        ))
     }
 
     fn lower_assignment_value(

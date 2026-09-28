@@ -1,12 +1,12 @@
 # Veryl corpus tests
 
-The pinned `celox-test-suite-veryl` 0.8.0 corpus exercises:
+The pinned `celox-test-suite-veryl` 0.8.1 corpus exercises:
 
 ```text
-Veryl -> Struo RTL -> synthesis -> ECP5 mapping -> Celox 0.8.0 native simulation
+Veryl -> Struo RTL -> synthesis -> ECP5 mapping -> Celox 0.8.1 native simulation
 ```
 
-CI enumerates every corpus case in the `Veryl corpus (Celox 0.8.0)` job on
+CI enumerates every corpus case in the `Veryl corpus (Celox 0.8.1)` job on
 pull requests and pushes to main. `Required CI` depends on this job. Known
 unsupported/failing cases are skipped using exact names and reasons in
 [veryl-suite-ignores.toml](veryl-suite-ignores.toml). They are reported as
@@ -60,9 +60,15 @@ around by globally disabling AIR constant folding.
 The pinned corpus also requires an uninitialized constant-driven FF to start at
 zero before its first clock. This is the suite's explicit two-state contract;
 synthesis treats the unspecified source initialization as a don't-care.
-Upstream https://github.com/celox-sim/celox/pull/917 separates initialization
-coverage from constant-folding coverage. The pinned expectation is unchanged
-here and is explicitly ignored until that change is available.
+Celox 0.8.1 separates that check into
+`operators::test_ff_constant_two_state_initialization`, which remains explicitly
+ignored. The original constant-folding case runs in CI again.
+
+Function inputs support unpacked arrays, nested array literals, repetition and
+default filling. Each element is converted to the formal element width and
+signedness before binding the automatic frame; dynamic multidimensional reads
+and forwarding to nested function calls preserve the array shape. Array-valued
+function returns remain unsupported.
 
 A no-op tick is permitted only for a source RTL register clock when the mapped
 design has no state cells or event handlers. Unknown clocks are not accepted as
