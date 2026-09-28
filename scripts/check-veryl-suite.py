@@ -5,7 +5,9 @@ import concurrent.futures
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 import sys
 import tomllib
 
@@ -48,66 +50,72 @@ def main():
     build.check_returncode()
     binary = next(item['executable'] for item in artifacts
                   if item.get('executable') and item.get('target', {}).get('name') == 'veryl_suite')
-    listing = subprocess.check_output([binary, '--ignored', '--exact', 'corpus_list', '--nocapture'], text=True)
-    catalogue = [line.removeprefix('STRUO_CASE ') for line in listing.splitlines()
-                 if line.startswith('STRUO_CASE ')]
-    ignored = load_ignores(set(catalogue))
-    names = [name for name in catalogue if args.filter in name]
-    if not names:
-        parser.error('no matching cases')
+    # Cargo can replace the test executable during another build in this workspace.
+    # Keep one immutable worker binary for the entire audit.
+    with tempfile.TemporaryDirectory(prefix='struo-veryl-suite-') as directory:
+        snapshot = Path(directory) / 'corpus-worker'
+        shutil.copy2(binary, snapshot)
+        binary = str(snapshot)
+        listing = subprocess.check_output([binary, '--ignored', '--exact', 'corpus_list', '--nocapture'], text=True)
+        catalogue = [line.removeprefix('STRUO_CASE ') for line in listing.splitlines()
+                     if line.startswith('STRUO_CASE ')]
+        ignored = load_ignores(set(catalogue))
+        names = [name for name in catalogue if args.filter in name]
+        if not names:
+            parser.error('no matching cases')
 
-    def run(name):
-        if name in ignored and not args.include_ignored and not args.reference:
-            result = {'name': name, 'status': 'ignored', 'reason': ignored[name]}
-            print(f"{'ignored':24} {name}: {ignored[name]}", flush=True)
+        def run(name):
+            if name in ignored and not args.include_ignored and not args.reference:
+                result = {'name': name, 'status': 'ignored', 'reason': ignored[name]}
+                print(f"{'ignored':24} {name}: {ignored[name]}", flush=True)
+                return result
+            env = dict(os.environ, STRUO_VERYL_CASE=name)
+            env.pop('STRUO_VERYL_REFERENCE', None)
+            if args.timing:
+                env['STRUO_VERYL_TIMING'] = '1'
+            if args.reference:
+                env['STRUO_VERYL_REFERENCE'] = '1'
+            try:
+                proc = subprocess.run([binary, '--ignored', '--exact', 'corpus_case', '--nocapture'],
+                                      env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, timeout=args.timeout)
+                output = proc.stdout
+                result = next((json.loads(line.removeprefix('STRUO_RESULT '))
+                               for line in proc.stdout.splitlines() if line.startswith('STRUO_RESULT ')),
+                              {'name': name, 'status': 'process_error'})
+                if result['status'] not in ('passed', 'rejected'):
+                    result['diagnostic'] = proc.stdout
+                elif proc.returncode:
+                    result.update(status='process_error', diagnostic=proc.stdout)
+            except subprocess.TimeoutExpired as error:
+                output = error.stdout or b''
+                result = {'name': name, 'status': 'timeout',
+                          'diagnostic': output.decode(errors='replace') if isinstance(output, bytes) else output}
+            if args.timing:
+                if isinstance(output, bytes):
+                    output = output.decode(errors='replace')
+                timings = {}
+                for line in output.splitlines():
+                    if line.startswith('STRUO_TIMING '):
+                        _, stage, seconds = line.split()
+                        timings[stage] = timings.get(stage, 0.0) + float(seconds)
+                result['timings_seconds'] = timings
+            print(f"{result['status']:24} {name}", flush=True)
             return result
-        env = dict(os.environ, STRUO_VERYL_CASE=name)
-        env.pop('STRUO_VERYL_REFERENCE', None)
-        if args.timing:
-            env['STRUO_VERYL_TIMING'] = '1'
-        if args.reference:
-            env['STRUO_VERYL_REFERENCE'] = '1'
-        try:
-            proc = subprocess.run([binary, '--ignored', '--exact', 'corpus_case', '--nocapture'],
-                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, timeout=args.timeout)
-            output = proc.stdout
-            result = next((json.loads(line.removeprefix('STRUO_RESULT '))
-                           for line in proc.stdout.splitlines() if line.startswith('STRUO_RESULT ')),
-                          {'name': name, 'status': 'process_error'})
-            if result['status'] not in ('passed', 'rejected'):
-                result['diagnostic'] = proc.stdout
-            elif proc.returncode:
-                result.update(status='process_error', diagnostic=proc.stdout)
-        except subprocess.TimeoutExpired as error:
-            output = error.stdout or b''
-            result = {'name': name, 'status': 'timeout',
-                      'diagnostic': output.decode(errors='replace') if isinstance(output, bytes) else output}
-        if args.timing:
-            if isinstance(output, bytes):
-                output = output.decode(errors='replace')
-            timings = {}
-            for line in output.splitlines():
-                if line.startswith('STRUO_TIMING '):
-                    _, stage, seconds = line.split()
-                    timings[stage] = timings.get(stage, 0.0) + float(seconds)
-            result['timings_seconds'] = timings
-        print(f"{result['status']:24} {name}", flush=True)
-        return result
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        results = list(pool.map(run, names))
-    counts = {}
-    for result in results:
-        counts[result['status']] = counts.get(result['status'], 0) + 1
-    report = {'celox_version': '0.8.1', 'suite_version': '0.8.1',
-              'pipeline': 'Veryl -> Celox native' if args.reference else 'Veryl -> Struo RTL -> synthesis -> ECP5 -> Celox native',
-              'timeout_seconds': args.timeout, 'include_ignored': args.include_ignored or args.reference,
-              'counts': counts, 'cases': results}
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(report, indent=2) + '\n')
-    print(json.dumps(counts, sort_keys=True))
-    return int(any(r['status'] not in ('passed', 'rejected', 'ignored') for r in results))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            results = list(pool.map(run, names))
+        counts = {}
+        for result in results:
+            counts[result['status']] = counts.get(result['status'], 0) + 1
+        report = {'celox_version': '0.8.1', 'suite_version': '0.8.1',
+                  'pipeline': 'Veryl -> Celox native' if args.reference else 'Veryl -> Struo RTL -> synthesis -> ECP5 -> Celox native',
+                  'timeout_seconds': args.timeout, 'include_ignored': args.include_ignored or args.reference,
+                  'counts': counts, 'cases': results}
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(report, indent=2) + '\n')
+        print(json.dumps(counts, sort_keys=True))
+        return int(any(r['status'] not in ('passed', 'rejected', 'ignored') for r in results))
 
 
 if __name__ == '__main__':

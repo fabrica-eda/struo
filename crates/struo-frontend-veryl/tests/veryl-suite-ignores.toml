@@ -15,15 +15,17 @@ cases = [
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
   "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
   "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
+  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
   "signed_divrem::signed_divrem_i128",
   "signed_divrem::signed_divrem_i64",
   "wide_operators::test_wide_comb_div",
   "wide_operators::test_wide_comb_rem",
+]
+
+[[ignore]]
+reason = "Passes locally after LUT simplification; CI headroom under the 60-second limit is not yet validated."
+cases = [
   "wide_shift_mem::test_1024bit_sar_sign_extension",
-  "wide_shift_mem::test_1024bit_shift_left",
-  "wide_shift_mem::test_1024bit_shift_right",
-  "wide_shift_mem::test_512bit_arithmetic_shift_right",
-  "wide_shift_mem::test_512bit_sar_ff",
 ]
 
 [[ignore]]
@@ -52,14 +54,11 @@ cases = [
   "basic::test_statement_call_inputs_follow_output_writeback_order",
   "comb_observer::test_comb_function_packed_array_literal_preserves_source_order",
   "comb_observer::test_named_function_inputs_evaluate_in_source_order",
-  "data_access::test_dynamic_minus_colon_and_step_read_write",
-  "data_access::test_dynamic_slice_bullying",
   "data_access::test_partial_write_merging",
   "duplicate_varpath::test_duplicate_scoped_var_in_always_comb",
   "expression_semantics::short_circuit_operators_skip_effectful_operands",
   "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
   "false_loop::test_read_then_overwrite_convergence",
-  "ff_event_snapshot::ff_read_part_select_uses_previous_index",
   "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
   "flip_flop::test_ff_runtime_for_bitwise_steps",
   "flip_flop::test_ff_runtime_for_bounds",
@@ -89,7 +88,6 @@ cases = [
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
   "operators::test_pow_operator_constant_exponent",
   "operators::test_pow_operator_constant_exponent_ff",
-  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
   "std_binary_codec::test_binary_codec_roundtrip",
   "std_binary_codec::test_binary_encoder",
   "std_binary_codec::test_binary_encoder_disabled",
@@ -110,7 +108,6 @@ cases = [
   "synth_dynamic_loop::test_runtime_break_in_synth_comb_loop",
   "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
   "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
-  "system_function::test_comb_function_body_bits_size_system_functions",
 ]
 
 [[ignore]]

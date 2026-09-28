@@ -2587,18 +2587,16 @@ impl<'a> ModuleLowerer<'a> {
                         )));
                     }
                 };
-                if select.0.len() == 1
-                    && select.1.is_none()
-                    && evaluated_u64(&select.0[0]).is_none()
-                {
-                    let index = self.lower_expression(&select.0[0], env)?;
-                    let shifted =
-                        self.rtl
-                            .binary(BinaryOp::ShiftRightLogical, source.id, index.id)?;
+                if dynamic_packed_select(select) {
+                    let width = selected_width(select, source.width)?;
+                    let (offset, negative) = self.lower_select_offset(select, width, env)?;
+                    let shifted = self.shift_selected(source.id, offset, negative, false)?;
                     return Ok(LoweredExpr {
-                        id: self.rtl.expression_slice(shifted, 0, BitWidth::new(1)?)?,
-                        width: 1,
-                        signed: comptime.r#type.signed,
+                        id: self
+                            .rtl
+                            .expression_slice(shifted, 0, BitWidth::new(width)?)?,
+                        width,
+                        signed: false,
                     });
                 }
                 let (lsb, width) = static_select(select, source.width)?;
@@ -2832,6 +2830,59 @@ impl<'a> ModuleLowerer<'a> {
         Ok(changed)
     }
 
+    // Keep offset arithmetic wider than the source index so an out-of-range
+    // index cannot wrap back into the vector. Negative offsets reverse the
+    // shift direction, preserving the valid bits of partially overlapping slices.
+    fn lower_select_offset(
+        &mut self,
+        select: &VarSelect,
+        width: u32,
+        env: &Env,
+    ) -> Result<(ExprId, ExprId), ImportError> {
+        let index = self.lower_expression(&select.0[0], env)?;
+        let offset_width = index
+            .width
+            .checked_add(u32::BITS - width.leading_zeros() + 1)
+            .ok_or_else(|| ImportError::WidthTooLarge("packed select offset".into()))?;
+        let index = self.resize(index, offset_width, true)?;
+        let offset = match select.1 {
+            Some((VarSelectOp::Step, _)) => {
+                let stride = self.constant(offset_width, u64::from(width));
+                self.rtl.binary(BinaryOp::Mul, index.id, stride.id)?
+            }
+            Some((VarSelectOp::MinusColon, _)) => {
+                let adjustment = self.constant(offset_width, u64::from(width - 1));
+                self.rtl.binary(BinaryOp::Sub, index.id, adjustment.id)?
+            }
+            _ => index.id,
+        };
+        let negative = self
+            .rtl
+            .expression_slice(offset, offset_width - 1, BitWidth::new(1)?)?;
+        let zero = self.constant(offset_width, 0);
+        let magnitude = self.rtl.binary(BinaryOp::Sub, zero.id, offset)?;
+        let magnitude = self.rtl.mux(negative, magnitude, offset)?;
+        Ok((magnitude, negative))
+    }
+
+    fn shift_selected(
+        &mut self,
+        value: ExprId,
+        offset: ExprId,
+        negative: ExprId,
+        write: bool,
+    ) -> Result<ExprId, ImportError> {
+        let left = self.rtl.binary(BinaryOp::ShiftLeft, value, offset)?;
+        let right = self
+            .rtl
+            .binary(BinaryOp::ShiftRightLogical, value, offset)?;
+        Ok(if write {
+            self.rtl.mux(negative, right, left)?
+        } else {
+            self.rtl.mux(negative, left, right)?
+        })
+    }
+
     fn assign_key(
         &mut self,
         key: &SignalKey,
@@ -2843,15 +2894,7 @@ impl<'a> ModuleLowerer<'a> {
         let total_width = self.width(key)?;
         if dynamic_packed_select(select) {
             let width = selected_width(select, total_width)?;
-            let mut index = self.lower_expression(&select.0[0], reads)?;
-            if matches!(select.1, Some((VarSelectOp::Step, _))) {
-                let offset_width = index
-                    .width
-                    .checked_add(u32::BITS - width.leading_zeros())
-                    .ok_or_else(|| ImportError::WidthTooLarge("packed step offset".into()))?;
-                let stride = self.constant(offset_width, u64::from(width));
-                index = self.lower_binary(Op::Mul, index, stride, offset_width, false)?;
-            }
+            let (offset, negative) = self.lower_select_offset(select, width, reads)?;
             let value = self.resize(value, width, false)?;
             let value = self.resize(
                 LoweredExpr {
@@ -2868,8 +2911,8 @@ impl<'a> ModuleLowerer<'a> {
                 signed: false,
             };
             let ones = self.resize(ones, total_width, false)?;
-            let mask = self.rtl.binary(BinaryOp::ShiftLeft, ones.id, index.id)?;
-            let replacement = self.rtl.binary(BinaryOp::ShiftLeft, value.id, index.id)?;
+            let mask = self.shift_selected(ones.id, offset, negative, true)?;
+            let replacement = self.shift_selected(value.id, offset, negative, true)?;
             let inverse = self.rtl.unary(UnaryOp::BitNot, mask)?;
             let held = self.rtl.binary(BinaryOp::And, env[key].id, inverse)?;
             let value = self.rtl.binary(BinaryOp::Or, held, replacement)?;
@@ -3956,14 +3999,16 @@ fn selected_width(select: &VarSelect, total: u32) -> Result<u32, ImportError> {
     }
     match &select.1 {
         None => Ok(1),
-        Some((VarSelectOp::PlusColon | VarSelectOp::Step, count)) => evaluated_u64(count)
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|n| *n > 0 && *n <= total)
-            .ok_or_else(|| {
-                ImportError::UnsupportedBehavior(
-                    "dynamic packed select requires a fixed width".into(),
-                )
-            }),
+        Some((VarSelectOp::PlusColon | VarSelectOp::MinusColon | VarSelectOp::Step, count)) => {
+            evaluated_u64(count)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0 && *n <= total)
+                .ok_or_else(|| {
+                    ImportError::UnsupportedBehavior(
+                        "dynamic packed select requires a fixed width".into(),
+                    )
+                })
+        }
         _ => Err(ImportError::UnsupportedBehavior(
             "dynamic packed select direction is not supported".into(),
         )),
