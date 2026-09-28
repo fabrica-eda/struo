@@ -68,7 +68,9 @@ Function inputs support unpacked arrays, nested array literals, repetition and
 default filling. Each element is converted to the formal element width and
 signedness before binding the automatic frame; dynamic multidimensional reads
 and forwarding to nested function calls preserve the array shape. Array-valued
-function returns remain unsupported.
+function returns can be assigned or passed to another function, including as
+items of nested array literals. Calls with output side effects inside array
+expressions remain unsupported.
 
 A no-op tick is permitted only for a source RTL register clock when the mapped
 design has no state cells or event handlers. Unknown clocks are not accepted as

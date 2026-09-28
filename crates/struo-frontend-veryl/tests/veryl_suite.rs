@@ -301,6 +301,8 @@ fn corpus_function_array_arguments() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [
         "comb_observer::test_comb_function_direct_array_argument_converts_each_element",
+        "comb_observer::test_comb_function_direct_array_return_preserves_all_elements",
+        "comb_observer::test_comb_function_array_literal_accepts_array_returning_items",
         "comb_observer::test_comb_statement_function_direct_array_argument_converts_each_element",
         "comb_observer::test_comb_function_array_literal_array_item_preserves_element_type",
         "comb_observer::test_comb_function_nested_array_scalar_default_converts_each_element",
@@ -311,6 +313,55 @@ fn corpus_function_array_arguments() {
         celox_test_suite_veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn array_returns_preserve_runtime_elements_and_signedness() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(a: input signed logic<4>, b: input signed logic<4>,
+                   index: input logic, q: output signed logic<8>, copied: output signed logic<8>) {
+            type row_t = signed logic<4> [2];
+            function make_row(x: input signed logic<4>, y: input signed logic<4>) -> row_t {
+                var row: row_t;
+                row[0] = x;
+                row[1] = y;
+                return row;
+            }
+            function pick(row: input signed logic<8> [2], i: input logic) -> signed logic<8> {
+                return row[i];
+            }
+            always_comb {
+                var row: row_t;
+                row = make_row(a, b);
+                copied = pick(row, index);
+                q = pick(make_row(a, b), index);
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let a = sim.signal("a");
+    let b = sim.signal("b");
+    let index = sim.signal("index");
+    let q = sim.signal("q");
+    let copied = sim.signal("copied");
+    for (x, y) in [(8u8, 7u8), (1, 15), (6, 9)] {
+        for i in 0..2u8 {
+            sim.modify(|io| {
+                io.set(a, x);
+                io.set(b, y);
+                io.set(index, i);
+            })
+            .unwrap();
+            let value = if i == 0 { x } else { y };
+            let expected = if value & 8 == 0 { value } else { value | 0xf0 };
+            assert_eq!(sim.get(q), expected.into());
+            assert_eq!(sim.get(copied), expected.into());
+        }
     }
 }
 
