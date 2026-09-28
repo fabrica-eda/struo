@@ -297,6 +297,24 @@ fn corpus_functions_and_static_loops() {
 }
 
 #[test]
+fn corpus_function_array_arguments() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "comb_observer::test_comb_function_direct_array_argument_converts_each_element",
+        "comb_observer::test_comb_statement_function_direct_array_argument_converts_each_element",
+        "comb_observer::test_comb_function_array_literal_array_item_preserves_element_type",
+        "comb_observer::test_comb_function_nested_array_scalar_default_converts_each_element",
+        "flip_flop::test_ff_function_call_array_literal_element_uses_formal_context_width",
+        "flip_flop::test_ff_function_call_array_literal_supports_dynamic_multidim_indexing",
+        "flip_flop::test_ff_function_call_restores_nearest_array_view_after_deep_reentrant_call",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
 fn mixed_width_comparison_zero_extends_when_either_operand_is_unsigned() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = Design::new(

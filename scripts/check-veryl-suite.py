@@ -87,7 +87,7 @@ def main():
     counts = {}
     for result in results:
         counts[result['status']] = counts.get(result['status'], 0) + 1
-    report = {'celox_version': '0.8.0', 'suite_version': '0.8.0',
+    report = {'celox_version': '0.8.1', 'suite_version': '0.8.1',
               'pipeline': 'Veryl -> Celox native' if args.reference else 'Veryl -> Struo RTL -> synthesis -> ECP5 -> Celox native',
               'timeout_seconds': args.timeout, 'include_ignored': args.include_ignored or args.reference,
               'counts': counts, 'cases': results}

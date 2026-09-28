@@ -308,7 +308,7 @@ jobs:
           if-no-files-found: warn
 
   veryl-corpus:
-    name: Veryl corpus (Celox 0.8.0)
+    name: Veryl corpus (Celox 0.8.1)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
