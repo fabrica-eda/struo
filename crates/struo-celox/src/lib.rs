@@ -4,6 +4,10 @@
 //! Celox's Veryl frontend; only the post-technology-mapping object is converted
 //! into a synthetic [`celox::FrontendArtifact`].
 
+mod optimize;
+
+use optimize::{BitConstants, BitOptimizer};
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -359,7 +363,8 @@ fn emit_cell(
             let select = bit_expression(builder, wires, constants, *select)?;
             let lut_true = bit_expression(builder, wires, constants, *lut_true)?;
             let lut_false = bit_expression(builder, wires, constants, *lut_false)?;
-            let value = builder.mux(select, lut_true, lut_false)?;
+            let value = BitOptimizer::new(builder, constants.bit_constants())
+                .mux(select, lut_true, lut_false)?;
             let target = builder.whole(wire_ref(wires, *output)?.signal)?;
             builder.assign(target, value)?;
             Ok(())
@@ -374,7 +379,8 @@ fn emit_cell(
             let select = bit_expression(builder, wires, constants, *select)?;
             let data_zero = bit_expression(builder, wires, constants, *data_zero)?;
             let data_one = bit_expression(builder, wires, constants, *data_one)?;
-            let value = builder.mux(select, data_one, data_zero)?;
+            let value = BitOptimizer::new(builder, constants.bit_constants())
+                .mux(select, data_one, data_zero)?;
             let target = builder.whole(wire_ref(wires, *output)?.signal)?;
             builder.assign(target, value)?;
             Ok(())
@@ -466,7 +472,8 @@ fn emit_cell(
             let pad = bit_expression(builder, wires, constants, Bit::Wire(*pad))?;
             let driven = bit_expression(builder, wires, constants, *fabric_output)?;
             let tristate = bit_expression(builder, wires, constants, *tristate)?;
-            let resolved = builder.mux(tristate, pad, driven)?;
+            let resolved =
+                BitOptimizer::new(builder, constants.bit_constants()).mux(tristate, pad, driven)?;
             let target = builder.whole(wire_ref(wires, *fabric_input)?.signal)?;
             builder.assign(target, resolved)?;
             Ok(())
@@ -593,7 +600,8 @@ fn emit_ccu2c(
         };
         let sum = builder.binary(CeloxBinaryOp::Xor, lut4, gated_carry, one_bit)?;
         builder.assign(builder.whole(wire_ref(wires, sums[slice])?.signal)?, sum)?;
-        carry = builder.mux(lut4, gated_carry, lut2)?;
+        carry =
+            BitOptimizer::new(builder, constants.bit_constants()).mux(lut4, gated_carry, lut2)?;
     }
     builder.assign(builder.whole(wire_ref(wires, carry_out)?.signal)?, carry)?;
     Ok(())
@@ -626,6 +634,15 @@ struct Constants {
     one_expression: ExprId,
     zero_signal: SignalId,
     one_signal: SignalId,
+}
+
+impl Constants {
+    fn bit_constants(self) -> BitConstants {
+        BitConstants {
+            zero: self.zero_expression,
+            one: self.one_expression,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -813,30 +830,13 @@ fn lut_expression(
         table_index | (1 << input_index),
         constants,
     )?;
-    // Reduce constant cofactors before handing the LUT to the backend.
-    // Encoding even a wire as mux(input, 1, 0) multiplies optimizer work
-    // across large mapped bit-level networks.
-    let input = inputs[input_index];
-    let bit = ValueType::bits(1)?;
-    if low == high {
-        Ok(low)
-    } else if low == constants.zero_expression && high == constants.one_expression {
-        Ok(input)
-    } else if low == constants.one_expression && high == constants.zero_expression {
-        Ok(builder.unary(UnaryOp::LogicNot, input, bit)?)
-    } else if low == constants.zero_expression {
-        Ok(builder.binary(CeloxBinaryOp::LogicAnd, input, high, bit)?)
-    } else if high == constants.one_expression {
-        Ok(builder.binary(CeloxBinaryOp::LogicOr, input, low, bit)?)
-    } else if high == constants.zero_expression {
-        let inverted = builder.unary(UnaryOp::LogicNot, input, bit)?;
-        Ok(builder.binary(CeloxBinaryOp::LogicAnd, inverted, low, bit)?)
-    } else if low == constants.one_expression {
-        let inverted = builder.unary(UnaryOp::LogicNot, input, bit)?;
-        Ok(builder.binary(CeloxBinaryOp::LogicOr, inverted, high, bit)?)
-    } else {
-        Ok(builder.mux(input, high, low)?)
-    }
+    Ok(
+        BitOptimizer::new(builder, constants.bit_constants()).mux(
+            inputs[input_index],
+            high,
+            low,
+        )?,
+    )
 }
 
 fn emit_flip_flop_bank(
