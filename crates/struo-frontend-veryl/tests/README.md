@@ -81,3 +81,12 @@ expressions remain unsupported.
 A no-op tick is permitted only for a source RTL register clock when the mapped
 design has no state cells or event handlers. Unknown clocks are not accepted as
 eliminated events. All output assertions still execute.
+
+Dynamic packed `+:`, `-:`, and `step` selects support reads and writes.
+Offset arithmetic preserves signed indices without wrapping into the vector;
+partially overlapping writes affect only valid bits. Out-of-range read bits
+follow the mapped adapter's two-state zero convention. Regression tests cover
+negative indices, both vector boundaries, and step offsets beyond the vector.
+
+The corpus runner copies its worker executable into a temporary directory for
+each run, so concurrent Cargo builds cannot replace a worker mid-audit.

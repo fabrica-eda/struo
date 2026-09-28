@@ -388,6 +388,65 @@ fn array_returns_preserve_runtime_elements_and_signedness() {
 }
 
 #[test]
+fn dynamic_part_selects_preserve_only_in_range_bits() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(index: input signed logic<6>, data: input logic<16>, value: input logic<4>,
+                   plus_read: output logic<4>, minus_read: output logic<4>,
+                   plus_write: output logic<16>, minus_write: output logic<16>,
+                   step_read: output logic<4>, step_write: output logic<16>) {
+            assign plus_read = data[index +: 4];
+            assign minus_read = data[index -: 4];
+            assign step_read = data[index step 4];
+            always_comb {
+                plus_write = data;
+                plus_write[index +: 4] = value;
+                minus_write = data;
+                minus_write[index -: 4] = value;
+                step_write = data;
+                step_write[index step 4] = value;
+            }
+        }
+    ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let index = sim.signal("index");
+    let data = sim.signal("data");
+    let value = sim.signal("value");
+    for base in -32i32..32 {
+        sim.modify(|io| {
+            io.set(index, u8::try_from(base.rem_euclid(64)).unwrap());
+            io.set(data, 0xa53cu16);
+            io.set(value, 0xbu8);
+        })
+        .unwrap();
+        for (prefix, low) in [("plus", base), ("minus", base - 3), ("step", base * 4)] {
+            let mut read = 0u16;
+            let mut written = 0xa53cu16;
+            for bit in 0..4 {
+                let target = low + bit;
+                if (0..16).contains(&target) {
+                    read |= ((0xa53cu16 >> target) & 1) << bit;
+                    written = (written & !(1 << target)) | (((0xbu16 >> bit) & 1) << target);
+                }
+            }
+            assert_eq!(
+                sim.get(sim.signal(&format!("{prefix}_read"))),
+                read.into(),
+                "{prefix} index={base}"
+            );
+            assert_eq!(
+                sim.get(sim.signal(&format!("{prefix}_write"))),
+                written.into(),
+                "{prefix} index={base}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mixed_width_comparison_zero_extends_when_either_operand_is_unsigned() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = Design::new(
