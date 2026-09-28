@@ -24,6 +24,10 @@ cases = [
   "wide_shift_mem::test_1024bit_shift_right",
   "wide_shift_mem::test_512bit_arithmetic_shift_right",
   "wide_shift_mem::test_512bit_sar_ff",
+  "wide_shift_mem::test_512bit_shift_left",
+  "wide_shift_mem::test_512bit_shift_left_ff",
+  "wide_shift_mem::test_512bit_shift_left_multiword_pattern",
+  "wide_shift_mem::test_512bit_shift_right",
 ]
 
 [[ignore]]
