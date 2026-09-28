@@ -30,6 +30,7 @@ def load_ignores(catalogue):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--timing', action='store_true', help='record stage timings for each executed case')
     parser.add_argument('--reference', action='store_true', help='compare with direct Celox source simulation')
     parser.add_argument('--filter', default='')
     parser.add_argument('--include-ignored', action='store_true', help='execute known unsupported/failing cases too')
@@ -62,12 +63,15 @@ def main():
             return result
         env = dict(os.environ, STRUO_VERYL_CASE=name)
         env.pop('STRUO_VERYL_REFERENCE', None)
+        if args.timing:
+            env['STRUO_VERYL_TIMING'] = '1'
         if args.reference:
             env['STRUO_VERYL_REFERENCE'] = '1'
         try:
             proc = subprocess.run([binary, '--ignored', '--exact', 'corpus_case', '--nocapture'],
                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, timeout=args.timeout)
+            output = proc.stdout
             result = next((json.loads(line.removeprefix('STRUO_RESULT '))
                            for line in proc.stdout.splitlines() if line.startswith('STRUO_RESULT ')),
                           {'name': name, 'status': 'process_error'})
@@ -79,6 +83,15 @@ def main():
             output = error.stdout or b''
             result = {'name': name, 'status': 'timeout',
                       'diagnostic': output.decode(errors='replace') if isinstance(output, bytes) else output}
+        if args.timing:
+            if isinstance(output, bytes):
+                output = output.decode(errors='replace')
+            timings = {}
+            for line in output.splitlines():
+                if line.startswith('STRUO_TIMING '):
+                    _, stage, seconds = line.split()
+                    timings[stage] = timings.get(stage, 0.0) + float(seconds)
+            result['timings_seconds'] = timings
         print(f"{result['status']:24} {name}", flush=True)
         return result
 

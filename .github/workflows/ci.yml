@@ -337,7 +337,7 @@ jobs:
             cargo-${{ runner.os }}-${{ runner.arch }}-veryl-corpus-v1-
 
       - name: Run Veryl corpus with explicit known-case ignores
-        run: python3 scripts/check-veryl-suite.py --jobs 4 --timeout 60 --report target/veryl-corpus/results.json
+        run: python3 scripts/check-veryl-suite.py --timing --jobs 4 --timeout 60 --report target/veryl-corpus/results.json
 
       - name: Summarize corpus results
         if: ${{ always() }}

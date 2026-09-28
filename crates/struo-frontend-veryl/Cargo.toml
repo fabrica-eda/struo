@@ -20,6 +20,7 @@ veryl-metadata = "=0.21.0"
 veryl-parser = { version = "=0.21.0", default-features = false }
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 celox-test-suite-veryl = "=0.8.1"
 serde_json = "1"
 celox.workspace = true

@@ -813,10 +813,29 @@ fn lut_expression(
         table_index | (1 << input_index),
         constants,
     )?;
+    // Reduce constant cofactors before handing the LUT to the backend.
+    // Encoding even a wire as mux(input, 1, 0) multiplies optimizer work
+    // across large mapped bit-level networks.
+    let input = inputs[input_index];
+    let bit = ValueType::bits(1)?;
     if low == high {
         Ok(low)
+    } else if low == constants.zero_expression && high == constants.one_expression {
+        Ok(input)
+    } else if low == constants.one_expression && high == constants.zero_expression {
+        Ok(builder.unary(UnaryOp::LogicNot, input, bit)?)
+    } else if low == constants.zero_expression {
+        Ok(builder.binary(CeloxBinaryOp::LogicAnd, input, high, bit)?)
+    } else if high == constants.one_expression {
+        Ok(builder.binary(CeloxBinaryOp::LogicOr, input, low, bit)?)
+    } else if high == constants.zero_expression {
+        let inverted = builder.unary(UnaryOp::LogicNot, input, bit)?;
+        Ok(builder.binary(CeloxBinaryOp::LogicAnd, inverted, low, bit)?)
+    } else if low == constants.one_expression {
+        let inverted = builder.unary(UnaryOp::LogicNot, input, bit)?;
+        Ok(builder.binary(CeloxBinaryOp::LogicOr, inverted, high, bit)?)
     } else {
-        Ok(builder.mux(inputs[input_index], high, low)?)
+        Ok(builder.mux(input, high, low)?)
     }
 }
 
@@ -1334,6 +1353,54 @@ mod tests {
     };
 
     use super::{CeloxAdapterError, ecp5_frontend_artifact, ecp5_simulator};
+
+    #[test]
+    fn reduced_luts_match_truth_tables() {
+        use celox::frontend_sdk::{Constant, ModuleBuilder, ValueType};
+        let bit = ValueType::bits(1).unwrap();
+        let mut builder = ModuleBuilder::new("lut_tables").unwrap();
+        let input = builder.input("input", ValueType::bits(4).unwrap()).unwrap();
+        let inputs = (0..4)
+            .map(|index| {
+                let slice = builder.slice(input, index, 1).unwrap();
+                builder.read_slice(slice).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let zero = builder.constant(Constant::two_state(0u8, 1).unwrap());
+        let one = builder.constant(Constant::two_state(1u8, 1).unwrap());
+        let constants = super::Constants {
+            zero_expression: zero,
+            one_expression: one,
+            zero_signal: input,
+            one_signal: input,
+        };
+        let tables = [
+            0, 0xffff, 0xaaaa, 0x5555, 0x8888, 0xeeee, 0x2222, 0xbbbb, 0xcaca, 0x6996, 0x8000,
+            0xfffe, 0x1234, 0xabcd, 0x9876,
+        ];
+        for (index, table) in tables.iter().enumerate() {
+            let output = builder.output(format!("q{index}"), bit).unwrap();
+            let value =
+                super::lut_expression(&mut builder, &inputs, *table, 0, 0, constants).unwrap();
+            builder
+                .assign(builder.whole(output).unwrap(), value)
+                .unwrap();
+        }
+        let mut sim = celox::Simulator::from_frontend(super::finish_artifact(builder).unwrap())
+            .build_native()
+            .unwrap();
+        let input = sim.signal("input");
+        for value in 0..16u8 {
+            sim.modify(|io| io.set(input, value)).unwrap();
+            for (index, table) in tables.iter().enumerate() {
+                assert_eq!(
+                    sim.get(sim.signal(&format!("q{index}"))),
+                    ((table >> value) & 1u16).into(),
+                    "table={table:04x}, input={value}"
+                );
+            }
+        }
+    }
 
     fn bits(width: u32) -> ValueType {
         ValueType {

@@ -28,8 +28,14 @@ failed run. Reports are generated under `target/` and retained by Actions for
 python3 scripts/check-veryl-suite.py
 python3 scripts/check-veryl-suite.py --filter context_width:: --jobs 4
 python3 scripts/check-veryl-suite.py --include-ignored --timeout 180 --report target/veryl-suite.json
+python3 scripts/check-veryl-suite.py --timing --filter wide_shift_mem::test_512bit_shift
 cargo test --locked -p struo-frontend-veryl --test veryl_suite
 ```
+
+`--timing` records seconds spent in lowering, synthesis, mapping, simulation IR
+construction, native simulator construction, and the complete case. The native
+build stage includes backend optimization, code generation and initialization.
+For backend details, also set `CELOX_PASS_TIMING=1 RUST_LOG=debug`.
 
 The ordinary Rust tests cover selected corpus regressions and focused boundary
 checks. The ignored worker/catalogue tests are entry points for the full runner;
