@@ -120,6 +120,13 @@ impl Backend for MappedBackend {
     }
 }
 
+fn report_elapsed(label: &str, timer: &mut std::time::Instant) {
+    if std::env::var_os("STRUO_VERYL_TIMING").is_some() {
+        eprintln!("STRUO_TIMING {label} {:.6}", timer.elapsed().as_secs_f64());
+    }
+    *timer = std::time::Instant::now();
+}
+
 fn compile(design: &Design, stage: &Stage) -> Result<Box<dyn Backend>> {
     if design.four_state {
         *stage.borrow_mut() = "adapter_unsupported".into();
@@ -143,6 +150,7 @@ fn compile(design: &Design, stage: &Stage) -> Result<Box<dyn Backend>> {
             eliminated_events: std::collections::BTreeSet::default(),
         }));
     }
+    let mut timer = std::time::Instant::now();
     let rtl = analyze_and_lower(&source, "suite", &design.top).map_err(|error| {
         if let ImportError::AnalysisFailed(diagnostic) = error {
             *stage.borrow_mut() = "analysis_error".into();
@@ -151,17 +159,23 @@ fn compile(design: &Design, stage: &Stage) -> Result<Box<dyn Backend>> {
             error.to_string().into()
         }
     })?;
+    report_elapsed("lowering", &mut timer);
     *stage.borrow_mut() = "synthesis_error".into();
     let netlist = struo_synth::synthesize(&rtl)?.netlist;
+    report_elapsed("synthesis", &mut timer);
     *stage.borrow_mut() = "mapping_error".into();
     let mapped = struo_target_ecp5::map_to_ecp5(&netlist)?;
+    report_elapsed("mapping", &mut timer);
     *stage.borrow_mut() = "simulator_build_error".into();
     let ports = mapped
         .ports()
         .iter()
         .map(|p| (p.name.clone(), p.bits.len()))
         .collect();
-    let sim = struo_celox::ecp5_simulator(&mapped)?.build_native()?;
+    let builder = struo_celox::ecp5_simulator(&mapped)?;
+    report_elapsed("simulation_ir", &mut timer);
+    let sim = builder.build_native()?;
+    report_elapsed("native_build", &mut timer);
     let eliminated_events = if sim.named_events().is_empty()
         && mapped.cells().iter().all(|cell| {
             !matches!(
@@ -195,12 +209,20 @@ fn compile(design: &Design, stage: &Stage) -> Result<Box<dyn Backend>> {
 #[test]
 #[ignore = "invoked per case by scripts/check-veryl-suite.py"]
 fn corpus_case() {
+    if std::env::var_os("STRUO_VERYL_TIMING").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let name = std::env::var("STRUO_VERYL_CASE").expect("STRUO_VERYL_CASE");
     let case = celox_test_suite_veryl::case(&name).expect("unknown corpus case");
     let stage = Rc::new(RefCell::new("setup_error".into()));
+    let mut timer = std::time::Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         case.run(&mut |design| compile(design, &stage));
     }));
+    report_elapsed("case_total", &mut timer);
     let status = if result.is_ok() {
         if case.expectation == celox_test_suite_veryl::Expectation::CompilationError {
             "rejected".to_owned()

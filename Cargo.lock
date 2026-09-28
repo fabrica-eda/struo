@@ -3106,6 +3106,7 @@ dependencies = [
  "struo-synth",
  "struo-target-ecp5",
  "tempfile",
+ "tracing-subscriber",
  "veryl-analyzer",
  "veryl-metadata",
  "veryl-parser",
