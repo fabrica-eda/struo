@@ -1362,6 +1362,12 @@ impl<'a> ModuleLowerer<'a> {
         };
         match statement {
             Statement::Assign(assign) => {
+                if let [destination] = assign.dst.as_slice()
+                    && destination.index.0.len()
+                        < self.source.variables[&destination.id].r#type.array.dims()
+                {
+                    return self.lower_array_assignment(destination, &assign.expr, reads, writes);
+                }
                 // Reads observe the pre-edge register value, but a partial
                 // write composes over the value already scheduled for this
                 // edge (later writes win per bit).
@@ -1805,12 +1811,7 @@ impl<'a> ModuleLowerer<'a> {
         result?;
         let returned = body
             .ret
-            .map(|id| {
-                let key = self.key_from_index(id, &VarIndex::default())?;
-                env.get(&key)
-                    .copied()
-                    .ok_or_else(|| ImportError::MissingVariable("function return".into()))
-            })
+            .map(|id| self.pack_function_return(id, &env))
             .transpose()?;
         let mut outputs = Vec::new();
         for (path, destinations) in &call.outputs {
@@ -1821,6 +1822,33 @@ impl<'a> ModuleLowerer<'a> {
             outputs.push((destinations.clone(), env[&key]));
         }
         Ok((returned, outputs))
+    }
+
+    fn pack_function_return(&mut self, id: VarId, env: &Env) -> Result<LoweredExpr, ImportError> {
+        let ty = &self.source.variables[&id].r#type;
+        let values = array_indices(ty, "function return")?
+            .into_iter()
+            .map(|index| {
+                env.get(&SignalKey { id, index })
+                    .copied()
+                    .ok_or_else(|| ImportError::MissingVariable("function return".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.len() == 1 {
+            return Ok(values[0]);
+        }
+        let width = values
+            .iter()
+            .try_fold(0u32, |sum, value| sum.checked_add(value.width))
+            .ok_or_else(|| ImportError::NonConcreteWidth("function return".into()))?;
+        // Element zero occupies the low bits of this internal transport value.
+        Ok(LoweredExpr {
+            id: self
+                .rtl
+                .concat(values.iter().rev().map(|v| v.id).collect())?,
+            width,
+            signed: false,
+        })
     }
 
     fn merge_values(
@@ -1961,6 +1989,49 @@ impl<'a> ModuleLowerer<'a> {
         Ok(changed)
     }
 
+    fn lower_array_assignment(
+        &mut self,
+        destination: &AssignDestination,
+        expression: &Expression,
+        reads: &Env,
+        writes: &mut Env,
+    ) -> Result<DrivenBits, ImportError> {
+        if !destination.select.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "packed select on array assignment".into(),
+            ));
+        }
+        let ty = self.source.variables[&destination.id].r#type.clone();
+        let shape = ty
+            .array
+            .iter()
+            .skip(destination.index.0.len())
+            .copied()
+            .collect::<Vec<_>>();
+        let dimensions = shape
+            .iter()
+            .copied()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ImportError::NonConcreteWidth("array assignment".into()))?;
+        let values = self.lower_array_argument(
+            expression,
+            &dimensions,
+            concrete_width(&ty, "array assignment")?,
+            ty.signed,
+            reads,
+        )?;
+        let mut changed = DrivenBits::default();
+        for (flat, value) in values.into_iter().enumerate() {
+            let mut element = destination.clone();
+            element
+                .index
+                .0
+                .extend(VarIndex::from_index(flat, veryl_analyzer::ir::ShapeRef::new(&shape)).0);
+            changed.extend(self.assign_destination(&element, value, reads, writes)?);
+        }
+        Ok(changed)
+    }
+
     // Array arguments are copied into the automatic frame element by element.
     // Packed conversion applies to each leaf, not to the aggregate bit stream.
     fn lower_array_argument(
@@ -2025,6 +2096,17 @@ impl<'a> ModuleLowerer<'a> {
             return Ok(values);
         }
         if let Expression::Term(factor) = expression
+            && let Factor::FunctionCall(call) = factor.as_ref()
+        {
+            return self.lower_array_call(
+                call,
+                &expression.comptime().r#type,
+                dimensions,
+                (width, signed),
+                env,
+            );
+        }
+        if let Expression::Term(factor) = expression
             && let Factor::Variable(id, prefix, select, comptime) = factor.as_ref()
         {
             let ty = &self.source.variables[id].r#type;
@@ -2059,6 +2141,52 @@ impl<'a> ModuleLowerer<'a> {
         Err(ImportError::UnsupportedBehavior(
             "array-valued function argument".into(),
         ))
+    }
+
+    fn lower_array_call(
+        &mut self,
+        call: &veryl_analyzer::ir::FunctionCall,
+        ty: &Type,
+        dimensions: &[usize],
+        target: (u32, bool),
+        env: &Env,
+    ) -> Result<Vec<LoweredExpr>, ImportError> {
+        let (width, signed) = target;
+        let shape = dimensions.iter().copied().map(Some).collect::<Vec<_>>();
+        if ty.array.iter().copied().collect::<Vec<_>>() != shape {
+            return Err(ImportError::UnsupportedBehavior(
+                "array return shape mismatch".into(),
+            ));
+        }
+        let element_width = concrete_width(ty, "array return")?;
+        let element_signed = ty.signed;
+        let (value, outputs) = self.lower_function_call(call, env)?;
+        if !outputs.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "array call with output side effects".into(),
+            ));
+        }
+        let value =
+            value.ok_or_else(|| ImportError::UnsupportedBehavior("void array call".into()))?;
+        let mut values = Vec::new();
+        for flat in 0..dimensions.iter().product::<usize>() {
+            let element = LoweredExpr {
+                id: self.rtl.expression_slice(
+                    value.id,
+                    u32::try_from(flat)
+                        .ok()
+                        .and_then(|index| index.checked_mul(element_width))
+                        .ok_or_else(|| {
+                            ImportError::NonConcreteWidth("array return offset".into())
+                        })?,
+                    BitWidth::new(element_width)?,
+                )?,
+                width: element_width,
+                signed: element_signed,
+            };
+            values.push(self.resize(element, width, signed)?);
+        }
+        Ok(values)
     }
 
     fn lower_assignment_value(
