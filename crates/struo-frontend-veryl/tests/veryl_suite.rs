@@ -388,6 +388,121 @@ fn array_returns_preserve_runtime_elements_and_signedness() {
 }
 
 #[test]
+fn corpus_constant_power() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "operators::test_pow_operator_constant_exponent",
+        "operators::test_pow_operator_constant_exponent_ff",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn powers_preserve_context_and_self_determined_exponents() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, base: input logic<4>,
+                   signed_base: input signed logic<4>, exponent: input logic<4>,
+                   signed_exponent: input signed logic<4>, wide_exponent: input logic<8>,
+                   unsigned_o: output logic<8>, signed_o: output signed logic<8>,
+                   unsigned_negative_o: output logic<8>, ff_o: output signed logic<8>,
+                   zero_o: output logic<8>, cube_o: output logic<8>,
+                   high_o: output logic<8>, narrow_o: output logic<4>,
+                   negative_odd_o: output signed logic<8>, negative_even_o: output signed logic<8>,
+                   mixed_o: output logic<8>, wide_o: output signed logic<65>,
+                   small_o: output logic<4>, signed_unsigned_o: output signed logic<8>) {
+            assign unsigned_o = base ** exponent;
+            assign signed_o = signed_base ** signed_exponent;
+            assign unsigned_negative_o = base ** signed_exponent;
+            always_ff (clk) { ff_o = signed_base ** signed_exponent; }
+            assign zero_o = base ** 0;
+            assign cube_o = base ** 3;
+            assign high_o = base ** 8'd128;
+            assign narrow_o = {signed_base ** exponent};
+            assign negative_odd_o = signed_base ** -3;
+            assign negative_even_o = signed_base ** -2;
+            assign mixed_o = (signed_base ** 3) + 8'd0;
+            assign wide_o = signed_base ** 3;
+            assign small_o = base ** wide_exponent;
+            assign signed_unsigned_o = signed_base ** exponent;
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let base = sim.signal("base");
+    let signed_base = sim.signal("signed_base");
+    let exponent = sim.signal("exponent");
+    let signed_exponent = sim.signal("signed_exponent");
+    let wide_exponent = sim.signal("wide_exponent");
+    let clk = sim.event("clk");
+    for b in 0u8..16 {
+        for e in 0u8..16 {
+            sim.modify(|io| {
+                io.set(base, b);
+                io.set(signed_base, b);
+                io.set(exponent, e);
+                io.set(signed_exponent, e);
+                io.set(wide_exponent, 128 | e);
+            })
+            .unwrap();
+            sim.tick(clk).unwrap();
+            let signed_b = if b & 8 == 0 { b } else { b | 0xf0 };
+            let signed_expected = if e < 8 {
+                signed_b.wrapping_pow(u32::from(e))
+            } else {
+                match signed_b {
+                    255 if e & 1 == 1 => 255,
+                    1 | 255 => 1,
+                    _ => 0,
+                }
+            };
+            let unsigned_negative = if e < 8 {
+                b.wrapping_pow(u32::from(e))
+            } else {
+                u8::from(b == 1)
+            };
+            for (name, expected) in [
+                ("unsigned_o", b.wrapping_pow(u32::from(e))),
+                ("signed_o", signed_expected),
+                ("ff_o", signed_expected),
+                ("unsigned_negative_o", unsigned_negative),
+                ("zero_o", 1),
+                ("cube_o", b.wrapping_pow(3)),
+                ("high_o", b.wrapping_pow(128)),
+                ("narrow_o", b.wrapping_pow(u32::from(e)) & 15),
+                (
+                    "negative_odd_o",
+                    if b == 15 { 255 } else { u8::from(b == 1) },
+                ),
+                ("negative_even_o", u8::from(b == 1 || b == 15)),
+                ("mixed_o", b.wrapping_pow(3)),
+                ("small_o", b.wrapping_pow(u32::from(128 | e)) & 15),
+                ("signed_unsigned_o", signed_b.wrapping_pow(u32::from(e))),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: base={b}, exponent={e}"
+                );
+            }
+            let integer_base = i128::from(b & 7) - i128::from(b & 8);
+            let expected =
+                u128::from_le_bytes(integer_base.pow(3).to_le_bytes()) & ((1u128 << 65) - 1);
+            assert_eq!(
+                sim.get(sim.signal("wide_o")),
+                expected.into(),
+                "wide base={b}"
+            );
+        }
+    }
+}
+
+#[test]
 fn dynamic_part_selects_preserve_only_in_range_bits() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = Design::new(

@@ -2401,6 +2401,9 @@ impl<'a> ModuleLowerer<'a> {
         result_width: u32,
         result_signed: bool,
     ) -> Result<LoweredExpr, ImportError> {
+        if op == Op::Pow {
+            return self.lower_power(lhs, rhs, result_width, result_signed);
+        }
         if matches!(op, Op::LogicAnd | Op::LogicOr) {
             let lhs = self.boolean(lhs)?;
             let rhs = self.boolean(rhs)?;
@@ -2493,6 +2496,82 @@ impl<'a> ModuleLowerer<'a> {
             signed: !comparison && result_signed,
         };
         self.resize(value, result_width, result_signed)
+    }
+
+    // IEEE 1800-2023 11.4.3 and 11.6.1: the exponent is self-determined,
+    // while the base is widened to the result context before multiplication.
+    // Repeated squaring keeps the circuit size linear in the exponent width.
+    fn lower_power(
+        &mut self,
+        base: LoweredExpr,
+        exponent: LoweredExpr,
+        width: u32,
+        signed: bool,
+    ) -> Result<LoweredExpr, ImportError> {
+        let base = self.resize(LoweredExpr { signed, ..base }, width, signed)?;
+        let known = match self.rtl.expressions()[exponent.id.index() as usize].kind() {
+            ExprKind::Constant(value) => Some(value.clone()),
+            _ => None,
+        };
+        let negative = if exponent.signed {
+            Some(
+                self.rtl
+                    .expression_slice(exponent.id, exponent.width - 1, BitWidth::new(1)?)?,
+            )
+        } else {
+            None
+        };
+        let one = self.constant(width, 1).id;
+        let mut result = one;
+        let mut power = base.id;
+        let bits = known.as_ref().map_or(exponent.width, |value| {
+            if exponent.signed && value.bit(exponent.width - 1) {
+                0
+            } else {
+                (0..exponent.width)
+                    .rev()
+                    .find(|bit| value.bit(*bit))
+                    .map_or(0, |bit| bit + 1)
+            }
+        });
+        for bit in 0..bits {
+            if known.as_ref().is_none_or(|value| value.bit(bit)) {
+                let product = self.rtl.binary(BinaryOp::Mul, result, power)?;
+                result = if known.is_some() {
+                    product
+                } else {
+                    let enabled = self
+                        .rtl
+                        .expression_slice(exponent.id, bit, BitWidth::new(1)?)?;
+                    self.rtl.mux(enabled, product, result)?
+                };
+            }
+            if bit + 1 < bits {
+                power = self.rtl.binary(BinaryOp::Mul, power, power)?;
+            }
+        }
+        if let Some(negative) = negative {
+            let zero = self.constant(width, 0).id;
+            let is_one = self.rtl.binary(BinaryOp::Equal, base.id, one)?;
+            let mut reciprocal = self.rtl.mux(is_one, one, zero)?;
+            if signed {
+                let minus_one = self.rtl.unary(UnaryOp::BitNot, zero)?;
+                let is_minus_one = self.rtl.binary(BinaryOp::Equal, base.id, minus_one)?;
+                let odd = self
+                    .rtl
+                    .expression_slice(exponent.id, 0, BitWidth::new(1)?)?;
+                let unit = self.rtl.mux(odd, minus_one, one)?;
+                reciprocal = self.rtl.mux(is_minus_one, unit, reciprocal)?;
+            }
+            // Zero raised to a negative exponent is X in four-state SV.
+            // This two-state RTL follows the adapter's zero convention.
+            result = self.rtl.mux(negative, reciprocal, result)?;
+        }
+        Ok(LoweredExpr {
+            id: result,
+            width,
+            signed,
+        })
     }
 
     // Restoring division uses an extra remainder bit so the trial shift cannot

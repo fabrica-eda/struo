@@ -88,5 +88,16 @@ partially overlapping writes affect only valid bits. Out-of-range read bits
 follow the mapped adapter's two-state zero convention. Regression tests cover
 negative indices, both vector boundaries, and step offsets beyond the vector.
 
+Integral `**` expressions support constant and runtime exponents in combinational
+and FF logic. The base is widened to the expression context before repeated
+squaring, and the exponent retains its own width and signedness (IEEE 1800-2023
+11.4.3 and 11.6.1). Zero exponents produce one, including `0 ** 0`. Negative
+exponents produce zero except for bases one and signed minus one; minus one
+preserves exponent parity. `0 ** negative` follows the adapter's two-state zero
+convention rather than preserving the four-state X result. Effectful exponent
+calls and four-state operands remain subject to the existing frontend/adapter
+limitations. Boundary regressions cover all four-bit bases and exponents,
+constant negative exponents, unsigned parent contexts, and 65-bit results.
+
 The corpus runner copies its worker executable into a temporary directory for
 each run, so concurrent Cargo builds cannot replace a worker mid-audit.
