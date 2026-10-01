@@ -85,13 +85,19 @@ pub fn synthesize_with_options(
         .ok_or_else(|| SynthesisError::InvalidRtl(RtlError::MissingTop(design.top().into())))?;
     reject_unsupported(module)?;
 
-    let mut lowering = Lowering::new(module);
-    lowering.reserve_sources();
-    lowering.index_assignments();
-    lowering.connect_memories()?;
-    lowering.connect_registers()?;
-    lowering.connect_outputs()?;
-    let mut netlist = lowering.netlist;
+    // Keep the established whole-expression construction order for ordinary
+    // acyclic designs. Always resolving individual bits changes netlist sharing
+    // and node order, which can regress downstream placement and timing.
+    // A vector-level cycle may still be acyclic at bit granularity; retry that
+    // case from a fresh lowering state without hiding genuine feedback errors.
+    let mut netlist = match Lowering::new(module).lower() {
+        Err(SynthesisError::CombinationalLoop { .. }) => {
+            let mut lowering = Lowering::new(module);
+            lowering.resolve_driver_ranges = true;
+            lowering.lower()?
+        }
+        result => result?,
+    };
     let mut reports = vec![PassReport {
         pass: "lower-rtl",
         message: format!(
@@ -136,6 +142,7 @@ struct Lowering<'a> {
     drivers: Vec<Vec<Option<Driver>>>,
     expression_bits: Vec<Option<Vec<NetId>>>,
     resolving: HashSet<(SignalId, usize)>,
+    resolve_driver_ranges: bool,
 }
 
 impl<'a> Lowering<'a> {
@@ -157,7 +164,17 @@ impl<'a> Lowering<'a> {
             drivers,
             expression_bits: vec![None; module.expressions().len()],
             resolving: HashSet::new(),
+            resolve_driver_ranges: false,
         }
+    }
+
+    fn lower(mut self) -> Result<Netlist, SynthesisError> {
+        self.reserve_sources();
+        self.index_assignments();
+        self.connect_memories()?;
+        self.connect_registers()?;
+        self.connect_outputs()?;
+        Ok(self.netlist)
     }
 
     fn reserve_sources(&mut self) {
@@ -388,7 +405,15 @@ impl<'a> Lowering<'a> {
                 bit,
             });
         }
-        let result = self.lower_expression(driver.0).map(|bits| bits[driver.1]);
+        // Follow only this bit's dependency cone. A whole-vector connection
+        // can contain unrelated bits that lead back to the current signal,
+        // especially after flattening module ports.
+        let result = if self.resolve_driver_ranges {
+            self.lower_expression_range(driver.0, driver.1, 1)
+                .map(|bits| bits[0])
+        } else {
+            self.lower_expression(driver.0).map(|bits| bits[driver.1])
+        };
         self.resolving.remove(&(signal, bit));
         let net = result?;
         self.signal_bits[signal_index][bit] = Some(net);
@@ -1772,6 +1797,58 @@ mod tests {
                     .collect();
                 let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
                 assert_eq!(output_word(&outputs, "sum", 4), lhs.wrapping_sub(rhs) & 0xf);
+            }
+        }
+    }
+
+    #[test]
+    fn resolves_whole_vector_aliases_by_bit_without_masking_real_loops() {
+        for feedback_bit in [1, 0] {
+            let mut module = Module::new("BitDependencies");
+            let input = module.add_port(Port {
+                name: "input".into(),
+                direction: PortDirection::Input,
+                r#type: bits(1),
+            });
+            let output = module.add_port(Port {
+                name: "output".into(),
+                direction: PortDirection::Output,
+                r#type: bits(2),
+            });
+            let alias = module.add_signal("alias", bits(2));
+            let whole = module.read(output).unwrap();
+            module.assign(module.whole(alias).unwrap(), whole).unwrap();
+            let whole_alias = module.read(alias).unwrap();
+            let feedback = module
+                .expression_slice(whole_alias, feedback_bit, BitWidth::new(1).unwrap())
+                .unwrap();
+            module
+                .assign(
+                    module.slice(output, 0, BitWidth::new(1).unwrap()).unwrap(),
+                    feedback,
+                )
+                .unwrap();
+            let value = module.read(input).unwrap();
+            module
+                .assign(
+                    module.slice(output, 1, BitWidth::new(1).unwrap()).unwrap(),
+                    value,
+                )
+                .unwrap();
+            let mut design = Design::new("BitDependencies");
+            design.add_module(module);
+            if feedback_bit == 0 {
+                assert!(matches!(
+                    synthesize(&design),
+                    Err(super::SynthesisError::CombinationalLoop { .. })
+                ));
+            } else {
+                let synthesized = synthesize(&design).unwrap();
+                for value in 0..2 {
+                    let inputs = HashMap::from([("input".into(), value != 0)]);
+                    let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+                    assert_eq!(output_word(&outputs, "output", 2), value * 3);
+                }
             }
         }
     }

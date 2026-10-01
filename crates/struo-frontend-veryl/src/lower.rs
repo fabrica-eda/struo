@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory, MemoryPort,
@@ -791,7 +791,7 @@ impl<'a> ModuleLowerer<'a> {
         // real pass can then emit every ordinary register at its original
         // declaration position, preserving stable IDs and mapped QoR.
         let owners = self.ff_owners()?;
-        let mut driven_comb = BTreeSet::new();
+        let mut driven_comb = DrivenBits::default();
         let mut driven_ff = DrivenBits::default();
         for declaration in &self.source.declarations {
             match declaration {
@@ -812,8 +812,14 @@ impl<'a> ModuleLowerer<'a> {
                         changed
                             .extend(self.lower_statement(statement, &snapshot, &mut env, false)?);
                     }
+                    if let Some(key) = driven_comb.first_overlap(&changed) {
+                        return Err(ImportError::UnsupportedBehavior(format!(
+                            "multiple procedural drivers for {}",
+                            self.signal_name(key)
+                        )));
+                    }
                     for key in changed.keys() {
-                        if !driven_comb.insert(key.clone()) || driven_ff.contains_key(key) {
+                        if driven_ff.contains_key(key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
                                 "multiple procedural drivers for {}",
                                 self.signal_name(key)
@@ -821,13 +827,27 @@ impl<'a> ModuleLowerer<'a> {
                         }
                         let signal = self.signal(key)?;
                         let value = env[key];
-                        self.rtl.assign(self.rtl.whole(signal)?, value.id)?;
+                        // The environment holds a whole value so subsequent blocking
+                        // reads see prior writes. Only the written ranges belong to
+                        // this process; emitting the untouched bits would introduce
+                        // extra drivers and artificial combinational feedback.
+                        for (lsb, width) in changed.ranges(key) {
+                            let width = BitWidth::new(width)?;
+                            let target = self.rtl.slice(signal, lsb, width)?;
+                            let value = if lsb == 0 && width.get() == value.width {
+                                value.id
+                            } else {
+                                self.rtl.expression_slice(value.id, lsb, width)?
+                            };
+                            self.rtl.assign(target, value)?;
+                        }
                     }
+                    driven_comb.extend(changed);
                 }
                 Declaration::Ff(ff) => {
                     let block = self.lower_ff(ff)?;
                     for key in block.changed.keys() {
-                        if driven_comb.contains(key) {
+                        if driven_comb.contains_key(key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
                                 "multiple procedural drivers for {}",
                                 self.signal_name(key)

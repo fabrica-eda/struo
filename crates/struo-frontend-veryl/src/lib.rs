@@ -450,6 +450,31 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_combinational_drivers_remain_rejected() {
+        for (first, second) in [
+            ("v[3:0] = a[3:0];", "v[5:2] = a[3:0];"),
+            ("v = a;", "v[0] = a[0];"),
+            ("v[index] = a[0];", "v[7] = a[1];"),
+        ] {
+            let source = format!(
+                "module Top(a: input logic<8>, index: input logic<3>, q: output logic<8>) {{
+                    #[allow(multiple_assign)]
+                    var v: logic<8>;
+                    always_comb {{ {first} }}
+                    always_comb {{ {second} }}
+                    assign q = v;
+                }}"
+            );
+            let error = super::analyze_and_lower(&source, "overlap", "Top").unwrap_err();
+            assert!(
+                matches!(&error, super::ImportError::UnsupportedBehavior(message)
+                    if message.contains("multiple procedural drivers for v")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn empty_analyzer_ir_is_not_silently_made_valid() {
         let imported = import_analyzed_shell(&Ir::default(), "Top").unwrap();
 

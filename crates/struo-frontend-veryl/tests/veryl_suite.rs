@@ -295,6 +295,30 @@ fn corpus_width_and_signedness_regressions() {
 }
 
 #[test]
+fn corpus_disjoint_combinational_drivers() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "basic::test_mixed_selects_execution",
+        "data_access::test_partial_write_merging",
+        "false_loop::test_read_then_overwrite_convergence",
+        "std_lfsr::test_lfsr_basic_shift",
+        "std_lfsr::test_lfsr_deterministic_cycle",
+        "std_lfsr::test_lfsr_enable_hold",
+        "hierarchy::test_hierarchical_concat_feedback_runtime",
+        "hierarchy::test_hierarchical_concat_feedback_runtime_multi_observe",
+        "hierarchy::test_hierarchical_concat_feedback_with_constant_middle_bit",
+        "hierarchy::test_hierarchical_concat_then_overlap_dynamic_index_runtime",
+        "hierarchy::test_hierarchical_dynamic_index_feedback_runtime",
+        "hierarchy::test_hierarchical_dual_dynamic_readers_feedback_runtime",
+        "hierarchy::test_hierarchical_overlapping_partial_write_dynamic_index_runtime",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
 fn corpus_functions_and_static_loops() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [
