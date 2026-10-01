@@ -475,6 +475,61 @@ mod tests {
     }
 
     #[test]
+    fn runtime_loop_budget_requires_a_proof_for_every_input() {
+        for body in [
+            "q += 1;",
+            "if stop { break; } q += 1;",
+            "for j in 0..2 { break; } q += 1;",
+            "if i == 64 { break; } q += 1;",
+        ] {
+            let source = format!(
+                "module Top(count: input logic<32>, stop: input logic, q: output logic<16>) {{
+                    always_comb {{ q = 0; for i in 0..count {{ {body} }} }}
+                }}"
+            );
+            let error = super::analyze_and_lower(&source, "unproven_loop", "Top").unwrap_err();
+            assert!(
+                matches!(&error, super::ImportError::UnsupportedBehavior(message)
+                if message.contains("64-iteration synthesis budget")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_loop_start_truncation_is_not_mistaken_for_an_empty_range() {
+        let source = "module Top(count: input logic<3>, q: output logic<8>) {
+            always_comb { q = 0; for i in 64'd4294967296..count { q += 1; } }
+        }";
+        let error = super::analyze_and_lower(source, "truncated_start", "Top").unwrap_err();
+        assert!(
+            matches!(&error, super::ImportError::UnsupportedBehavior(message)
+            if message.contains("without truncation")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn empty_runtime_loop_does_not_discard_bound_output_effects() {
+        let source =
+            "module Top(count: input logic<3>, q: output logic<8>, side: output logic<8>) {
+            function end_value(x: input logic<3>, y: output logic<8>) -> logic<3> {
+                y = 1; return x;
+            }
+            always_comb {
+                q = 0; side = 0;
+                for i in 8..end_value(count, side) { q += 1; }
+            }
+        }";
+        let error = super::analyze_and_lower(source, "empty_bound_effect", "Top").unwrap_err();
+        assert!(
+            matches!(&error, super::ImportError::UnsupportedBehavior(message)
+            if message.contains("read-only expression")),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn empty_analyzer_ir_is_not_silently_made_valid() {
         let imported = import_analyzed_shell(&Ir::default(), "Top").unwrap();
 

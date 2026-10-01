@@ -319,6 +319,92 @@ fn corpus_disjoint_combinational_drivers() {
 }
 
 #[test]
+fn corpus_runtime_loops_with_proven_breaks() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "basic::test_comb_effectful_if_condition_after_dynamic_break_stays_inactive",
+        "synth_dynamic_loop::test_runtime_break_in_synth_comb_loop",
+        "synth_dynamic_loop::test_runtime_break_after_assign_in_synth_comb_loop",
+        "flip_flop::test_ff_runtime_for_break",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn bounded_runtime_loops_preserve_guards_steps_and_mutable_bounds() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(count: input logic<3>, bound: input logic<6>, stop: input logic,
+                   signed_end: input signed logic<4>,
+                   sum: output logic<16>, inclusive: output logic<8>,
+                   stepped: output logic<16>, hits: output logic<8>,
+                   signed_hits: output logic<8>, mutable_hits: output logic<8>) {
+            always_comb {
+                sum = 0;
+                for i in 0..count { sum += i as 16; }
+                inclusive = 0;
+                for i in 0..=bound { inclusive = (i + 1) as 8; }
+                stepped = 0;
+                for i in 0..count step += 3 { stepped += i as 16; }
+                hits = 0;
+                for i in 0..count {
+                    hits += 1;
+                    if stop { break; }
+                }
+                signed_hits = 0;
+                for i in 0..signed_end { signed_hits += 1; }
+                var limit: logic<4>;
+                limit = 5;
+                mutable_hits = 0;
+                for i in 0..limit {
+                    mutable_hits += 1;
+                    limit = 1;
+                }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let count = sim.signal("count");
+    let bound = sim.signal("bound");
+    let stop = sim.signal("stop");
+    let signed_end = sim.signal("signed_end");
+    let sum = sim.signal("sum");
+    let inclusive = sim.signal("inclusive");
+    let stepped = sim.signal("stepped");
+    let hits = sim.signal("hits");
+    let signed_hits = sim.signal("signed_hits");
+    let mutable_hits = sim.signal("mutable_hits");
+    for n in 0..64u16 {
+        for halted in [0u8, 1] {
+            for end in [0u8, 7, 8, 15] {
+                sim.modify(|io| {
+                    io.set(count, n % 8);
+                    io.set(bound, n);
+                    io.set(stop, halted);
+                    io.set(signed_end, end);
+                })
+                .unwrap();
+                assert_eq!(sim.get(sum), (0..n % 8).sum::<u16>().into());
+                assert_eq!(sim.get(inclusive), (n + 1).into());
+                assert_eq!(sim.get(stepped), (0..n % 8).step_by(3).sum::<u16>().into());
+                assert_eq!(
+                    sim.get(hits),
+                    (if halted == 0 { n % 8 } else { (n % 8).min(1) }).into()
+                );
+                assert_eq!(sim.get(signed_hits), (if end < 8 { end } else { 0 }).into());
+                assert_eq!(sim.get(mutable_hits), 1u8.into());
+            }
+        }
+    }
+}
+
+#[test]
 fn corpus_functions_and_static_loops() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [

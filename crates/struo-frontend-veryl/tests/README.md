@@ -132,3 +132,28 @@ expressions, nested argument effects and runtime loops still have limitations.
 Dynamic addressing of an instance output is rejected as an invalid implicit
 continuous assignment, independently of analyzer warnings (IEEE 1800-2023
 Table 10-1). Procedural dynamic part-select assignments remain supported.
+
+Runtime-loop synthesis uses a separate planner in `src/lower/loops.rs`. Existing
+constant-range expansion is retained. Runtime bounds are accepted for a
+non-negative constant start that fits the induction variable and a positive
+additive step, when either the bound's type or a guaranteed break proves that
+at most 64 candidate iterations are needed. This budget includes the iteration
+that executes a break; it is a compile-time resource policy, never a silent
+runtime truncation. An input-dependent break alone is not a termination proof,
+and a nested loop's break does not terminate its parent.
+
+Each candidate iteration retains the actual bound comparison and break guard.
+The bound is reevaluated against the current combinational environment (or the
+pre-edge FF reads), matching for-loop condition evaluation in IEEE 1800-2023
+12.7.1 and Veryl's emitted SV. No clock cycles are introduced. Tests cover the
+64-iteration boundary, signed bounds, stepped loops, changing bounds, FF writes,
+and proof rejection. Bound output effects remain unsupported and are rejected
+even for an empty range.
+
+The ignore manifest distinguishes runtime starts, reverse/non-additive loops,
+and loops without a proof inside the expansion budget. These are current Struo
+synthesis limits, not claims that every such loop is inherently unsynthesizable.
+For example, a 32-bit input trip count may require billions of expanded bodies;
+a small sampled count in a simulator test does not justify truncating it. New
+proofs or algebraic transformations can extend support independently of the
+lowering path. The always_ff function-effect restrictions remain unchanged.
