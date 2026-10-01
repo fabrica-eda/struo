@@ -56,9 +56,6 @@ cases = [
   "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
   "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
-  "std_binary_codec::test_binary_codec_roundtrip",
-  "std_binary_codec::test_binary_encoder",
-  "std_binary_codec::test_binary_encoder_disabled",
   "std_mux::test_demux_build_smoke",
   "std_mux::test_mux_build_smoke",
 ]
