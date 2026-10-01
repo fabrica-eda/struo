@@ -1027,6 +1027,38 @@ impl<'a> ModuleLowerer<'a> {
                     continue;
                 }
             }
+            let destinations = output
+                .dst
+                .iter()
+                .map(|destination| self.destination_slice(destination))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !child.variable_type(output.id)?.array.is_empty() {
+                // AIR expands an unpacked slice into destinations in element
+                // order. These are separate element assignments, not the
+                // high-to-low pieces of a packed concatenation.
+                let child_keys = child.keys_for_id(output.id);
+                if child_keys.len() != destinations.len() {
+                    return Err(ImportError::UnsupportedBehavior(format!(
+                        "array instance output {} has {} child elements and {} destinations",
+                        child.variable_name(output.id),
+                        child_keys.len(),
+                        destinations.len()
+                    )));
+                }
+                for (child_key, destination) in child_keys.iter().zip(destinations) {
+                    if child.width(child_key)? != destination.width.get() {
+                        return Err(ImportError::UnsupportedBehavior(format!(
+                            "array instance output {} element width mismatch",
+                            child.variable_name(output.id)
+                        )));
+                    }
+                    let source = inline_signals[&child.signal(child_key)?];
+                    let value = self.rtl.read(source)?;
+                    self.rtl.assign(destination, value)?;
+                }
+                output_elements.insert(output.id, child_keys.len());
+                continue;
+            }
             let element = output_elements.entry(output.id).or_insert(0);
             let child_key = child.port_element_key(output.id, *element)?;
             *element += 1;
@@ -1034,17 +1066,9 @@ impl<'a> ModuleLowerer<'a> {
             let source = inline_signals[&child_signal];
             let source_width = child.width(&child_key)?;
             let source_expr = self.rtl.read(source)?;
-            let destinations = output
-                .dst
-                .iter()
-                .map(|destination| {
-                    self.destination_slice(destination)
-                        .map(|slice| (destination, slice))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
             let destination_width = destinations
                 .iter()
-                .map(|(_, slice)| slice.width.get())
+                .map(|slice| slice.width.get())
                 .sum::<u32>();
             if destination_width != source_width {
                 return Err(ImportError::UnsupportedBehavior(format!(
@@ -1053,7 +1077,7 @@ impl<'a> ModuleLowerer<'a> {
                 )));
             }
             let mut remaining = source_width;
-            for (_, destination) in destinations {
+            for destination in destinations {
                 remaining -= destination.width.get();
                 let value = if remaining == 0 && destination.width.get() == source_width {
                     source_expr

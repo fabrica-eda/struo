@@ -52,7 +52,6 @@ cases = [
   "function_arguments::test_ff_inout_expression_copyout_commits_with_nonblocking_assignments",
   "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
   "hierarchy::test_instance_input_function_output_writeback",
-  "hierarchy::test_instance_unpacked_array_slice_output",
   "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
   "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
