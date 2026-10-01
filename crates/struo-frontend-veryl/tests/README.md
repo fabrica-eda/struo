@@ -109,7 +109,10 @@ ignore manifest distinguishes those restrictions, invalid signed loop ranges,
 and compile-time system-function operand requirements.
 
 Combinational function output effects are supported in arithmetic, concatenation,
-short-circuit and conditional expressions, and in if/case conditions. Effects
+short-circuit and conditional expressions, and in if/case conditions. Value-returning
+system functions also preserve argument effects, including nested `$signed` /
+`$unsigned` wrappers and calls whose return value is discarded in statement position
+(IEEE 1800-2023 20.5). Type queries (`$bits` / `$size`) do not evaluate their operands. Effects
 are merged with the same condition as the expression value; early returns and
 static-loop break guards suppress subsequent writes. Non-local function writes
 are explicitly rejected until caller writeback is implemented. Array-valued
