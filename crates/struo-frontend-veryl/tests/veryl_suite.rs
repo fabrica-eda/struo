@@ -295,6 +295,92 @@ fn corpus_width_and_signedness_regressions() {
 }
 
 #[test]
+fn corpus_unpacked_array_output_slice() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("hierarchy::test_instance_unpacked_array_slice_output")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn array_output_slices_preserve_element_order_and_neighbors() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for (selection, count) in [("1+:2", 2), ("2-:2", 2), ("1:2", 2), ("1+:1", 1)] {
+        let neighbor = if count == 1 {
+            "assign data[2] = 8'h7e;"
+        } else {
+            ""
+        };
+        let code = format!(
+            r"
+            module Child #(param N: u32 = 2) (
+                i_data: input logic<8>, o_data: output logic<8>[N]
+            ) {{
+                always_comb {{
+                    for j in 0..N {{ o_data[j] = i_data + j as 8; }}
+                }}
+            }}
+            module Packed(i: input logic<8>, o: output logic<16>) {{
+                assign o = {{i + 8'd1, i}};
+            }}
+            module Top(i: input logic<8>, o: output logic<32>, o_packed: output logic<16>) {{
+                var data: logic<8>[4];
+                assign data[0] = 8'h5a;
+                assign data[3] = 8'ha5;
+                {neighbor}
+                inst child: Child #(N: {count}) (i_data: i, o_data: data[{selection}]);
+                inst packed_child: Packed(i, o: {{o_packed[7:0], o_packed[15:8]}});
+                assign o = {{data[3], data[2], data[1], data[0]}};
+            }}
+            "
+        );
+        let design = Design::new(&code, "Top");
+        let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+        let i = sim.signal("i");
+        let o = sim.signal("o");
+        let packed = sim.signal("o_packed");
+        for value in 0..=255u8 {
+            sim.modify(|io| io.set(i, value)).unwrap();
+            let second = if count == 1 {
+                0x7e
+            } else {
+                value.wrapping_add(1)
+            };
+            let expected = 0xa500_005a_u32 | (u32::from(second) << 16) | (u32::from(value) << 8);
+            assert_eq!(
+                sim.get(o),
+                expected.into(),
+                "slice {selection}, input {value}"
+            );
+            let expected_packed = (u16::from(value) << 8) | u16::from(value.wrapping_add(1));
+            assert_eq!(sim.get(packed), expected_packed.into());
+        }
+    }
+}
+
+#[test]
+fn array_output_slices_reject_element_count_and_width_mismatches() {
+    for (width, count) in [(8, 3), (4, 2), (4, 4)] {
+        let source = format!(
+            "module Child(o: output logic<8>[2]) {{
+                assign o[0] = 8'h12; assign o[1] = 8'h34;
+            }}
+            module Top(o: output logic<{width}>[{count}]) {{
+                inst child: Child(o: o[0+:{count}]);
+            }}"
+        );
+        let error = analyze_and_lower(&source, "array_output_mismatch", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::UnsupportedBehavior(message)
+                if message.contains("array instance output"))
+                || matches!(&error, ImportError::AnalysisFailed(message)
+                    if message.contains("MismatchAssignment")),
+            "unexpected rejection for {count} elements of width {width}: {error}"
+        );
+    }
+}
+
+#[test]
 fn corpus_open_output_ports() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [
