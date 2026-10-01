@@ -1,3 +1,5 @@
+mod loops;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use struo_rtl::{
@@ -1520,15 +1522,47 @@ impl<'a> ModuleLowerer<'a> {
         writes: &mut Env,
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
-        let mut context = veryl_analyzer::Context::default();
-        let iterations = statement.range.eval_iter(&mut context).ok_or_else(|| {
-            ImportError::UnsupportedBehavior(
-                "loop bounds are dynamic or exceed the static unroll limit".into(),
-            )
-        })?;
+        let plan = loops::plan(statement)?;
+        if plan.iterations.is_empty()
+            && let Some((veryl_analyzer::ir::ForBound::Expression(end), _)) = &plan.guard
+        {
+            // Even an empty range evaluates its first condition. Until bound
+            // effects are supported, reject them rather than dropping them.
+            let snapshot = if sequential {
+                self.sequential_reads(reads, writes)
+            } else {
+                writes.clone()
+            };
+            self.lower_expression(end, &snapshot)?;
+        }
         let mut changed = DrivenBits::default();
         let mut stopped = self.constant(1, 0);
-        for iteration in iterations {
+        for iteration in plan.iterations {
+            if let Some((bound, inclusive)) = &plan.guard {
+                let snapshot = if sequential {
+                    self.sequential_reads(reads, writes)
+                } else {
+                    writes.clone()
+                };
+                let end = match bound {
+                    veryl_analyzer::ir::ForBound::Const(value) => self.constant(64, *value as u64),
+                    veryl_analyzer::ir::ForBound::Expression(expression) => {
+                        self.lower_expression(expression, &snapshot)?
+                    }
+                };
+                let width = concrete_width(&statement.var_type, "loop induction variable")?;
+                let index = LoweredExpr {
+                    signed: statement.var_type.signed,
+                    ..self.constant(width, iteration as u64)
+                };
+                let op = if *inclusive {
+                    Op::Greater
+                } else {
+                    Op::GreaterEq
+                };
+                let finished = self.lower_binary(op, index, end, 1, false)?;
+                stopped = self.lower_binary(Op::LogicOr, stopped, finished, 1, false)?;
+            }
             let mut body = statement.body.clone();
             substitute_statements(&mut body, statement.var_id, iteration)?;
             let before = writes.clone();
