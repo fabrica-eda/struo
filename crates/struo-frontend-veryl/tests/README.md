@@ -101,3 +101,20 @@ constant negative exponents, unsigned parent contexts, and 65-bit results.
 
 The corpus runner copies its worker executable into a temporary directory for
 each run, so concurrent Cargo builds cannot replace a worker mid-audit.
+
+Analyzer diagnostics are classified by Veryl's severity: warnings (including
+unused return values and unsigned arithmetic shifts) do not reject a design.
+Actual errors, including FF function-output restrictions, remain fatal. The
+ignore manifest distinguishes those restrictions, invalid signed loop ranges,
+and compile-time system-function operand requirements.
+
+Combinational function output effects are supported in arithmetic, concatenation,
+short-circuit and conditional expressions, and in if/case conditions. Effects
+are merged with the same condition as the expression value; early returns and
+static-loop break guards suppress subsequent writes. Non-local function writes
+are explicitly rejected until caller writeback is implemented. Array-valued
+expressions, nested argument effects and runtime loops still have limitations.
+
+Dynamic addressing of an instance output is rejected as an invalid implicit
+continuous assignment, independently of analyzer warnings (IEEE 1800-2023
+Table 10-1). Procedural dynamic part-select assignments remain supported.

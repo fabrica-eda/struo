@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use struo_rtl::{BitWidth, Design, Module, Port, PortDirection, RtlError, StateDomain, ValueType};
 use veryl_analyzer::ir::{Component, Declaration, Ir, VarKind};
-use veryl_analyzer::{Analyzer, Context};
+use veryl_analyzer::{Analyzer, AnalyzerError, Context};
 use veryl_metadata::Metadata;
 use veryl_parser::{Parser, resource_table};
 
@@ -26,8 +26,8 @@ pub use lower::lower_analyzed_ir;
 ///
 /// # Errors
 ///
-/// Returns an error for parser or analyzer diagnostics, metadata setup, or
-/// semantic lowering failures.
+/// Analyzer warnings are non-fatal. Returns an error for parser or analyzer
+/// errors, metadata setup, or semantic lowering failures.
 pub fn analyze_and_lower(source: &str, project: &str, top: &str) -> Result<Design, ImportError> {
     let metadata = Metadata::create_default(project)
         .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
@@ -110,27 +110,35 @@ fn analyze_parsed_and_lower(
     for (project, parser) in parsed {
         pass1.append(&mut analyzer.analyze_pass1(project, &parser.veryl));
     }
-    if !pass1.is_empty() {
-        return Err(ImportError::AnalysisFailed(format!("{pass1:?}")));
-    }
+    reject_analysis_errors(pass1)?;
     let post1 = Analyzer::analyze_post_pass1();
-    if !post1.is_empty() {
-        return Err(ImportError::AnalysisFailed(format!("{post1:?}")));
-    }
+    reject_analysis_errors(post1)?;
 
     let mut pass2 = Vec::new();
     for (project, parser) in parsed {
         context.set_project_name(project);
         pass2.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
     }
-    if !pass2.is_empty() {
-        return Err(ImportError::AnalysisFailed(format!("{pass2:?}")));
-    }
+    pass2.append(&mut context.drain_errors());
+    reject_analysis_errors(pass2)?;
     let post2 = Analyzer::analyze_post_pass2(&ir);
-    if !post2.is_empty() {
-        return Err(ImportError::AnalysisFailed(format!("{post2:?}")));
-    }
+    reject_analysis_errors(post2)?;
     lower_analyzed_ir(&ir, top)
+}
+
+// AnalyzerError includes warnings (e.g. unused variables and unsigned
+// arithmetic shifts). Respect Veryl's severity instead of turning every lint
+// into a language rejection. Unknown severity remains fatal via is_error().
+fn reject_analysis_errors(diagnostics: Vec<AnalyzerError>) -> Result<(), ImportError> {
+    let errors = diagnostics
+        .into_iter()
+        .filter(AnalyzerError::is_error)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ImportError::AnalysisFailed(format!("{errors:?}")))
+    }
 }
 
 /// Exact Veryl analyzer release supported by this adapter.
@@ -406,6 +414,40 @@ mod tests {
     use veryl_analyzer::ir::Ir;
 
     use super::{SUPPORTED_VERYL_VERSION, analyze_project_and_lower, import_analyzed_shell};
+
+    #[test]
+    fn analyzer_warnings_do_not_reject_valid_designs() {
+        let source = "module Top(a: input logic<8>, q: output logic<8>) {
+            var unused: logic<8>;
+            assign q = a >>> 1;
+        }";
+        super::analyze_and_lower(source, "warnings", "Top")
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn analyzer_errors_remain_fatal_alongside_warnings() {
+        let source = "module Top(a: input logic<8>, q: output logic<8>) {
+            var unused: logic<8>;
+            assign q = (a >>> 1) + missing;
+        }";
+        let error = super::analyze_and_lower(source, "errors", "Top").unwrap_err();
+        assert!(matches!(error, super::ImportError::AnalysisFailed(_)));
+        assert!(error.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn nonlocal_function_writes_are_not_silently_discarded() {
+        let source = "module Top(a: input logic<8>, q: output logic<8>, side: output logic<8>) {
+            function f(x: input logic<8>) -> logic<8> { side = x; return x; }
+            always_comb { side = 0; q = f(a); }
+        }";
+        let error = super::analyze_and_lower(source, "nonlocal", "Top").unwrap_err();
+        assert!(matches!(error, super::ImportError::UnsupportedBehavior(_)));
+        assert!(error.to_string().contains("non-local storage"));
+    }
 
     #[test]
     fn empty_analyzer_ir_is_not_silently_made_valid() {

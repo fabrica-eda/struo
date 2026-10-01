@@ -319,6 +319,28 @@ fn corpus_functions_and_static_loops() {
 }
 
 #[test]
+fn corpus_comb_function_effects_and_language_rejections() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "basic::test_comb_function_call_expression_output_is_visible_to_later_operand",
+        "basic::test_comb_function_call_expression_output_is_guarded_by_ternary",
+        "basic::test_comb_function_call_expression_output_respects_short_circuit",
+        "basic::test_comb_function_call_with_output_argument_in_if_condition",
+        "basic::test_comb_function_call_with_output_argument_in_case_target",
+        "basic::test_comb_function_condition_output_is_guarded_after_early_return",
+        "basic::test_comb_nested_function_output_call_in_function_condition",
+        "concat_operators::test_shift_in_concat",
+        "hierarchy::test_instance_output_dynamic_index_function_output_writeback",
+        "hierarchy::test_instance_output_concat_advances_each_destination",
+        "hierarchy::test_dynamic_output_port_rmw_preserves_unselected_bits",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
 fn corpus_function_array_arguments() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [
