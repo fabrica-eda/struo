@@ -1477,8 +1477,17 @@ impl<'a> ModuleLowerer<'a> {
             }
             Statement::For(statement) => self.lower_for(statement, reads, writes, sequential),
             Statement::FunctionCall(call) => {
-                let (_, outputs) = self.lower_function_call(call, reads)?;
-                self.copy_function_outputs(outputs, reads, writes)
+                if sequential {
+                    let (_, outputs) = self.lower_function_call(call, reads)?;
+                    self.copy_function_outputs(outputs, reads, writes)
+                } else {
+                    let mut effects = DrivenBits::default();
+                    let (_, outputs) =
+                        self.lower_function_call_effects(call, writes, &mut effects)?;
+                    let reads = writes.clone();
+                    effects.extend(self.copy_function_outputs(outputs, &reads, writes)?);
+                    Ok(effects)
+                }
             }
             Statement::SystemFunctionCall(call) => {
                 let mut effects = DrivenBits::default();
@@ -1880,6 +1889,23 @@ impl<'a> ModuleLowerer<'a> {
         call: &veryl_analyzer::ir::FunctionCall,
         reads: &Env,
     ) -> Result<FunctionResult, ImportError> {
+        let mut caller = reads.clone();
+        let mut effects = DrivenBits::default();
+        let result = self.lower_function_call_effects(call, &mut caller, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "function input effects in a read-only call".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn lower_function_call_effects(
+        &mut self,
+        call: &veryl_analyzer::ir::FunctionCall,
+        caller: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<FunctionResult, ImportError> {
         if self.call_depth >= 64 {
             return Err(ImportError::UnsupportedBehavior(
                 "recursive function expansion exceeds 64 calls".into(),
@@ -1895,7 +1921,38 @@ impl<'a> ModuleLowerer<'a> {
             .ok_or_else(|| {
                 ImportError::UnsupportedBehavior("unresolved function specialization".into())
             })?;
-        let mut env = reads.clone();
+        // Choose AIR argument order (source order), without implying that SV
+        // requires this order: IEEE 1800-2023 13.5 leaves it undefined. Freeze
+        // each value after its evaluation, while exposing its writes to later
+        // arguments. Only then create the callee's automatic frame (13.5.1).
+        let mut inputs = Vec::new();
+        for (path, expression) in &call.inputs {
+            let id = *body.arg_map.get(path).ok_or_else(|| {
+                ImportError::UnsupportedBehavior("missing function formal".into())
+            })?;
+            let ty = self.source.variables[&id].r#type.clone();
+            let dimensions = ty
+                .array
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| ImportError::NonConcreteWidth("function argument".into()))?;
+            let width = concrete_width(&ty, "function argument")?;
+            let values = if dimensions.is_empty() {
+                vec![self.lower_assignment_value_effects(
+                    expression, caller, width, ty.signed, effects,
+                )?]
+            } else {
+                self.lower_array_argument(expression, &dimensions, width, ty.signed, caller)?
+            };
+            for (index, value) in array_indices(&ty, "function argument")?
+                .into_iter()
+                .zip(values)
+            {
+                inputs.push((SignalKey { id, index }, value));
+            }
+        }
+        let mut env = caller.clone();
         // Function storage is an automatic frame, never a hardware register.
         let locals = self
             .source
@@ -1921,39 +1978,14 @@ impl<'a> ModuleLowerer<'a> {
                 env.insert(key, value);
             }
         }
-        // Freeze every actual in the caller frame before mutating any formal.
-        for (path, expression) in &call.inputs {
-            let id = *body.arg_map.get(path).ok_or_else(|| {
-                ImportError::UnsupportedBehavior("missing function formal".into())
-            })?;
-            let ty = self.source.variables[&id].r#type.clone();
-            let dimensions = ty
-                .array
-                .iter()
-                .copied()
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| ImportError::NonConcreteWidth("function argument".into()))?;
-            let values = self.lower_array_argument(
-                expression,
-                &dimensions,
-                concrete_width(&ty, "function argument")?,
-                ty.signed,
-                reads,
-            )?;
-            for (index, value) in array_indices(&ty, "function argument")?
-                .into_iter()
-                .zip(values)
-            {
-                env.insert(SignalKey { id, index }, value);
-            }
-        }
+        env.extend(inputs);
         self.call_depth += 1;
         let result = self.lower_function_statements(&body.statements, &mut env, body.ret);
         self.call_depth -= 1;
         result?;
         // Explicit output formals are copied below. A write directly to module
         // storage must not disappear when this automatic frame is discarded.
-        if reads.iter().any(|(key, before)| {
+        if caller.iter().any(|(key, before)| {
             self.source.variables.get(&key.id).is_some_and(|variable| {
                 variable.affiliation != veryl_analyzer::symbol::Affiliation::Function
             }) && env.get(key).is_some_and(|after| after.id != before.id)
@@ -2362,6 +2394,21 @@ impl<'a> ModuleLowerer<'a> {
         self.resize(value, width, signed)
     }
 
+    fn lower_assignment_value_effects(
+        &mut self,
+        expression: &Expression,
+        env: &mut Env,
+        width: u32,
+        signed: bool,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut contextual = expression.clone();
+        contextual.comptime_mut().expr_context.width =
+            contextual.comptime().expr_context.width.max(width as usize);
+        let value = self.lower_comb_expression(&contextual, env, effects)?;
+        self.resize(value, width, signed)
+    }
+
     fn lower_expression(
         &mut self,
         expression: &Expression,
@@ -2507,7 +2554,7 @@ impl<'a> ModuleLowerer<'a> {
         effects: &mut DrivenBits,
     ) -> Result<LoweredExpr, ImportError> {
         if let Factor::FunctionCall(call) = factor {
-            let (value, outputs) = self.lower_function_call(call, env)?;
+            let (value, outputs) = self.lower_function_call_effects(call, env, effects)?;
             let reads = env.clone();
             effects.extend(self.copy_function_outputs(outputs, &reads, env)?);
             value.ok_or_else(|| ImportError::UnsupportedBehavior("void function expression".into()))

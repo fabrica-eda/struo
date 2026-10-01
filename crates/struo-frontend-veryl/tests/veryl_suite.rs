@@ -538,6 +538,133 @@ fn bounded_runtime_loops_preserve_guards_steps_and_mutable_bounds() {
 }
 
 #[test]
+fn corpus_function_input_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "basic::test_statement_call_inputs_follow_output_writeback_order",
+        "comb_observer::test_named_function_inputs_evaluate_in_source_order",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+fn function_input_effects_design() -> Design {
+    Design::new(
+        r"
+        module Top(d: input logic<8>, gate: input logic,
+                   frozen: output logic<16>, named: output logic<16>,
+                   nested: output logic<16>, guarded: output logic<16>,
+                   side: output logic<8>, named_side: output logic<8>,
+                   nested_side: output logic<8>, guarded_side: output logic<8>,
+                   overwritten: output logic<8>, global_side: output logic<8>,
+                   global_read: output logic<8>, returned: output logic<8>,
+                   return_side: output logic<8>, and_side: output logic<8>,
+                   or_side: output logic<8>, and_result: output logic, or_result: output logic) {
+            function bump(x: input logic<8>, y: output logic<8>) -> logic<8> {
+                y = x + 8'd1;
+                return x + 8'd2;
+            }
+            function pair(first: input logic<8>, second: input logic<8>) -> logic<16> {
+                return {first, second};
+            }
+            function finish(x: input logic<8>, dst: output logic<8>) {
+                dst = x ^ 8'ha5;
+            }
+            function read_global(x: input logic<8>) -> logic<8> {
+                return x ^ global_side;
+            }
+            function identity(x: input logic<8>) -> logic<8> { return x; }
+            function early(stop: input logic, x: input logic<8>, dst: output logic<8>) -> logic<8> {
+                dst = 8'd7;
+                if stop { return 8'd0; }
+                return identity(bump(x, dst));
+            }
+            always_comb {
+                side = 8'h5a;
+                frozen = pair(side, bump(d, side));
+                named_side = 0;
+                named = pair(second: bump(d, named_side), first: named_side);
+                nested_side = 0;
+                nested = pair(bump(d, nested_side), pair(nested_side, d) as 8);
+                guarded_side = 8'd3;
+                guarded = if gate ? pair(bump(d, guarded_side), guarded_side) : 16'habcd;
+                overwritten = 0;
+                finish(bump(d, overwritten), overwritten);
+                global_side = 0;
+                global_read = read_global(bump(d, global_side));
+                returned = early(gate, d, return_side);
+                and_side = 8'd4;
+                and_result = gate && identity(bump(d, and_side));
+                or_side = 8'd4;
+                or_result = gate || identity(bump(d, or_side));
+            }
+        }
+        ",
+        "Top",
+    )
+}
+
+#[test]
+fn function_input_effects_preserve_snapshots_frames_and_guards() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = function_input_effects_design();
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let gate = sim.signal("gate");
+    for value in 0..=255u8 {
+        for stop in [0u8, 1] {
+            sim.modify(|io| {
+                io.set(d, value);
+                io.set(gate, stop);
+            })
+            .unwrap();
+            let written = value.wrapping_add(1);
+            let result = value.wrapping_add(2);
+            for (name, expected) in [
+                ("frozen", 0x5a00 | u16::from(result)),
+                ("named", (u16::from(written) << 8) | u16::from(result)),
+                ("nested", (u16::from(result) << 8) | u16::from(value)),
+                (
+                    "guarded",
+                    if stop == 1 {
+                        (u16::from(result) << 8) | u16::from(written)
+                    } else {
+                        0xabcd
+                    },
+                ),
+                ("side", u16::from(written)),
+                ("named_side", u16::from(written)),
+                ("nested_side", u16::from(written)),
+                (
+                    "guarded_side",
+                    u16::from(if stop == 1 { written } else { 3 }),
+                ),
+                ("and_side", u16::from(if stop == 1 { written } else { 4 })),
+                ("or_side", u16::from(if stop == 0 { written } else { 4 })),
+                ("and_result", u16::from(stop == 1 && result != 0)),
+                ("or_result", u16::from(stop == 1 || result != 0)),
+                ("overwritten", u16::from(result ^ 0xa5)),
+                ("global_side", u16::from(written)),
+                ("global_read", u16::from(result ^ written)),
+                ("returned", u16::from(if stop == 1 { 0 } else { result })),
+                (
+                    "return_side",
+                    u16::from(if stop == 1 { 7 } else { written }),
+                ),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: input {value}, gate {stop}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn corpus_functions_and_static_loops() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [
