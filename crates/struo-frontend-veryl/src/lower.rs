@@ -2645,6 +2645,8 @@ impl<'a> ModuleLowerer<'a> {
             let reads = env.clone();
             effects.extend(self.copy_function_outputs(outputs, &reads, env)?);
             value.ok_or_else(|| ImportError::UnsupportedBehavior("void function expression".into()))
+        } else if let Factor::Variable(id, index, select, comptime) = factor {
+            self.lower_variable_effects(*id, index, select, comptime, env, effects)
         } else if let Factor::SystemFunctionCall(call) = factor {
             self.lower_system_function_effects(call, env, effects)
         } else {
@@ -3002,58 +3004,22 @@ impl<'a> ModuleLowerer<'a> {
     fn lower_factor(&mut self, factor: &Factor, env: &Env) -> Result<LoweredExpr, ImportError> {
         match factor {
             Factor::Variable(id, index, select, comptime) => {
-                let source = if has_dynamic_array_index(index) {
-                    self.lower_dynamic_array_read(*id, index, env)?
-                } else {
-                    let key = self.key_from_index(*id, index)?;
-                    if let Some(source) = env.get(&key).copied() {
-                        source
-                    } else if comptime.is_const {
-                        self.lower_comptime(comptime, "constant variable")?
-                    } else {
-                        return Err(ImportError::UnsupportedBehavior(format!(
-                            "reference to non-runtime variable {}",
-                            self.signal_name(&key)
-                        )));
-                    }
-                };
-                if dynamic_packed_select(select) {
-                    let width = selected_width(select, source.width)?;
-                    let (offset, negative) = self.lower_select_offset(select, width, env)?;
-                    let shifted = self.shift_selected(source.id, offset, negative, false)?;
-                    return Ok(LoweredExpr {
-                        id: self
-                            .rtl
-                            .expression_slice(shifted, 0, BitWidth::new(width)?)?,
-                        width,
-                        signed: false,
-                    });
+                let mut temporary = env.clone();
+                let mut effects = DrivenBits::default();
+                let value = self.lower_variable_effects(
+                    *id,
+                    index,
+                    select,
+                    comptime,
+                    &mut temporary,
+                    &mut effects,
+                )?;
+                if !effects.ranges.is_empty() {
+                    return Err(ImportError::UnsupportedBehavior(
+                        "index effects in a read-only expression".into(),
+                    ));
                 }
-                let (lsb, width) = static_select(select, source.width)?;
-                let signed = if select.is_empty() {
-                    source.signed
-                } else if matches!(
-                    self.variable_type(*id)?.kind,
-                    TypeKind::Bit | TypeKind::Logic
-                ) {
-                    false
-                } else {
-                    match &comptime.value {
-                        ValueVariant::Numeric(value) => value.signed(),
-                        _ => comptime.r#type.signed,
-                    }
-                };
-                if lsb == 0 && width == source.width {
-                    Ok(LoweredExpr { signed, ..source })
-                } else {
-                    Ok(LoweredExpr {
-                        id: self
-                            .rtl
-                            .expression_slice(source.id, lsb, BitWidth::new(width)?)?,
-                        width,
-                        signed,
-                    })
-                }
+                Ok(value)
             }
             Factor::Value(comptime) | Factor::Anonymous(comptime) => {
                 self.lower_comptime(comptime, "literal")
@@ -3076,6 +3042,83 @@ impl<'a> ModuleLowerer<'a> {
                 })
             }
             Factor::SystemFunctionCall(call) => self.lower_system_function(call, env),
+        }
+    }
+
+    fn lower_variable_effects(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        select: &VarSelect,
+        comptime: &Comptime,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        // Freeze each address component once, in source order, before reading data.
+        let elements = if has_dynamic_array_index(index) {
+            Some(self.lower_array_elements_effects(id, index, env, effects)?)
+        } else {
+            None
+        };
+        let offset = if dynamic_packed_select(select) {
+            let width = selected_width(
+                select,
+                concrete_width(self.variable_type(id)?, "indexed variable")?,
+            )?;
+            Some(self.lower_select_offset_effects(select, width, env, effects)?)
+        } else {
+            None
+        };
+        let source = if let Some(elements) = elements {
+            self.lower_dynamic_array_read(elements, env)?
+        } else {
+            let key = self.key_from_index(id, index)?;
+            if let Some(source) = env.get(&key).copied() {
+                source
+            } else if comptime.is_const {
+                self.lower_comptime(comptime, "constant variable")?
+            } else {
+                return Err(ImportError::UnsupportedBehavior(format!(
+                    "reference to non-runtime variable {}",
+                    self.signal_name(&key)
+                )));
+            }
+        };
+        if let Some((offset, negative)) = offset {
+            let width = selected_width(select, source.width)?;
+            let shifted = self.shift_selected(source.id, offset, negative, false)?;
+            return Ok(LoweredExpr {
+                id: self
+                    .rtl
+                    .expression_slice(shifted, 0, BitWidth::new(width)?)?,
+                width,
+                signed: false,
+            });
+        }
+        let (lsb, width) = static_select(select, source.width)?;
+        let signed = if select.is_empty() {
+            source.signed
+        } else if matches!(
+            self.variable_type(id)?.kind,
+            TypeKind::Bit | TypeKind::Logic
+        ) {
+            false
+        } else {
+            match &comptime.value {
+                ValueVariant::Numeric(value) => value.signed(),
+                _ => comptime.r#type.signed,
+            }
+        };
+        if lsb == 0 && width == source.width {
+            Ok(LoweredExpr { signed, ..source })
+        } else {
+            Ok(LoweredExpr {
+                id: self
+                    .rtl
+                    .expression_slice(source.id, lsb, BitWidth::new(width)?)?,
+                width,
+                signed,
+            })
         }
     }
 
@@ -3215,11 +3258,9 @@ impl<'a> ModuleLowerer<'a> {
 
     fn lower_dynamic_array_read(
         &mut self,
-        id: VarId,
-        index: &VarIndex,
+        elements: Vec<(SignalKey, LoweredExpr)>,
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
-        let elements = self.lower_array_elements(id, index, env)?;
         let first = &elements[0].0;
         let width = self.width(first)?;
         let signed = self.is_signed(first);
@@ -3286,7 +3327,26 @@ impl<'a> ModuleLowerer<'a> {
         width: u32,
         env: &Env,
     ) -> Result<(ExprId, ExprId), ImportError> {
-        let index = self.lower_expression(&select.0[0], env)?;
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let offset =
+            self.lower_select_offset_effects(select, width, &mut temporary, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "index effects in a read-only select".into(),
+            ));
+        }
+        Ok(offset)
+    }
+
+    fn lower_select_offset_effects(
+        &mut self,
+        select: &VarSelect,
+        width: u32,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<(ExprId, ExprId), ImportError> {
+        let index = self.lower_comb_expression(&select.0[0], env, effects)?;
         let offset_width = index
             .width
             .checked_add(u32::BITS - width.leading_zeros() + 1)
@@ -3618,6 +3678,25 @@ impl<'a> ModuleLowerer<'a> {
         index: &VarIndex,
         env: &Env,
     ) -> Result<Vec<(SignalKey, LoweredExpr)>, ImportError> {
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let elements =
+            self.lower_array_elements_effects(id, index, &mut temporary, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "array index effects in a read-only expression".into(),
+            ));
+        }
+        Ok(elements)
+    }
+
+    fn lower_array_elements_effects(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<Vec<(SignalKey, LoweredExpr)>, ImportError> {
         let variable = self
             .source
             .variables
@@ -3653,7 +3732,7 @@ impl<'a> ModuleLowerer<'a> {
                 indices.push(LoweredArrayIndex::Static(value));
             } else {
                 indices.push(LoweredArrayIndex::Dynamic(
-                    self.lower_expression(expression, env)?,
+                    self.lower_comb_expression(expression, env, effects)?,
                 ));
             }
         }
