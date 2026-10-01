@@ -82,6 +82,14 @@ A no-op tick is permitted only for a source RTL register clock when the mapped
 design has no state cells or event handlers. Unknown clocks are not accepted as
 eliminated events. All output assertions still execute.
 
+Independent combinational processes may drive disjoint packed ranges of the
+same variable (IEEE 1800-2023 9.2.2.2 and 11.5.3). Driver checks and emitted RTL
+assignments use the actual written ranges, while blocking reads within each
+process still see its earlier writes. Overlapping ranges, including possible
+dynamic-index overlap, remain rejected. Synthesis resolves bit dependencies
+through whole-vector connections so flattened ports do not create false loops;
+actual combinational feedback remains an error.
+
 Dynamic packed `+:`, `-:`, and `step` selects support reads and writes.
 Offset arithmetic preserves signed indices without wrapping into the vector;
 partially overlapping writes affect only valid bits. Out-of-range read bits
