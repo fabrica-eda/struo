@@ -85,13 +85,19 @@ pub fn synthesize_with_options(
         .ok_or_else(|| SynthesisError::InvalidRtl(RtlError::MissingTop(design.top().into())))?;
     reject_unsupported(module)?;
 
-    let mut lowering = Lowering::new(module);
-    lowering.reserve_sources();
-    lowering.index_assignments();
-    lowering.connect_memories()?;
-    lowering.connect_registers()?;
-    lowering.connect_outputs()?;
-    let mut netlist = lowering.netlist;
+    // Keep the established whole-expression construction order for ordinary
+    // acyclic designs. Always resolving individual bits changes netlist sharing
+    // and node order, which can regress downstream placement and timing.
+    // A vector-level cycle may still be acyclic at bit granularity; retry that
+    // case from a fresh lowering state without hiding genuine feedback errors.
+    let mut netlist = match Lowering::new(module).lower() {
+        Err(SynthesisError::CombinationalLoop { .. }) => {
+            let mut lowering = Lowering::new(module);
+            lowering.resolve_driver_ranges = true;
+            lowering.lower()?
+        }
+        result => result?,
+    };
     let mut reports = vec![PassReport {
         pass: "lower-rtl",
         message: format!(
@@ -136,6 +142,7 @@ struct Lowering<'a> {
     drivers: Vec<Vec<Option<Driver>>>,
     expression_bits: Vec<Option<Vec<NetId>>>,
     resolving: HashSet<(SignalId, usize)>,
+    resolve_driver_ranges: bool,
 }
 
 impl<'a> Lowering<'a> {
@@ -157,7 +164,17 @@ impl<'a> Lowering<'a> {
             drivers,
             expression_bits: vec![None; module.expressions().len()],
             resolving: HashSet::new(),
+            resolve_driver_ranges: false,
         }
+    }
+
+    fn lower(mut self) -> Result<Netlist, SynthesisError> {
+        self.reserve_sources();
+        self.index_assignments();
+        self.connect_memories()?;
+        self.connect_registers()?;
+        self.connect_outputs()?;
+        Ok(self.netlist)
     }
 
     fn reserve_sources(&mut self) {
@@ -391,9 +408,12 @@ impl<'a> Lowering<'a> {
         // Follow only this bit's dependency cone. A whole-vector connection
         // can contain unrelated bits that lead back to the current signal,
         // especially after flattening module ports.
-        let result = self
-            .lower_expression_range(driver.0, driver.1, 1)
-            .map(|bits| bits[0]);
+        let result = if self.resolve_driver_ranges {
+            self.lower_expression_range(driver.0, driver.1, 1)
+                .map(|bits| bits[0])
+        } else {
+            self.lower_expression(driver.0).map(|bits| bits[driver.1])
+        };
         self.resolving.remove(&(signal, bit));
         let net = result?;
         self.signal_bits[signal_index][bit] = Some(net);

@@ -88,7 +88,10 @@ assignments use the actual written ranges, while blocking reads within each
 process still see its earlier writes. Overlapping ranges, including possible
 dynamic-index overlap, remain rejected. Synthesis resolves bit dependencies
 through whole-vector connections so flattened ports do not create false loops;
-actual combinational feedback remains an error.
+actual combinational feedback remains an error. Ordinary acyclic designs keep
+the established whole-expression construction order. Bitwise resolution retries
+from a fresh state only when that path reports a loop, preserving existing
+netlist sharing and placement behavior.
 
 Dynamic packed `+:`, `-:`, and `step` selects support reads and writes.
 Offset arithmetic preserves signed indices without wrapping into the vector;
