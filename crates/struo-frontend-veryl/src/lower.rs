@@ -866,6 +866,22 @@ impl<'a> ModuleLowerer<'a> {
     }
 
     fn lower_instance(&mut self, instance: &InstDeclaration) -> Result<(), ImportError> {
+        // Instance outputs are implicit continuous assignments (IEEE 1800
+        // 10.2): every selected destination must have constant addressing.
+        for destination in instance.outputs.iter().flat_map(|output| &output.dst) {
+            let dynamic = destination
+                .index
+                .0
+                .iter()
+                .chain(&destination.select.0)
+                .chain(destination.select.1.iter().map(|(_, bound)| bound))
+                .any(|index| !index.comptime().is_const && evaluated_u64(index).is_none());
+            if dynamic {
+                return Err(ImportError::AnalysisFailed(
+                    "instance output destination requires constant indices and bounds".into(),
+                ));
+            }
+        }
         let Component::Module(child_source) = instance.component.as_ref() else {
             return Err(ImportError::UnsupportedBehavior(
                 "only synthesizable module instances can be flattened".into(),
@@ -1361,38 +1377,14 @@ impl<'a> ModuleLowerer<'a> {
             reads
         };
         match statement {
-            Statement::Assign(assign) => {
-                if let [destination] = assign.dst.as_slice()
-                    && destination.index.0.len()
-                        < self.source.variables[&destination.id].r#type.array.dims()
-                {
-                    return self.lower_array_assignment(destination, &assign.expr, reads, writes);
-                }
-                // Reads observe the pre-edge register value, but a partial
-                // write composes over the value already scheduled for this
-                // edge (later writes win per bit).
-                let (value, mut changed) = if let Expression::Term(factor) = &assign.expr
-                    && let Factor::FunctionCall(call) = factor.as_ref()
-                {
-                    let (value, outputs) = self.lower_function_call(call, reads)?;
-                    let changed = self.copy_function_outputs(outputs, reads, writes)?;
-                    (
-                        value.ok_or_else(|| {
-                            ImportError::UnsupportedBehavior("void function assignment".into())
-                        })?,
-                        changed,
-                    )
-                } else {
-                    (
-                        self.lower_expression(&assign.expr, reads)?,
-                        DrivenBits::default(),
-                    )
-                };
-                changed.extend(self.assign_destinations(&assign.dst, value, reads, writes)?);
-                Ok(changed)
-            }
+            Statement::Assign(assign) => self.lower_assignment(assign, reads, writes, sequential),
             Statement::If(branch) => {
-                let condition = self.lower_expression(&branch.cond, reads)?;
+                let mut effects = DrivenBits::default();
+                let condition = if sequential {
+                    self.lower_expression(&branch.cond, reads)?
+                } else {
+                    self.lower_comb_expression(&branch.cond, writes, &mut effects)?
+                };
                 let condition = self.boolean(condition)?;
                 let base = writes.clone();
                 let mut true_env = base.clone();
@@ -1421,6 +1413,7 @@ impl<'a> ModuleLowerer<'a> {
                         },
                     );
                 }
+                changed.extend(effects);
                 Ok(changed)
             }
             Statement::IfReset(_) if sequential => Err(ImportError::UnsupportedBehavior(
@@ -1451,6 +1444,47 @@ impl<'a> ModuleLowerer<'a> {
                 "if_reset outside always_ff".into(),
             )),
         }
+    }
+
+    fn lower_assignment(
+        &mut self,
+        assign: &veryl_analyzer::ir::AssignStatement,
+        reads: &Env,
+        writes: &mut Env,
+        sequential: bool,
+    ) -> Result<DrivenBits, ImportError> {
+        if let [destination] = assign.dst.as_slice()
+            && destination.index.0.len()
+                < self.source.variables[&destination.id].r#type.array.dims()
+        {
+            return self.lower_array_assignment(destination, &assign.expr, reads, writes);
+        }
+        // Reads observe the pre-edge register value, but a partial
+        // write composes over the value already scheduled for this
+        // edge (later writes win per bit).
+        let (value, mut changed) = if !sequential {
+            let mut effects = DrivenBits::default();
+            let value = self.lower_comb_expression(&assign.expr, writes, &mut effects)?;
+            (value, effects)
+        } else if let Expression::Term(factor) = &assign.expr
+            && let Factor::FunctionCall(call) = factor.as_ref()
+        {
+            let (value, outputs) = self.lower_function_call(call, reads)?;
+            let changed = self.copy_function_outputs(outputs, reads, writes)?;
+            (
+                value.ok_or_else(|| {
+                    ImportError::UnsupportedBehavior("void function assignment".into())
+                })?,
+                changed,
+            )
+        } else {
+            (
+                self.lower_expression(&assign.expr, reads)?,
+                DrivenBits::default(),
+            )
+        };
+        changed.extend(self.assign_destinations(&assign.dst, value, reads, writes)?);
+        Ok(changed)
     }
 
     fn lower_for(
@@ -1499,15 +1533,21 @@ impl<'a> ModuleLowerer<'a> {
             let (written, stop) = match statement {
                 Statement::Break => (DrivenBits::default(), self.constant(1, 1)),
                 Statement::If(branch) => {
-                    let condition = self.lower_expression(&branch.cond, &snapshot)?;
+                    let mut effects = DrivenBits::default();
+                    let condition = if sequential {
+                        self.lower_expression(&branch.cond, &snapshot)?
+                    } else {
+                        self.lower_comb_expression(&branch.cond, writes, &mut effects)?
+                    };
                     let condition = self.boolean(condition)?;
-                    let mut yes = before.clone();
-                    let mut no = before.clone();
+                    let mut yes = writes.clone();
+                    let mut no = writes.clone();
                     let (mut written, yes_stop) =
                         self.lower_loop_body(&branch.true_side, reads, &mut yes, sequential)?;
                     let (no_written, no_stop) =
                         self.lower_loop_body(&branch.false_side, reads, &mut no, sequential)?;
                     written.extend(no_written);
+                    written.extend(effects);
                     *writes = self.merge_values(condition, &yes, &no)?;
                     (
                         written,
@@ -1519,14 +1559,20 @@ impl<'a> ModuleLowerer<'a> {
                     )
                 }
                 Statement::Case(case) => {
-                    let target = self.lower_expression(&case.case_target, &snapshot)?;
-                    let mut result = before.clone();
+                    let mut effects = DrivenBits::default();
+                    let target = if sequential {
+                        self.lower_expression(&case.case_target, &snapshot)?
+                    } else {
+                        self.lower_comb_expression(&case.case_target, writes, &mut effects)?
+                    };
+                    let mut result = writes.clone();
                     let (mut written, mut stop) =
                         self.lower_loop_body(&case.default, reads, &mut result, sequential)?;
+                    written.extend(effects);
                     for arm in case.arms.iter().rev() {
                         let condition =
                             self.lower_case_patterns(target, &arm.patterns, &snapshot)?;
-                        let mut yes = before.clone();
+                        let mut yes = writes.clone();
                         let (yes_written, yes_stop) =
                             self.lower_loop_body(&arm.body, reads, &mut yes, sequential)?;
                         written.extend(yes_written);
@@ -1559,11 +1605,17 @@ impl<'a> ModuleLowerer<'a> {
         writes: &mut Env,
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
-        let target = self.lower_expression(&statement.case_target, reads)?;
+        let mut effects = DrivenBits::default();
+        let target = if sequential {
+            self.lower_expression(&statement.case_target, reads)?
+        } else {
+            self.lower_comb_expression(&statement.case_target, writes, &mut effects)?
+        };
         let base = writes.clone();
         let mut else_env = base.clone();
         let mut changed =
             self.lower_statements(&statement.default, reads, &mut else_env, sequential)?;
+        changed.extend(effects);
 
         // A balanced first-match tree does not reduce the mux depth below four
         // arms: the final default selection replaces the level saved in the
@@ -1809,6 +1861,17 @@ impl<'a> ModuleLowerer<'a> {
         let result = self.lower_function_statements(&body.statements, &mut env, body.ret);
         self.call_depth -= 1;
         result?;
+        // Explicit output formals are copied below. A write directly to module
+        // storage must not disappear when this automatic frame is discarded.
+        if reads.iter().any(|(key, before)| {
+            self.source.variables.get(&key.id).is_some_and(|variable| {
+                variable.affiliation != veryl_analyzer::symbol::Affiliation::Function
+            }) && env.get(key).is_some_and(|after| after.id != before.id)
+        }) {
+            return Err(ImportError::UnsupportedBehavior(
+                "function writes to non-local storage require caller writeback".into(),
+            ));
+        }
         let returned = body
             .ret
             .map(|id| self.pack_function_return(id, &env))
@@ -1884,10 +1947,11 @@ impl<'a> ModuleLowerer<'a> {
             let before = env.clone();
             let this_return = match statement {
                 Statement::If(branch) => {
-                    let condition = self.lower_expression(&branch.cond, &before)?;
+                    let condition =
+                        self.lower_comb_expression(&branch.cond, env, &mut DrivenBits::default())?;
                     let condition = self.boolean(condition)?;
-                    let mut yes = before.clone();
-                    let mut no = before.clone();
+                    let mut yes = env.clone();
+                    let mut no = env.clone();
                     let yes_return =
                         self.lower_function_statements(&branch.true_side, &mut yes, ret)?;
                     let no_return =
@@ -1900,13 +1964,17 @@ impl<'a> ModuleLowerer<'a> {
                     }
                 }
                 Statement::Case(case) => {
-                    let target = self.lower_expression(&case.case_target, &before)?;
-                    let mut result = before.clone();
+                    let target = self.lower_comb_expression(
+                        &case.case_target,
+                        env,
+                        &mut DrivenBits::default(),
+                    )?;
+                    let mut result = env.clone();
                     let mut flag =
                         self.lower_function_statements(&case.default, &mut result, ret)?;
                     for arm in case.arms.iter().rev() {
                         let condition = self.lower_case_patterns(target, &arm.patterns, &before)?;
-                        let mut yes = before.clone();
+                        let mut yes = env.clone();
                         let yes_return =
                             self.lower_function_statements(&arm.body, &mut yes, ret)?;
                         result = self.merge_values(condition, &yes, &result)?;
@@ -2219,12 +2287,43 @@ impl<'a> ModuleLowerer<'a> {
         expression: &Expression,
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let value = self.lower_expression_effects(expression, &mut temporary, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "function output effects in a read-only expression".into(),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn lower_comb_expression(
+        &mut self,
+        expression: &Expression,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut expression = expression.clone();
+        repair_expression_signedness(&mut expression, None);
+        self.lower_expression_effects(&expression, env, effects)
+    }
+
+    fn lower_expression_effects(
+        &mut self,
+        expression: &Expression,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
         match expression {
-            Expression::Term(factor) => self.lower_factor(factor, env),
-            Expression::Unary(op, input, comptime) => self.lower_unary(*op, input, comptime, env),
+            Expression::Term(factor) => self.lower_factor_effects(factor, env, effects),
+            Expression::Unary(op, input, comptime) => {
+                let input = self.lower_expression_effects(input, env, effects)?;
+                self.lower_unary(*op, input, comptime)
+            }
             Expression::Binary(lhs, op, rhs, comptime) => {
                 if *op == Op::As {
-                    let lhs = self.lower_prepared_expression(lhs, env)?;
+                    let lhs = self.lower_expression_effects(lhs, env, effects)?;
                     let width = concrete_width(&comptime.r#type, "cast expression")?;
                     let signed = if matches!(rhs.comptime().value, ValueVariant::Type(_)) {
                         comptime.r#type.signed
@@ -2233,17 +2332,29 @@ impl<'a> ModuleLowerer<'a> {
                     };
                     return self.resize(lhs, width, signed);
                 }
-                let lhs = self.lower_prepared_expression(lhs, env)?;
-                let rhs = self.lower_prepared_expression(rhs, env)?;
+                let lhs = self.lower_expression_effects(lhs, env, effects)?;
+                let before_rhs = env.clone();
+                let rhs = self.lower_expression_effects(rhs, env, effects)?;
+                if matches!(op, Op::LogicAnd | Op::LogicOr) {
+                    let condition = self.boolean(lhs)?;
+                    *env = if *op == Op::LogicAnd {
+                        self.merge_values(condition, env, &before_rhs)?
+                    } else {
+                        self.merge_values(condition, &before_rhs, env)?
+                    };
+                }
                 let result_width = binary_width(*op, comptime)?;
                 let signed = binary_signed(*op, comptime);
                 self.lower_binary(*op, lhs, rhs, result_width, signed)
             }
             Expression::Ternary(condition, then_expr, else_expr, comptime) => {
-                let condition = self.lower_prepared_expression(condition, env)?;
+                let condition = self.lower_expression_effects(condition, env, effects)?;
                 let condition = self.boolean(condition)?;
-                let then_expr = self.lower_prepared_expression(then_expr, env)?;
-                let else_expr = self.lower_prepared_expression(else_expr, env)?;
+                let mut yes = env.clone();
+                let mut no = env.clone();
+                let then_expr = self.lower_expression_effects(then_expr, &mut yes, effects)?;
+                let else_expr = self.lower_expression_effects(else_expr, &mut no, effects)?;
+                *env = self.merge_values(condition, &yes, &no)?;
                 let width = context_width(comptime)?
                     .max(then_expr.width)
                     .max(else_expr.width);
@@ -2273,7 +2384,7 @@ impl<'a> ModuleLowerer<'a> {
             Expression::Concatenation(parts, comptime) => {
                 let mut lowered = Vec::new();
                 for (part, repeat) in parts {
-                    let part = self.lower_prepared_expression(part, env)?;
+                    let part = self.lower_expression_effects(part, env, effects)?;
                     let count = if let Some(repeat) = repeat {
                         constant_value(repeat)?
                     } else {
@@ -2299,14 +2410,28 @@ impl<'a> ModuleLowerer<'a> {
         }
     }
 
+    fn lower_factor_effects(
+        &mut self,
+        factor: &Factor,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        if let Factor::FunctionCall(call) = factor {
+            let (value, outputs) = self.lower_function_call(call, env)?;
+            let reads = env.clone();
+            effects.extend(self.copy_function_outputs(outputs, &reads, env)?);
+            value.ok_or_else(|| ImportError::UnsupportedBehavior("void function expression".into()))
+        } else {
+            self.lower_factor(factor, env)
+        }
+    }
+
     fn lower_unary(
         &mut self,
         op: Op,
-        input: &Expression,
+        input: LoweredExpr,
         comptime: &Comptime,
-        env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
-        let input = self.lower_prepared_expression(input, env)?;
         let sized = matches!(op, Op::Add | Op::Sub | Op::BitNot);
         let width = if sized { context_width(comptime)? } else { 1 };
         let signed = sized && comptime.expr_context.signed;
