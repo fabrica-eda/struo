@@ -538,6 +538,167 @@ fn bounded_runtime_loops_preserve_guards_steps_and_mutable_bounds() {
 }
 
 #[test]
+fn packed_array_literals_reject_invalid_shapes() {
+    for literal in [
+        "'{1'b0}",
+        "'{1'b0 repeat 3}",
+        "'{default: 1'b0, default: 1'b1}",
+    ] {
+        let source = format!(
+            "module Top(q: output logic<2>) {{
+                function identity(x: input logic<2>) -> logic<2> {{ return x; }}
+                always_comb {{ q = identity({literal}); }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "invalid_pattern", "Top").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ImportError::AnalysisFailed(_) | ImportError::UnsupportedBehavior(_)
+            ),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn corpus_array_literal_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case(
+        "comb_observer::test_comb_function_packed_array_literal_preserves_source_order",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
+}
+
+fn array_literal_effects_design() -> Design {
+    Design::new(
+        r"
+        module Top(d: input logic<8>, gate: input logic,
+                   values: output logic<24>, side: output logic<8>,
+                   repeated: output logic<24>, repeat_side: output logic<8>,
+                   returned: output logic<24>, return_side: output logic<8>,
+                   p: output logic<8>, packed_side: output logic<8>,
+                   packed_nested: output logic<8>, packed_wide: output logic<16>,
+                   packed_repeat: output logic<4>, packed_repeat_side: output logic<8>,
+                   nested: output logic<32>, nested_side: output logic<8>,
+                   loop_value: output logic<16>, loop_side: output logic<8>,
+                   guarded: output logic<24>, guard_side: output logic<8>) {
+            type row_t = logic<8>[2];
+            function mark(x: input logic<8>, y: output logic<8>) -> logic<8> {
+                y = x; return x;
+            }
+            function bump(x: input logic<8>, y: output logic<8>) -> logic<8> {
+                y = x + 8'd1; return y;
+            }
+            function pack3(x: input logic<8>[3]) -> logic<24> {
+                return {x[2], x[1], x[0]};
+            }
+            function pack2(x: input logic<8>[2]) -> logic<16> {
+                return {x[1], x[0]};
+            }
+            function pack_grid(x: input logic<8>[2,2]) -> logic<32> {
+                return {x[1][1], x[1][0], x[0][1], x[0][0]};
+            }
+            function make(x: input logic<8>, y: output logic<8>) -> row_t {
+                y = x + 8'd1;
+                return '{x, x + 8'd2};
+            }
+            function consume(x: input logic<8>[2], later: input logic<8>) -> logic<24> {
+                return {later, x[1], x[0]};
+            }
+            function packed_identity(x: input logic<2,4>) -> logic<8> { return x; }
+            function packed_grid(x: input logic<2,2,2>) -> logic<8> { return x; }
+            function packed_bytes(x: input logic<2,8>) -> logic<16> { return x; }
+            function packed_bits(x: input logic<4>) -> logic<4> { return x; }
+            always_comb {
+                side = 0;
+                values = pack3('{default: mark(d, side), mark(d + 8'd1, side)});
+                repeat_side = 0;
+                repeated = pack3('{bump(repeat_side, repeat_side) repeat 3});
+                return_side = 0;
+                returned = consume(make(d, return_side), return_side);
+                packed_side = 0;
+                p = packed_identity('{default: mark(d, packed_side), 4'ha});
+                packed_nested = packed_grid('{'{d as 2, 2'b01}, '{2'b10, d as 2}});
+                packed_wide = packed_bytes('{4'sh8, d});
+                packed_repeat_side = 0;
+                packed_repeat = packed_bits('{bump(packed_repeat_side, packed_repeat_side) repeat 4});
+                nested_side = 0;
+                nested = pack_grid('{'{mark(d, nested_side), bump(nested_side, nested_side)},
+                                     '{default: bump(nested_side, nested_side)}});
+                loop_side = 0;
+                loop_value = 0;
+                for i in 0..3 {
+                    loop_value = pack2('{bump(i as 8, loop_side), d});
+                }
+                guard_side = 8'd7;
+                guarded = if gate ? pack3('{default: bump(d, guard_side)}) : 24'habcdef;
+            }
+        }
+    ",
+        "Top",
+    )
+}
+
+#[test]
+fn array_literal_effects_preserve_values_order_and_guards() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = array_literal_effects_design();
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let gate = sim.signal("gate");
+    for value in 0..=255u8 {
+        for enabled in [0u8, 1] {
+            sim.modify(|io| {
+                io.set(d, value);
+                io.set(gate, enabled);
+            })
+            .unwrap();
+            let first = u32::from(value);
+            let second = u32::from(value.wrapping_add(1));
+            let third = u32::from(value.wrapping_add(2));
+            for (name, expected) in [
+                ("values", (first << 16) | (first << 8) | second),
+                ("side", second),
+                ("repeated", 0x0001_0101),
+                ("repeat_side", 1),
+                ("returned", (second << 16) | (third << 8) | first),
+                ("return_side", second),
+                ("p", 0xa0 | (first & 0xf)),
+                ("packed_side", first),
+                ("packed_nested", ((first & 3) << 6) | 0x18 | (first & 3)),
+                ("packed_wide", 0xf800 | first),
+                ("packed_repeat", 0xf),
+                ("packed_repeat_side", 1),
+                (
+                    "nested",
+                    (third << 24) | (third << 16) | (second << 8) | first,
+                ),
+                ("nested_side", third),
+                ("loop_value", (first << 8) | 3),
+                ("loop_side", 3),
+                (
+                    "guarded",
+                    if enabled == 1 {
+                        second * 0x0001_0101
+                    } else {
+                        0x00ab_cdef
+                    },
+                ),
+                ("guard_side", if enabled == 1 { second } else { 7 }),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: input {value}, gate {enabled}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn corpus_function_input_effects() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [

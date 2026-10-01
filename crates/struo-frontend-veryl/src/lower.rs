@@ -1,3 +1,4 @@
+mod arrays;
 mod loops;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1930,24 +1931,20 @@ impl<'a> ModuleLowerer<'a> {
             let id = *body.arg_map.get(path).ok_or_else(|| {
                 ImportError::UnsupportedBehavior("missing function formal".into())
             })?;
-            let ty = self.source.variables[&id].r#type.clone();
+            let mut ty = self.source.variables[&id].r#type.clone();
             let dimensions = ty
                 .array
                 .iter()
                 .copied()
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| ImportError::NonConcreteWidth("function argument".into()))?;
-            let width = concrete_width(&ty, "function argument")?;
-            let values = if dimensions.is_empty() {
-                vec![self.lower_assignment_value_effects(
-                    expression, caller, width, ty.signed, effects,
-                )?]
-            } else {
-                self.lower_array_argument(expression, &dimensions, width, ty.signed, caller)?
-            };
-            for (index, value) in array_indices(&ty, "function argument")?
-                .into_iter()
-                .zip(values)
+            ty.array.clear();
+            let values =
+                self.lower_array_argument_effects(expression, &dimensions, &ty, caller, effects)?;
+            for (index, value) in
+                array_indices(&self.source.variables[&id].r#type, "function argument")?
+                    .into_iter()
+                    .zip(values)
             {
                 inputs.push((SignalKey { id, index }, value));
             }
@@ -2191,7 +2188,7 @@ impl<'a> ModuleLowerer<'a> {
                 "packed select on array assignment".into(),
             ));
         }
-        let ty = self.source.variables[&destination.id].r#type.clone();
+        let mut ty = self.source.variables[&destination.id].r#type.clone();
         let shape = ty
             .array
             .iter()
@@ -2203,13 +2200,8 @@ impl<'a> ModuleLowerer<'a> {
             .copied()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| ImportError::NonConcreteWidth("array assignment".into()))?;
-        let values = self.lower_array_argument(
-            expression,
-            &dimensions,
-            concrete_width(&ty, "array assignment")?,
-            ty.signed,
-            reads,
-        )?;
+        ty.array.clear();
+        let values = self.lower_array_argument(expression, &dimensions, &ty, reads)?;
         let mut changed = DrivenBits::default();
         for (flat, value) in values.into_iter().enumerate() {
             let mut element = destination.clone();
@@ -2228,59 +2220,81 @@ impl<'a> ModuleLowerer<'a> {
         &mut self,
         expression: &Expression,
         dimensions: &[usize],
-        width: u32,
-        signed: bool,
+        element_type: &Type,
         env: &Env,
     ) -> Result<Vec<LoweredExpr>, ImportError> {
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let values = self.lower_array_argument_effects(
+            expression,
+            dimensions,
+            element_type,
+            &mut temporary,
+            &mut effects,
+        )?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "array argument effects in a read-only expression".into(),
+            ));
+        }
+        Ok(values)
+    }
+
+    fn lower_array_argument_effects(
+        &mut self,
+        expression: &Expression,
+        dimensions: &[usize],
+        element_type: &Type,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<Vec<LoweredExpr>, ImportError> {
+        let width = concrete_width(element_type, "array element")?;
+        let signed = element_type.signed;
         let Some((&length, tail)) = dimensions.split_first() else {
-            return Ok(vec![
-                self.lower_assignment_value(expression, env, width, signed)?,
-            ]);
+            if let Expression::ArrayLiteral(items, _) = expression {
+                return Ok(vec![self.lower_packed_array_literal(
+                    items,
+                    element_type,
+                    env,
+                    effects,
+                )?]);
+            }
+            return Ok(vec![self.lower_assignment_value_effects(
+                expression, env, width, signed, effects,
+            )?]);
         };
         if let Expression::ArrayLiteral(items, _) = expression {
+            let repetitions = arrays::literal_repetitions(items, length)?;
             let mut values = Vec::new();
-            let mut count = 0;
             let mut default = None;
-            for item in items {
-                match item {
-                    ArrayLiteralItem::Value(value, repeat) => {
-                        let repeat = repeat
-                            .as_ref()
-                            .map(|x| constant_value(x))
-                            .transpose()?
-                            .unwrap_or(1);
-                        let repeat = usize::try_from(repeat).map_err(|_| {
-                            ImportError::UnsupportedBehavior("array repetition overflow".into())
-                        })?;
-                        if repeat > length.saturating_sub(count) {
-                            return Err(ImportError::UnsupportedBehavior(
-                                "array literal shape mismatch".into(),
-                            ));
-                        }
-                        for _ in 0..repeat {
-                            values.extend(
-                                self.lower_array_argument(value, tail, width, signed, env)?,
-                            );
-                        }
-                        count += repeat;
+            for (item, repeat) in items.iter().zip(repetitions) {
+                if repeat == 0 {
+                    continue;
+                }
+                let value = match item {
+                    ArrayLiteralItem::Value(value, _) | ArrayLiteralItem::Defaul(value) => value,
+                };
+                let elements = if matches!(item, ArrayLiteralItem::Defaul(_))
+                    && !matches!(value.as_ref(), Expression::ArrayLiteral(_, _))
+                    && value.comptime().r#type.array.is_empty()
+                {
+                    let leaf =
+                        self.lower_assignment_value_effects(value, env, width, signed, effects)?;
+                    vec![leaf; tail.iter().product()]
+                } else {
+                    self.lower_array_argument_effects(value, tail, element_type, env, effects)?
+                };
+                if matches!(item, ArrayLiteralItem::Defaul(_)) {
+                    default = Some((elements, repeat));
+                } else {
+                    for _ in 0..repeat {
+                        values.extend_from_slice(&elements);
                     }
-                    ArrayLiteralItem::Defaul(value) => default = Some(value),
                 }
             }
-            if count < length {
-                let default = default.ok_or_else(|| {
-                    ImportError::UnsupportedBehavior("incomplete array literal".into())
-                })?;
-                for _ in count..length {
-                    if !matches!(default.as_ref(), Expression::ArrayLiteral(_, _))
-                        && default.comptime().r#type.array.is_empty()
-                    {
-                        let leaf = self.lower_assignment_value(default, env, width, signed)?;
-                        values.extend(std::iter::repeat_n(leaf, tail.iter().product()));
-                    } else {
-                        values
-                            .extend(self.lower_array_argument(default, tail, width, signed, env)?);
-                    }
+            if let Some((elements, repeat)) = default {
+                for _ in 0..repeat {
+                    values.extend_from_slice(&elements);
                 }
             }
             return Ok(values);
@@ -2292,8 +2306,9 @@ impl<'a> ModuleLowerer<'a> {
                 call,
                 &expression.comptime().r#type,
                 dimensions,
-                (width, signed),
+                element_type,
                 env,
+                effects,
             );
         }
         if let Expression::Term(factor) = expression
@@ -2338,10 +2353,12 @@ impl<'a> ModuleLowerer<'a> {
         call: &veryl_analyzer::ir::FunctionCall,
         ty: &Type,
         dimensions: &[usize],
-        target: (u32, bool),
-        env: &Env,
+        target: &Type,
+        env: &mut Env,
+        effects: &mut DrivenBits,
     ) -> Result<Vec<LoweredExpr>, ImportError> {
-        let (width, signed) = target;
+        let width = concrete_width(target, "array return target")?;
+        let signed = target.signed;
         let shape = dimensions.iter().copied().map(Some).collect::<Vec<_>>();
         if ty.array.iter().copied().collect::<Vec<_>>() != shape {
             return Err(ImportError::UnsupportedBehavior(
@@ -2350,12 +2367,9 @@ impl<'a> ModuleLowerer<'a> {
         }
         let element_width = concrete_width(ty, "array return")?;
         let element_signed = ty.signed;
-        let (value, outputs) = self.lower_function_call(call, env)?;
-        if !outputs.is_empty() {
-            return Err(ImportError::UnsupportedBehavior(
-                "array call with output side effects".into(),
-            ));
-        }
+        let (value, outputs) = self.lower_function_call_effects(call, env, effects)?;
+        let reads = env.clone();
+        effects.extend(self.copy_function_outputs(outputs, &reads, env)?);
         let value =
             value.ok_or_else(|| ImportError::UnsupportedBehavior("void array call".into()))?;
         let mut values = Vec::new();
@@ -2377,6 +2391,79 @@ impl<'a> ModuleLowerer<'a> {
             values.push(self.resize(element, width, signed)?);
         }
         Ok(values)
+    }
+
+    fn lower_packed_array_literal(
+        &mut self,
+        items: &[ArrayLiteralItem],
+        ty: &Type,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        if matches!(ty.kind, TypeKind::Unknown) {
+            return Err(ImportError::NonConcreteWidth(
+                "packed array literal type".into(),
+            ));
+        }
+        if !ty.array.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "unpacked array literal in a scalar expression".into(),
+            ));
+        }
+        let width = concrete_width(ty, "packed array literal")?;
+        let length = if ty.width().is_empty() {
+            width as usize
+        } else {
+            ty.width()[0]
+                .ok_or_else(|| ImportError::NonConcreteWidth("packed array literal".into()))?
+        };
+        if length == 0 || !(width as usize).is_multiple_of(length) {
+            return Err(ImportError::UnsupportedBehavior(
+                "packed array literal shape mismatch".into(),
+            ));
+        }
+        let element_width = width
+            / u32::try_from(length)
+                .map_err(|_| ImportError::WidthTooLarge("packed array literal dimension".into()))?;
+        let mut element_type = ty.clone();
+        element_type.signed = false;
+        if element_type.width().is_empty() {
+            element_type.kind = TypeKind::Logic;
+        } else {
+            element_type.width_mut().drain(0..1);
+        }
+        let repetitions = arrays::literal_repetitions(items, length)?;
+        let mut parts = Vec::new();
+        let mut default = None;
+        // Evaluate active items once in AIR order, then replicate their values.
+        // IEEE 1800-2023 10.9.1 leaves evaluation counts for defaults and
+        // repetitions with side effects undefined; this is our chosen policy.
+        for (item, repeat) in items.iter().zip(repetitions) {
+            if repeat == 0 {
+                continue;
+            }
+            let expression = match item {
+                ArrayLiteralItem::Value(value, _) | ArrayLiteralItem::Defaul(value) => value,
+            };
+            let value = if let Expression::ArrayLiteral(nested, _) = expression.as_ref() {
+                self.lower_packed_array_literal(nested, &element_type, env, effects)?
+            } else {
+                self.lower_assignment_value_effects(expression, env, element_width, false, effects)?
+            };
+            if matches!(item, ArrayLiteralItem::Defaul(_)) {
+                default = Some((value.id, repeat));
+            } else {
+                parts.extend(std::iter::repeat_n(value.id, repeat));
+            }
+        }
+        if let Some((value, repeat)) = default {
+            parts.extend(std::iter::repeat_n(value, repeat));
+        }
+        Ok(LoweredExpr {
+            id: self.rtl.concat(parts)?,
+            width,
+            signed: ty.signed,
+        })
     }
 
     fn lower_assignment_value(
@@ -2541,9 +2628,9 @@ impl<'a> ModuleLowerer<'a> {
             Expression::StructConstructor(r#type, fields, _) => {
                 self.lower_struct_constructor(r#type, fields, env)
             }
-            Expression::ArrayLiteral(_, _) => Err(ImportError::UnsupportedBehavior(
-                "array literal expression".into(),
-            )),
+            Expression::ArrayLiteral(items, comptime) => {
+                self.lower_packed_array_literal(items, &comptime.r#type, env, effects)
+            }
         }
     }
 
@@ -4218,10 +4305,20 @@ fn substitute_induction(
                 substitute_induction(field, id, value)?;
             }
         }
-        Expression::ArrayLiteral(_, _) => {
-            return Err(ImportError::UnsupportedBehavior(
-                "array literal in unrolled loop".into(),
-            ));
+        Expression::ArrayLiteral(items, _) => {
+            for item in items {
+                match item {
+                    ArrayLiteralItem::Value(expression, repeat) => {
+                        substitute_induction(expression, id, value)?;
+                        if let Some(repeat) = repeat {
+                            substitute_induction(repeat, id, value)?;
+                        }
+                    }
+                    ArrayLiteralItem::Defaul(expression) => {
+                        substitute_induction(expression, id, value)?;
+                    }
+                }
+            }
         }
     }
     // eval_value never invents values for unresolved runtime variables. Only
