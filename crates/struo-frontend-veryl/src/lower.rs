@@ -1428,9 +1428,15 @@ impl<'a> ModuleLowerer<'a> {
                 let (_, outputs) = self.lower_function_call(call, reads)?;
                 self.copy_function_outputs(outputs, reads, writes)
             }
-            Statement::SystemFunctionCall(_) => Err(ImportError::UnsupportedBehavior(
-                "statement-level function calls".into(),
-            )),
+            Statement::SystemFunctionCall(call) => {
+                let mut effects = DrivenBits::default();
+                if sequential {
+                    self.lower_system_function(call, reads)?;
+                } else {
+                    self.lower_system_function_effects(call, writes, &mut effects)?;
+                }
+                Ok(effects)
+            }
             Statement::TbMethodCall(_) => Err(ImportError::UnsupportedBehavior(
                 "testbench method calls are not synthesizable".into(),
             )),
@@ -2421,6 +2427,8 @@ impl<'a> ModuleLowerer<'a> {
             let reads = env.clone();
             effects.extend(self.copy_function_outputs(outputs, &reads, env)?);
             value.ok_or_else(|| ImportError::UnsupportedBehavior("void function expression".into()))
+        } else if let Factor::SystemFunctionCall(call) = factor {
+            self.lower_system_function_effects(call, env, effects)
         } else {
             self.lower_factor(factor, env)
         }
@@ -2858,10 +2866,27 @@ impl<'a> ModuleLowerer<'a> {
         call: &veryl_analyzer::ir::SystemFunctionCall,
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let value = self.lower_system_function_effects(call, &mut temporary, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "function output effects in a read-only system function".into(),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn lower_system_function_effects(
+        &mut self,
+        call: &veryl_analyzer::ir::SystemFunctionCall,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
         use veryl_analyzer::ir::SystemFunctionKind;
         let value = match &call.kind {
             SystemFunctionKind::Signed(input) | SystemFunctionKind::Unsigned(input) => {
-                let value = self.lower_expression(&input.0, env)?;
+                let value = self.lower_comb_expression(&input.0, env, effects)?;
                 LoweredExpr {
                     signed: matches!(call.kind, SystemFunctionKind::Signed(_)),
                     ..value
@@ -2895,7 +2920,7 @@ impl<'a> ModuleLowerer<'a> {
                 }
             }
             SystemFunctionKind::Onehot(input) => {
-                let value = self.lower_expression(&input.0, env)?;
+                let value = self.lower_comb_expression(&input.0, env, effects)?;
                 let one = self.constant(value.width, 1);
                 let zero = self.constant(value.width, 0);
                 let less = self.rtl.binary(BinaryOp::Sub, value.id, one.id)?;
@@ -2909,7 +2934,7 @@ impl<'a> ModuleLowerer<'a> {
                 }
             }
             SystemFunctionKind::Clog2(input) => {
-                let value = self.lower_expression(&input.0, env)?;
+                let value = self.lower_comb_expression(&input.0, env, effects)?;
                 let one = self.constant(value.width, 1);
                 let zero = self.constant(value.width, 0);
                 let less = self.rtl.binary(BinaryOp::Sub, value.id, one.id)?;
@@ -4036,11 +4061,7 @@ fn substitute_induction(
                 }
             }
             Factor::FunctionCall(call) => substitute_call(call, id, value)?,
-            Factor::SystemFunctionCall(_) => {
-                return Err(ImportError::UnsupportedBehavior(
-                    "system function in unrolled loop".into(),
-                ));
-            }
+            Factor::SystemFunctionCall(call) => substitute_system_call(call, id, value)?,
             _ => (),
         },
         Expression::Unary(_, a, _) => substitute_induction(a, id, value)?,
@@ -4095,6 +4116,25 @@ fn substitute_access(
         substitute_induction(expression, id, value)?;
     }
     Ok(())
+}
+
+fn substitute_system_call(
+    call: &mut veryl_analyzer::ir::SystemFunctionCall,
+    id: VarId,
+    value: usize,
+) -> Result<(), ImportError> {
+    use veryl_analyzer::ir::SystemFunctionKind;
+    match &mut call.kind {
+        SystemFunctionKind::Signed(input)
+        | SystemFunctionKind::Unsigned(input)
+        | SystemFunctionKind::Onehot(input)
+        | SystemFunctionKind::Clog2(input)
+        | SystemFunctionKind::Bits(input)
+        | SystemFunctionKind::Size(input) => substitute_induction(&mut input.0, id, value),
+        _ => Err(ImportError::UnsupportedBehavior(
+            "system task in unrolled loop".into(),
+        )),
+    }
 }
 
 fn substitute_call(
@@ -4160,6 +4200,7 @@ fn substitute_statements(
                 substitute_statements(&mut nested.body, id, value)?;
             }
             Statement::FunctionCall(call) => substitute_call(call, id, value)?,
+            Statement::SystemFunctionCall(call) => substitute_system_call(call, id, value)?,
             Statement::Null | Statement::Break => (),
             _ => {
                 return Err(ImportError::UnsupportedBehavior(

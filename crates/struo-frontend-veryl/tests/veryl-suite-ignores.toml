@@ -44,13 +44,11 @@ reason = "The frontend does not yet lower this construct; retain the upstream ex
 cases = [
   "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
   "basic::test_comb_effectful_if_condition_after_dynamic_break_stays_inactive",
-  "basic::test_comb_function_call_expression_output_survives_system_function_wrapper",
   "basic::test_comb_function_call_with_output_argument_in_destination_index",
   "basic::test_comb_function_call_with_output_argument_in_display_argument",
   "basic::test_comb_function_call_with_output_argument_in_index_expression",
   "basic::test_comb_loop_bound_output_call_writes_back_once",
   "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
-  "basic::test_comb_value_system_function_statement_applies_argument_outputs",
   "basic::test_mixed_selects_execution",
   "basic::test_statement_call_inputs_follow_output_writeback_order",
   "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",

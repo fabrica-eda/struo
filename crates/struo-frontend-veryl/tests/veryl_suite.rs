@@ -341,6 +341,85 @@ fn corpus_comb_function_effects_and_language_rejections() {
 }
 
 #[test]
+fn corpus_system_function_output_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "basic::test_comb_function_call_expression_output_survives_system_function_wrapper",
+        "basic::test_comb_value_system_function_statement_applies_argument_outputs",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn system_function_effects_preserve_values_and_execution_guards() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<8>, stop: input logic,
+                   signed_q: output logic<16>, unsigned_q: output logic<16>,
+                   side: output logic<8>,
+                   loop_side: output logic<8>, return_side: output logic<8>) {
+            function f(x: input logic<8>, y: output logic<8>) -> logic<8> {
+                y = x + 8'd1;
+                return x;
+            }
+            function guarded(x: input logic<8>, stop: input logic,
+                             y: output logic<8>) -> logic<8> {
+                y = 0;
+                if stop { return 0; }
+                $unsigned(f(x, y));
+                return y;
+            }
+            always_comb {
+                signed_q = $signed(f(d, side));
+                unsigned_q = $unsigned($signed(f(d, side)));
+                loop_side = 0;
+                for i in 0..2 {
+                    if stop { break; }
+                    $unsigned(f(d + i, loop_side));
+                }
+                var ignored: logic<8>;
+                ignored = guarded(d, stop, return_side);
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let stop = sim.signal("stop");
+    let signed_q = sim.signal("signed_q");
+    let unsigned_q = sim.signal("unsigned_q");
+    let side = sim.signal("side");
+    let loop_side = sim.signal("loop_side");
+    let return_side = sim.signal("return_side");
+    for x in [0u8, 1, 3, 8, 128, 255] {
+        for halted in [1u8, 0, 1] {
+            sim.modify(|io| {
+                io.set(d, x);
+                io.set(stop, halted);
+            })
+            .unwrap();
+            assert_eq!(
+                sim.get(signed_q),
+                i16::from(x.cast_signed()).cast_unsigned().into()
+            );
+            assert_eq!(sim.get(unsigned_q), x.into());
+            assert_eq!(sim.get(side), x.wrapping_add(1).into());
+            let guarded = if halted == 0 { x.wrapping_add(1) } else { 0 };
+            assert_eq!(
+                sim.get(loop_side),
+                if halted == 0 { x.wrapping_add(2) } else { 0 }.into()
+            );
+            assert_eq!(sim.get(return_side), guarded.into());
+        }
+    }
+}
+
+#[test]
 fn corpus_function_array_arguments() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [
