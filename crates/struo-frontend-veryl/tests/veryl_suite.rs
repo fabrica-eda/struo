@@ -295,6 +295,53 @@ fn corpus_width_and_signedness_regressions() {
 }
 
 #[test]
+fn corpus_open_output_ports() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "hierarchy::test_unconnected_child_output_needs_no_parent_glue",
+        "std_binary_codec::test_binary_encoder",
+        "std_binary_codec::test_binary_encoder_disabled",
+        "std_binary_codec::test_binary_codec_roundtrip",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn open_output_ports_preserve_child_internal_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Child(i: input logic<4>, unused: output logic<4>,
+                     unused_array: output logic<4>[2], o: output logic<4>) {
+            assign unused = ~i;
+            assign unused_array[0] = i;
+            assign unused_array[1] = unused;
+            assign o = unused_array[1] ^ 4'h5;
+        }
+        module Top(i: input logic<4>, explicit: output logic<4>,
+                   omitted: output logic<4>) {
+            inst explicit_open: Child(i, unused: _, unused_array: _, o: explicit);
+            inst omitted_open: Child(i, o: omitted);
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let i = sim.signal("i");
+    let explicit = sim.signal("explicit");
+    let omitted = sim.signal("omitted");
+    for value in 0..16u8 {
+        sim.modify(|io| io.set(i, value)).unwrap();
+        let expected = ((!value & 0xf) ^ 5).into();
+        assert_eq!(sim.get(explicit), expected);
+        assert_eq!(sim.get(omitted), expected);
+    }
+}
+
+#[test]
 fn corpus_disjoint_combinational_drivers() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [

@@ -988,6 +988,12 @@ impl<'a> ModuleLowerer<'a> {
     ) -> Result<(), ImportError> {
         let mut output_elements = HashMap::new();
         for output in &instance.outputs {
+            // An explicit anonymous connection (`port: _`) has no destinations.
+            // The child still drives its own signal; only parent wiring is absent
+            // (IEEE 1800-2023 23.3.2.2, empty named port connections).
+            if output.dst.is_empty() {
+                continue;
+            }
             if let [destination] = output.dst.as_slice()
                 && destination.index.0.is_empty()
                 && destination.select.is_empty()
