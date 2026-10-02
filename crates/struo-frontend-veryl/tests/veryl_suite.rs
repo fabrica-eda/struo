@@ -1323,3 +1323,107 @@ fn upstream_constant_function_actual_regression() {
     celox_test_suite_veryl::case("flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion")
         .unwrap().run(&mut |design| compile(design, &stage));
 }
+
+#[test]
+fn corpus_index_read_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case(
+        "basic::test_comb_function_call_with_output_argument_in_index_expression",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
+}
+
+fn index_read_effects_design() -> Design {
+    Design::new(
+        r"
+        module Top(d: input logic<8>, sel: input logic<3>, gate: input logic,
+                   bit_q: output logic, slice_q: output logic<3>,
+                   array_q: output logic<8>, nested_q: output logic,
+                   guarded_q: output logic, side: output logic<8>,
+                   slice_side: output logic<8>, array_side: output logic<8>,
+                   nested_side: output logic<8>, guard_side: output logic<8>,
+                   changed_q: output logic, changed: output logic<8>) {
+            function index(x: input logic<3>, count: input logic<8>,
+                           next: output logic<8>) -> logic<3> {
+                next = count + 8'd1;
+                return x;
+            }
+            function replace(x: input logic<3>, data: output logic<8>) -> logic<3> {
+                data = 8'hff;
+                return x;
+            }
+            var words: logic<8>[4];
+            always_comb {
+                words[0] = d;
+                words[1] = ~d;
+                words[2] = 8'h35;
+                words[3] = 8'hca;
+                side = 0;
+                bit_q = d[index(sel, side, side)];
+                slice_side = 0;
+                slice_q = d[index(sel, slice_side, slice_side)+:3];
+                array_side = 0;
+                array_q = words[index(sel, array_side, array_side)];
+                nested_side = 0;
+                nested_q = words[index(sel, nested_side, nested_side)]
+                                [index(sel, nested_side, nested_side)];
+                guard_side = 0;
+                guarded_q = if gate ? d[index(sel, guard_side, guard_side)] : 1'b0;
+                changed = 0;
+                changed_q = changed[replace(sel, changed)];
+            }
+        }
+        ",
+        "Top",
+    )
+}
+
+#[test]
+fn index_reads_evaluate_once_and_preserve_guards() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = index_read_effects_design();
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let sel = sim.signal("sel");
+    let gate = sim.signal("gate");
+    for value in 0..=255u8 {
+        for index in 0..8u8 {
+            for enabled in [0u8, 1] {
+                sim.modify(|io| {
+                    io.set(d, value);
+                    io.set(sel, index);
+                    io.set(gate, enabled);
+                })
+                .unwrap();
+                let selected = match index {
+                    0 => value,
+                    1 => !value,
+                    2 => 0x35,
+                    3 => 0xca,
+                    _ => 0,
+                };
+                for (name, expected) in [
+                    ("bit_q", (value >> index) & 1),
+                    ("slice_q", (value >> index) & 7),
+                    ("array_q", selected),
+                    ("nested_q", (selected >> index) & 1),
+                    ("guarded_q", enabled & (value >> index) & 1),
+                    ("side", 1),
+                    ("slice_side", 1),
+                    ("array_side", 1),
+                    ("nested_side", 2),
+                    ("guard_side", enabled),
+                    ("changed_q", 1),
+                    ("changed", 255),
+                ] {
+                    assert_eq!(
+                        sim.get(sim.signal(name)),
+                        u32::from(expected).into(),
+                        "{name}: data {value}, index {index}, gate {enabled}"
+                    );
+                }
+            }
+        }
+    }
+}
