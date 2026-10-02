@@ -3266,6 +3266,21 @@ impl<'a> ModuleLowerer<'a> {
         let signed = self.is_signed(first);
         let mut result = self.constant(width, 0);
         result.signed = signed;
+        if elements.len() >= 4 {
+            let mut entries = Vec::with_capacity(elements.len());
+            for (key, condition) in elements {
+                let value = env.get(&key).copied().ok_or_else(|| {
+                    ImportError::UnsupportedBehavior(format!(
+                        "reference to non-runtime variable {}",
+                        self.signal_name(&key)
+                    ))
+                })?;
+                entries.push((condition, value));
+            }
+            let (matched, value) = self.lower_array_read_tree(&entries)?;
+            result.id = self.rtl.mux(matched.id, value.id, result.id)?;
+            return Ok(result);
+        }
         for (key, condition) in elements.into_iter().rev() {
             let value = env.get(&key).copied().ok_or_else(|| {
                 ImportError::UnsupportedBehavior(format!(
@@ -3280,6 +3295,27 @@ impl<'a> ModuleLowerer<'a> {
             };
         }
         Ok(result)
+    }
+
+    /// Balance the selected value and its match predicate together. Retaining
+    /// first-match priority also preserves behavior if index predicates overlap;
+    /// the caller supplies the existing zero result when no element matches.
+    fn lower_array_read_tree(
+        &mut self,
+        entries: &[(LoweredExpr, LoweredExpr)],
+    ) -> Result<(LoweredExpr, LoweredExpr), ImportError> {
+        if entries.len() == 1 {
+            return Ok(entries[0]);
+        }
+        let split = entries.len() / 2;
+        let (left_match, left_value) = self.lower_array_read_tree(&entries[..split])?;
+        let (right_match, right_value) = self.lower_array_read_tree(&entries[split..])?;
+        let matched = self.lower_binary(Op::LogicOr, left_match, right_match, 1, false)?;
+        let value = LoweredExpr {
+            id: self.rtl.mux(left_match.id, left_value.id, right_value.id)?,
+            ..left_value
+        };
+        Ok((matched, value))
     }
 
     fn assign_destination(
@@ -5535,6 +5571,56 @@ module WideLiteralTop (
         // levels (seventeen operations including its leaf equality) here.
         assert_eq!(expression_depth(top, *condition), 5);
         assert_eq!(case_data_mux_depth(top, value), 5);
+    }
+
+    #[test]
+    fn dynamic_array_reads_have_logarithmic_depth_and_preserve_bounds() {
+        for count in [3_u32, 5, 16, 17] {
+            let source = format!(
+                "module ArrayReadTop (values: input logic<8> [{count}], \
+                 index: input logic<6>, result: output logic<8>) {{ \
+                 assign result = values[index]; }}"
+            );
+            let design = analyze_and_lower(&source, "balanced_array", "ArrayReadTop").unwrap();
+            let top = design.top_module().unwrap();
+            let output = top
+                .signals()
+                .iter()
+                .find(|s| s.name() == "result")
+                .unwrap()
+                .id();
+            let value = top
+                .assignments()
+                .iter()
+                .find(|a| a.target.signal == output)
+                .unwrap()
+                .value;
+            let bound = (count.next_power_of_two().ilog2() + 1) as usize;
+            assert!(
+                case_data_mux_depth(top, value) <= bound,
+                "{count} entries exceed logarithmic mux depth {bound}"
+            );
+
+            let synthesized = synthesize(&design).unwrap();
+            let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+            let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+            for pattern in [0_u8, 0x31, 0x80, 0xff] {
+                let bytes = (0..count)
+                    .map(|i| pattern.wrapping_add(u8::try_from(i).unwrap().wrapping_mul(19)))
+                    .collect::<Vec<_>>();
+                for (i, &byte) in bytes.iter().enumerate() {
+                    set(&mut simulator, &format!("values[{i}]"), byte);
+                }
+                for index in 0_u8..64 {
+                    set(&mut simulator, "index", index);
+                    assert_value(
+                        &mut simulator,
+                        "result",
+                        u64::from(bytes.get(usize::from(index)).copied().unwrap_or(0)),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
