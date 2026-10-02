@@ -225,10 +225,8 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Struo runtime-loop synthesis currently requires a constant non-negative start; a proof for runtime initial values is not implemented."
+reason = "The runtime start is not proven non-negative without truncation, or the counter can overflow before termination."
 cases = [
-  "basic::test_comb_loop_bound_output_call_writes_back_once",
-  "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",
   "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
   "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
   "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
@@ -305,7 +303,7 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Runtime loop bounds fall outside the current non-negative constant-start and proven 64-iteration synthesis policy."
+reason = "Runtime loop bounds fall outside the proven non-negative range and 64-iteration synthesis policy."
 cases = [
   "veryl_context_regressions::runtime_for_with_negative_bound",
   "veryl_context_regressions::runtime_for_bound_keeps_its_type",

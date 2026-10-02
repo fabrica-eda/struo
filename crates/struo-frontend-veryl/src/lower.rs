@@ -1676,10 +1676,13 @@ impl<'a> ModuleLowerer<'a> {
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
         let plan = loops::plan(statement, self.source)?;
+        let mut changed = DrivenBits::default();
+        let mut cursor =
+            self.lower_loop_start(&plan, statement, reads, writes, sequential, &mut changed)?;
         if plan.iterations.is_empty()
             && let Some((veryl_analyzer::ir::ForBound::Expression(end), _)) = &plan.guard
         {
-            // Even an empty range evaluates its first condition. Until bound
+            // Even an empty range evaluates its first condition. Until condition
             // effects are supported, reject them rather than dropping them.
             let snapshot = if sequential {
                 self.sequential_reads(reads, writes)
@@ -1688,7 +1691,6 @@ impl<'a> ModuleLowerer<'a> {
             };
             self.lower_expression(end, &snapshot)?;
         }
-        let mut changed = DrivenBits::default();
         let mut stopped = self.constant(1, 0);
         for iteration in plan.iterations {
             if let Some((bound, inclusive)) = &plan.guard {
@@ -1719,15 +1721,62 @@ impl<'a> ModuleLowerer<'a> {
                 let finished = self.lower_binary(op, index, end, 1, false)?;
                 stopped = self.lower_binary(Op::LogicOr, stopped, finished, 1, false)?;
             }
+            // Candidates before initialization or skipped by the step are
+            // inactive. In particular, their breaks must not stop later work.
+            let skip = if let Some(cursor) = cursor {
+                let candidate = self.constant(cursor.width, iteration as u64);
+                let differs = self.lower_binary(Op::Ne, cursor, candidate, 1, false)?;
+                self.lower_binary(Op::LogicOr, stopped, differs, 1, false)?
+            } else {
+                stopped
+            };
             let mut body = statement.body.clone();
             substitute_statements(&mut body, statement.var_id, iteration)?;
             let before = writes.clone();
-            let (written, stop) = self.lower_loop_body(&body, reads, writes, sequential)?;
-            *writes = self.merge_values(stopped, &before, writes)?;
+            let (written, mut stop) = self.lower_loop_body(&body, reads, writes, sequential)?;
+            *writes = self.merge_values(skip, &before, writes)?;
+            if let (Some(current), Some((_, step))) = (cursor, &plan.runtime_start) {
+                let increment = self.constant(current.width, *step as u64);
+                let next =
+                    self.lower_binary(Op::Add, current, increment, current.width, current.signed)?;
+                cursor = Some(LoweredExpr {
+                    id: self.rtl.mux(skip.id, current.id, next.id)?,
+                    ..current
+                });
+                let zero = self.constant(1, 0);
+                stop.id = self.rtl.mux(skip.id, zero.id, stop.id)?;
+            }
             stopped = self.lower_binary(Op::LogicOr, stopped, stop, 1, false)?;
             changed.extend(written);
         }
         Ok(changed)
+    }
+
+    fn lower_loop_start(
+        &mut self,
+        plan: &loops::LoopPlan,
+        statement: &veryl_analyzer::ir::ForStatement,
+        reads: &Env,
+        writes: &mut Env,
+        sequential: bool,
+        changed: &mut DrivenBits,
+    ) -> Result<Option<LoweredExpr>, ImportError> {
+        let Some((veryl_analyzer::ir::ForBound::Expression(start), _)) = &plan.runtime_start else {
+            return Ok(None);
+        };
+        // Initialization precedes the first condition, including empty ranges
+        // (IEEE 1800-2023 12.7.1). Preserve output-argument writes exactly once.
+        let value = if sequential {
+            self.lower_expression(start, &self.sequential_reads(reads, writes))?
+        } else {
+            self.lower_comb_expression(start, writes, changed)?
+        };
+        self.resize(
+            value,
+            concrete_width(&statement.var_type, "loop induction variable")?,
+            statement.var_type.signed,
+        )
+        .map(Some)
     }
 
     fn lower_loop_body(
