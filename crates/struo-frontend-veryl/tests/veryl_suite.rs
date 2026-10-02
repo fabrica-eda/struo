@@ -2196,6 +2196,14 @@ fn corpus_scoped_local_variables() {
 }
 
 #[test]
+fn corpus_generate_constant_mux_dependencies() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("duplicate_varpath::test_duplicate_scoped_var_with_generate_for")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
 fn scoped_signal_names_are_unique_and_stable() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = Design::new(

@@ -27,7 +27,6 @@ cases = [
 [[ignore]]
 reason = "Synthesis currently reports a combinational loop or an undriven signal."
 cases = [
-  "duplicate_varpath::test_duplicate_scoped_var_with_generate_for",
   "std_onehot::test_onehot_8bit_exhaustive",
 ]
 
