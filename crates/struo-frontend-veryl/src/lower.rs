@@ -244,13 +244,21 @@ pub fn lower_analyzed_ir(ir: &Ir, top: &str) -> Result<Design, ImportError> {
 
 impl<'a> ModuleLowerer<'a> {
     fn new(source: &'a Module) -> Result<Self, ImportError> {
+        Self::new_without_memories(source, &HashSet::new())
+    }
+
+    fn new_without_memories(
+        source: &'a Module,
+        excluded: &HashSet<VarId>,
+    ) -> Result<Self, ImportError> {
         let mut rtl = RtlModule::new(resolve_name(source.name)?);
         let mut signals = HashMap::new();
         let mut signal_order = Vec::new();
         let mut widths = HashMap::new();
         let mut signed = HashMap::new();
         let memory_policies = memory_inference_policies(source)?;
-        let inferred_memories = memory_candidates(source, &memory_policies);
+        let mut inferred_memories = memory_candidates(source, &memory_policies);
+        inferred_memories.retain(|memory| !excluded.contains(memory));
 
         let mut ports = source.ports.iter().collect::<Vec<_>>();
         ports.sort_by_key(|(path, _)| path.to_string());
@@ -336,66 +344,91 @@ impl<'a> ModuleLowerer<'a> {
     }
 
     fn infer_memories(&mut self) -> Result<(), ImportError> {
-        let mut candidates = self.inferred_memories.iter().copied().collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok(());
-        }
-        candidates.sort_by_key(|memory| self.variable_name(*memory));
-
-        let mut patterns = self.collect_memory_patterns(&self.inferred_memories)?;
-        for memory_id in candidates {
-            if self.source.variables[&memory_id].affiliation
-                == veryl_analyzer::symbol::Affiliation::AlwaysFf
-            {
-                return Err(self.memory_inference_failure(memory_id,
-                    "blocking always_ff-local accesses cannot use the synchronous read-first memory template"));
+        let mut excluded = HashSet::new();
+        loop {
+            let mut candidates = self.inferred_memories.iter().copied().collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return Ok(());
             }
-            let mut pattern = patterns.remove(&memory_id).unwrap_or_default();
-            if self.memory_policy(memory_id) == MemoryInferencePolicy::Distributed {
-                if let Err(error) = self.lower_distributed_memory(memory_id, pattern) {
-                    return Err(self.requirement_failure(memory_id, error));
+            candidates.sort_by_key(|memory| (self.variable_name(*memory), *memory));
+            let mut patterns = self.collect_memory_patterns(&self.inferred_memories)?;
+            let mut retry = false;
+            for memory in candidates {
+                let pattern = patterns.remove(&memory).unwrap_or_default();
+                if let Err(error) = self.infer_memory(memory, pattern) {
+                    if self.memory_policy(memory) != MemoryInferencePolicy::Preferred {
+                        return Err(error);
+                    }
+                    excluded.insert(memory);
+                    // Inference can already have emitted ports and expressions.
+                    // Rebuild from AIR so ordinary lowering sees every original
+                    // statement, with no leftover drivers from the failed attempt.
+                    *self = Self::new_without_memories(self.source, &excluded)?;
+                    retry = true;
+                    break;
                 }
-                continue;
             }
-            if pattern.writes.is_empty() || pattern.reads.is_empty() {
-                let missing = if pattern.writes.is_empty() && pattern.reads.is_empty() {
-                    "no supported synchronous read or write port was found"
-                } else if pattern.writes.is_empty() {
-                    "no supported synchronous write port was found"
-                } else {
-                    "no supported synchronous read port was found"
-                };
-                return Err(self.memory_inference_failure(memory_id, missing));
+            if !retry {
+                return Ok(());
             }
-            if pattern.writes.len() > 2 || pattern.reads.len() > 2 {
-                return Err(self.memory_inference_failure(
-                    memory_id,
-                    "more than two read/write ports are not supported",
-                ));
-            }
-            let mut ports = Vec::new();
-            for write in pattern.writes {
-                let Some(index) = pattern
-                    .reads
-                    .iter()
-                    .position(|read| read.clock == write.clock && read.edge == write.edge)
-                else {
-                    return Err(self.memory_inference_failure(
-                        memory_id,
-                        "each write port requires a read port on the same clock edge",
-                    ));
-                };
-                ports.push((write, pattern.reads.remove(index)));
-            }
-            if !pattern.reads.is_empty() {
-                return Err(self.memory_inference_failure(
-                    memory_id,
-                    "each read port requires a write port on the same clock edge",
-                ));
-            }
-            if let Err(error) = self.lower_inferred_memory(memory_id, ports) {
+        }
+    }
+
+    fn infer_memory(
+        &mut self,
+        memory_id: VarId,
+        mut pattern: PartialMemoryPattern,
+    ) -> Result<(), ImportError> {
+        if self.source.variables[&memory_id].affiliation
+            == veryl_analyzer::symbol::Affiliation::AlwaysFf
+        {
+            return Err(self.memory_inference_failure(memory_id,
+                "blocking always_ff-local accesses cannot use the synchronous read-first memory template"));
+        }
+        if self.memory_policy(memory_id) == MemoryInferencePolicy::Distributed {
+            if let Err(error) = self.lower_distributed_memory(memory_id, pattern) {
                 return Err(self.requirement_failure(memory_id, error));
             }
+            return Ok(());
+        }
+        if pattern.writes.is_empty() || pattern.reads.is_empty() {
+            let missing = if pattern.writes.is_empty() && pattern.reads.is_empty() {
+                "no supported synchronous read or write port was found"
+            } else if pattern.writes.is_empty() {
+                "no supported synchronous write port was found"
+            } else {
+                "no supported synchronous read port was found"
+            };
+            return Err(self.memory_inference_failure(memory_id, missing));
+        }
+        if pattern.writes.len() > 2 || pattern.reads.len() > 2 {
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "more than two read/write ports are not supported",
+            ));
+        }
+        let mut ports = Vec::new();
+        for write in pattern.writes {
+            let Some(index) = pattern
+                .reads
+                .iter()
+                .position(|read| read.clock == write.clock && read.edge == write.edge)
+            else {
+                return Err(self.memory_inference_failure(
+                    memory_id,
+                    "each write port requires a read port on the same clock edge",
+                ));
+            };
+            ports.push((write, pattern.reads.remove(index)));
+        }
+        if !pattern.reads.is_empty() {
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "each read port requires a write port on the same clock edge",
+            ));
+        }
+        if let Err(error) = self.lower_inferred_memory(memory_id, ports) {
+            return Err(self.requirement_failure(memory_id, error));
         }
         Ok(())
     }

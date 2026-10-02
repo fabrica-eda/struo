@@ -34,11 +34,8 @@ cases = [
 reason = "The frontend does not yet lower this construct; retain the upstream expectation."
 cases = [
   "basic::test_comb_function_call_with_output_argument_in_display_argument",
-  "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
   "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
   "hierarchy::test_instance_input_function_output_writeback",
-  "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
-  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
   "std_mux::test_demux_build_smoke",
   "std_mux::test_mux_build_smoke",
 ]
