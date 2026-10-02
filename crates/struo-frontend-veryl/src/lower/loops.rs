@@ -6,7 +6,7 @@ use veryl_analyzer::ir::{
 use super::{ImportError, concrete_width, context_width, evaluated_u64, substitute_statements};
 
 /// Resource budget for newly supported runtime-bound loops, not a runtime cap.
-const GUARDED_ITERATION_BUDGET: usize = 64;
+const GUARDED_ITERATION_BUDGET: usize = 256;
 
 pub(super) struct LoopPlan {
     pub iterations: Vec<usize>,
@@ -101,7 +101,7 @@ pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan
         });
     }
     Err(unsupported(
-        "runtime loop termination is not proven within the 64-iteration synthesis budget",
+        "runtime loop termination is not proven within the 256-iteration synthesis budget",
     ))
 }
 
@@ -139,7 +139,7 @@ fn plan_runtime_start(
         .filter(|count| *count <= GUARDED_ITERATION_BUDGET)
         .ok_or_else(|| {
             unsupported(
-                "runtime loop termination is not proven within the 64-iteration synthesis budget",
+                "runtime loop termination is not proven within the 256-iteration synthesis budget",
             )
         })?;
     let counter_max = if magnitude >= usize::BITS {

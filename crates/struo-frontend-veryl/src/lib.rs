@@ -480,7 +480,7 @@ mod tests {
             "q += 1;",
             "if stop { break; } q += 1;",
             "for j in 0..2 { break; } q += 1;",
-            "if i == 64 { break; } q += 1;",
+            "if i == 256 { break; } q += 1;",
         ] {
             let source = format!(
                 "module Top(count: input logic<32>, stop: input logic, q: output logic<16>) {{
@@ -490,7 +490,7 @@ mod tests {
             let error = super::analyze_and_lower(&source, "unproven_loop", "Top").unwrap_err();
             assert!(
                 matches!(&error, super::ImportError::UnsupportedBehavior(message)
-                if message.contains("64-iteration synthesis budget")),
+                if message.contains("256-iteration synthesis budget")),
                 "{error}"
             );
         }

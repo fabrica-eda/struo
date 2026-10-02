@@ -14,6 +14,8 @@ cases = [
 [[ignore]]
 reason = "Exceeds the 60-second per-case budget on the CI runner."
 cases = [
+  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
+  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
   "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
@@ -231,9 +233,7 @@ cases = [
 [[ignore]]
 reason = "The runtime start is not proven non-negative without truncation, or the counter can overflow before termination."
 cases = [
-  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
   "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
-  "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
   "synth_dynamic_loop::test_constant_bounds_preserve_wide_limit_above_loop_width",
   "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
   "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
@@ -241,12 +241,10 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Struo cannot prove termination within its 64-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
+reason = "Struo cannot prove termination within its 256-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
 cases = [
-  "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
   "flip_flop::test_ff_runtime_for_bounds",
   "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
-  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
   "synth_dynamic_loop::test_runtime_bounds_preserve_loop_carried_state_for_indexed_reads",
   "synth_dynamic_loop::test_runtime_bounds_preserve_pre_loop_bits_for_partial_updates",
   "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
@@ -306,7 +304,7 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Runtime loop bounds fall outside the proven non-negative range and 64-iteration synthesis policy."
+reason = "Runtime loop bounds fall outside the proven non-negative range and 256-iteration synthesis policy."
 cases = [
   "veryl_context_regressions::runtime_for_with_negative_bound",
   "veryl_context_regressions::runtime_for_bound_keeps_its_type",

@@ -152,7 +152,7 @@ Runtime-loop synthesis uses a separate planner in `src/lower/loops.rs`. Existing
 constant-range expansion is retained. Runtime bounds are accepted for a
 non-negative constant start that fits the induction variable and a positive
 additive step, when either the bound's type or a guaranteed break proves that
-at most 64 candidate iterations are needed. This budget includes the iteration
+at most 256 candidate iterations are needed. This budget includes the iteration
 that executes a break; it is a compile-time resource policy, never a silent
 runtime truncation. An input-dependent break alone is not a termination proof,
 and a nested loop's break does not terminate its parent.
@@ -162,17 +162,19 @@ lowering. A missing/non-terminating default or any non-terminating arm does not
 prove a bound, even if test inputs happen to select a terminating arm.
 
 A runtime start is also accepted when its unsigned leaf type fits the counter
-without truncation and the end range fits within 64 non-negative counter values.
+without truncation and the end range fits within 256 non-negative counter values.
 The initializer is evaluated exactly once, including output-argument writes and
 empty ranges. Lowering tracks the counter value reached by each positive additive
-step, suppressing both writes and breaks from skipped candidates. Signed starts
+step, suppressing both writes and breaks from skipped candidates. Unit-stride
+loops compare each candidate with the captured start directly, avoiding a chain
+of counter increments and muxes. Signed starts
 without a non-negative proof and possible counter overflow remain unsupported.
 
 Each candidate iteration retains the actual bound comparison and break guard.
 The bound is reevaluated against the current combinational environment (or the
 pre-edge FF reads), matching for-loop condition evaluation in IEEE 1800-2023
 12.7.1 and Veryl's emitted SV. No clock cycles are introduced. Tests cover the
-64-iteration boundary, signed bounds, stepped loops, changing bounds, FF writes,
+256-iteration boundary, signed bounds, stepped loops, changing bounds, FF writes,
 and proof rejection. Runtime-start tests also cover 4,096 start/end/break
 combinations, initialization effects, empty ranges, and unsigned packed selects.
 Output effects in the end condition remain unsupported and are rejected even

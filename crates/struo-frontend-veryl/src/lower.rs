@@ -1720,7 +1720,18 @@ impl<'a> ModuleLowerer<'a> {
             // inactive. In particular, their breaks must not stop later work.
             let skip = if let Some(cursor) = cursor {
                 let candidate = self.constant(cursor.width, iteration as u64);
-                let differs = self.lower_binary(Op::Ne, cursor, candidate, 1, false)?;
+                // With unit stride, every candidate at or above the captured
+                // start is reachable. Avoid a chain of counter adders/muxes.
+                let op = if plan
+                    .runtime_start
+                    .as_ref()
+                    .is_some_and(|(_, step)| *step == 1)
+                {
+                    Op::Greater
+                } else {
+                    Op::Ne
+                };
+                let differs = self.lower_binary(op, cursor, candidate, 1, false)?;
                 self.lower_binary(Op::LogicOr, stopped, differs, 1, false)?
             } else {
                 stopped
@@ -1731,13 +1742,20 @@ impl<'a> ModuleLowerer<'a> {
             let (written, mut stop) = self.lower_loop_body(&body, reads, writes, sequential)?;
             *writes = self.merge_values(skip, &before, writes)?;
             if let (Some(current), Some((_, step))) = (cursor, &plan.runtime_start) {
-                let increment = self.constant(current.width, *step as u64);
-                let next =
-                    self.lower_binary(Op::Add, current, increment, current.width, current.signed)?;
-                cursor = Some(LoweredExpr {
-                    id: self.rtl.mux(skip.id, current.id, next.id)?,
-                    ..current
-                });
+                if *step != 1 {
+                    let increment = self.constant(current.width, *step as u64);
+                    let next = self.lower_binary(
+                        Op::Add,
+                        current,
+                        increment,
+                        current.width,
+                        current.signed,
+                    )?;
+                    cursor = Some(LoweredExpr {
+                        id: self.rtl.mux(skip.id, current.id, next.id)?,
+                        ..current
+                    });
+                }
                 let zero = self.constant(1, 0);
                 stop.id = self.rtl.mux(skip.id, zero.id, stop.id)?;
             }
