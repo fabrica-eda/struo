@@ -2953,3 +2953,231 @@ fn static_loop_proofs_preserve_signed_sentinels_and_guaranteed_breaks() {
         assert_eq!(sim.get(sim.signal("empty")), 0u8.into());
     }
 }
+
+#[test]
+fn corpus_reverse_loop_with_guaranteed_first_iteration_break() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case(
+        "flip_flop::test_ff_runtime_reverse_min_i32_end_wraps_before_range_check",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn single_iteration_loops_use_truncated_counters_and_preserve_nested_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(start: input signed logic<64>, limit: input signed logic<64>, gate: input logic,
+                   fwd: output logic<32>, reverse_value: output logic<32>, nested: output logic<32>,
+                   calls: output logic<8>, branch: output logic<8>) {
+            function seed(x: input signed logic<64>, n: inout logic<8>) -> signed logic<64> {
+                n += 1;
+                return x;
+            }
+            always_comb {
+                calls = 0;
+                fwd = 32'heeeeeeee;
+                reverse_value = 32'hdddddddd;
+                nested = 32'hcccccccc;
+                branch = 0;
+                for i in seed(start, calls)..limit step *= 2 {
+                    fwd = i as 32;
+                    for j in rev start..limit { nested = (i + j) as 32; break; }
+                    if gate { branch = 1; break; } else { branch = 2; break; }
+                }
+                for i in rev start..seed(limit, calls) { reverse_value = i as 32; break; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let start = sim.signal("start");
+    let limit = sim.signal("limit");
+    let gate = sim.signal("gate");
+    let values = [
+        i64::MIN,
+        -4_294_967_296,
+        -2_147_483_648,
+        -1,
+        0,
+        1,
+        2_147_483_647,
+        4_294_967_299,
+        i64::MAX,
+    ];
+    for first in values {
+        for end in values {
+            for enabled in [0u8, 1] {
+                sim.modify(|io| {
+                    io.set(start, first.cast_unsigned());
+                    io.set(limit, end.cast_unsigned());
+                    io.set(gate, enabled);
+                })
+                .unwrap();
+                let forward_counter =
+                    i32::from_le_bytes(first.to_le_bytes()[..4].try_into().unwrap());
+                let reverse_counter =
+                    i32::from_le_bytes(end.wrapping_sub(1).to_le_bytes()[..4].try_into().unwrap());
+                let forward_active = i64::from(forward_counter) < end;
+                let reverse_active = i64::from(reverse_counter) >= first;
+                assert_eq!(
+                    sim.get(sim.signal("fwd")),
+                    (if forward_active {
+                        forward_counter.cast_unsigned()
+                    } else {
+                        0xeeee_eeee
+                    })
+                    .into()
+                );
+                assert_eq!(
+                    sim.get(sim.signal("reverse_value")),
+                    (if reverse_active {
+                        reverse_counter.cast_unsigned()
+                    } else {
+                        0xdddd_dddd
+                    })
+                    .into()
+                );
+                assert_eq!(
+                    sim.get(sim.signal("nested")),
+                    (if forward_active && reverse_active {
+                        forward_counter
+                            .wrapping_add(reverse_counter)
+                            .cast_unsigned()
+                    } else {
+                        0xcccc_cccc
+                    })
+                    .into()
+                );
+                assert_eq!(sim.get(sim.signal("calls")), 2u8.into());
+                assert_eq!(
+                    sim.get(sim.signal("branch")),
+                    (if forward_active {
+                        if enabled == 1 { 1u8 } else { 2 }
+                    } else {
+                        0
+                    })
+                    .into()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn single_iteration_ff_reverse_comparison_keeps_unsigned_bound_context() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, start: input logic<64>, limit: input signed logic<64>,
+                   q: output logic<32>) {
+            always_ff (clk) {
+                q = 32'heeeeeeee;
+                for i in rev start..limit { q = i as 32; break; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let clk = sim.event("clk");
+    let start = sim.signal("start");
+    let limit = sim.signal("limit");
+    for first in [
+        0u64,
+        1,
+        2_147_483_647,
+        4_294_967_295,
+        4_294_967_296,
+        u64::MAX,
+    ] {
+        for end in [
+            i64::MIN,
+            -2_147_483_648,
+            -1,
+            0,
+            1,
+            2_147_483_647,
+            4_294_967_296,
+            i64::MAX,
+        ] {
+            sim.modify(|io| {
+                io.set(start, first);
+                io.set(limit, end.cast_unsigned());
+            })
+            .unwrap();
+            sim.tick(clk).unwrap();
+            let counter =
+                u32::from_le_bytes(end.wrapping_sub(1).to_le_bytes()[..4].try_into().unwrap());
+            let expected = if u64::from(counter) >= first {
+                counter
+            } else {
+                0xeeee_eeee
+            };
+            assert_eq!(
+                sim.get(sim.signal("q")),
+                expected.into(),
+                "start={first}, end={end}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_iteration_counter_drives_dynamic_selects_and_constant_array_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(start: input signed logic<64>, bits: output logic<16>, data: output logic<8>) {
+            const A: logic<8> [4] = '{11, 22, 33, 44};
+            always_comb {
+                bits = 0;
+                data = 0;
+                for i in start..64'sh7fff_ffff_ffff_ffff step *= 2 {
+                    bits[i] = 1;
+                    data = A[i];
+                    break;
+                }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let start = sim.signal("start");
+    for first in [-1i64, 0, 1, 3, 4, 15, 16, 2_147_483_648, 4_294_967_299] {
+        sim.modify(|io| io.set(start, first.cast_unsigned()))
+            .unwrap();
+        let counter = i32::from_le_bytes(first.to_le_bytes()[..4].try_into().unwrap());
+        let bits = if (0..16).contains(&counter) {
+            1u16 << counter
+        } else {
+            0
+        };
+        let data = usize::try_from(counter)
+            .ok()
+            .and_then(|i| [11u8, 22, 33, 44].get(i).copied())
+            .unwrap_or(0);
+        assert_eq!(sim.get(sim.signal("bits")), bits.into());
+        assert_eq!(sim.get(sim.signal("data")), data.into());
+    }
+}
+
+#[test]
+fn single_iteration_loops_reject_lost_constant_initializer_bits() {
+    for start in ["128'h1_0000_0000_0000_0003", "128'sh1_0000_0000_0000_0003"] {
+        let source = format!(
+            "module Top(limit: input logic<128>, q: output logic<32>) {{
+                always_comb {{ q = 0; for i in {start}..limit {{ q = i as 32; break; }} }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "saturated_loop_initializer", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains("saturated")),
+            "{error}"
+        );
+    }
+}

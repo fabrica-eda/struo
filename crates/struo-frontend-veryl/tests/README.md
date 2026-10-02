@@ -186,6 +186,22 @@ combinations, initialization effects, empty ranges, and unsigned packed selects.
 Output effects in the end condition remain unsupported and are rejected even
 for an empty range.
 
+When range expansion cannot prove a bound, `src/lower/single_iteration.rs` also
+accepts a body that exits through `break` on every path. It evaluates the actual
+initializer, assigns it into the counter's declared width, and then compares it
+with the condition bound. This supports wide or signed initializers and reverse
+ranges, including wrapped exclusive reverse initializers, without executing any
+step. A scoped runtime binding supplies the counter to expressions and nested
+loops; constant and parameter reads elsewhere keep their usual treatment.
+Initializer effects happen once even when the first condition is false. Body
+writes are guarded by that condition, and existing FF function-write restrictions
+remain in force. Tests cover 162 signed-bound/gate combinations and 48 FF cases
+with mixed signed/unsigned comparison contexts, dynamic packed selects, and
+constant-array reads. Veryl saturates constant range values at host integer
+limits; a constant initializer at that boundary is rejected because AIR cannot
+distinguish the exact boundary from a larger original value with different low
+bits. Runtime expressions retain their full initializer bits.
+
 Veryl 0.22 has an upstream static-unrolling limitation before this validation:
 when no `break` retains the loop in AIR, it already expands
 `for i in rev 8'd0..4 { q += 1; }` into four assignments. Its emitted SV instead

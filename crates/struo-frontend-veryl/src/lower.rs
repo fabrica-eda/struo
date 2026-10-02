@@ -2,6 +2,7 @@ mod arrays;
 mod comparisons;
 mod loops;
 mod members;
+mod single_iteration;
 mod system_tasks;
 mod types;
 
@@ -174,6 +175,7 @@ struct ModuleLowerer<'a> {
     signed: HashMap<SignalKey, bool>,
     inferred_memories: HashSet<VarId>,
     memory_policies: HashMap<VarId, MemoryInferencePolicy>,
+    runtime_loop_variables: HashSet<VarId>,
 }
 
 #[derive(Clone)]
@@ -341,6 +343,7 @@ impl<'a> ModuleLowerer<'a> {
             signed,
             inferred_memories,
             memory_policies,
+            runtime_loop_variables: HashSet::new(),
         })
     }
 
@@ -1670,7 +1673,13 @@ impl<'a> ModuleLowerer<'a> {
         writes: &mut Env,
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
-        let plan = loops::plan(statement, self.source)?;
+        let plan = match loops::plan(statement, self.source) {
+            Ok(plan) => plan,
+            Err(_) if loops::always_breaks(&statement.body, self.source) => {
+                return self.lower_single_iteration(statement, reads, writes, sequential);
+            }
+            Err(error) => return Err(error),
+        };
         let mut changed = DrivenBits::default();
         let mut cursor =
             self.lower_loop_start(&plan, statement, reads, writes, sequential, &mut changed)?;

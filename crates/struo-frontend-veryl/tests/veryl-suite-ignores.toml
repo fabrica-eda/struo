@@ -263,7 +263,6 @@ cases = [
   "flip_flop::test_ff_runtime_for_bitwise_steps",
   "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
   "flip_flop::test_ff_runtime_reverse_exclusive_i32_upper_sentinel",
-  "flip_flop::test_ff_runtime_reverse_min_i32_end_wraps_before_range_check",
   "flip_flop::test_ff_runtime_reverse_step_matches_emitted_sv_order",
   "flip_flop::test_ff_signed_xor_step_uses_loop_counter_width",
   "synth_dynamic_loop::test_i32_bitwise_steps_discard_bits_above_the_counter_width",

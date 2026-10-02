@@ -206,7 +206,7 @@ fn past_end(value: usize, maximum: Option<usize>, inclusive: bool) -> bool {
     })
 }
 
-fn always_breaks(statements: &[Statement], source: &Module) -> bool {
+pub(super) fn always_breaks(statements: &[Statement], source: &Module) -> bool {
     statements.iter().any(|statement| match statement {
         Statement::Break => true,
         Statement::If(branch) => match known_condition(&branch.cond, source) {
