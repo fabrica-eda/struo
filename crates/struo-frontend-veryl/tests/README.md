@@ -129,6 +129,21 @@ static-loop break guards suppress subsequent writes. Non-local function writes
 are explicitly rejected until caller writeback is implemented. Array-valued
 expressions, nested argument effects and runtime loops still have limitations.
 
+`$display` and `$write` statements preserve function output/inout effects in
+argument expressions, including short-circuit and loop-break guards. Formatting
+and literal arguments produce no hardware or console output. This statement
+lowering lives in `src/lower/system_tasks.rs`; value-returning system functions
+keep their existing expression behavior and other unsupported tasks still fail.
+FF function-write restrictions are unchanged.
+
+Function output arguments in an instance input connection remain rejected:
+IEEE 1800-2023 13.4 prohibits those calls outside procedural statements. The
+suite's packed/unpacked mux-port mismatches also remain explicit ignores rather
+than being accepted through an implicit layout conversion (7.6 and 23.3.3.3).
+Missing drivers in a supplied library, such as the onehot W=1 base case, are not
+filled with invented constants. The manifest distinguishes these fixture issues
+from missing lowering support; absence of a suite tag does not prove valid SV.
+
 Dynamic addressing of an instance output is rejected as an invalid implicit
 continuous assignment, independently of analyzer warnings (IEEE 1800-2023
 Table 10-1). Procedural dynamic part-select assignments remain supported.

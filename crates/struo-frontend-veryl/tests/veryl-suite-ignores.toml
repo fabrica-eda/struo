@@ -26,17 +26,21 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Synthesis currently reports a combinational loop or an undriven signal."
+reason = "The upstream veryl-std 0.21 onehot leaves o_gt_one undriven in its W=1 base case; filling it with zero would change the supplied RTL."
 cases = [
   "std_onehot::test_onehot_8bit_exhaustive",
 ]
 
 [[ignore]]
-reason = "The frontend does not yet lower this construct; retain the upstream expectation."
+reason = "The fixture calls a function with output arguments in a module input connection, outside a procedural statement; IEEE 1800-2023 13.4 prohibits this."
 cases = [
-  "basic::test_comb_function_call_with_output_argument_in_display_argument",
   "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
   "hierarchy::test_instance_input_function_output_writeback",
+]
+
+[[ignore]]
+reason = "The fixture connects an unpacked array to a packed port without an explicit cast (IEEE 1800-2023 7.6 and 23.3.3.3); implicit layout reinterpretation is not supported."
+cases = [
   "std_mux::test_demux_build_smoke",
   "std_mux::test_mux_build_smoke",
 ]

@@ -2655,3 +2655,100 @@ fn runtime_start_packed_select_remains_unsigned() {
         assert_eq!(sim.get(sim.signal("q")), (start..8).sum::<u8>().into());
     }
 }
+
+#[test]
+fn corpus_display_argument_function_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case(
+        "basic::test_comb_function_call_with_output_argument_in_display_argument",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn output_task_arguments_preserve_short_circuit_and_break_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r#"
+        module Top(d: input logic<8>, gate: input logic, stop: input logic<3>, q: output logic<8>) {
+            function bump(x: input logic<8>, calls: inout logic<8>) -> logic<8> {
+                calls += x + 8'd1;
+                return x;
+            }
+            always_comb {
+                q = 0;
+                $display("", 8'hxx);
+                $display("%d", gate && bump(d, q));
+                if !gate { $write("%d", bump(d, q)); }
+                for i in 0..4 {
+                    if i == stop { break; }
+                    $write("%d", bump(i as 8, q));
+                }
+            }
+        }
+        "#,
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let gate = sim.signal("gate");
+    let stop = sim.signal("stop");
+    for value in [0u8, 1, 255] {
+        for enabled in [0u8, 1] {
+            for stopped_at in 0..8u8 {
+                sim.modify(|io| {
+                    io.set(d, value);
+                    io.set(gate, enabled);
+                    io.set(stop, stopped_at);
+                })
+                .unwrap();
+                assert_eq!(
+                    sim.get(sim.signal("q")),
+                    value
+                        .wrapping_add(1)
+                        .wrapping_add((0..stopped_at.min(4)).map(|i| i + 1).sum::<u8>())
+                        .into()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn output_tasks_do_not_bypass_ff_function_write_restrictions() {
+    for task in ["display", "write"] {
+        let source = format!(
+            r#"
+            module Top(clk: input clock, q: output logic<8>) {{
+                function mark(x: output logic<8>) -> logic {{ x = 8'd1; return 1'b1; }}
+                always_ff(clk) {{ ${task}("%d", mark(q)); }}
+            }}
+        "#
+        );
+        let error = analyze_and_lower(&source, "ff_output_task_effects", "Top").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ImportError::AnalysisFailed(_) | ImportError::UnsupportedBehavior(_)
+            ),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn instance_input_function_output_effects_remain_rejected() {
+    let source = r"
+        module Child(i: input logic, o: output logic) { assign o = i; }
+        module Top(d: input logic, q: output logic, side: output logic) {
+            function mark(x: input logic, seen: output logic) -> logic { seen = x; return x; }
+            inst u: Child(i: mark(d, side), o: q);
+        }
+    ";
+    let error = analyze_and_lower(source, "nonprocedural_function_outputs", "Top").unwrap_err();
+    assert!(
+        matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains("read-only expression")),
+        "{error}"
+    );
+}
