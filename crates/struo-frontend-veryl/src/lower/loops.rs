@@ -1,5 +1,7 @@
 //! Plans finite hardware expansion without using simulation input samples.
-use veryl_analyzer::ir::{ForBound, ForRange, ForStatement, Op, Statement};
+use veryl_analyzer::ir::{
+    Expression, Factor, ForBound, ForRange, ForStatement, Module, Op, Statement,
+};
 
 use super::{ImportError, concrete_width, context_width, evaluated_u64, substitute_statements};
 
@@ -11,7 +13,7 @@ pub(super) struct LoopPlan {
     pub guard: Option<(ForBound, bool)>,
 }
 
-pub(super) fn plan(statement: &ForStatement) -> Result<LoopPlan, ImportError> {
+pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan, ImportError> {
     let mut context = veryl_analyzer::Context::default();
     if let Some(iterations) = statement.range.eval_iter(&mut context) {
         return Ok(LoopPlan {
@@ -73,7 +75,7 @@ pub(super) fn plan(statement: &ForStatement) -> Result<LoopPlan, ImportError> {
         iterations.push(value);
         let mut body = statement.body.clone();
         substitute_statements(&mut body, statement.var_id, value)?;
-        if always_breaks(&body) {
+        if always_breaks(&body, source) {
             return Ok(LoopPlan {
                 iterations,
                 guard: Some((end.clone(), *inclusive)),
@@ -137,16 +139,57 @@ fn past_end(value: usize, maximum: Option<usize>, inclusive: bool) -> bool {
     })
 }
 
-fn always_breaks(statements: &[Statement]) -> bool {
+fn always_breaks(statements: &[Statement], source: &Module) -> bool {
     statements.iter().any(|statement| match statement {
         Statement::Break => true,
-        Statement::If(branch) => match evaluated_u64(&branch.cond) {
-            Some(0) => always_breaks(&branch.false_side),
-            Some(_) => always_breaks(&branch.true_side),
-            None => always_breaks(&branch.true_side) && always_breaks(&branch.false_side),
+        Statement::If(branch) => match known_condition(&branch.cond, source) {
+            Some(0) => always_breaks(&branch.false_side, source),
+            Some(_) => always_breaks(&branch.true_side, source),
+            None => {
+                always_breaks(&branch.true_side, source)
+                    && always_breaks(&branch.false_side, source)
+            }
         },
         // A break in a nested loop does not terminate this loop. Case-based
         // termination and other proofs can be added independently later.
         _ => false,
+    })
+}
+
+fn known_condition(expression: &Expression, source: &Module) -> Option<u64> {
+    if let Some(value) = evaluated_u64(expression) {
+        return Some(value);
+    }
+    // An effectful function can still have a fixed return value. Prove that
+    // from its body rather than trusting the AIR numeric cache of a non-const
+    // expression (which can contain a representative array element).
+    let Expression::Term(factor) = expression else {
+        return None;
+    };
+    let Factor::FunctionCall(call) = factor.as_ref() else {
+        return None;
+    };
+    let body = source
+        .functions
+        .get(&call.id)?
+        .get_function(call.index.as_deref().unwrap_or(&[]))?;
+    let ret = body.ret?;
+    let (last, prefix) = body.statements.split_last()?;
+    let Statement::Assign(assign) = last else {
+        return None;
+    };
+    if super::contains_destination(prefix, ret) || assign.dst.len() != 1 {
+        return None;
+    }
+    let destination = &assign.dst[0];
+    if destination.id != ret || !destination.index.0.is_empty() || !destination.select.is_empty() {
+        return None;
+    }
+    let value = evaluated_u64(&assign.expr)?;
+    let width = source.variables.get(&ret)?.r#type.total_width()?;
+    Some(if width < 64 {
+        value & ((1u64 << width) - 1)
+    } else {
+        value
     })
 }

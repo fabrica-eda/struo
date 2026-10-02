@@ -1586,7 +1586,7 @@ impl<'a> ModuleLowerer<'a> {
         writes: &mut Env,
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
-        let plan = loops::plan(statement)?;
+        let plan = loops::plan(statement, self.source)?;
         if plan.iterations.is_empty()
             && let Some((veryl_analyzer::ir::ForBound::Expression(end), _)) = &plan.guard
         {
@@ -3259,8 +3259,13 @@ impl<'a> ModuleLowerer<'a> {
         env: &mut Env,
         effects: &mut DrivenBits,
     ) -> Result<LoweredExpr, ImportError> {
+        let constant = if self.is_constant_variable(id) {
+            Some(self.lower_constant_variable_read(id, index, env, effects)?)
+        } else {
+            None
+        };
         // Freeze each address component once, in source order, before reading data.
-        let elements = if has_dynamic_array_index(index) {
+        let elements = if constant.is_none() && has_dynamic_array_index(index) {
             Some(self.lower_array_elements_effects(id, index, env, effects)?)
         } else {
             None
@@ -3280,7 +3285,9 @@ impl<'a> ModuleLowerer<'a> {
         } else {
             None
         };
-        let source = if let Some(elements) = elements {
+        let source = if let Some(value) = constant {
+            value
+        } else if let Some(elements) = elements {
             self.lower_dynamic_array_read(elements, env)?
         } else {
             let key = self.key_from_index(id, index)?;
@@ -4024,6 +4031,17 @@ impl<'a> ModuleLowerer<'a> {
         env: &mut Env,
         effects: &mut DrivenBits,
     ) -> Result<Vec<(SignalKey, LoweredExpr)>, ImportError> {
+        self.lower_array_candidates_effects(id, index, self.keys_for_id(id), env, effects)
+    }
+
+    fn lower_array_candidates_effects(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        candidates: Vec<SignalKey>,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<Vec<(SignalKey, LoweredExpr)>, ImportError> {
         let variable = self
             .source
             .variables
@@ -4065,7 +4083,7 @@ impl<'a> ModuleLowerer<'a> {
         }
 
         let mut elements = Vec::new();
-        for key in self.keys_for_id(id) {
+        for key in candidates {
             let mut condition = None;
             let mut matches = true;
             for (index, candidate) in indices.iter().zip(&key.index) {
@@ -4075,7 +4093,10 @@ impl<'a> ModuleLowerer<'a> {
                         let candidate = u64::try_from(*candidate).map_err(|_| {
                             ImportError::UnsupportedBehavior("unpacked array index overflow".into())
                         })?;
-                        if value.width < u64::BITS && candidate >= (1_u64 << value.width) {
+                        // A signed address has one fewer non-negative magnitude bit.
+                        // Do not alias a negative index to an upper array element.
+                        let magnitude = value.width - u32::from(value.signed);
+                        if magnitude < u64::BITS && candidate >= (1_u64 << magnitude) {
                             matches = false;
                             break;
                         }
@@ -4638,6 +4659,7 @@ fn substitute_induction(
         && !number.is_xz()
     {
         expression.comptime_mut().value = ValueVariant::Numeric(number);
+        expression.comptime_mut().is_const = true;
     }
     Ok(())
 }
@@ -4772,6 +4794,11 @@ fn has_dynamic_array_index(index: &VarIndex) -> bool {
 }
 
 fn evaluated_u64(expression: &Expression) -> Option<u64> {
+    // AIR can retain a representative numeric value for a runtime expression,
+    // notably A[index] with a constant array. It is not a compile-time address.
+    if !expression.comptime().is_const {
+        return None;
+    }
     expression
         .comptime()
         .get_value()

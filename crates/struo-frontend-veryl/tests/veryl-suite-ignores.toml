@@ -316,17 +316,7 @@ cases = [
   "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
 ]
 
-[[ignore]]
-reason = "Dynamic reads of constant unpacked arrays are not lowered."
-cases = [
-  "veryl_context_regressions::folded_const_select_keeps_its_sign",
-  "veryl_regressions::nested_array_index_const_array",
-]
 
-[[ignore]]
-reason = "Wildcard equality used by inside/case expressions is not lowered."
-cases = [
-]
 
 [[ignore]]
 reason = "An omitted child input with a default value remains undriven."

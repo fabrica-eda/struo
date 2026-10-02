@@ -2007,3 +2007,182 @@ fn case_context_preserves_priority_and_evaluates_target_once() {
         }
     }
 }
+
+#[test]
+fn corpus_constant_array_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "veryl_regressions::nested_array_index_const_array",
+        "veryl_context_regressions::folded_const_select_keeps_its_sign",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+fn constant_array_read_design() -> Design {
+    Design::new(
+        r"
+        package pkg {
+            const W: logic<80> [2] = '{80'h123456789abcdef01234, 80'hfedcba9876543210abcd};
+        }
+        module Top #(
+            param TABLE: i8 [2,3] = '{'{-3, 7, -5}, '{9, -11, 13}},
+        ) (
+            row: input logic<8>, col: input logic<8>,
+            selected: output logic<16>, nibble: output logic<16>, calls: output logic<8>,
+            row_sum: output logic<16>, fixed_row: output logic<16>,
+            defaults: output logic<8>, repeated: output logic<8>, wide: output logic<80>,
+        ) {
+            const D: logic<8> [5] = '{default: 8'ha5};
+            const R: logic<8> [5] = '{8'h12, 8'h34 repeat 3, 8'h56};
+            function observe(x: input logic<8>, old: input logic<8>, next: output logic<8>) -> logic<8> {
+                next = old + 1;
+                return x;
+            }
+            function sum(values: input i8 [3]) -> i16 {
+                return values[0] + values[1] + values[2];
+            }
+            always_comb {
+                calls = 0;
+                selected = TABLE[observe(row, calls, calls)][observe(col, calls, calls)];
+                nibble = TABLE[row][col][3:0];
+                row_sum = sum(TABLE[row]);
+                fixed_row = TABLE[1][col];
+                defaults = D[col];
+                repeated = R[col];
+                wide = pkg::W[row];
+            }
+        }
+        ",
+        "Top",
+    )
+}
+
+#[test]
+fn constant_arrays_preserve_shape_sign_and_index_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = constant_array_read_design();
+    let rtl = analyze_and_lower(&design.sources[0].text, "constant_rom", "Top").unwrap();
+    let top = rtl.top_module().unwrap();
+    assert!(top.registers().is_empty());
+    assert!(top.memories().is_empty());
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let row = sim.signal("row");
+    let col = sim.signal("col");
+    let table = [[-3i16, 7, -5], [9, -11, 13]];
+    for r in [0u8, 1, 2, 3, 255] {
+        for c in [0u8, 1, 2, 3, 4, 5, 255] {
+            sim.modify(|io| {
+                io.set(row, r);
+                io.set(col, c);
+            })
+            .unwrap();
+            let value = table
+                .get(usize::from(r))
+                .and_then(|row| row.get(usize::from(c)))
+                .copied()
+                .unwrap_or(0);
+            let fixed = table[1].get(usize::from(c)).copied().unwrap_or(0);
+            let sum = table
+                .get(usize::from(r))
+                .map_or(0, |row| row.iter().sum::<i16>());
+            for (name, expected) in [
+                ("selected", u16::from_le_bytes(value.to_le_bytes())),
+                ("nibble", u16::from_le_bytes(value.to_le_bytes()) & 15),
+                ("calls", 2),
+                ("fixed_row", u16::from_le_bytes(fixed.to_le_bytes())),
+                ("row_sum", u16::from_le_bytes(sum.to_le_bytes())),
+                ("defaults", if c < 5 { 0xa5 } else { 0 }),
+                (
+                    "repeated",
+                    match c {
+                        0 => 0x12,
+                        1..=3 => 0x34,
+                        4 => 0x56,
+                        _ => 0,
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: row={r}, col={c}"
+                );
+            }
+            let wide = match r {
+                0 => 0x1234_5678_9abc_def0_1234u128,
+                1 => 0xfedc_ba98_7654_3210_abcdu128,
+                _ => 0,
+            };
+            assert_eq!(sim.get(sim.signal("wide")), wide.into(), "row={r}");
+        }
+    }
+}
+
+#[test]
+fn signed_array_indices_do_not_alias_negative_values() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(idx: input signed logic<2>, rom: output logic<8>,
+                   read: output logic<8>, written: output logic<32>) {
+            const TABLE: logic<8> [4] = '{11, 22, 33, 44};
+            var data: logic<8> [4];
+            always_comb {
+                data = '{11, 22, 33, 44};
+                rom = TABLE[idx];
+                read = data[idx];
+                data[idx] = 8'hcc;
+                written = {data[3], data[2], data[1], data[0]};
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let idx = sim.signal("idx");
+    for (bits, expected, written) in [
+        (0u8, 11u8, 0x2c21_16ccu32),
+        (1, 22, 0x2c21_cc0b),
+        (2, 0, 0x2c21_160b),
+        (3, 0, 0x2c21_160b),
+    ] {
+        sim.modify(|io| io.set(idx, bits)).unwrap();
+        assert_eq!(sim.get(sim.signal("rom")), expected.into());
+        assert_eq!(sim.get(sim.signal("read")), expected.into());
+        assert_eq!(sim.get(sim.signal("written")), written.into());
+    }
+}
+
+#[test]
+fn runtime_values_do_not_prove_unconditional_loop_breaks() {
+    for condition in ["A[index]", "early(index)", "truncated()"] {
+        let source = format!(
+            r"
+            module Top(index: input logic, count: input logic<8>, q: output logic<8>) {{
+                const A: logic [2] = '{{1'b1, 1'b0}};
+                function early(x: input logic) -> logic {{
+                    if x {{ return 1'b0; }}
+                    return 1'b1;
+                }}
+                function truncated() -> logic {{ return 2'd2; }}
+                always_comb {{
+                    q = 0;
+                    for i in 0..count {{
+                        if {condition} {{ break; }}
+                        q += 1;
+                    }}
+                }}
+            }}
+            "
+        );
+        let error = analyze_and_lower(&source, "runtime_break_proof", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::UnsupportedBehavior(message)
+                if message.contains("termination is not proven")),
+            "{condition}: {error}"
+        );
+    }
+}
