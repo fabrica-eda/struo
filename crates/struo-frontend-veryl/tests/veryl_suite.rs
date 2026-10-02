@@ -2186,3 +2186,162 @@ fn runtime_values_do_not_prove_unconditional_loop_breaks() {
         );
     }
 }
+
+#[test]
+fn corpus_scoped_local_variables() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("duplicate_varpath::test_duplicate_scoped_var_in_always_comb")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn scoped_signal_names_are_unique_and_stable() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<4>, clk: input clock,
+                   c0: output logic<4>, c1: output logic<4>,
+                   q0: output logic<4>, q1: output logic<4>) {
+            always_comb {
+                for i in 0..2 {
+                    var tmp: logic<4>;
+                    tmp = d + i;
+                    c0 = tmp;
+                }
+                for j in 0..3 {
+                    var tmp: logic<4>;
+                    tmp = d + j;
+                    c1 = tmp;
+                }
+            }
+            always_ff (clk) {
+                var tmp: logic<4>;
+                tmp = d + 4'd1;
+                q0 = tmp;
+            }
+            always_ff (clk) {
+                var tmp: logic<4>;
+                tmp = d + 4'd2;
+                q1 = tmp;
+            }
+        }
+        ",
+        "Top",
+    );
+    let names = || {
+        let rtl = analyze_and_lower(&design.sources[0].text, "scoped_locals", "Top").unwrap();
+        rtl.top_module()
+            .unwrap()
+            .signals()
+            .iter()
+            .map(|signal| signal.name().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let first = names();
+    assert_eq!(
+        first.iter().collect::<std::collections::HashSet<_>>().len(),
+        first.len()
+    );
+    assert!(first.iter().any(|name| name.contains("$scope")));
+    analyze_and_lower(
+        "module Other(a: input logic, q: output logic) { assign q = a; }",
+        "other",
+        "Other",
+    )
+    .unwrap();
+    assert_eq!(first, names());
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let clk = sim.event("clk");
+    for value in 0..16u8 {
+        sim.modify(|io| io.set(d, value)).unwrap();
+        sim.tick(clk).unwrap();
+        for (name, increment) in [("c0", 1), ("c1", 2), ("q0", 1), ("q1", 2)] {
+            assert_eq!(
+                sim.get(sim.signal(name)),
+                ((value + increment) & 15).into(),
+                "{name}: d={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ff_local_blocking_updates_preserve_state_and_global_nba_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, clear: input logic, d: input logic<8>, idx: input logic<2>,
+                   current: output logic<8>, prior: output logic<8>, local_read: output logic<8>) {
+            var delayed: logic<8>;
+            always_ff (clk) {
+                var state: logic<8>;
+                if clear {
+                    state = 0;
+                    delayed = 0;
+                    current = 0;
+                    prior = 0;
+                } else {
+                    state += d;
+                    delayed = state;
+                    current = state;
+                    prior = delayed;
+                }
+            }
+            always_ff (clk) {
+                var words: logic<8> [4];
+                words[idx] = d;
+                local_read = words[idx];
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let clk = sim.event("clk");
+    let clear = sim.signal("clear");
+    let d = sim.signal("d");
+    let idx = sim.signal("idx");
+    sim.modify(|io| io.set(clear, 1u8)).unwrap();
+    sim.tick(clk).unwrap();
+    sim.modify(|io| io.set(clear, 0u8)).unwrap();
+    let mut previous = 0u8;
+    for value in 0..=255u8 {
+        sim.modify(|io| {
+            io.set(d, value);
+            io.set(idx, value & 3);
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+        let current = previous.wrapping_add(value);
+        assert_eq!(sim.get(sim.signal("current")), current.into());
+        assert_eq!(sim.get(sim.signal("prior")), previous.into());
+        assert_eq!(sim.get(sim.signal("local_read")), value.into());
+        previous = current;
+    }
+}
+
+#[test]
+fn ff_local_blocking_memory_requirement_is_not_silently_read_first() {
+    for policy in ["required", "block", "distributed"] {
+        let source = format!(
+            r#"
+            module Top(clk: input clock, idx: input logic<2>, d: input logic<8>, q: output logic<8>) {{
+                always_ff (clk) {{
+                    #[sv("struo_memory = \"{policy}\"")]
+                    var words: logic<8> [4];
+                    words[idx] = d;
+                    q = words[idx];
+                }}
+            }}
+            "#
+        );
+        let error = analyze_and_lower(&source, "blocking_memory", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::RequiredMemoryInferenceFailed { reason, .. }
+            if reason.contains("blocking always_ff-local")),
+            "{policy}: {error}"
+        );
+    }
+}

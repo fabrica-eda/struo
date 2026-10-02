@@ -35,7 +35,6 @@ cases = [
 reason = "The frontend does not yet lower this construct; retain the upstream expectation."
 cases = [
   "basic::test_comb_function_call_with_output_argument_in_display_argument",
-  "duplicate_varpath::test_duplicate_scoped_var_in_always_comb",
   "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
   "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
   "hierarchy::test_instance_input_function_output_writeback",

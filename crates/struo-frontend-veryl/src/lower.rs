@@ -293,7 +293,12 @@ impl<'a> ModuleLowerer<'a> {
                     && !inferred_memories.contains(&variable.id)
             })
             .collect::<Vec<_>>();
-        internals.sort_by_key(|variable| variable.path.to_string());
+        internals.sort_by_key(|variable| (variable.path.to_string(), variable.id));
+        let mut names = rtl
+            .signals()
+            .iter()
+            .map(|signal| signal.name().to_owned())
+            .collect::<HashSet<_>>();
         for variable in internals {
             let base_name = variable.path.to_string();
             let r#type = value_type(&variable.r#type, &base_name)?;
@@ -302,7 +307,14 @@ impl<'a> ModuleLowerer<'a> {
                     id: variable.id,
                     index,
                 };
-                let signal = rtl.add_signal(indexed_name(&base_name, &key.index), r#type);
+                let base = indexed_name(&base_name, &key.index);
+                let mut name = base.clone();
+                let mut suffix = 0usize;
+                while !names.insert(name.clone()) {
+                    suffix += 1;
+                    name = format!("{base}$scope{suffix}");
+                }
+                let signal = rtl.add_signal(name, r#type);
                 signals.insert(key.clone(), signal);
                 signal_order.push(key.clone());
                 widths.insert(key.clone(), r#type.width.get());
@@ -332,6 +344,12 @@ impl<'a> ModuleLowerer<'a> {
 
         let mut patterns = self.collect_memory_patterns(&self.inferred_memories)?;
         for memory_id in candidates {
+            if self.source.variables[&memory_id].affiliation
+                == veryl_analyzer::symbol::Affiliation::AlwaysFf
+            {
+                return Err(self.memory_inference_failure(memory_id,
+                    "blocking always_ff-local accesses cannot use the synchronous read-first memory template"));
+            }
             let mut pattern = patterns.remove(&memory_id).unwrap_or_default();
             if self.memory_policy(memory_id) == MemoryInferencePolicy::Distributed {
                 if let Err(error) = self.lower_distributed_memory(memory_id, pattern) {
@@ -1421,12 +1439,10 @@ impl<'a> ModuleLowerer<'a> {
     fn sequential_reads(&self, reads: &Env, writes: &Env) -> Env {
         let mut result = reads.clone();
         for (key, value) in writes {
-            if self
-                .source
-                .variables
-                .get(&key.id)
-                .is_some_and(|v| v.kind == VarKind::Let)
-            {
+            if self.source.variables.get(&key.id).is_some_and(|v| {
+                v.kind == VarKind::Let
+                    || v.affiliation == veryl_analyzer::symbol::Affiliation::AlwaysFf
+            }) {
                 result.insert(key.clone(), *value);
             }
         }
@@ -4191,7 +4207,14 @@ impl<'a> ModuleLowerer<'a> {
     }
 
     fn signal_name(&self, key: &SignalKey) -> String {
-        indexed_name(&self.variable_name(key.id), &key.index)
+        self.signals.get(key).map_or_else(
+            || indexed_name(&self.variable_name(key.id), &key.index),
+            |signal| {
+                self.rtl.signals()[signal.index() as usize]
+                    .name()
+                    .to_owned()
+            },
+        )
     }
 
     fn unsupported_expression(op: Op) -> ImportError {
@@ -4206,7 +4229,11 @@ fn memory_candidates(
     let arrays = source
         .variables
         .values()
-        .filter(|variable| variable.kind == VarKind::Variable && !variable.r#type.array.is_empty())
+        .filter(|variable| {
+            variable.kind == VarKind::Variable
+                && variable.affiliation != veryl_analyzer::symbol::Affiliation::AlwaysFf
+                && !variable.r#type.array.is_empty()
+        })
         .map(|variable| variable.id)
         .collect::<HashSet<_>>();
     let mut candidates = policies
