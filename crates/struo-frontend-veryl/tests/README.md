@@ -142,15 +142,24 @@ that executes a break; it is a compile-time resource policy, never a silent
 runtime truncation. An input-dependent break alone is not a termination proof,
 and a nested loop's break does not terminate its parent.
 
+A runtime start is also accepted when its unsigned leaf type fits the counter
+without truncation and the end range fits within 64 non-negative counter values.
+The initializer is evaluated exactly once, including output-argument writes and
+empty ranges. Lowering tracks the counter value reached by each positive additive
+step, suppressing both writes and breaks from skipped candidates. Signed starts
+without a non-negative proof and possible counter overflow remain unsupported.
+
 Each candidate iteration retains the actual bound comparison and break guard.
 The bound is reevaluated against the current combinational environment (or the
 pre-edge FF reads), matching for-loop condition evaluation in IEEE 1800-2023
 12.7.1 and Veryl's emitted SV. No clock cycles are introduced. Tests cover the
 64-iteration boundary, signed bounds, stepped loops, changing bounds, FF writes,
-and proof rejection. Bound output effects remain unsupported and are rejected
-even for an empty range.
+and proof rejection. Runtime-start tests also cover 4,096 start/end/break
+combinations, initialization effects, empty ranges, and unsigned packed selects.
+Output effects in the end condition remain unsupported and are rejected even
+for an empty range.
 
-The ignore manifest distinguishes runtime starts, reverse/non-additive loops,
+The ignore manifest distinguishes unproven runtime starts, reverse/non-additive loops,
 and loops without a proof inside the expansion budget. These are current Struo
 synthesis limits, not claims that every such loop is inherently unsynthesizable.
 For example, a 32-bit input trip count may require billions of expanded bodies;
