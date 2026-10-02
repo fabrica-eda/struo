@@ -21,7 +21,11 @@ use crate::physical::{PhysicalFeedback, PhysicalLocation};
 
 mod lut;
 mod multiply;
+mod replicate;
 use multiply::map_multiply;
+pub use replicate::{
+    RegisterBranchReplication, RegisterBranchReplicationError, RegisterBranchReplicationReport,
+};
 
 use lut::{
     BRAM_CLOCK_TO_OUTPUT_PS, CCU_CARRY_PS, CCU_INPUT_PS, CCU_SUM_PS, CutDatabase,

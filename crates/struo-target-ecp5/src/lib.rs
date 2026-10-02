@@ -10,6 +10,7 @@ pub use mapped::{
     IoTimingConstraints, JtaggBinding, MappedPort, MappingError, MappingOptions,
     MulticyclePathConstraint, NextpnrJsonError, OocClockConstraint, OocPortConstraint,
     OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput, PortDirection as MappedPortDirection,
+    RegisterBranchReplication, RegisterBranchReplicationError, RegisterBranchReplicationReport,
     RegisterEnableFanoutConstraint, RegisterEnableFanoutError, RegisterEnableFanoutReport, Reset,
     RetimingSelection, TimingClockConstraint, TimingConstraints, TimingPathConstraint, map_to_ecp5,
     map_to_ecp5_ooc, map_to_ecp5_with_constraints, map_to_ecp5_with_jtagg,
