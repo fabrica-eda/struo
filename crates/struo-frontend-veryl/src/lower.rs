@@ -1,5 +1,6 @@
 mod arrays;
 mod loops;
+mod members;
 mod types;
 
 use types::{repair_expression_signedness, variable_signedness};
@@ -27,10 +28,15 @@ struct SignalKey {
     index: Vec<usize>,
 }
 
-struct PreparedDestination {
-    elements: Vec<(SignalKey, Option<LoweredExpr>)>,
+struct PreparedSelect {
     select: VarSelect,
     offset: Option<(ExprId, ExprId)>,
+    domain: Option<veryl_analyzer::ir::MemberSelectDomain>,
+}
+
+struct PreparedDestination {
+    elements: Vec<(SignalKey, Option<LoweredExpr>)>,
+    packed: PreparedSelect,
     width: u32,
 }
 
@@ -1490,6 +1496,7 @@ impl<'a> ModuleLowerer<'a> {
             Statement::FunctionCall(call) => {
                 if sequential {
                     let (_, outputs) = self.lower_function_call(call, reads)?;
+                    self.validate_ff_function_outputs(&outputs)?;
                     self.copy_function_outputs(outputs, reads, writes)
                 } else {
                     let mut effects = DrivenBits::default();
@@ -1548,6 +1555,7 @@ impl<'a> ModuleLowerer<'a> {
             && let Factor::FunctionCall(call) = factor.as_ref()
         {
             let (value, outputs) = self.lower_function_call(call, reads)?;
+            self.validate_ff_function_outputs(&outputs)?;
             let changed = self.copy_function_outputs(outputs, reads, writes)?;
             (
                 value.ok_or_else(|| {
@@ -1599,7 +1607,10 @@ impl<'a> ModuleLowerer<'a> {
                     writes.clone()
                 };
                 let end = match bound {
-                    veryl_analyzer::ir::ForBound::Const(value) => self.constant(64, *value as u64),
+                    veryl_analyzer::ir::ForBound::Const(value, signed) => LoweredExpr {
+                        signed: *signed,
+                        ..self.constant(64, *value as u64)
+                    },
                     veryl_analyzer::ir::ForBound::Expression(expression) => {
                         self.lower_expression(expression, &snapshot)?
                     }
@@ -2139,6 +2150,22 @@ impl<'a> ModuleLowerer<'a> {
         Ok(returned)
     }
 
+    fn validate_ff_function_outputs(&self, outputs: &FunctionOutputs) -> Result<(), ImportError> {
+        // Veryl 0.22 now converts inout formals. Do not let that bypass the
+        // retained restriction on function copy-out to module state in always_ff.
+        if outputs.iter().any(|(destinations, _)| {
+            destinations.iter().any(|dst| {
+                self.source.variables[&dst.id].affiliation
+                    != veryl_analyzer::symbol::Affiliation::AlwaysFf
+            })
+        }) {
+            return Err(ImportError::UnsupportedBehavior(
+                "function output/inout copy-out to module state in always_ff".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn copy_function_outputs(
         &mut self,
         outputs: FunctionOutputs,
@@ -2206,14 +2233,23 @@ impl<'a> ModuleLowerer<'a> {
         };
         let width = selected_width(&destination.select, self.width(&elements[0].0)?)?;
         let offset = if dynamic_packed_select(&destination.select) {
-            Some(self.lower_select_offset_effects(&destination.select, width, env, effects)?)
+            Some(self.lower_select_offset_effects(
+                &destination.select,
+                width,
+                env,
+                effects,
+                destination.comptime.member_select_domain.is_some(),
+            )?)
         } else {
             None
         };
         Ok(PreparedDestination {
             elements,
-            select: destination.select.clone(),
-            offset,
+            packed: PreparedSelect {
+                select: destination.select.clone(),
+                offset,
+                domain: destination.comptime.member_select_domain,
+            },
             width,
         })
     }
@@ -2258,9 +2294,9 @@ impl<'a> ModuleLowerer<'a> {
                 }
             };
             for (key, condition) in &dst.elements {
-                let (lsb, width) = driven_select(&dst.select, self.width(key)?)?;
+                let (lsb, width) = driven_select(&dst.packed.select, self.width(key)?)?;
                 let current = env[key];
-                self.assign_key_prepared(key, &dst.select, dst.offset, part, env)?;
+                self.assign_key_prepared(key, &dst.packed, part, env)?;
                 if let Some(condition) = condition {
                     let assigned = env[key];
                     env.insert(
@@ -2657,7 +2693,14 @@ impl<'a> ModuleLowerer<'a> {
                     };
                     return self.resize(lhs, width, signed);
                 }
+                let skip_rhs = lhs.comptime().is_const
+                    && evaluated_u64(lhs).is_some_and(|value| {
+                        (*op == Op::LogicAnd && value == 0) || (*op == Op::LogicOr && value != 0)
+                    });
                 let lhs = self.lower_expression_effects(lhs, env, effects)?;
+                if skip_rhs {
+                    return self.boolean(lhs);
+                }
                 let before_rhs = env.clone();
                 let rhs = self.lower_expression_effects(rhs, env, effects)?;
                 if matches!(op, Op::LogicAnd | Op::LogicOr) {
@@ -2673,38 +2716,7 @@ impl<'a> ModuleLowerer<'a> {
                 self.lower_binary(*op, lhs, rhs, result_width, signed)
             }
             Expression::Ternary(condition, then_expr, else_expr, comptime) => {
-                let condition = self.lower_expression_effects(condition, env, effects)?;
-                let condition = self.boolean(condition)?;
-                let mut yes = env.clone();
-                let mut no = env.clone();
-                let then_expr = self.lower_expression_effects(then_expr, &mut yes, effects)?;
-                let else_expr = self.lower_expression_effects(else_expr, &mut no, effects)?;
-                *env = self.merge_values(condition, &yes, &no)?;
-                let width = context_width(comptime)?
-                    .max(then_expr.width)
-                    .max(else_expr.width);
-                let signed = comptime.expr_context.signed;
-                let then_expr = self.resize(
-                    LoweredExpr {
-                        signed,
-                        ..then_expr
-                    },
-                    width,
-                    signed,
-                )?;
-                let else_expr = self.resize(
-                    LoweredExpr {
-                        signed,
-                        ..else_expr
-                    },
-                    width,
-                    signed,
-                )?;
-                Ok(LoweredExpr {
-                    id: self.rtl.mux(condition.id, then_expr.id, else_expr.id)?,
-                    width,
-                    signed,
-                })
+                self.lower_ternary_effects(condition, then_expr, else_expr, comptime, env, effects)
             }
             Expression::Concatenation(parts, _) => {
                 let mut lowered = Vec::new();
@@ -2738,6 +2750,64 @@ impl<'a> ModuleLowerer<'a> {
                 self.lower_packed_array_literal(items, &comptime.r#type, env, effects)
             }
         }
+    }
+
+    fn lower_ternary_effects(
+        &mut self,
+        condition: &Expression,
+        then_expr: &Expression,
+        else_expr: &Expression,
+        comptime: &Comptime,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        let selected = condition
+            .comptime()
+            .is_const
+            .then(|| evaluated_u64(condition))
+            .flatten();
+        let condition = self.lower_expression_effects(condition, env, effects)?;
+        if let Some(selected) = selected {
+            let value = self.lower_expression_effects(
+                if selected != 0 { then_expr } else { else_expr },
+                env,
+                effects,
+            )?;
+            let width = context_width(comptime)?.max(value.width);
+            let signed = comptime.expr_context.signed;
+            return self.resize(LoweredExpr { signed, ..value }, width, signed);
+        }
+        let condition = self.boolean(condition)?;
+        let mut yes = env.clone();
+        let mut no = env.clone();
+        let then_expr = self.lower_expression_effects(then_expr, &mut yes, effects)?;
+        let else_expr = self.lower_expression_effects(else_expr, &mut no, effects)?;
+        *env = self.merge_values(condition, &yes, &no)?;
+        let width = context_width(comptime)?
+            .max(then_expr.width)
+            .max(else_expr.width);
+        let signed = comptime.expr_context.signed;
+        let then_expr = self.resize(
+            LoweredExpr {
+                signed,
+                ..then_expr
+            },
+            width,
+            signed,
+        )?;
+        let else_expr = self.resize(
+            LoweredExpr {
+                signed,
+                ..else_expr
+            },
+            width,
+            signed,
+        )?;
+        Ok(LoweredExpr {
+            id: self.rtl.mux(condition.id, then_expr.id, else_expr.id)?,
+            width,
+            signed,
+        })
     }
 
     fn lower_factor_effects(
@@ -3171,7 +3241,13 @@ impl<'a> ModuleLowerer<'a> {
                 select,
                 concrete_width(self.variable_type(id)?, "indexed variable")?,
             )?;
-            Some(self.lower_select_offset_effects(select, width, env, effects)?)
+            Some(self.lower_select_offset_effects(
+                select,
+                width,
+                env,
+                effects,
+                comptime.member_select_domain.is_some(),
+            )?)
         } else {
             None
         };
@@ -3189,6 +3265,15 @@ impl<'a> ModuleLowerer<'a> {
                     self.signal_name(&key)
                 )));
             }
+        };
+        let source = if let Some(domain) = comptime.member_select_domain {
+            let mask = self.member_mask(source.width, domain)?;
+            LoweredExpr {
+                id: self.rtl.binary(BinaryOp::And, source.id, mask)?,
+                ..source
+            }
+        } else {
+            source
         };
         if let Some((offset, negative)) = offset {
             let width = selected_width(select, source.width)?;
@@ -3247,7 +3332,7 @@ impl<'a> ModuleLowerer<'a> {
                     ..value
                 }
             }
-            SystemFunctionKind::Bits(input) | SystemFunctionKind::Size(input) => {
+            SystemFunctionKind::Bits(input) | SystemFunctionKind::Size(input, _) => {
                 let comptime = input.0.comptime();
                 let ty = if let ValueVariant::Type(ty) = &comptime.value {
                     ty
@@ -3261,9 +3346,24 @@ impl<'a> ModuleLowerer<'a> {
                             .try_fold(width, |total, dim| total.checked_mul((*dim)?))
                     })
                 } else {
+                    let dimension = match &call.kind {
+                        SystemFunctionKind::Size(_, Some(dimension)) => {
+                            constant_value(&dimension.0)?
+                        }
+                        _ => 1,
+                    };
+                    let dimension = usize::try_from(dimension)
+                        .ok()
+                        .and_then(|dimension| dimension.checked_sub(1))
+                        .ok_or_else(|| {
+                            ImportError::UnsupportedBehavior(
+                                "$size dimension must be a positive constant".into(),
+                            )
+                        })?;
                     ty.array
-                        .first()
-                        .or_else(|| ty.width().first())
+                        .iter()
+                        .chain(ty.width().iter())
+                        .nth(dimension)
                         .copied()
                         .flatten()
                 }
@@ -3427,7 +3527,7 @@ impl<'a> ModuleLowerer<'a> {
         if !has_dynamic_array_index(&destination.index) {
             let key = self.destination_key(destination)?;
             let (lsb, width) = driven_select(&destination.select, self.width(&key)?)?;
-            self.assign_key(&key, &destination.select, value, reads, writes)?;
+            self.assign_key(&key, destination, value, reads, writes)?;
             let mut changed = DrivenBits::default();
             changed.insert_range(key, lsb, width);
             return Ok(changed);
@@ -3438,7 +3538,7 @@ impl<'a> ModuleLowerer<'a> {
         for (key, condition) in elements {
             let (lsb, width) = driven_select(&destination.select, self.width(&key)?)?;
             let current = writes[&key];
-            self.assign_key(&key, &destination.select, value, reads, writes)?;
+            self.assign_key(&key, destination, value, reads, writes)?;
             let assigned = writes[&key];
             writes.insert(
                 key.clone(),
@@ -3461,11 +3561,12 @@ impl<'a> ModuleLowerer<'a> {
         select: &VarSelect,
         width: u32,
         env: &Env,
+        member: bool,
     ) -> Result<(ExprId, ExprId), ImportError> {
         let mut temporary = env.clone();
         let mut effects = DrivenBits::default();
         let offset =
-            self.lower_select_offset_effects(select, width, &mut temporary, &mut effects)?;
+            self.lower_select_offset_effects(select, width, &mut temporary, &mut effects, member)?;
         if !effects.ranges.is_empty() {
             return Err(ImportError::UnsupportedBehavior(
                 "index effects in a read-only select".into(),
@@ -3480,8 +3581,13 @@ impl<'a> ModuleLowerer<'a> {
         width: u32,
         env: &mut Env,
         effects: &mut DrivenBits,
+        member: bool,
     ) -> Result<(ExprId, ExprId), ImportError> {
-        let index = self.lower_comb_expression(&select.0[0], env, effects)?;
+        let index = if member {
+            self.lower_member_index(&select.0[0], env, effects)?
+        } else {
+            self.lower_comb_expression(&select.0[0], env, effects)?
+        };
         let offset_width = index
             .width
             .checked_add(u32::BITS - width.leading_zeros() + 1)
@@ -3528,21 +3634,62 @@ impl<'a> ModuleLowerer<'a> {
     fn assign_key(
         &mut self,
         key: &SignalKey,
-        select: &VarSelect,
+        destination: &AssignDestination,
         value: LoweredExpr,
         reads: &Env,
         env: &mut Env,
     ) -> Result<(), ImportError> {
+        let select = &destination.select;
         let offset = if dynamic_packed_select(select) {
             let width = selected_width(select, self.width(key)?)?;
-            Some(self.lower_select_offset(select, width, reads)?)
+            Some(self.lower_select_offset(
+                select,
+                width,
+                reads,
+                destination.comptime.member_select_domain.is_some(),
+            )?)
         } else {
             None
         };
-        self.assign_key_prepared(key, select, offset, value, env)
+        self.assign_key_prepared(
+            key,
+            &PreparedSelect {
+                select: select.clone(),
+                offset,
+                domain: destination.comptime.member_select_domain,
+            },
+            value,
+            env,
+        )
     }
 
     fn assign_key_prepared(
+        &mut self,
+        key: &SignalKey,
+        packed: &PreparedSelect,
+        value: LoweredExpr,
+        env: &mut Env,
+    ) -> Result<(), ImportError> {
+        let previous = env[key];
+        self.assign_key_bits(key, &packed.select, packed.offset, value, env)?;
+        if let Some(domain) = packed.domain {
+            let assigned = env[key];
+            let mask = self.member_mask(previous.width, domain)?;
+            let inverse = self.rtl.unary(UnaryOp::BitNot, mask)?;
+            let held = self.rtl.binary(BinaryOp::And, previous.id, inverse)?;
+            let written = self.rtl.binary(BinaryOp::And, assigned.id, mask)?;
+            env.insert(
+                key.clone(),
+                LoweredExpr {
+                    id: self.rtl.binary(BinaryOp::Or, held, written)?,
+                    ..assigned
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn assign_key_bits(
         &mut self,
         key: &SignalKey,
         select: &VarSelect,
@@ -4490,8 +4637,14 @@ fn substitute_system_call(
         | SystemFunctionKind::Unsigned(input)
         | SystemFunctionKind::Onehot(input)
         | SystemFunctionKind::Clog2(input)
-        | SystemFunctionKind::Bits(input)
-        | SystemFunctionKind::Size(input) => substitute_induction(&mut input.0, id, value),
+        | SystemFunctionKind::Bits(input) => substitute_induction(&mut input.0, id, value),
+        SystemFunctionKind::Size(input, dimension) => {
+            substitute_induction(&mut input.0, id, value)?;
+            if let Some(dimension) = dimension {
+                substitute_induction(&mut dimension.0, id, value)?;
+            }
+            Ok(())
+        }
         _ => Err(ImportError::UnsupportedBehavior(
             "system task in unrolled loop".into(),
         )),

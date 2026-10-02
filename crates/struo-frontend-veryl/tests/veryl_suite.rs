@@ -1628,3 +1628,216 @@ fn expression_types_preserve_members_selections_and_context() {
         }
     }
 }
+
+#[test]
+fn packed_member_dynamic_access_stays_in_its_domain() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<8>, idx: input signed logic<8>,
+                   read: output logic<3>, written: output logic<16>,
+                   row_read: output logic, row_written: output logic<16>, expr_read: output logic, calls: output logic<8>) {
+            struct S { high: logic<4>, data: logic<8>, low: logic<4>, }
+            struct Rows { high: logic<4>, data: logic<2,4>, low: logic<4>, }
+            function address(x: input signed logic<8>, old: input logic<8>,
+                             next: output logic<8>) -> signed logic<8> {
+                next = old + 1;
+                return x;
+            }
+            var s: S;
+            var rows: Rows;
+            always_comb {
+                calls = 0;
+                s.high = 4'ha;
+                s.data = d;
+                s.low = 4'h5;
+                read = s.data[address(idx, calls, calls)+:3];
+                s.data[address(idx, calls, calls)+:3] = 3'b101;
+                written = {s.high, s.data, s.low};
+                rows.high = 4'ha;
+                rows.data = d;
+                rows.low = 4'h5;
+                row_read = rows.data[1][idx];
+                expr_read = rows.data[1][((idx as u8) + 8'hff)];
+                rows.data[1][idx] = 1'b1;
+                row_written = {rows.high, rows.data, rows.low};
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let idx = sim.signal("idx");
+    for value in 0..256u32 {
+        for index in -12..20i32 {
+            sim.modify(|io| {
+                io.set(d, value);
+                io.set(idx, index.to_le_bytes()[0]);
+            })
+            .unwrap();
+            let mut read = 0u32;
+            let mut written = value;
+            for bit in 0..3 {
+                let target = index + bit;
+                if (0..8).contains(&target) {
+                    read |= ((value >> target) & 1) << bit;
+                    written = (written & !(1 << target)) | (((5 >> bit) & 1) << target);
+                }
+            }
+            let row_read = if (0..4).contains(&index) {
+                (value >> (index + 4)) & 1
+            } else {
+                0
+            };
+            let row_written = if (0..4).contains(&index) {
+                value | (1 << (index + 4))
+            } else {
+                value
+            };
+            for (name, expected) in [
+                ("calls", 2),
+                ("read", read),
+                ("written", 0xa005 | (written << 4)),
+                ("row_read", row_read),
+                (
+                    "expr_read",
+                    if (1..=4).contains(&index) {
+                        (value >> (index + 3)) & 1
+                    } else {
+                        0
+                    },
+                ),
+                ("row_written", 0xa005 | (row_written << 4)),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: d={value}, idx={index}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_member_stride_does_not_wrap_large_indices() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<8>, idx: input logic<32>,
+                   read: output logic<4>, written: output logic<16>) {
+            struct S { high: logic<4>, data: logic<2,4>, low: logic<4>, }
+            var s: S;
+            always_comb {
+                s.high = 4'ha;
+                s.data = d;
+                s.low = 4'h5;
+                read = s.data[idx];
+                s.data[idx] = 4'hc;
+                written = {s.high, s.data, s.low};
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let idx = sim.signal("idx");
+    for value in 0..256u32 {
+        for index in [0, 1, 2, 0x4000_0000, 0x8000_0000, u32::MAX] {
+            sim.modify(|io| {
+                io.set(d, value);
+                io.set(idx, index);
+            })
+            .unwrap();
+            let (read, written) = if index < 2 {
+                let shift = index * 4;
+                (
+                    (value >> shift) & 15,
+                    (value & !(15 << shift)) | (12 << shift),
+                )
+            } else {
+                (0, value)
+            };
+            assert_eq!(sim.get(sim.signal("read")), read.into(), "idx={index}");
+            assert_eq!(
+                sim.get(sim.signal("written")),
+                (0xa005 | (written << 4)).into(),
+                "idx={index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn corpus_veryl_022_regressions() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "expression_semantics::short_circuit_operators_skip_effectful_operands",
+        "expression_semantics::constant_and_runtime_casts_use_the_same_resize_rule",
+        "flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion",
+        "system_function::test_direct_ff_size_packed_multidimensional_system_function",
+        "system_function::test_direct_ff_size_packed_multidimensional_type_system_function",
+        "veryl_context_regressions::constant_ternary_keeps_both_arm_types",
+        "veryl_context_regressions::signed_cast_of_folded_constant_sign_extends",
+        "veryl_context_regressions::constant_case_on_signed_target",
+        "veryl_regressions::wide_struct_bit_field_rhs_no_spill",
+        "hierarchy::test_inactive_instance_input_output_call_adds_no_parent_driver",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn function_inout_variable_formals_copy_in_before_body() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<8>, q: output logic<8>, original: output logic<8>) {
+            function update(value: inout logic<8>, snapshot: input logic<8>,
+                            observed: output logic<8>) {
+                value += 8'd3;
+                observed = snapshot;
+                value += snapshot;
+            }
+            always_comb {
+                q = d;
+                update(q, q, original);
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    for value in 0..=255u8 {
+        sim.modify(|io| io.set(d, value)).unwrap();
+        assert_eq!(
+            sim.get(sim.signal("q")),
+            value.wrapping_mul(2).wrapping_add(3).into()
+        );
+        assert_eq!(sim.get(sim.signal("original")), value.into());
+    }
+}
+
+#[test]
+fn ff_inout_to_module_state_remains_rejected() {
+    let error = analyze_and_lower(
+        r"
+        module Top(clk: input clock, q: output logic<8>) {
+            function update(value: inout logic<8>) { value += 8'd1; }
+            always_ff(clk) { update(q); }
+        }
+        ",
+        "ff_inout",
+        "Top",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ImportError::AnalysisFailed(_) | ImportError::UnsupportedBehavior(_)
+    ));
+}

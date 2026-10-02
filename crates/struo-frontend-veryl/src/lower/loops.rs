@@ -43,7 +43,7 @@ pub(super) fn plan(statement: &ForStatement) -> Result<LoopPlan, ImportError> {
     if *step == 0 {
         return Err(unsupported("runtime loop step does not advance"));
     }
-    let end_max = maximum_bound(end)?;
+    let end_max = maximum_bound(end, statement.var_type.signed)?;
     let variable_width = concrete_width(&statement.var_type, "loop induction variable")?;
     let magnitude_bits = variable_width - u32::from(statement.var_type.signed);
     let variable_max = if magnitude_bits >= usize::BITS {
@@ -101,14 +101,23 @@ fn unsupported(message: &str) -> ImportError {
     ImportError::UnsupportedBehavior(message.into())
 }
 
-fn maximum_bound(bound: &ForBound) -> Result<Option<usize>, ImportError> {
+fn maximum_bound(bound: &ForBound, induction_signed: bool) -> Result<Option<usize>, ImportError> {
     if let Some(value) = bound.eval_value(&mut veryl_analyzer::Context::default()) {
         return Ok(Some(value));
     }
     let ForBound::Expression(expression) = bound else {
         unreachable!()
     };
-    let width = context_width(expression.comptime())?;
+    // A value-producing leaf keeps its declared result width even when the
+    // for comparison widens it to int. Unsigned leaves zero-extend; signed
+    // leaves compared with a signed induction cannot gain a larger positive value.
+    let width = if matches!(expression.as_ref(), veryl_analyzer::ir::Expression::Term(_))
+        && (!expression.comptime().r#type.signed || induction_signed)
+    {
+        concrete_width(&expression.comptime().r#type, "runtime loop bound")?
+    } else {
+        context_width(expression.comptime())?
+    };
     // Treating signed operands as unsigned here is conservative: this is only
     // an upper-bound proof. The actual comparison retains operand signedness.
     Ok(if width >= usize::BITS {
