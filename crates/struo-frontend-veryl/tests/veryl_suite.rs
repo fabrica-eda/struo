@@ -2353,3 +2353,88 @@ fn ff_local_blocking_memory_requirement_is_not_silently_read_first() {
         );
     }
 }
+
+#[test]
+fn corpus_instance_input_defaults() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("veryl_regressions::inst_port_default_value_connected_not_folded")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn instance_input_defaults_preserve_connected_runtime_values() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Child(i: input logic<80> = 80'hfedc_ba98_7654_3210_abcd,
+                     o: output logic<80>) { assign o = i; }
+        module Top(d: input logic<80>, a: output logic<80>, b: output logic<80>) {
+            inst omitted: Child(o: a);
+            inst connected: Child(i: d, o: b);
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    for value in [
+        0u128,
+        1,
+        0xffff_ffff_ffff_ffff_ffff,
+        0x1234_5678_9abc_def0_1234,
+    ] {
+        sim.modify(|io| io.set(d, value)).unwrap();
+        assert_eq!(
+            sim.get(sim.signal("a")),
+            0xfedc_ba98_7654_3210_abcdu128.into()
+        );
+        assert_eq!(sim.get(sim.signal("b")), value.into());
+    }
+}
+
+#[test]
+fn instance_input_defaults_do_not_zero_unknowns() {
+    let source = "module Child(i: input logic<8> = 8'hxx, o: output logic<8>) { assign o = i; }
+                  module Top(q: output logic<8>) { inst u: Child(o: q); }";
+    let design = analyze_and_lower(source, "unknown_input_default", "Top").unwrap();
+    let error = struo_synth::synthesize(&design).unwrap_err();
+    assert!(
+        matches!(error, struo_synth::SynthesisError::UndrivenSignalBit { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn instance_input_defaults_do_not_bypass_anonymous_input_rejection() {
+    let source = "module Child(i: input logic<8> = 8'h5a, o: output logic<8>) { assign o = i; }
+                  module Top(q: output logic<8>) { inst u: Child(i: _, o: q); }";
+    let error = analyze_and_lower(source, "anonymous_input_default", "Top").unwrap_err();
+    assert!(
+        matches!(&error, ImportError::AnalysisFailed(message) if message.contains("AnonymousIdentifierUsage")),
+        "{error}"
+    );
+}
+
+#[test]
+fn instance_input_defaults_preserve_signed_extension() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Child (
+            i: input signed logic<12> = -12'sd3,
+            o: output signed logic<16>
+        ) { assign o = i; }
+        module Top(a: output logic<16>, b: output logic<16>, c: output logic<16>) {
+            inst first: Child(o: a);
+            inst second: Child(o: b);
+            inst explicit: Child(i: 12'sd2, o: c);
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    for (name, expected) in [("a", 0xfffdu16), ("b", 0xfffd), ("c", 2)] {
+        assert_eq!(sim.get(sim.signal(name)), expected.into());
+    }
+}
