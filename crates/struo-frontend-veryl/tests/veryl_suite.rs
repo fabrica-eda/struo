@@ -2438,3 +2438,83 @@ fn instance_input_defaults_preserve_signed_extension() {
         assert_eq!(sim.get(sim.signal(name)), expected.into());
     }
 }
+
+#[test]
+fn corpus_preferred_memory_falls_back_to_registers() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
+        "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
+        "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn preferred_memory_fallback_retains_other_memories_and_required_policy() {
+    let source = r"
+        module Top(clk: input clock, idx: input logic<2>, d: input logic<8>,
+                   good_q: output logic<8>, bad_q: output logic<8>) {
+            var a_good: logic<8> [4];
+            BAD_POLICY
+            var z_bad: logic<8> [4];
+            always_ff (clk) {
+                a_good[idx] = d;
+                good_q = a_good[idx];
+                z_bad[idx] = d;
+                z_bad[0] = d + 8'd1;
+                bad_q = z_bad[idx];
+            }
+        }
+    ";
+    let ordinary = source.replace("BAD_POLICY", "");
+    let lowered = analyze_and_lower(&ordinary, "mixed_memory_fallback", "Top").unwrap();
+    let memories = lowered.top_module().unwrap().memories();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].name, "a_good");
+    let stage = Rc::new(RefCell::new(String::new()));
+    let mut sim = celox_test_suite_veryl::Simulator::new(
+        compile(&Design::new(&ordinary, "Top"), &stage).unwrap(),
+    );
+    let clk = sim.event("clk");
+    let idx = sim.signal("idx");
+    let d = sim.signal("d");
+    for index in 0..4u8 {
+        sim.modify(|io| {
+            io.set(idx, index);
+            io.set(d, 20u8 + index);
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+    }
+    let mut good = [20u8, 21, 22, 23];
+    let mut bad = [24u8, 21, 22, 23];
+    for value in 0..64u8 {
+        let index = value & 3;
+        sim.modify(|io| {
+            io.set(idx, index);
+            io.set(d, value);
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+        assert_eq!(sim.get(sim.signal("good_q")), good[index as usize].into());
+        assert_eq!(sim.get(sim.signal("bad_q")), bad[index as usize].into());
+        good[index as usize] = value;
+        bad[index as usize] = value;
+        bad[0] = value + 1;
+    }
+    for policy in ["required", "block"] {
+        let required = source.replace(
+            "BAD_POLICY",
+            &format!(r#"#[sv("struo_memory = \"{policy}\"")]"#),
+        );
+        let error = analyze_and_lower(&required, "required_memory_fallback", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::RequiredMemoryInferenceFailed { memory, .. } if memory == "z_bad"),
+            "{error}"
+        );
+    }
+}
