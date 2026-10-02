@@ -1427,3 +1427,111 @@ fn index_reads_evaluate_once_and_preserve_guards() {
         }
     }
 }
+
+#[test]
+fn corpus_destination_index_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case(
+        "basic::test_comb_function_call_with_output_argument_in_destination_index",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
+}
+
+fn destination_index_effects_design() -> Design {
+    Design::new(
+        r"
+        module Top(sel: input logic<3>, gate: input logic,
+                   words_q: output logic<32>, count: output logic<8>,
+                   slice_q: output logic<8>, slice_count: output logic<8>,
+                   concat_q: output logic<8>, concat_count: output logic<8>,
+                   changed: output logic<8>, guarded: output logic<8>,
+                   guard_count: output logic<8>, rhs_q: output logic<8>,
+                   frozen_q: output logic<8>, address: output logic<3>) {
+            function index(x: input logic<3>, old: input logic<8>,
+                           next: output logic<8>) -> logic<3> {
+                next = old + 8'd1;
+                return x;
+            }
+            function replace(x: input logic<3>, data: output logic<8>) -> logic<3> {
+                data = 8'hff;
+                return x;
+            }
+            function rhs(x: input logic<3>, dest: output logic<3>) -> logic {
+                dest = x;
+                return 1'b1;
+            }
+            var words: logic<8>[4];
+            var rhs_address: logic<3>;
+            always_comb {
+                words[0] = 0;
+                words[1] = 0;
+                words[2] = 0;
+                words[3] = 0;
+                count = 0;
+                words[index(sel, count, count)][index(sel, count, count)] = 1'b1;
+                words_q = {words[3], words[2], words[1], words[0]};
+                slice_q = 0;
+                slice_count = 0;
+                slice_q[index(sel, slice_count, slice_count)+:3] = 3'b111;
+                concat_q = 0;
+                concat_count = 0;
+                {concat_q[index(sel, concat_count, concat_count)],
+                 concat_q[index(sel + 3'd1, concat_count, concat_count)]} = 2'b10;
+                changed = 0;
+                changed[replace(sel, changed)] = 1'b0;
+                guarded = 0;
+                guard_count = 0;
+                if gate {
+                    guarded[index(sel, guard_count, guard_count)] = 1'b1;
+                }
+                rhs_q = 0;
+                rhs_address = 0;
+                rhs_q[rhs_address] = rhs(sel, rhs_address);
+                address = sel;
+                frozen_q = 0;
+                {address, frozen_q[address]} = {3'd7, 1'b1};
+            }
+        }
+        ",
+        "Top",
+    )
+}
+
+#[test]
+fn destination_indices_freeze_once_before_writes() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = destination_index_effects_design();
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let sel = sim.signal("sel");
+    let gate = sim.signal("gate");
+    for index in 0..8u32 {
+        for enabled in [0u32, 1] {
+            sim.modify(|io| {
+                io.set(sel, index);
+                io.set(gate, enabled);
+            })
+            .unwrap();
+            for (name, expected) in [
+                ("words_q", if index < 4 { 1 << (9 * index) } else { 0 }),
+                ("count", 2),
+                ("slice_q", (7 << index) & 255),
+                ("slice_count", 1),
+                ("concat_q", 1 << index),
+                ("concat_count", 2),
+                ("changed", 255 ^ (1 << index)),
+                ("guarded", enabled << index),
+                ("guard_count", enabled),
+                ("rhs_q", 1 << index),
+                ("frozen_q", 1 << index),
+                ("address", 7),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: index {index}, gate {enabled}"
+                );
+            }
+        }
+    }
+}
