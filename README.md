@@ -258,6 +258,17 @@ branches. Zero limits, unmatched patterns, overlapping patterns, and selected
 FFs without a wire-driven CE are errors rather than silently ignored. Library
 callers can apply the same constraints with
 `Ecp5Netlist::apply_register_enable_fanout_constraints`.
+When a previous placement is available, library callers can use
+`Ecp5Netlist::apply_register_enable_fanout_with_placement` with a map from FF
+names to `RegisterEnablePlacement { x, y, shared_enable }`. Nearby sinks are
+grouped together instead of using mapped-cell order. The optional
+`shared_enable` wire name keeps existing shared control pins together when
+the fanout limit permits it. Different logical enable drivers remain separate;
+registers without hints use the original ordering in separate fallback groups.
+An empty or entirely unmatched map produces the original grouping exactly.
+These are grouping hints, not site constraints or timing evidence; fresh
+placement, routing, and timing checks are still required.
+
 ECP5 technology mapping enumerates bounded four-input cuts and selects a cover
 using a 300 MHz required-time model. The estimate includes LUT, routing,
 carry-chain, BRAM, and setup arcs; fanout-weighted timing selection is enabled
