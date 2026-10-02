@@ -149,7 +149,13 @@ continuous assignment, independently of analyzer warnings (IEEE 1800-2023
 Table 10-1). Procedural dynamic part-select assignments remain supported.
 
 Runtime-loop synthesis uses a separate planner in `src/lower/loops.rs`. Existing
-constant-range expansion is retained. Runtime bounds are accepted for a
+constant-range expansion of retained AIR loops is checked by
+`src/lower/loops/static_range.rs`: initialization and updates must fit the
+counter, and a negative reverse sentinel must not become a large unsigned
+comparison operand (IEEE 1800-2023 11.8.1). Guaranteed breaks need no final
+update. An exclusive zero upper bound with a larger reverse step is an empty
+signed range, even when the analyzer's host enumerator saturates it to zero.
+Runtime bounds are accepted for a
 non-negative constant start that fits the induction variable and a positive
 additive step, when either the bound's type or a guaranteed break proves that
 at most 256 candidate iterations are needed. This budget includes the iteration
@@ -179,6 +185,16 @@ and proof rejection. Runtime-start tests also cover 4,096 start/end/break
 combinations, initialization effects, empty ranges, and unsigned packed selects.
 Output effects in the end condition remain unsupported and are rejected even
 for an empty range.
+
+Veryl 0.22 has an upstream static-unrolling limitation before this validation:
+when no `break` retains the loop in AIR, it already expands
+`for i in rev 8'd0..4 { q += 1; }` into four assignments. Its emitted SV instead
+uses `for (int i = 4 - 1; i >= 8'd0; i--)`, whose unsigned comparison does not
+terminate at -1. Likewise, a wide initializer can be truncated by the emitted
+`int` counter while host enumeration uses the original wide value. The original
+range is absent from this AIR, so the lowering check cannot repair these upstream
+expansions. Constant optimization remains enabled; this is an unresolved analyzer
+conformance issue, not a supported finite-loop interpretation.
 
 The ignore manifest distinguishes unproven runtime starts, reverse/non-additive loops,
 and loops without a proof inside the expansion budget. These are current Struo
