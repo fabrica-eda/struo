@@ -156,6 +156,10 @@ at most 64 candidate iterations are needed. This budget includes the iteration
 that executes a break; it is a compile-time resource policy, never a silent
 runtime truncation. An input-dependent break alone is not a termination proof,
 and a nested loop's break does not terminate its parent.
+The proof also accepts a `case` whose default and every arm terminate this loop.
+Case-target effects and guarded branch writes are still evaluated by ordinary
+lowering. A missing/non-terminating default or any non-terminating arm does not
+prove a bound, even if test inputs happen to select a terminating arm.
 
 A runtime start is also accepted when its unsigned leaf type fits the counter
 without truncation and the end range fits within 64 non-negative counter values.

@@ -243,7 +243,6 @@ cases = [
 [[ignore]]
 reason = "Struo cannot prove termination within its 64-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
 cases = [
-  "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
   "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
   "flip_flop::test_ff_runtime_for_bounds",
   "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",

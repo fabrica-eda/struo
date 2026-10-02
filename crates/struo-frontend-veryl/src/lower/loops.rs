@@ -215,8 +215,12 @@ fn always_breaks(statements: &[Statement], source: &Module) -> bool {
                     && always_breaks(&branch.false_side, source)
             }
         },
-        // A break in a nested loop does not terminate this loop. Case-based
-        // termination and other proofs can be added independently later.
+        Statement::Case(case) => {
+            always_breaks(&case.default, source)
+                && case.arms.iter().all(|arm| always_breaks(&arm.body, source))
+        }
+        // A break in a nested loop does not terminate this loop. Require a
+        // terminating default above instead of assuming case patterns exhaustive.
         _ => false,
     })
 }
