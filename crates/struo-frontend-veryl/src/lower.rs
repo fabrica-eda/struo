@@ -1,8 +1,10 @@
 mod arrays;
+mod comparisons;
 mod loops;
 mod members;
 mod types;
 
+use comparisons::PreparedCaseTarget;
 use types::{repair_expression_signedness, variable_signedness};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1685,18 +1687,20 @@ impl<'a> ModuleLowerer<'a> {
                 }
                 Statement::Case(case) => {
                     let mut effects = DrivenBits::default();
-                    let target = if sequential {
-                        self.lower_expression(&case.case_target, &snapshot)?
-                    } else {
-                        self.lower_comb_expression(&case.case_target, writes, &mut effects)?
-                    };
+                    let target = self.prepare_case_target(
+                        &case.case_target,
+                        &snapshot,
+                        writes,
+                        sequential,
+                        &mut effects,
+                    )?;
                     let mut result = writes.clone();
                     let (mut written, mut stop) =
                         self.lower_loop_body(&case.default, reads, &mut result, sequential)?;
                     written.extend(effects);
                     for arm in case.arms.iter().rev() {
                         let condition =
-                            self.lower_case_patterns(target, &arm.patterns, &snapshot)?;
+                            self.lower_case_patterns(&target, &arm.patterns, &snapshot)?;
                         let mut yes = writes.clone();
                         let (yes_written, yes_stop) =
                             self.lower_loop_body(&arm.body, reads, &mut yes, sequential)?;
@@ -1731,11 +1735,13 @@ impl<'a> ModuleLowerer<'a> {
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
         let mut effects = DrivenBits::default();
-        let target = if sequential {
-            self.lower_expression(&statement.case_target, reads)?
-        } else {
-            self.lower_comb_expression(&statement.case_target, writes, &mut effects)?
-        };
+        let target = self.prepare_case_target(
+            &statement.case_target,
+            reads,
+            writes,
+            sequential,
+            &mut effects,
+        )?;
         let base = writes.clone();
         let mut else_env = base.clone();
         let mut changed =
@@ -1752,7 +1758,7 @@ impl<'a> ModuleLowerer<'a> {
                 let mut then_env = base.clone();
                 let arm_changed =
                     self.lower_statements(&arm.body, reads, &mut then_env, sequential)?;
-                let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
+                let condition = self.lower_case_patterns(&target, &arm.patterns, &base)?;
                 let mut merged_changed = changed.clone();
                 merged_changed.extend(arm_changed);
                 let mut merged_env = base.clone();
@@ -1788,7 +1794,7 @@ impl<'a> ModuleLowerer<'a> {
         for arm in statement.arms.iter().rev() {
             let mut then_env = base.clone();
             let arm_changed = self.lower_statements(&arm.body, reads, &mut then_env, sequential)?;
-            let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
+            let condition = self.lower_case_patterns(&target, &arm.patterns, &base)?;
             changed.extend(arm_changed);
             lowered_arms.push((condition, then_env));
         }
@@ -1881,7 +1887,7 @@ impl<'a> ModuleLowerer<'a> {
 
     fn lower_case_patterns(
         &mut self,
-        target: LoweredExpr,
+        target: &PreparedCaseTarget,
         patterns: &[CasePattern],
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
@@ -1889,15 +1895,22 @@ impl<'a> ModuleLowerer<'a> {
         for pattern in patterns {
             let matches = match pattern {
                 CasePattern::Eq(value) => {
-                    let value = self.lower_expression(value, env)?;
-                    self.lower_binary(Op::Eq, target, value, 1, false)?
+                    let target = self.lower_case_operand(target, value)?;
+                    if let Some(ct) = comparisons::wildcard_pattern(value) {
+                        self.lower_wildcard_pattern(target, Op::EqWildcard, &ct)?
+                    } else {
+                        let value = self.lower_case_label(value, env)?;
+                        self.lower_binary(Op::Eq, target, value, 1, false)?
+                    }
                 }
                 CasePattern::Range { lo, hi, inclusive } => {
-                    let lo = self.lower_expression(lo, env)?;
-                    let hi = self.lower_expression(hi, env)?;
-                    let lower = self.lower_binary(Op::LessEq, lo, target, 1, false)?;
+                    let lo_target = self.lower_case_operand(target, lo)?;
+                    let hi_target = self.lower_case_operand(target, hi)?;
+                    let lo = self.lower_case_label(lo, env)?;
+                    let hi = self.lower_case_label(hi, env)?;
+                    let lower = self.lower_binary(Op::LessEq, lo, lo_target, 1, false)?;
                     let upper_op = if *inclusive { Op::LessEq } else { Op::Less };
-                    let upper = self.lower_binary(upper_op, target, hi, 1, false)?;
+                    let upper = self.lower_binary(upper_op, hi_target, hi, 1, false)?;
                     self.lower_binary(Op::LogicAnd, lower, upper, 1, false)?
                 }
             };
@@ -2108,16 +2121,19 @@ impl<'a> ModuleLowerer<'a> {
                     }
                 }
                 Statement::Case(case) => {
-                    let target = self.lower_comb_expression(
+                    let target = self.prepare_case_target(
                         &case.case_target,
+                        &before,
                         env,
+                        false,
                         &mut DrivenBits::default(),
                     )?;
                     let mut result = env.clone();
                     let mut flag =
                         self.lower_function_statements(&case.default, &mut result, ret)?;
                     for arm in case.arms.iter().rev() {
-                        let condition = self.lower_case_patterns(target, &arm.patterns, &before)?;
+                        let condition =
+                            self.lower_case_patterns(&target, &arm.patterns, &before)?;
                         let mut yes = env.clone();
                         let yes_return =
                             self.lower_function_statements(&arm.body, &mut yes, ret)?;
@@ -2683,6 +2699,12 @@ impl<'a> ModuleLowerer<'a> {
                 self.lower_unary(*op, input, comptime)
             }
             Expression::Binary(lhs, op, rhs, comptime) => {
+                if matches!(op, Op::EqWildcard | Op::NeWildcard)
+                    && let Some(ct) = comparisons::wildcard_pattern(rhs)
+                {
+                    let lhs = self.lower_expression_effects(lhs, env, effects)?;
+                    return self.lower_wildcard_pattern(lhs, *op, &ct);
+                }
                 if *op == Op::As {
                     let lhs = self.lower_expression_effects(lhs, env, effects)?;
                     let width = concrete_width(&comptime.r#type, "cast expression")?;
@@ -2966,7 +2988,14 @@ impl<'a> ModuleLowerer<'a> {
         }
         let comparison = matches!(
             op,
-            Op::Eq | Op::Ne | Op::Less | Op::LessEq | Op::Greater | Op::GreaterEq
+            Op::Eq
+                | Op::Ne
+                | Op::EqWildcard
+                | Op::NeWildcard
+                | Op::Less
+                | Op::LessEq
+                | Op::Greater
+                | Op::GreaterEq
         );
         // Widen arithmetic operands before evaluation; widening the result
         // afterwards cannot recover lost carry, borrow or product bits.
@@ -3003,8 +3032,8 @@ impl<'a> ModuleLowerer<'a> {
             Op::BitAnd => BinaryOp::And,
             Op::BitOr => BinaryOp::Or,
             Op::BitXor | Op::BitXnor => BinaryOp::Xor,
-            Op::Eq => BinaryOp::Equal,
-            Op::Ne => BinaryOp::NotEqual,
+            Op::Eq | Op::EqWildcard => BinaryOp::Equal,
+            Op::Ne | Op::NeWildcard => BinaryOp::NotEqual,
             Op::Less if signed_compare => BinaryOp::LessThanSigned,
             Op::Less => BinaryOp::LessThanUnsigned,
             Op::LessEq if signed_compare => BinaryOp::LessOrEqualSigned,
@@ -4485,6 +4514,8 @@ fn is_boolean_operator(op: Op) -> bool {
         op,
         Op::Eq
             | Op::Ne
+            | Op::EqWildcard
+            | Op::NeWildcard
             | Op::Less
             | Op::LessEq
             | Op::Greater

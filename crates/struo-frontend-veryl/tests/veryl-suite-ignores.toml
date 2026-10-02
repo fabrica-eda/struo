@@ -36,7 +36,6 @@ reason = "The frontend does not yet lower this construct; retain the upstream ex
 cases = [
   "basic::test_comb_function_call_with_output_argument_in_display_argument",
   "duplicate_varpath::test_duplicate_scoped_var_in_always_comb",
-  "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
   "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
   "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
   "hierarchy::test_instance_input_function_output_writeback",
@@ -327,9 +326,6 @@ cases = [
 [[ignore]]
 reason = "Wildcard equality used by inside/case expressions is not lowered."
 cases = [
-  "veryl_context_regressions::case_compares_each_label_as_an_if_does",
-  "veryl_context_regressions::runtime_case_target_uses_comparison_context",
-  "veryl_language::inside_outside_range_endpoints",
 ]
 
 [[ignore]]

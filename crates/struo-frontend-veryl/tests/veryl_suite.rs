@@ -1841,3 +1841,169 @@ fn ff_inout_to_module_state_remains_rejected() {
         ImportError::AnalysisFailed(_) | ImportError::UnsupportedBehavior(_)
     ));
 }
+
+#[test]
+fn corpus_wildcard_comparisons() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "veryl_context_regressions::runtime_case_target_uses_comparison_context",
+        "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
+        "veryl_context_regressions::case_compares_each_label_as_an_if_does",
+        "veryl_language::inside_outside_range_endpoints",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn wildcard_constant_masks_preserve_width_and_signedness() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(a: input logic<8>, s: input signed logic<8>, wide: input logic<128>,
+                   eq: output logic, ne: output logic, sx: output logic, ux: output logic,
+                   sign: output logic, all: output logic, calls: output logic<8>, wide_eq: output logic,
+                   bits: output logic<3>, registered: output logic<3>, clk: input clock) {
+            function observe(x: input logic<8>, old: input logic<8>, next: output logic<8>) -> logic<8> {
+                next = old + 1;
+                return x;
+            }
+            const P: signed logic<4> = 4'sbx101;
+            assign eq = a ==? 8'b10xz01xz;
+            assign ne = a !=? 8'b10xz01xz;
+            assign sx = s ==? P;
+            assign ux = a ==? P;
+            assign sign = s ==? 4'sb1x01;
+            always_comb {
+                calls = 0;
+                all = observe(a, calls, calls) ==? 'x;
+            }
+            assign wide_eq = wide ==? {48'hxxxxxxxxxxxx, 8'b10xz01xz, 8'hzz,
+                                       48'hzzzzzzzzzzzz, 8'b01xz10xz, 8'hxx};
+            assign bits = {1'b1, (a ==? 8'b10xz01xz), (a !=? 8'b10xz01xz)};
+            always_ff (clk) {
+                registered = {1'b1, (a ==? 8'b10xz01xz), (a !=? 8'b10xz01xz)};
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let a = sim.signal("a");
+    let s = sim.signal("s");
+    let wide = sim.signal("wide");
+    let clk = sim.event("clk");
+    for value in 0..256u32 {
+        sim.modify(|io| {
+            io.set(a, value);
+            io.set(s, value);
+            io.set(
+                wide,
+                (u128::from(value) << 72) | (u128::from(value ^ 255) << 8),
+            );
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+        let eq = u32::from(value & 0xcc == 0x84);
+        for (name, expected) in [
+            ("eq", eq),
+            ("ne", 1 - eq),
+            ("sx", u32::from(value & 7 == 5)),
+            ("ux", u32::from(value & 0xf7 == 5)),
+            ("sign", u32::from(value & 0xfb == 0xf9)),
+            ("all", 1),
+            ("calls", 1),
+            ("wide_eq", eq),
+            ("bits", 4 | (eq << 1) | (1 - eq)),
+            ("registered", 4 | (eq << 1) | (1 - eq)),
+        ] {
+            assert_eq!(
+                sim.get(sim.signal(name)),
+                expected.into(),
+                "{name}: a={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn case_context_preserves_priority_and_evaluates_target_once() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(a: input logic<8>, clk: input clock,
+                   calls: output logic<8>, y: output logic<3>, f: output logic<3>,
+                   function_y: output logic<3>, loop_y: output logic<3>) {
+            function observe(x: input logic<8>, old: input logic<8>, next: output logic<8>) -> logic<8> {
+                next = old + 1;
+                return x;
+            }
+            function select_value(x: input logic<8>) -> logic<3> {
+                var result: logic<3>;
+                case x + 8'h10 {
+                    9'h105: result = 1;
+                    default: result = 0;
+                }
+                return result;
+            }
+            always_comb {
+                calls = 0;
+                case observe(a, calls, calls) + 8'h10 {
+                    9'h105: y = 1;
+                    9'h106: y = 2;
+                    9'bx0000xxxx: y = 3;
+                    9'bxxxxx0000: y = 4;
+                    default: y = 0;
+                }
+                function_y = select_value(a);
+                loop_y = 0;
+                for i in 0..2 {
+                    case a + 8'h10 {
+                        9'h105: loop_y += 1;
+                        default: loop_y += 0;
+                    }
+                }
+            }
+            always_ff (clk) {
+                case a + 8'h10 {
+                    9'h105: f = 1;
+                    9'h106: f = 2;
+                    9'bx0000xxxx: f = 3;
+                    9'bxxxxx0000: f = 4;
+                    default: f = 0;
+                }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let a = sim.signal("a");
+    let clk = sim.event("clk");
+    for value in 0..256u32 {
+        sim.modify(|io| io.set(a, value)).unwrap();
+        sim.tick(clk).unwrap();
+        let selected = match value {
+            245 => 1u32,
+            246 => 2,
+            240..=255 => 3,
+            _ if value % 16 == 0 => 4,
+            _ => 0,
+        };
+        for (name, expected) in [
+            ("calls", 1),
+            ("y", selected),
+            ("f", selected),
+            ("function_y", u32::from(value == 245)),
+            ("loop_y", 2 * u32::from(value == 245)),
+        ] {
+            assert_eq!(
+                sim.get(sim.signal(name)),
+                expected.into(),
+                "{name}: a={value}"
+            );
+        }
+    }
+}
