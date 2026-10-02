@@ -1,4 +1,5 @@
 //! Plans finite hardware expansion without using simulation input samples.
+mod static_range;
 use veryl_analyzer::ir::{
     Expression, Factor, ForBound, ForRange, ForStatement, Module, Op, Statement,
 };
@@ -16,7 +17,8 @@ pub(super) struct LoopPlan {
 
 pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan, ImportError> {
     let mut context = veryl_analyzer::Context::default();
-    if let Some(iterations) = statement.range.eval_iter(&mut context) {
+    if let Some(mut iterations) = statement.range.eval_iter(&mut context) {
+        static_range::validate(statement, source, &mut iterations)?;
         return Ok(LoopPlan {
             iterations,
             guard: None,

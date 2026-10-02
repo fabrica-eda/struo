@@ -2890,3 +2890,66 @@ fn byte_bound_loops_cover_the_full_range_and_break_boundary() {
         }
     }
 }
+
+#[test]
+fn static_loop_ranges_do_not_hide_counter_wrap_or_unsigned_reverse_sentinels() {
+    for range in [
+        "rev 8'd0..4",
+        "rev 8'd1..3 step += 3",
+        "rev 8'd0..0",
+        "64'd4294967296..64'd4294967298",
+        "2147483646..=2147483647",
+    ] {
+        let source = format!(
+            "module Top(stop: input logic, q: output logic<8>) {{
+                always_comb {{ q = 0; for i in {range} {{ if stop {{ break; }} q += 1; }} }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "static_loop_range", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{range}: {error}"
+        );
+    }
+}
+
+#[test]
+fn static_loop_proofs_preserve_signed_sentinels_and_guaranteed_breaks() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(stop: input logic, digits: output logic<16>, singleton: output logic<8>,
+                   broken: output logic<8>, empty: output logic<8>) {
+            always_comb {
+                digits = 0;
+                for i in rev 8'sd0..4 {
+                    digits = digits * 10 + i as 16;
+                    if stop { break; }
+                }
+                singleton = 0;
+                for i in rev 8'd1..4 step += 3 {
+                    singleton = i as 8;
+                    if stop { break; }
+                }
+                broken = 0;
+                for i in rev 8'd0..1 { broken += 1; break; }
+                empty = 0;
+                for i in rev 0..0 step += 2 { empty += 1; if stop { break; } }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let stop = sim.signal("stop");
+    for halted in [0u8, 1] {
+        sim.modify(|io| io.set(stop, halted)).unwrap();
+        assert_eq!(
+            sim.get(sim.signal("digits")),
+            (if halted == 0 { 3210u16 } else { 3 }).into()
+        );
+        assert_eq!(sim.get(sim.signal("singleton")), 3u8.into());
+        assert_eq!(sim.get(sim.signal("broken")), 1u8.into());
+        assert_eq!(sim.get(sim.signal("empty")), 0u8.into());
+    }
+}
