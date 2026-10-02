@@ -464,6 +464,7 @@ fn corpus_runtime_loops_with_proven_breaks() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [
         "basic::test_comb_effectful_if_condition_after_dynamic_break_stays_inactive",
+        "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
         "synth_dynamic_loop::test_runtime_break_in_synth_comb_loop",
         "synth_dynamic_loop::test_runtime_break_after_assign_in_synth_comb_loop",
         "flip_flop::test_ff_runtime_for_break",
@@ -2751,4 +2752,88 @@ fn instance_input_function_output_effects_remain_rejected() {
         matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains("read-only expression")),
         "{error}"
     );
+}
+
+#[test]
+fn case_loop_termination_preserves_target_effects_and_each_branch() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(count: input logic<32>, sel: input logic<2>, gate: input logic,
+                   q: output logic<8>, calls: output logic<8>) {
+            function target(x: input logic<2>, n: inout logic<8>) -> logic<2> {
+                n += 1;
+                return x;
+            }
+            always_comb {
+                q = 0;
+                calls = 0;
+                for i in 0..count {
+                    case target(sel, calls) {
+                        0: { q = 10; break; }
+                        1: {
+                            if gate { q = 20; break; }
+                            else { q = 30; break; }
+                        }
+                        default: { q = 40; break; }
+                    }
+                    q = 99;
+                }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let count = sim.signal("count");
+    let sel = sim.signal("sel");
+    let gate = sim.signal("gate");
+    for bound in [0u32, 1, 64, 255, u32::MAX] {
+        for selector in 0..4u8 {
+            for enabled in [0u8, 1] {
+                sim.modify(|io| {
+                    io.set(count, bound);
+                    io.set(sel, selector);
+                    io.set(gate, enabled);
+                })
+                .unwrap();
+                let expected = if bound == 0 {
+                    0u8
+                } else {
+                    match selector {
+                        0 => 10,
+                        1 if enabled == 1 => 20,
+                        1 => 30,
+                        _ => 40,
+                    }
+                };
+                assert_eq!(sim.get(sim.signal("q")), expected.into());
+                assert_eq!(sim.get(sim.signal("calls")), u8::from(bound != 0).into());
+            }
+        }
+    }
+}
+
+#[test]
+fn case_loop_termination_requires_every_path_to_break_this_loop() {
+    for body in [
+        "case sel { 0: break; }",
+        "case sel { 0: break; default: { q += 1; } }",
+        "case sel { 0: { q += 1; } default: break; }",
+        "case sel { 0: break; default: { if gate { break; } } }",
+        "case sel { 0: break; default: { for j in 0..2 { break; } } }",
+    ] {
+        let source = format!(
+            "module Top(count: input logic<32>, sel: input logic<2>, gate: input logic,
+                        q: output logic<8>) {{
+                always_comb {{ q = 0; for i in 0..count {{ {body} }} }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "case_termination", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("termination"), "{error}");
+    }
 }
