@@ -142,11 +142,11 @@ fn reject_analysis_errors(diagnostics: Vec<AnalyzerError>) -> Result<(), ImportE
 }
 
 /// Exact Veryl analyzer release supported by this adapter.
-pub const SUPPORTED_VERYL_VERSION: &str = "0.21.0";
+pub const SUPPORTED_VERYL_VERSION: &str = "0.22.0";
 
 /// Requested treatment of an unpacked Veryl array during memory inference.
 ///
-/// Veryl 0.21.0 does not accept tool-defined attribute names, so source code
+/// Veryl 0.22.0 does not accept tool-defined attribute names, so source code
 /// selects this policy through its portable `SystemVerilog` attribute escape:
 /// `#[sv("struo_memory = \"distributed\"")]`. The accepted values are
 /// `preferred`, `required`, `forbidden`, `block`, and `distributed`.
@@ -533,7 +533,7 @@ mod tests {
     fn empty_analyzer_ir_is_not_silently_made_valid() {
         let imported = import_analyzed_shell(&Ir::default(), "Top").unwrap();
 
-        assert_eq!(SUPPORTED_VERYL_VERSION, "0.21.0");
+        assert_eq!(SUPPORTED_VERYL_VERSION, "0.22.0");
         assert!(imported.design.validate().is_err());
     }
 

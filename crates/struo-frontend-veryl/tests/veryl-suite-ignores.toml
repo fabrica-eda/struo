@@ -36,14 +36,11 @@ reason = "The frontend does not yet lower this construct; retain the upstream ex
 cases = [
   "basic::test_comb_function_call_with_output_argument_in_display_argument",
   "duplicate_varpath::test_duplicate_scoped_var_in_always_comb",
-  "expression_semantics::short_circuit_operators_skip_effectful_operands",
   "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
   "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
-  "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
   "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
   "hierarchy::test_instance_input_function_output_writeback",
   "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
-  "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
   "std_mux::test_demux_build_smoke",
   "std_mux::test_mux_build_smoke",
@@ -170,32 +167,13 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 folds $size of packed dimensions to total width instead of the first dimension."
-cases = [
-  "system_function::test_direct_ff_size_packed_multidimensional_system_function",
-  "system_function::test_direct_ff_size_packed_multidimensional_type_system_function",
-]
-
-[[ignore]]
-reason = "Veryl 0.21.0 folds a function actual before the formal width is applied."
-cases = [
-  "flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion",
-]
-
-[[ignore]]
-reason = "Veryl 0.21.0 folds signed size-cast division/remainder with incorrect signedness."
-cases = [
-  "expression_semantics::constant_and_runtime_casts_use_the_same_resize_rule",
-]
-
-[[ignore]]
 reason = "Requires previous-evaluation state from an always_comb read before write; the mapped combinational circuit settles to the current input."
 cases = [
   "basic::test_always_comb_read_before_write_uses_previous_value",
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 forbids function output/non-local writes from always_ff; these corpus cases require non-default FF function effects."
+reason = "Veryl 0.22.0 forbids function output/non-local writes from always_ff; these corpus cases require non-default FF function effects."
 cases = [
   "flip_flop::test_ff_bits_and_size_array_dependencies_do_not_alias_later_write",
   "flip_flop::test_ff_bits_and_size_operands_do_not_alias_earlier_array_argument",
@@ -236,14 +214,14 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 rejects constant signed loop bounds (InvalidForRange)."
+reason = "Veryl 0.22.0 rejects constant signed loop bounds (InvalidForRange)."
 cases = [
   "flip_flop::test_ff_constant_signed_bounds_in_unrolled_loops",
   "synth_dynamic_loop::test_constant_signed_bounds_in_unrolled_synth_loops",
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 requires a compile-time operand for this system-function use (UnevaluableValue)."
+reason = "Veryl 0.22.0 requires a compile-time operand for this system-function use (UnevaluableValue)."
 cases = [
   "system_function::test_direct_comb_clog2_system_function",
   "system_function::test_direct_comb_onehot_system_function",
@@ -332,15 +310,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "New 0.9.0 regression exposes incorrect width/signedness or constant-context behavior; retain the upstream expectation pending diagnosis."
-cases = [
-  "veryl_context_regressions::constant_ternary_keeps_both_arm_types",
-  "veryl_context_regressions::signed_cast_of_folded_constant_sign_extends",
-  "veryl_context_regressions::constant_case_on_signed_target",
-  "veryl_regressions::wide_struct_bit_field_rhs_no_spill",
-]
-
-[[ignore]]
 reason = "Runtime loop bounds fall outside the current non-negative constant-start and proven 64-iteration synthesis policy."
 cases = [
   "veryl_context_regressions::runtime_for_with_negative_bound",
@@ -367,4 +336,22 @@ cases = [
 reason = "An omitted child input with a default value remains undriven."
 cases = [
   "veryl_regressions::inst_port_default_value_connected_not_folded",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 rejects scalar x[0] (InvalidSelect::Scalar); the suite expects acceptance of a scalar bit-select."
+cases = [
+  "flip_flop::test_ff_function_call_bit_select_on_nonvariable_one_bit_formal",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 rejects tri on a function formal (NetInFunction); legal inout variable formals are covered separately."
+cases = [
+  "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 reports CombinationalLoop for cand: the runtime-bounded write leaves array entries unassigned."
+cases = [
+  "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
 ]
