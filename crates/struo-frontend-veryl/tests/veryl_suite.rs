@@ -1543,3 +1543,88 @@ fn destination_indices_freeze_once_before_writes() {
         }
     }
 }
+
+#[test]
+fn corpus_expression_type_regressions() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "veryl_context_regressions::part_select_of_signed_is_unsigned",
+        "veryl_context_regressions::signed_struct_member_sign_extends",
+        "veryl_context_regressions::wide_logical_operand_keeps_result_type",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+fn expression_type_design() -> Design {
+    Design::new(
+        r"
+        module Top(a: input logic<8>, b: input logic<2>,
+                   member: output logic<16>, selected: output logic<16>,
+                   numeric: output logic<16>, mixed: output logic<16>,
+                   signed_sum: output logic<16>, joined: output logic<16>,
+                   repeated: output logic<24>) {
+            struct Inner { m: signed logic<8>, n: logic<8>, }
+            struct Outer { inner: Inner, tail: logic<4>, }
+            var s: Outer;
+            var i: i32;
+            always_comb {
+                s.inner.m = a;
+                s.inner.n = a;
+                s.tail = b;
+                i = $signed(a);
+                member = s.inner.m;
+                selected = s.inner.m[7:0] + 16'sd0;
+                numeric = i[7:0] + 16'sd0;
+                mixed = $signed(a[3:0]) + b;
+                signed_sum = $signed(a[3:0]) + 16'sd0;
+                joined = {(if 1 ? a : b), 4'h5};
+                repeated = {(if 1 ? a : b) repeat 2, 4'h5};
+            }
+        }
+        ",
+        "Top",
+    )
+}
+
+#[test]
+fn expression_types_preserve_members_selections_and_context() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = expression_type_design();
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let a = sim.signal("a");
+    let b = sim.signal("b");
+    for value in 0..=255u32 {
+        for other in 0..4u32 {
+            sim.modify(|io| {
+                io.set(a, value);
+                io.set(b, other);
+            })
+            .unwrap();
+            let member = if value & 128 != 0 {
+                value | 0xff00
+            } else {
+                value
+            };
+            let low = value & 15;
+            let signed = if low & 8 != 0 { low | 0xfff0 } else { low };
+            for (name, expected) in [
+                ("member", member),
+                ("selected", value),
+                ("numeric", value),
+                ("mixed", low + other),
+                ("signed_sum", signed),
+                ("joined", (value << 4) | 5),
+                ("repeated", (value << 12) | (value << 4) | 5),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: a={value}, b={other}"
+                );
+            }
+        }
+    }
+}

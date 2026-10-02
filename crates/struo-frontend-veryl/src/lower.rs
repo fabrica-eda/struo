@@ -1,5 +1,8 @@
 mod arrays;
 mod loops;
+mod types;
+
+use types::{repair_expression_signedness, variable_signedness};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -2703,8 +2706,9 @@ impl<'a> ModuleLowerer<'a> {
                     signed,
                 })
             }
-            Expression::Concatenation(parts, comptime) => {
+            Expression::Concatenation(parts, _) => {
                 let mut lowered = Vec::new();
+                let mut width = 0u32;
                 for (part, repeat) in parts {
                     let part = self.lower_expression_effects(part, env, effects)?;
                     let count = if let Some(repeat) = repeat {
@@ -2712,11 +2716,15 @@ impl<'a> ModuleLowerer<'a> {
                     } else {
                         1
                     };
+                    width = count
+                        .checked_mul(u64::from(part.width))
+                        .and_then(|bits| bits.checked_add(u64::from(width)))
+                        .and_then(|bits| u32::try_from(bits).ok())
+                        .ok_or_else(|| ImportError::WidthTooLarge("concatenation".into()))?;
                     for _ in 0..count {
                         lowered.push(part.id);
                     }
                 }
-                let width = concrete_width(&comptime.r#type, "concatenation")?;
                 Ok(LoweredExpr {
                     id: self.rtl.concat(lowered)?,
                     width,
@@ -3194,19 +3202,7 @@ impl<'a> ModuleLowerer<'a> {
             });
         }
         let (lsb, width) = static_select(select, source.width)?;
-        let signed = if select.is_empty() {
-            source.signed
-        } else if matches!(
-            self.variable_type(id)?.kind,
-            TypeKind::Bit | TypeKind::Logic
-        ) {
-            false
-        } else {
-            match &comptime.value {
-                ValueVariant::Numeric(value) => value.signed(),
-                _ => comptime.r#type.signed,
-            }
-        };
+        let signed = variable_signedness(select, comptime);
         if lsb == 0 && width == source.width {
             Ok(LoweredExpr { signed, ..source })
         } else {
@@ -3314,7 +3310,12 @@ impl<'a> ModuleLowerer<'a> {
                 ));
             }
         };
-        self.resize(value, context_width(&call.comptime)?, value.signed)
+        let signed = call.comptime.expr_context.signed;
+        self.resize(
+            LoweredExpr { signed, ..value },
+            context_width(&call.comptime)?,
+            signed,
+        )
     }
 
     fn lower_comptime(
@@ -4326,103 +4327,6 @@ fn concrete_width(r#type: &Type, name: &str) -> Result<u32, ImportError> {
         .total_width()
         .ok_or_else(|| ImportError::NonConcreteWidth(name.into()))?;
     u32::try_from(width).map_err(|_| ImportError::WidthTooLarge(name.into()))
-}
-
-// AIR keeps intrinsic types separate from the propagated expression context.
-// IEEE 1800-2023 11.8.2 requires widening operands before applying the operator.
-// Numeric size casts preserve source signedness, which is not reliably
-// reflected in AIR's propagated expression context. Recompute the common
-// type before lowering, including unsigned context inherited from a parent.
-fn expression_signedness(expression: &Expression) -> bool {
-    match expression {
-        Expression::Binary(lhs, Op::As, rhs, comptime) => {
-            if matches!(rhs.comptime().value, ValueVariant::Type(_)) {
-                comptime.r#type.signed
-            } else {
-                expression_signedness(lhs)
-            }
-        }
-        Expression::Binary(_, op, _, _) if is_boolean_operator(*op) => false,
-        Expression::Binary(lhs, op, rhs, _) => {
-            expression_signedness(lhs)
-                && (matches!(
-                    op,
-                    Op::LogicShiftL | Op::LogicShiftR | Op::ArithShiftL | Op::ArithShiftR | Op::Pow
-                ) || expression_signedness(rhs))
-        }
-        Expression::Unary(op, input, _) => {
-            matches!(op, Op::Add | Op::Sub | Op::BitNot) && expression_signedness(input)
-        }
-        Expression::Ternary(_, yes, no, _) => {
-            expression_signedness(yes) && expression_signedness(no)
-        }
-        Expression::Concatenation(..) => false,
-        Expression::Term(factor) => match factor.as_ref() {
-            Factor::SystemFunctionCall(call) => {
-                use veryl_analyzer::ir::SystemFunctionKind;
-                match call.kind {
-                    SystemFunctionKind::Bits(_)
-                    | SystemFunctionKind::Size(_)
-                    | SystemFunctionKind::Clog2(_)
-                    | SystemFunctionKind::Signed(_) => true,
-                    SystemFunctionKind::Unsigned(_) | SystemFunctionKind::Onehot(_) => false,
-                    _ => expression.comptime().r#type.signed,
-                }
-            }
-            Factor::Variable(_, _, select, ct)
-                if !select.is_empty()
-                    && matches!(ct.r#type.kind, TypeKind::Bit | TypeKind::Logic) =>
-            {
-                false
-            }
-            _ => expression.comptime().r#type.signed,
-        },
-        _ => expression.comptime().r#type.signed,
-    }
-}
-
-fn repair_expression_signedness(expression: &mut Expression, inherited: Option<bool>) {
-    let signed = inherited.unwrap_or_else(|| expression_signedness(expression));
-    expression.comptime_mut().expr_context.signed = signed;
-    match expression {
-        Expression::Binary(lhs, Op::As, _, _) => repair_expression_signedness(lhs, None),
-        Expression::Binary(lhs, op, rhs, _) => {
-            if matches!(op, Op::LogicAnd | Op::LogicOr) {
-                repair_expression_signedness(lhs, None);
-                repair_expression_signedness(rhs, None);
-            } else if is_boolean_operator(*op) {
-                let common = expression_signedness(lhs) && expression_signedness(rhs);
-                repair_expression_signedness(lhs, Some(common));
-                repair_expression_signedness(rhs, Some(common));
-            } else {
-                repair_expression_signedness(lhs, Some(signed));
-                let shift = matches!(
-                    op,
-                    Op::LogicShiftL | Op::LogicShiftR | Op::ArithShiftL | Op::ArithShiftR | Op::Pow
-                );
-                repair_expression_signedness(rhs, if shift { None } else { Some(signed) });
-            }
-        }
-        Expression::Unary(op, input, _) => repair_expression_signedness(
-            input,
-            if matches!(op, Op::Add | Op::Sub | Op::BitNot) {
-                Some(signed)
-            } else {
-                None
-            },
-        ),
-        Expression::Concatenation(parts, _) => {
-            for (part, _) in parts {
-                repair_expression_signedness(part, None);
-            }
-        }
-        Expression::Ternary(cond, yes, no, _) => {
-            repair_expression_signedness(cond, None);
-            repair_expression_signedness(yes, Some(signed));
-            repair_expression_signedness(no, Some(signed));
-        }
-        _ => {}
-    }
 }
 
 fn binary_signed(op: Op, comptime: &Comptime) -> bool {
