@@ -317,12 +317,6 @@ cases = [
 
 
 [[ignore]]
-reason = "An omitted child input with a default value remains undriven."
-cases = [
-  "veryl_regressions::inst_port_default_value_connected_not_folded",
-]
-
-[[ignore]]
 reason = "Veryl 0.22.0 rejects scalar x[0] (InvalidSelect::Scalar); the suite expects acceptance of a scalar bit-select."
 cases = [
   "flip_flop::test_ff_function_call_bit_select_on_nonvariable_one_bit_formal",

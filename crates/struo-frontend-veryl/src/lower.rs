@@ -960,6 +960,7 @@ impl<'a> ModuleLowerer<'a> {
         let inline_signals = self.inline_module(&child.rtl, &prefix)?;
         let parent_env = self.read_env()?;
         self.lower_instance_inputs(instance, &child, &inline_signals, &parent_env)?;
+        self.lower_instance_input_defaults(instance, &child, &inline_signals)?;
         self.lower_instance_outputs(instance, &child, &inline_signals)?;
         Ok(())
     }
@@ -1013,6 +1014,45 @@ impl<'a> ModuleLowerer<'a> {
                 )?;
                 self.rtl.assign(self.rtl.whole(target)?, value.id)?;
             }
+        }
+        Ok(())
+    }
+
+    fn lower_instance_input_defaults(
+        &mut self,
+        instance: &InstDeclaration,
+        child: &ModuleLowerer<'_>,
+        inline_signals: &HashMap<SignalId, SignalId>,
+    ) -> Result<(), ImportError> {
+        // Explicit connections, including empty ones, suppress defaults
+        // (IEEE 1800-2023 23.3.2.2). AIR stores input defaults in the port's
+        // initial value while keeping the shared child IR runtime-dependent.
+        let explicit = instance
+            .inputs
+            .iter()
+            .map(|input| input.id)
+            .collect::<HashSet<_>>();
+        for key in &child.signal_order {
+            let variable = &child.source.variables[&key.id];
+            if variable.kind != VarKind::Input || explicit.contains(&key.id) {
+                continue;
+            }
+            let Some(value) = variable.get_value(&key.index) else {
+                continue;
+            };
+            // Ports without defaults have an X template. Preserve undriven
+            // diagnostics; never invent a zero driver or erase unknown bits.
+            if value.is_xz() {
+                continue;
+            }
+            let width = child.width(key)?;
+            let value = value.expand(width as usize, child.is_signed(key));
+            let value = self.rtl.constant(Constant::new(
+                BitWidth::new(width)?,
+                value.payload().to_u64_digits(),
+            ));
+            let target = inline_signals[&child.signal(key)?];
+            self.rtl.assign(self.rtl.whole(target)?, value)?;
         }
         Ok(())
     }
