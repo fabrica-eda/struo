@@ -346,9 +346,9 @@ dependencies = [
 
 [[package]]
 name = "celox"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c315d8067404c55b28952248008681f7455df80988aa5fa263b30f470d362e6a"
+checksum = "c10b42f02c2f901cffdcca1bf77909d3b0c11a6495a1304d9738334fdf5ced44"
 dependencies = [
  "bit-set",
  "celox-analysis",
@@ -393,18 +393,18 @@ dependencies = [
 
 [[package]]
 name = "celox-analysis"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4930ab2a6ea412271340b86bf45da8437e1a5417c22484880cfe106959bbb3a"
+checksum = "825b53317b9ce9bcb26d4eeb64e36833fb34b98d0e002c7bb7ae0ec1c9298e5c"
 dependencies = [
  "fxhash",
 ]
 
 [[package]]
 name = "celox-backend-arm64"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "087aba25121a2e7e9ce9d742527f37d72a92bfb4ac0af5af2e230007ff453763"
+checksum = "b3163766e447eb128a1b31051881b67394fffd54995e654d5b19db87dd9888b1"
 dependencies = [
  "celox-analysis",
  "celox-backend-common",
@@ -420,18 +420,18 @@ dependencies = [
 
 [[package]]
 name = "celox-backend-common"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee024bd172a8d023cf650c76fd07a201ac946b3d2bd3c51596cfba13cbffea57"
+checksum = "e2738199b0d496e0d883b152e0dce5cdf5a52adc27b90fdcb92cc689220c5850"
 dependencies = [
  "fxhash",
 ]
 
 [[package]]
 name = "celox-backend-cranelift"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e60e81df4fd5252eab41340a009ea15eaacca41e2cd3fe971fbfd1828ef614b0"
+checksum = "2818c47525cb904f8db4a39b80e69941f23616df5a35a969e3a39b5df84eec49"
 dependencies = [
  "celox-design",
  "celox-sir",
@@ -448,9 +448,9 @@ dependencies = [
 
 [[package]]
 name = "celox-backend-wasm"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee2025d0a232dab1e65e31ad785f626b4c9afeb8b8d1c40eb8b4e3d8c19f1c31"
+checksum = "676cc137325f1f93d08964e607b42387f8467689282acbb926747feb54813403"
 dependencies = [
  "celox-design",
  "celox-sir",
@@ -461,9 +461,9 @@ dependencies = [
 
 [[package]]
 name = "celox-backend-x86"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd48c21ea3ac3b04517154026468ea91ad5234dd0d920cc485472c9a6e5a9c4e"
+checksum = "c94a0cee994d7d8eef9ad7167c3b748e05ea0b97670e332cf08ae290e3ad7759"
 dependencies = [
  "celox-analysis",
  "celox-backend-common",
@@ -480,9 +480,9 @@ dependencies = [
 
 [[package]]
 name = "celox-design"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d655d47e2301693abff384a05db2e1d9fe9a8f8c4121321f89f2ceb2d6cebba"
+checksum = "8f0c514e8733ea7a3b972efb655f572c91086ca2ba7c01bc1ab4f547ecc0ec83"
 dependencies = [
  "fxhash",
  "num-bigint",
@@ -491,9 +491,9 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-core"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3feee0d9f4f8821eeb2e34243c4cb9ca4e38a066df23b3d1bf6044f86f2a0ed7"
+checksum = "633cfc27557133bcb42e5a775713010e045ee606ae3e97246d45f710b5d43cd3"
 dependencies = [
  "celox-design",
  "celox-frontend-sdk",
@@ -509,9 +509,9 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-sdk"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68d739b6b2dc72fbcb262c83fbbc8d0290381317894418868c053ef621b4d250"
+checksum = "7ce8fad7b7be2eb6ec72537836125c94d611369391639c5ca10a48982fb89cbc"
 dependencies = [
  "fxhash",
  "num-bigint",
@@ -522,9 +522,9 @@ dependencies = [
 
 [[package]]
 name = "celox-frontend-veryl"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37a0ae889595b243721498f984384c93f15b254f61335baf9a2ecc1efb233e50"
+checksum = "23e25f59698181e3d9efefcb96d9972dcae3146756bdd7ce0664cc9b16ea2c77"
 dependencies = [
  "bit-set",
  "celox-design",
@@ -545,9 +545,9 @@ dependencies = [
 
 [[package]]
 name = "celox-macros"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab26cf2fae804f1cacd55f8948e52f74f3551eb695ef34a719780307a7763ab5"
+checksum = "96e5bea0c45da8b12e425886f543f59c4f776b4dd52b2be07fa2b31bdd380b65"
 dependencies = [
  "fxhash",
  "num-bigint",
@@ -561,9 +561,9 @@ dependencies = [
 
 [[package]]
 name = "celox-runtime"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd975f606d5324864d2f9c34ff61b4ef26ede79365aafbedaebff5a30ffdb1cf"
+checksum = "9435219b37c5987d281aa5f81ae71ca6f67aac405c93607e003ded4d209485da"
 dependencies = [
  "bit-set",
  "celox-design",
@@ -577,9 +577,9 @@ dependencies = [
 
 [[package]]
 name = "celox-sir"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be56232ffc36a73febc95a0aaecacd2408dd05a13459347ef61f276892f21aea"
+checksum = "9db29fc74ea3e2be72be2f7c73eeb7e41aac67befe9076a817f3d9b5f7cbd2a1"
 dependencies = [
  "celox-analysis",
  "celox-design",
@@ -591,9 +591,9 @@ dependencies = [
 
 [[package]]
 name = "celox-sir-opt"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81333dd8a860fb0ec84405a290907f8c654d9d7e97c317481ece8a9217064c46"
+checksum = "98f9572298b480724b43c3e418f847d9d9a20997794cead1f5772146ea7178d6"
 dependencies = [
  "bit-set",
  "celox-analysis",
@@ -610,9 +610,9 @@ dependencies = [
 
 [[package]]
 name = "celox-slt"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8949b774c4d919b73abecb7a20cd7b6d2499c239551f88b4eafc20bdedf1eb09"
+checksum = "16ef6e7ce72848fe629fb23dbc901e2406361f2630cc53ac54eb4ae5c790b614"
 dependencies = [
  "celox-analysis",
  "celox-design",
@@ -627,9 +627,9 @@ dependencies = [
 
 [[package]]
 name = "celox-state-layout"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2baf4fe3af0a391d3f0c1c664f405d2ed24d18134ff1c3dfb32c9bc1452a6c2"
+checksum = "728eec69375a03b3a08b51370d8a45cdd164d3d9a9edb9cbe122d6069c214b4d"
 dependencies = [
  "celox-design",
  "fxhash",
@@ -638,9 +638,9 @@ dependencies = [
 
 [[package]]
 name = "celox-test-suite-veryl"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a204fd1cb3747b32ab1199cc0240b5e1408a6a92d8968638561d45be817b883"
+checksum = "5c77627ccbd6792b6dadead63f42a01b83c31e49e555700465bf27fdef0c2d21"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -649,9 +649,9 @@ dependencies = [
 
 [[package]]
 name = "celox-testbench"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa81e78a5432ef1a211058e2c659ed6894272bb27c7bfc0503bd4597f5d18451"
+checksum = "6f811f1bc098ec58b74bc0666e42289a3f7b802cdce5680d86ceaace21db68fd"
 dependencies = [
  "num-bigint",
  "num-traits",

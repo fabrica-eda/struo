@@ -243,7 +243,15 @@ fn corpus_case() {
 #[ignore = "catalogue for scripts/check-veryl-suite.py"]
 fn corpus_list() {
     for case in celox_test_suite_veryl::cases() {
-        println!("STRUO_CASE {}", case.name);
+        println!(
+            "STRUO_CASE {}",
+            serde_json::json!({
+                "name": case.name,
+                "tags": case.tags.iter().map(|tag| tag.as_str()).collect::<Vec<_>>(),
+                "tag_reasons": case.tags.iter().map(|tag| tag.reason()).collect::<Vec<_>>(),
+                "stronger_than_sv": case.has_stronger_than_sv_expectations(),
+            })
+        );
     }
 }
 

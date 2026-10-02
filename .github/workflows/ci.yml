@@ -308,7 +308,7 @@ jobs:
           if-no-files-found: warn
 
   veryl-corpus:
-    name: Veryl corpus (Celox 0.8.1)
+    name: Veryl corpus (Celox 0.9.0)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -336,7 +336,7 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-veryl-corpus-v1-
 
-      - name: Run Veryl corpus with explicit known-case ignores
+      - name: Run Veryl corpus with explicit ignores and expectation policies
         run: python3 scripts/check-veryl-suite.py --timing --jobs 4 --timeout 60 --report target/veryl-corpus/results.json
 
       - name: Summarize corpus results
@@ -356,7 +356,7 @@ jobs:
                   for status, count in sorted(data["counts"].items()):
                       summary.write(f"| `{status}` | {count} |\n")
                   summary.write(f"| Total | {len(data['cases'])} |\n\n")
-                  summary.write("Per-case diagnostics are in the veryl-corpus-results artifact.\n")
+                  summary.write("Ignored cases are known limitations; excluded cases require incompatible tagged expectations. Neither counts as a pass. Per-case diagnostics and upstream tags are in the veryl-corpus-results artifact.\n")
               else:
                   summary.write("The runner did not produce a report; inspect the build/run logs.\n")
           PYTHON

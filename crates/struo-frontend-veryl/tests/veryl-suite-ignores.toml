@@ -1,9 +1,11 @@
-# Explicit exclusions for celox-test-suite-veryl 0.8.1.
+# Explicit exclusions for celox-test-suite-veryl 0.9.0.
 # Skipped cases are not passes. Remove entries only after validation.
+# Tag exclusions below describe incompatible oracles, not frontend gaps.
+# Untagged cases are not automatically proof of portable SV conformance.
 # Recheck with scripts/check-veryl-suite.py --include-ignored --filter <case>.
 
 [[ignore]]
-reason = "Celox 0.8.1 rejects an asynchronous reset shared across distinct clock domains."
+reason = "Celox 0.9.0 rejects an asynchronous reset shared across distinct clock domains."
 cases = [
   "multi_clock::test_clock_domain_crossing_pattern",
   "multi_clock::test_independent_clock_domains",
@@ -23,12 +25,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Passes locally after LUT simplification; CI headroom under the 60-second limit is not yet validated."
-cases = [
-  "wide_shift_mem::test_1024bit_sar_sign_extension",
-]
-
-[[ignore]]
 reason = "Synthesis currently reports a combinational loop or an undriven signal."
 cases = [
   "duplicate_varpath::test_duplicate_scoped_var_with_generate_for",
@@ -44,7 +40,6 @@ cases = [
   "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
   "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
   "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
-  "function_arguments::test_ff_inout_expression_copyout_commits_with_nonblocking_assignments",
   "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
   "hierarchy::test_instance_input_function_output_writeback",
   "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
@@ -175,12 +170,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "The suite requires zero-start storage; synthesis folds the constant FF. See celox-sim/celox#917."
-cases = [
-  "operators::test_ff_constant_two_state_initialization",
-]
-
-[[ignore]]
 reason = "Veryl 0.21.0 folds $size of packed dimensions to total width instead of the first dimension."
 cases = [
   "system_function::test_direct_ff_size_packed_multidimensional_system_function",
@@ -208,7 +197,6 @@ cases = [
 [[ignore]]
 reason = "Veryl 0.21.0 forbids function output/non-local writes from always_ff; these corpus cases require non-default FF function effects."
 cases = [
-  "flip_flop::test_ff_assert_message_output_argument_is_eager",
   "flip_flop::test_ff_bits_and_size_array_dependencies_do_not_alias_later_write",
   "flip_flop::test_ff_bits_and_size_operands_do_not_alias_earlier_array_argument",
   "flip_flop::test_ff_dynamic_nonlocal_store_follows_pending_whole_write",
@@ -217,13 +205,11 @@ cases = [
   "flip_flop::test_ff_function_call_array_literal_effect_is_eager_in_short_circuit_rhs",
   "flip_flop::test_ff_function_call_array_literal_effect_is_eager_in_ternary_arm",
   "flip_flop::test_ff_function_call_array_literal_snapshots_scalar_before_callee_write",
-  "flip_flop::test_ff_function_call_array_literal_snapshots_scalar_before_later_write",
   "flip_flop::test_ff_function_call_array_literal_view_preserves_expression_order",
   "flip_flop::test_ff_function_call_array_literal_view_preserves_source_order",
   "flip_flop::test_ff_function_call_bits_and_size_evaluate_effectful_array_argument",
   "flip_flop::test_ff_function_call_carries_branch_local_static_array_item_cache",
   "flip_flop::test_ff_function_call_effectful_array_items_are_eager_before_conditional_access",
-  "flip_flop::test_ff_function_call_expression_with_output_argument_and_return_value",
   "flip_flop::test_ff_function_call_keeps_array_view_active_for_output_index",
   "flip_flop::test_ff_function_call_merges_directly_forwarded_array_cache",
   "flip_flop::test_ff_function_call_merges_nested_array_state_at_cache_completion",
@@ -231,9 +217,6 @@ cases = [
   "flip_flop::test_ff_function_call_merges_outer_array_view_across_nested_short_circuit",
   "flip_flop::test_ff_function_call_nested_bits_evaluates_effectful_array_argument",
   "flip_flop::test_ff_function_call_nested_output_statement_in_function_body",
-  "flip_flop::test_ff_function_call_snapshots_pure_array_items_before_later_effect",
-  "flip_flop::test_ff_function_call_statement_with_output_argument",
-  "flip_flop::test_ff_function_call_statement_with_output_argument_and_return_value",
   "flip_flop::test_ff_function_call_tracks_array_reads_in_output_indices",
   "flip_flop::test_ff_function_call_tracks_array_view_hidden_in_bound_literal",
   "flip_flop::test_ff_function_call_tracks_nested_array_reads_in_output_indices",
@@ -245,15 +228,10 @@ cases = [
   "flip_flop::test_ff_outputless_wrapper_expression_copyout_to_nonlocal_is_observable",
   "flip_flop::test_ff_outputless_wrapper_indexed_copyout_to_nonlocal_is_observable",
   "flip_flop::test_ff_outputless_wrapper_nested_copyout_to_nonlocal_is_observable",
-  "flip_flop::test_ff_pure_input_is_snapshotted_before_later_effectful_input",
   "flip_flop::test_ff_runtime_function_snapshots_helper_input_before_callee_nonlocal_write",
   "flip_flop::test_ff_runtime_function_snapshots_input_before_callee_nonlocal_write",
-  "flip_flop::test_ff_short_circuit_runtime_write_preserves_later_state_source",
   "flip_flop::test_ff_skipped_conditional_nonlocal_write_preserves_prior_ff_assignment",
   "flip_flop::test_ff_statement_function_direct_nonlocal_assignment_is_observable",
-  "function_arguments::test_ff_nested_output_copyout_is_visible_before_outer_copyout",
-  "function_arguments::test_ff_output_copyout_to_dynamic_slice_preserves_other_bits",
-  "function_arguments::test_ff_statement_output_copyout_freezes_all_inputs",
   "operators::test_pow_operator_runtime_exponent_comb_and_ff",
 ]
 
@@ -322,4 +300,79 @@ cases = [
   "synth_dynamic_loop::test_runtime_bounds_stalled_step_with_break_exits_cleanly",
   "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
   "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
+]
+
+
+# These oracles require behavior outside Struo's synthesis contract.
+# --include-ignored executes them too, retaining upstream tag metadata.
+[[exclude_tag]]
+tag = "deferred_function_effects"
+reason = "Celox-specific deferred function copy-out in FFs; Struo retains the Veryl always_ff function-effect restriction."
+
+[[exclude_tag]]
+tag = "eager_assertion_messages"
+reason = "Successful assertions do not execute failure-message effects; do not synthesize the suite's eager-message policy."
+
+[[exclude_tag]]
+tag = "two_state_initialization"
+reason = "Synthesis does not promise zero initialization of four-state storage or retain constant FFs to provide it."
+
+[[ignore]]
+reason = "Requires four-state storage/unknown masks; the mapped ECP5 adapter is two-state."
+cases = [
+  "ff_narrow_arrays::ff_captures_padded_elements_and_unknown_masks",
+  "veryl_regressions::wide_shift_count_preserves_unknowns_and_sign_fill",
+  "veryl_regressions::constant_arrays_initialize_comb_and_ff_reads",
+]
+
+[[ignore]]
+reason = "Packed scatter store exceeds the 60-second case budget during synthesis."
+cases = [
+  "packed_scatter_store::packed_scatter_last_lane_does_not_touch_adjacent_storage",
+]
+
+[[ignore]]
+reason = "New 0.9.0 regression exposes incorrect width/signedness or constant-context behavior; retain the upstream expectation pending diagnosis."
+cases = [
+  "veryl_context_regressions::part_select_of_signed_is_unsigned",
+  "veryl_context_regressions::signed_struct_member_sign_extends",
+  "veryl_context_regressions::constant_ternary_keeps_both_arm_types",
+  "veryl_context_regressions::signed_cast_of_folded_constant_sign_extends",
+  "veryl_context_regressions::constant_case_on_signed_target",
+  "veryl_regressions::wide_struct_bit_field_rhs_no_spill",
+]
+
+[[ignore]]
+reason = "Logical-expression result width is incorrectly inherited from its operand context."
+cases = [
+  "veryl_context_regressions::wide_logical_operand_keeps_result_type",
+]
+
+[[ignore]]
+reason = "Runtime loop bounds fall outside the current non-negative constant-start and proven 64-iteration synthesis policy."
+cases = [
+  "veryl_context_regressions::runtime_for_with_negative_bound",
+  "veryl_context_regressions::runtime_for_bound_keeps_its_type",
+  "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
+]
+
+[[ignore]]
+reason = "Dynamic reads of constant unpacked arrays are not lowered."
+cases = [
+  "veryl_context_regressions::folded_const_select_keeps_its_sign",
+  "veryl_regressions::nested_array_index_const_array",
+]
+
+[[ignore]]
+reason = "Wildcard equality used by inside/case expressions is not lowered."
+cases = [
+  "veryl_context_regressions::case_compares_each_label_as_an_if_does",
+  "veryl_context_regressions::runtime_case_target_uses_comparison_context",
+  "veryl_language::inside_outside_range_endpoints",
+]
+
+[[ignore]]
+reason = "An omitted child input with a default value remains undriven."
+cases = [
+  "veryl_regressions::inst_port_default_value_connected_not_folded",
 ]
