@@ -3979,6 +3979,11 @@ fn replicate_physically_critical_cells(
         .unwrap_or(1);
     let mut replicas = 0usize;
     let mut rewires = 0usize;
+    let mut names = netlist
+        .cells
+        .iter()
+        .map(|cell| mapped_cell_name(cell).to_owned())
+        .collect::<HashSet<_>>();
     for timing in feedback.net_timings() {
         if replicas >= MAX_PHYSICAL_REPLICAS {
             break;
@@ -4033,7 +4038,14 @@ fn replicate_physically_critical_cells(
         }
         match &mut replica {
             Ecp5Cell::Lut4 { name, output, .. } | Ecp5Cell::FlipFlop { name, output, .. } => {
-                *name = format!("physical_replicate_{}_{replicas}", timing.driver);
+                let mut serial = replicas;
+                *name = loop {
+                    let proposed = format!("physical_replicate_{}_{serial}", timing.driver);
+                    if names.insert(proposed.clone()) {
+                        break proposed;
+                    }
+                    serial += 1;
+                };
                 *output = clone_output;
             }
             _ => unreachable!("only LUT and flip-flop drivers are selected"),
@@ -10408,10 +10420,10 @@ mod tests {
             })
             .collect();
         let feedback = PhysicalFeedback::from_observations(
-            placements,
-            bels,
+            placements.clone(),
+            bels.clone(),
             vec![PhysicalNetTiming {
-                driver,
+                driver: driver.clone(),
                 net: "critical".into(),
                 endpoints,
             }],
@@ -10428,6 +10440,38 @@ mod tests {
             Ecp5Cell::FlipFlop { name, .. } if name.starts_with("physical_replicate_")
         )));
         assert!(refined.retiming.equivalence_signed_off);
+
+        // A later physical result can make another branch of the same Q net
+        // critical. Per-pass numbering must not duplicate the first clone name.
+        let later = PhysicalFeedback::from_observations(
+            placements,
+            bels,
+            vec![PhysicalNetTiming {
+                driver,
+                net: "critical".into(),
+                endpoints: sinks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, cell)| PhysicalTimingEndpoint {
+                        cell: cell.clone(),
+                        port: "A".into(),
+                        delay_ps: if (4..8).contains(&index) {
+                            4_000
+                        } else {
+                            2_000
+                        },
+                        budget_ps: 3_000,
+                    })
+                    .collect(),
+            }],
+            Vec::new(),
+            BTreeMap::new(),
+        );
+        let second = refined.apply_physical_feedback(&later);
+        assert_eq!(second.cells.len(), refined.cells.len() + 1);
+        assert_eq!(second.retiming.equivalent_physical_rewires, 8);
+        second.validate_export_names().unwrap();
+        assert!(second.retiming.equivalence_signed_off);
     }
 
     #[test]
