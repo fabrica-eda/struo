@@ -24,6 +24,13 @@ struct SignalKey {
     index: Vec<usize>,
 }
 
+struct PreparedDestination {
+    elements: Vec<(SignalKey, Option<LoweredExpr>)>,
+    select: VarSelect,
+    offset: Option<(ExprId, ExprId)>,
+    width: u32,
+}
+
 type Env = HashMap<SignalKey, LoweredExpr>;
 type FunctionOutputs = Vec<(Vec<AssignDestination>, LoweredExpr)>;
 type FunctionResult = (Option<LoweredExpr>, FunctionOutputs);
@@ -1551,7 +1558,11 @@ impl<'a> ModuleLowerer<'a> {
                 DrivenBits::default(),
             )
         };
-        changed.extend(self.assign_destinations(&assign.dst, value, reads, writes)?);
+        if sequential {
+            changed.extend(self.assign_destinations(&assign.dst, value, reads, writes)?);
+        } else {
+            changed.extend(self.assign_destinations_effects(&assign.dst, value, writes)?);
+        }
         Ok(changed)
     }
 
@@ -2172,6 +2183,93 @@ impl<'a> ModuleLowerer<'a> {
                 signed: false,
             };
             changed.extend(self.assign_destination(dst, part, reads, writes)?);
+        }
+        Ok(changed)
+    }
+
+    fn prepare_destination(
+        &mut self,
+        destination: &AssignDestination,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<PreparedDestination, ImportError> {
+        let elements = if has_dynamic_array_index(&destination.index) {
+            self.lower_array_elements_effects(destination.id, &destination.index, env, effects)?
+                .into_iter()
+                .map(|(key, condition)| (key, Some(condition)))
+                .collect()
+        } else {
+            vec![(self.destination_key(destination)?, None)]
+        };
+        let width = selected_width(&destination.select, self.width(&elements[0].0)?)?;
+        let offset = if dynamic_packed_select(&destination.select) {
+            Some(self.lower_select_offset_effects(&destination.select, width, env, effects)?)
+        } else {
+            None
+        };
+        Ok(PreparedDestination {
+            elements,
+            select: destination.select.clone(),
+            offset,
+            width,
+        })
+    }
+
+    fn assign_destinations_effects(
+        &mut self,
+        destinations: &[AssignDestination],
+        value: LoweredExpr,
+        env: &mut Env,
+    ) -> Result<DrivenBits, ImportError> {
+        let mut changed = DrivenBits::default();
+        // The RHS is already frozen. Evaluate all LHS addresses in AIR order
+        // before storing any parts; IEEE 1800-2023 10.4.1 leaves RHS/LHS
+        // evaluation order unspecified for blocking assignments without timing.
+        let prepared = destinations
+            .iter()
+            .map(|dst| self.prepare_destination(dst, env, &mut changed))
+            .collect::<Result<Vec<_>, _>>()?;
+        let total = prepared
+            .iter()
+            .try_fold(0u32, |sum, dst| sum.checked_add(dst.width))
+            .ok_or_else(|| ImportError::WidthTooLarge("concatenated assignment".into()))?;
+        let value = if prepared.len() == 1 {
+            value
+        } else {
+            self.resize(value, total, value.signed)?
+        };
+        let mut remaining = total;
+        for dst in &prepared {
+            remaining -= dst.width;
+            let part = if prepared.len() == 1 {
+                value
+            } else {
+                LoweredExpr {
+                    id: self.rtl.expression_slice(
+                        value.id,
+                        remaining,
+                        BitWidth::new(dst.width)?,
+                    )?,
+                    width: dst.width,
+                    signed: false,
+                }
+            };
+            for (key, condition) in &dst.elements {
+                let (lsb, width) = driven_select(&dst.select, self.width(key)?)?;
+                let current = env[key];
+                self.assign_key_prepared(key, &dst.select, dst.offset, part, env)?;
+                if let Some(condition) = condition {
+                    let assigned = env[key];
+                    env.insert(
+                        key.clone(),
+                        LoweredExpr {
+                            id: self.rtl.mux(condition.id, assigned.id, current.id)?,
+                            ..current
+                        },
+                    );
+                }
+                changed.insert_range(key.clone(), lsb, width);
+            }
         }
         Ok(changed)
     }
@@ -3434,10 +3532,26 @@ impl<'a> ModuleLowerer<'a> {
         reads: &Env,
         env: &mut Env,
     ) -> Result<(), ImportError> {
+        let offset = if dynamic_packed_select(select) {
+            let width = selected_width(select, self.width(key)?)?;
+            Some(self.lower_select_offset(select, width, reads)?)
+        } else {
+            None
+        };
+        self.assign_key_prepared(key, select, offset, value, env)
+    }
+
+    fn assign_key_prepared(
+        &mut self,
+        key: &SignalKey,
+        select: &VarSelect,
+        offset: Option<(ExprId, ExprId)>,
+        value: LoweredExpr,
+        env: &mut Env,
+    ) -> Result<(), ImportError> {
         let total_width = self.width(key)?;
-        if dynamic_packed_select(select) {
+        if let Some((offset, negative)) = offset {
             let width = selected_width(select, total_width)?;
-            let (offset, negative) = self.lower_select_offset(select, width, reads)?;
             let value = self.resize(value, width, false)?;
             let value = self.resize(
                 LoweredExpr {
