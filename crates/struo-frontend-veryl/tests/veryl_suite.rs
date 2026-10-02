@@ -465,9 +465,11 @@ fn corpus_runtime_loops_with_proven_breaks() {
     for name in [
         "basic::test_comb_effectful_if_condition_after_dynamic_break_stays_inactive",
         "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
+        "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
         "synth_dynamic_loop::test_runtime_break_in_synth_comb_loop",
         "synth_dynamic_loop::test_runtime_break_after_assign_in_synth_comb_loop",
         "flip_flop::test_ff_runtime_for_break",
+        "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
     ] {
         celox_test_suite_veryl::case(name)
             .unwrap()
@@ -2162,7 +2164,7 @@ fn runtime_values_do_not_prove_unconditional_loop_breaks() {
     for condition in ["A[index]", "early(index)", "truncated()"] {
         let source = format!(
             r"
-            module Top(index: input logic, count: input logic<8>, q: output logic<8>) {{
+            module Top(index: input logic, count: input logic<32>, q: output logic<8>) {{
                 const A: logic [2] = '{{1'b1, 1'b0}};
                 function early(x: input logic) -> logic {{
                     if x {{ return 1'b0; }}
@@ -2835,5 +2837,56 @@ fn case_loop_termination_requires_every_path_to_break_this_loop() {
             "{error}"
         );
         assert!(error.to_string().contains("termination"), "{error}");
+    }
+}
+
+#[test]
+fn byte_bound_loops_cover_the_full_range_and_break_boundary() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(count: input logic<8>, start: input logic<8>, stop: input logic<8>,
+                   hits: output logic<9>, sum: output logic<16>, tail: output logic<9>) {
+            always_comb {
+                hits = 0;
+                for i in 0..=count { hits = (i + 1) as 9; }
+                sum = 0;
+                for i in 0..count step += 3 {
+                    if i == stop { break; }
+                    sum ^= i as 16;
+                }
+                tail = 0;
+                for i in start..=count { tail = (i + 1) as 9; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let count = sim.signal("count");
+    let start = sim.signal("start");
+    let stop = sim.signal("stop");
+    for n in 0..256u16 {
+        for stop_at in [0u16, 63, 64, 252, 255] {
+            sim.modify(|io| {
+                io.set(count, n);
+                io.set(start, n ^ 128);
+                io.set(stop, stop_at);
+            })
+            .unwrap();
+            assert_eq!(sim.get(sim.signal("hits")), (n + 1).into());
+            assert_eq!(
+                sim.get(sim.signal("tail")),
+                (if (n ^ 128) <= n { n + 1 } else { 0 }).into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("sum")),
+                (0..n)
+                    .step_by(3)
+                    .take_while(|i| *i != stop_at)
+                    .fold(0u16, |value, i| value ^ i)
+                    .into()
+            );
+        }
     }
 }
