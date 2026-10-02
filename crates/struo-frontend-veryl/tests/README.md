@@ -82,11 +82,78 @@ A no-op tick is permitted only for a source RTL register clock when the mapped
 design has no state cells or event handlers. Unknown clocks are not accepted as
 eliminated events. All output assertions still execute.
 
+Independent combinational processes may drive disjoint packed ranges of the
+same variable (IEEE 1800-2023 9.2.2.2 and 11.5.3). Driver checks and emitted RTL
+assignments use the actual written ranges, while blocking reads within each
+process still see its earlier writes. Overlapping ranges, including possible
+dynamic-index overlap, remain rejected. Synthesis resolves bit dependencies
+through whole-vector connections so flattened ports do not create false loops;
+actual combinational feedback remains an error. Ordinary acyclic designs keep
+the established whole-expression construction order. Bitwise resolution retries
+from a fresh state only when that path reports a loop, preserving existing
+netlist sharing and placement behavior.
+
 Dynamic packed `+:`, `-:`, and `step` selects support reads and writes.
 Offset arithmetic preserves signed indices without wrapping into the vector;
 partially overlapping writes affect only valid bits. Out-of-range read bits
 follow the mapped adapter's two-state zero convention. Regression tests cover
 negative indices, both vector boundaries, and step offsets beyond the vector.
 
+Integral `**` expressions support constant and runtime exponents in combinational
+and FF logic. The base is widened to the expression context before repeated
+squaring, and the exponent retains its own width and signedness (IEEE 1800-2023
+11.4.3 and 11.6.1). Zero exponents produce one, including `0 ** 0`. Negative
+exponents produce zero except for bases one and signed minus one; minus one
+preserves exponent parity. `0 ** negative` follows the adapter's two-state zero
+convention rather than preserving the four-state X result. Effectful exponent
+calls and four-state operands remain subject to the existing frontend/adapter
+limitations. Boundary regressions cover all four-bit bases and exponents,
+constant negative exponents, unsigned parent contexts, and 65-bit results.
+
 The corpus runner copies its worker executable into a temporary directory for
 each run, so concurrent Cargo builds cannot replace a worker mid-audit.
+
+Analyzer diagnostics are classified by Veryl's severity: warnings (including
+unused return values and unsigned arithmetic shifts) do not reject a design.
+Actual errors, including FF function-output restrictions, remain fatal. The
+ignore manifest distinguishes those restrictions, invalid signed loop ranges,
+and compile-time system-function operand requirements.
+
+Combinational function output effects are supported in arithmetic, concatenation,
+short-circuit and conditional expressions, and in if/case conditions. Value-returning
+system functions also preserve argument effects, including nested `$signed` /
+`$unsigned` wrappers and calls whose return value is discarded in statement position
+(IEEE 1800-2023 20.5). Type queries (`$bits` / `$size`) do not evaluate their operands. Effects
+are merged with the same condition as the expression value; early returns and
+static-loop break guards suppress subsequent writes. Non-local function writes
+are explicitly rejected until caller writeback is implemented. Array-valued
+expressions, nested argument effects and runtime loops still have limitations.
+
+Dynamic addressing of an instance output is rejected as an invalid implicit
+continuous assignment, independently of analyzer warnings (IEEE 1800-2023
+Table 10-1). Procedural dynamic part-select assignments remain supported.
+
+Runtime-loop synthesis uses a separate planner in `src/lower/loops.rs`. Existing
+constant-range expansion is retained. Runtime bounds are accepted for a
+non-negative constant start that fits the induction variable and a positive
+additive step, when either the bound's type or a guaranteed break proves that
+at most 64 candidate iterations are needed. This budget includes the iteration
+that executes a break; it is a compile-time resource policy, never a silent
+runtime truncation. An input-dependent break alone is not a termination proof,
+and a nested loop's break does not terminate its parent.
+
+Each candidate iteration retains the actual bound comparison and break guard.
+The bound is reevaluated against the current combinational environment (or the
+pre-edge FF reads), matching for-loop condition evaluation in IEEE 1800-2023
+12.7.1 and Veryl's emitted SV. No clock cycles are introduced. Tests cover the
+64-iteration boundary, signed bounds, stepped loops, changing bounds, FF writes,
+and proof rejection. Bound output effects remain unsupported and are rejected
+even for an empty range.
+
+The ignore manifest distinguishes runtime starts, reverse/non-additive loops,
+and loops without a proof inside the expansion budget. These are current Struo
+synthesis limits, not claims that every such loop is inherently unsynthesizable.
+For example, a 32-bit input trip count may require billions of expanded bodies;
+a small sampled count in a simulator test does not justify truncating it. New
+proofs or algebraic transformations can extend support independently of the
+lowering path. The always_ff function-effect restrictions remain unchanged.

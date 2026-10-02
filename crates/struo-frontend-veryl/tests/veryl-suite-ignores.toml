@@ -1,5 +1,5 @@
 # Explicit exclusions for celox-test-suite-veryl 0.8.1.
-# These are skipped cases, not passing observations. Remove entries as support is fixed.
+# Skipped cases are not passes. Remove entries only after validation.
 # Recheck with scripts/check-veryl-suite.py --include-ignored --filter <case>.
 
 [[ignore]]
@@ -31,83 +31,27 @@ cases = [
 [[ignore]]
 reason = "Synthesis currently reports a combinational loop or an undriven signal."
 cases = [
-  "hierarchy::test_hierarchical_concat_feedback_runtime",
-  "hierarchy::test_hierarchical_concat_feedback_runtime_multi_observe",
-  "hierarchy::test_hierarchical_concat_feedback_with_constant_middle_bit",
-  "hierarchy::test_hierarchical_concat_then_overlap_dynamic_index_runtime",
+  "duplicate_varpath::test_duplicate_scoped_var_with_generate_for",
   "std_onehot::test_onehot_8bit_exhaustive",
 ]
 
 [[ignore]]
 reason = "The frontend does not yet lower this construct; retain the upstream expectation."
 cases = [
-  "basic::test_comb_case_target_output_call_is_evaluated_once",
-  "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
-  "basic::test_comb_effectful_if_condition_after_dynamic_break_stays_inactive",
-  "basic::test_comb_function_call_expression_output_is_guarded_by_ternary",
-  "basic::test_comb_function_call_expression_output_is_visible_to_later_operand",
-  "basic::test_comb_function_call_expression_output_respects_short_circuit",
-  "basic::test_comb_function_call_expression_with_constant_input_keeps_output_write",
-  "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
-  "basic::test_comb_value_system_function_statement_applies_argument_outputs",
-  "basic::test_mixed_selects_execution",
-  "basic::test_statement_call_inputs_follow_output_writeback_order",
-  "comb_observer::test_comb_function_packed_array_literal_preserves_source_order",
-  "comb_observer::test_named_function_inputs_evaluate_in_source_order",
-  "data_access::test_partial_write_merging",
+  "basic::test_comb_function_call_with_output_argument_in_display_argument",
   "duplicate_varpath::test_duplicate_scoped_var_in_always_comb",
   "expression_semantics::short_circuit_operators_skip_effectful_operands",
   "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
-  "false_loop::test_read_then_overwrite_convergence",
-  "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
-  "flip_flop::test_ff_runtime_for_bitwise_steps",
-  "flip_flop::test_ff_runtime_for_bounds",
-  "flip_flop::test_ff_runtime_for_break",
-  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
-  "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
-  "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
-  "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
-  "flip_flop::test_ff_runtime_reverse_exclusive_i32_upper_sentinel",
-  "flip_flop::test_ff_runtime_reverse_min_i32_end_wraps_before_range_check",
-  "flip_flop::test_ff_runtime_reverse_step_matches_emitted_sv_order",
-  "flip_flop::test_ff_signed_xor_step_uses_loop_counter_width",
   "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
   "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
   "function_arguments::test_ff_inout_expression_copyout_commits_with_nonblocking_assignments",
-  "hierarchy::test_dynamic_minus_colon_output_port_rmw",
-  "hierarchy::test_dynamic_output_port_converts_four_state_child_to_two_state_parent",
-  "hierarchy::test_dynamic_output_port_rmw_preserves_unselected_bits",
-  "hierarchy::test_dynamic_step_output_port_rmw",
-  "hierarchy::test_hierarchical_dual_dynamic_readers_feedback_runtime",
-  "hierarchy::test_hierarchical_dynamic_index_feedback_runtime",
-  "hierarchy::test_hierarchical_overlapping_partial_write_dynamic_index_runtime",
-  "hierarchy::test_instance_output_concat_advances_each_destination",
-  "hierarchy::test_instance_output_dynamic_index_composes_aliasing_writeback",
+  "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
+  "hierarchy::test_instance_input_function_output_writeback",
   "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
   "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
-  "operators::test_pow_operator_constant_exponent",
-  "operators::test_pow_operator_constant_exponent_ff",
-  "std_binary_codec::test_binary_codec_roundtrip",
-  "std_binary_codec::test_binary_encoder",
-  "std_binary_codec::test_binary_encoder_disabled",
-  "std_lfsr::test_lfsr_basic_shift",
-  "std_lfsr::test_lfsr_deterministic_cycle",
-  "std_lfsr::test_lfsr_enable_hold",
-  "synth_dynamic_loop::test_constant_bounds_preserve_wide_limit_above_loop_width",
-  "synth_dynamic_loop::test_i32_bitwise_steps_discard_bits_above_the_counter_width",
-  "synth_dynamic_loop::test_runtime_bitwise_steps_in_synth_for_loops",
-  "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
-  "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_loop_carried_state_for_indexed_reads",
-  "synth_dynamic_loop::test_runtime_bounds_reverse_singleton_exits_cleanly",
-  "synth_dynamic_loop::test_runtime_bounds_signed_inclusive_range_preserves_negative_bounds",
-  "synth_dynamic_loop::test_runtime_bounds_truncate_loop_var_to_declared_width",
-  "synth_dynamic_loop::test_runtime_break_after_assign_in_synth_comb_loop",
-  "synth_dynamic_loop::test_runtime_break_in_synth_comb_loop",
-  "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
-  "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
+  "std_mux::test_demux_build_smoke",
+  "std_mux::test_mux_build_smoke",
 ]
 
 [[ignore]]
@@ -256,38 +200,19 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 rejects the input during analysis; lowering is not reached."
+reason = "Requires previous-evaluation state from an always_comb read before write; the mapped combinational circuit settles to the current input."
 cases = [
-  "advanced_interface::test_transitive_generics",
-  "advanced_interface::test_transitive_generics_two_level",
   "basic::test_always_comb_read_before_write_uses_previous_value",
-  "basic::test_comb_function_call_expression_output_survives_system_function_wrapper",
-  "basic::test_comb_function_call_statement_ignores_return_value",
-  "basic::test_comb_function_call_statement_preserves_conditional_return_control_flow",
-  "basic::test_comb_function_call_statement_preserves_return_control_flow",
-  "basic::test_comb_function_call_with_output_argument_in_case_target",
-  "basic::test_comb_function_call_with_output_argument_in_destination_index",
-  "basic::test_comb_function_call_with_output_argument_in_display_argument",
-  "basic::test_comb_function_call_with_output_argument_in_if_condition",
-  "basic::test_comb_function_call_with_output_argument_in_index_expression",
-  "basic::test_comb_function_call_with_output_argument_in_loop_condition",
-  "basic::test_comb_function_condition_output_is_guarded_after_early_return",
-  "basic::test_comb_loop_bound_output_call_writes_back_once",
-  "basic::test_comb_nested_function_output_call_in_function_condition",
-  "basic::test_comb_returning_output_function_allows_nested_output_call",
-  "basic::test_comb_returning_output_function_reads_current_caller_store",
-  "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",
-  "comb_observer::test_comb_function_loop_skips_conditions_after_break",
-  "comb_observer::test_named_function_outputs_apply_in_source_order",
-  "concat_operators::test_shift_in_concat",
-  "duplicate_varpath::test_duplicate_scoped_var_with_generate_for",
+]
+
+[[ignore]]
+reason = "Veryl 0.21.0 forbids function output/non-local writes from always_ff; these corpus cases require non-default FF function effects."
+cases = [
   "flip_flop::test_ff_assert_message_output_argument_is_eager",
   "flip_flop::test_ff_bits_and_size_array_dependencies_do_not_alias_later_write",
   "flip_flop::test_ff_bits_and_size_operands_do_not_alias_earlier_array_argument",
-  "flip_flop::test_ff_constant_signed_bounds_in_unrolled_loops",
   "flip_flop::test_ff_dynamic_nonlocal_store_follows_pending_whole_write",
   "flip_flop::test_ff_effectful_array_item_output_is_not_a_read_alias",
-  "flip_flop::test_ff_function_array_element_assignment_preserves_signedness",
   "flip_flop::test_ff_function_call_array_literal_branch_view_is_reused_after_merge",
   "flip_flop::test_ff_function_call_array_literal_effect_is_eager_in_short_circuit_rhs",
   "flip_flop::test_ff_function_call_array_literal_effect_is_eager_in_ternary_arm",
@@ -306,7 +231,6 @@ cases = [
   "flip_flop::test_ff_function_call_merges_outer_array_view_across_nested_short_circuit",
   "flip_flop::test_ff_function_call_nested_bits_evaluates_effectful_array_argument",
   "flip_flop::test_ff_function_call_nested_output_statement_in_function_body",
-  "flip_flop::test_ff_function_call_preserves_unsigned_formal_signedness_for_nonvariable_actual",
   "flip_flop::test_ff_function_call_snapshots_pure_array_items_before_later_effect",
   "flip_flop::test_ff_function_call_statement_with_output_argument",
   "flip_flop::test_ff_function_call_statement_with_output_argument_and_return_value",
@@ -330,28 +254,72 @@ cases = [
   "function_arguments::test_ff_nested_output_copyout_is_visible_before_outer_copyout",
   "function_arguments::test_ff_output_copyout_to_dynamic_slice_preserves_other_bits",
   "function_arguments::test_ff_statement_output_copyout_freezes_all_inputs",
-  "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
-  "hierarchy::test_instance_input_function_output_writeback",
-  "hierarchy::test_instance_unpacked_array_slice_output",
-  "hierarchy::test_unconnected_child_output_needs_no_parent_glue",
   "operators::test_pow_operator_runtime_exponent_comb_and_ff",
-  "operators::test_shift_logical_vs_arithmetic",
-  "shift_signedness::test_shift_constant_folding_native",
-  "shift_signedness::test_shift_constant_folding_wide",
-  "std_mux::test_demux_build_smoke",
-  "std_mux::test_mux_build_smoke",
+]
+
+[[ignore]]
+reason = "Veryl 0.21.0 rejects constant signed loop bounds (InvalidForRange)."
+cases = [
+  "flip_flop::test_ff_constant_signed_bounds_in_unrolled_loops",
   "synth_dynamic_loop::test_constant_signed_bounds_in_unrolled_synth_loops",
-  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_pre_loop_bits_for_partial_updates",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
-  "synth_dynamic_loop::test_runtime_bounds_reconstruct_wide_loop_carried_reads_from_partial_state",
-  "synth_dynamic_loop::test_runtime_bounds_stalled_step_with_break_exits_cleanly",
-  "synth_dynamic_loop::test_runtime_bounds_track_initial_seed_dependency",
-  "synth_dynamic_loop::test_runtime_bounds_track_initial_seed_dependency_across_module_boundary",
-  "synth_dynamic_loop::test_runtime_break_condition_dependency_across_module_boundary",
-  "synth_dynamic_loop::test_runtime_if_without_break_in_synth_comb_loop",
+]
+
+[[ignore]]
+reason = "Veryl 0.21.0 requires a compile-time operand for this system-function use (UnevaluableValue)."
+cases = [
   "system_function::test_direct_comb_clog2_system_function",
   "system_function::test_direct_comb_onehot_system_function",
   "system_function::test_direct_ff_clog2_system_function",
   "system_function::test_direct_ff_onehot_system_function",
+]
+
+[[ignore]]
+reason = "Struo runtime-loop synthesis currently requires a constant non-negative start; a proof for runtime initial values is not implemented."
+cases = [
+  "basic::test_comb_loop_bound_output_call_writes_back_once",
+  "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",
+  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
+  "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
+  "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
+  "synth_dynamic_loop::test_constant_bounds_preserve_wide_limit_above_loop_width",
+  "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
+  "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
+  "synth_dynamic_loop::test_runtime_bounds_signed_inclusive_range_preserves_negative_bounds",
+]
+
+[[ignore]]
+reason = "Struo cannot prove termination within its 64-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
+cases = [
+  "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
+  "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
+  "flip_flop::test_ff_runtime_for_bounds",
+  "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
+  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
+  "synth_dynamic_loop::test_runtime_bounds_preserve_loop_carried_state_for_indexed_reads",
+  "synth_dynamic_loop::test_runtime_bounds_preserve_pre_loop_bits_for_partial_updates",
+  "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
+  "synth_dynamic_loop::test_runtime_bounds_reconstruct_wide_loop_carried_reads_from_partial_state",
+  "synth_dynamic_loop::test_runtime_bounds_track_initial_seed_dependency",
+  "synth_dynamic_loop::test_runtime_bounds_track_initial_seed_dependency_across_module_boundary",
+  "synth_dynamic_loop::test_runtime_bounds_truncate_loop_var_to_declared_width",
+  "synth_dynamic_loop::test_runtime_break_condition_dependency_across_module_boundary",
+  "synth_dynamic_loop::test_runtime_if_without_break_in_synth_comb_loop",
+]
+
+[[ignore]]
+reason = "Struo has no bounded expansion proof for reverse or non-additive runtime loops; this is a synthesis support limit, not a universal language prohibition."
+cases = [
+  "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
+  "flip_flop::test_ff_runtime_for_bitwise_steps",
+  "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
+  "flip_flop::test_ff_runtime_reverse_exclusive_i32_upper_sentinel",
+  "flip_flop::test_ff_runtime_reverse_min_i32_end_wraps_before_range_check",
+  "flip_flop::test_ff_runtime_reverse_step_matches_emitted_sv_order",
+  "flip_flop::test_ff_signed_xor_step_uses_loop_counter_width",
+  "synth_dynamic_loop::test_i32_bitwise_steps_discard_bits_above_the_counter_width",
+  "synth_dynamic_loop::test_runtime_bitwise_steps_in_synth_for_loops",
+  "synth_dynamic_loop::test_runtime_bounds_reverse_singleton_exits_cleanly",
+  "synth_dynamic_loop::test_runtime_bounds_stalled_step_with_break_exits_cleanly",
+  "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
+  "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
 ]
