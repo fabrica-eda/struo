@@ -2,6 +2,7 @@ mod arrays;
 mod comparisons;
 mod loops;
 mod members;
+mod system_tasks;
 mod types;
 
 use comparisons::PreparedCaseTarget;
@@ -1599,13 +1600,7 @@ impl<'a> ModuleLowerer<'a> {
                 }
             }
             Statement::SystemFunctionCall(call) => {
-                let mut effects = DrivenBits::default();
-                if sequential {
-                    self.lower_system_function(call, reads)?;
-                } else {
-                    self.lower_system_function_effects(call, writes, &mut effects)?;
-                }
-                Ok(effects)
+                self.lower_system_statement(call, reads, writes, sequential)
             }
             Statement::TbMethodCall(_) => Err(ImportError::UnsupportedBehavior(
                 "testbench method calls are not synthesizable".into(),
@@ -4844,6 +4839,12 @@ fn substitute_system_call(
             substitute_induction(&mut input.0, id, value)?;
             if let Some(dimension) = dimension {
                 substitute_induction(&mut dimension.0, id, value)?;
+            }
+            Ok(())
+        }
+        SystemFunctionKind::Display(args) | SystemFunctionKind::Write(args) => {
+            for arg in args {
+                substitute_induction(&mut arg.0, id, value)?;
             }
             Ok(())
         }
