@@ -11,6 +11,7 @@ const GUARDED_ITERATION_BUDGET: usize = 64;
 pub(super) struct LoopPlan {
     pub iterations: Vec<usize>,
     pub guard: Option<(ForBound, bool)>,
+    pub runtime_start: Option<(ForBound, usize)>,
 }
 
 pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan, ImportError> {
@@ -19,6 +20,7 @@ pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan
         return Ok(LoopPlan {
             iterations,
             guard: None,
+            runtime_start: None,
         });
     }
     let (ForRange::Forward {
@@ -39,9 +41,10 @@ pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan
             "reverse or non-additive runtime loops need a termination proof",
         ));
     };
-    let start = start
-        .eval_value(&mut context)
-        .ok_or_else(|| unsupported("runtime loop start is not a non-negative constant"))?;
+    let Some(start_value) = start.eval_value(&mut context) else {
+        return plan_runtime_start(statement, start, end, *inclusive, *step);
+    };
+    let start = start_value;
     if *step == 0 {
         return Err(unsupported("runtime loop step does not advance"));
     }
@@ -65,6 +68,7 @@ pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan
             return Ok(LoopPlan {
                 iterations,
                 guard: Some((end.clone(), *inclusive)),
+                runtime_start: None,
             });
         }
         if value > variable_max {
@@ -79,6 +83,7 @@ pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan
             return Ok(LoopPlan {
                 iterations,
                 guard: Some((end.clone(), *inclusive)),
+                runtime_start: None,
             });
         }
         value = value
@@ -92,11 +97,71 @@ pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan
         return Ok(LoopPlan {
             iterations,
             guard: Some((end.clone(), *inclusive)),
+            runtime_start: None,
         });
     }
     Err(unsupported(
         "runtime loop termination is not proven within the 64-iteration synthesis budget",
     ))
+}
+
+// Enumerate every possible non-negative counter value, not sampled input
+// values. Lowering tracks which candidates the initialized counter reaches.
+fn plan_runtime_start(
+    statement: &ForStatement,
+    start: &ForBound,
+    end: &ForBound,
+    inclusive: bool,
+    step: usize,
+) -> Result<LoopPlan, ImportError> {
+    let ForBound::Expression(expression) = start else {
+        return Err(unsupported(
+            "runtime loop start is not a non-negative constant",
+        ));
+    };
+    let width = concrete_width(&statement.var_type, "loop induction variable")?;
+    let magnitude = width - u32::from(statement.var_type.signed);
+    // A narrow unsigned leaf zero-extends into the counter. Do not infer a
+    // range from a context-sized arithmetic expression or a truncated value.
+    if !matches!(expression.as_ref(), Expression::Term(_))
+        || super::types::expression_signedness(expression)
+        || concrete_width(&expression.comptime().r#type, "loop start")? > magnitude
+    {
+        return Err(unsupported(
+            "runtime loop start is not proven non-negative without truncation",
+        ));
+    }
+    if step == 0 {
+        return Err(unsupported("runtime loop step does not advance"));
+    }
+    let count = maximum_bound(end, statement.var_type.signed)?
+        .and_then(|maximum| maximum.checked_add(usize::from(inclusive)))
+        .filter(|count| *count <= GUARDED_ITERATION_BUDGET)
+        .ok_or_else(|| {
+            unsupported(
+                "runtime loop termination is not proven within the 64-iteration synthesis budget",
+            )
+        })?;
+    let counter_max = if magnitude >= usize::BITS {
+        usize::MAX
+    } else {
+        (1usize << magnitude) - 1
+    };
+    if count != 0
+        && count
+            .checked_sub(1)
+            .and_then(|last| last.checked_add(step))
+            .is_none_or(|next| next > counter_max)
+    {
+        return Err(unsupported(
+            "runtime loop induction could overflow before termination",
+        ));
+    }
+    Ok(LoopPlan {
+        iterations: (0..count).collect(),
+        guard: Some((end.clone(), inclusive)),
+        runtime_start: Some((start.clone(), step)),
+    })
 }
 
 fn unsupported(message: &str) -> ImportError {

@@ -2518,3 +2518,140 @@ fn preferred_memory_fallback_retains_other_memories_and_required_policy() {
         );
     }
 }
+
+#[test]
+fn corpus_bounded_runtime_loop_initializers() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "basic::test_comb_loop_bound_output_call_writes_back_once",
+        "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn bounded_runtime_starts_preserve_steps_effects_breaks_and_empty_ranges() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, start: input logic<4>, limit: input logic<4>,
+                   stop: input logic<4>, sum: output logic<8>, q: output logic<8>,
+                   init_calls: output logic<8>, body_calls: output logic<8>) {
+            function begin_loop(x: input logic<4>, calls: inout logic<8>) -> logic<4> {
+                calls += 8'd1;
+                return x;
+            }
+            function mark(x: input logic<4>, calls: inout logic<8>) -> logic<4> {
+                calls += 8'd1;
+                return x;
+            }
+            always_comb {
+                init_calls = 0;
+                body_calls = 0;
+                sum = 0;
+                for i in begin_loop(start, init_calls)..limit step += 3 {
+                    if i == stop { break; }
+                    sum += mark(i as 4, body_calls) as 8;
+                }
+                for unused in begin_loop(start, init_calls)..0 {
+                    body_calls += 8'd10;
+                }
+            }
+            always_ff (clk) {
+                var tmp: logic<8>;
+                tmp = 0;
+                for i in start..=limit step += 2 { tmp += i as 8; }
+                q = tmp;
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let clk = sim.event("clk");
+    let start = sim.signal("start");
+    let limit = sim.signal("limit");
+    let stop = sim.signal("stop");
+    for first in 0..16u8 {
+        for end in 0..16u8 {
+            for stop_at in 0..16u8 {
+                sim.modify(|io| {
+                    io.set(start, first);
+                    io.set(limit, end);
+                    io.set(stop, stop_at);
+                })
+                .unwrap();
+                let values = (first..end)
+                    .step_by(3)
+                    .take_while(|i| *i != stop_at)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    sim.get(sim.signal("sum")),
+                    values.iter().copied().sum::<u8>().into(),
+                    "start={first}, end={end}, stop={stop_at}"
+                );
+                assert_eq!(sim.get(sim.signal("init_calls")), 2u8.into());
+                assert_eq!(sim.get(sim.signal("body_calls")), values.len().into());
+                sim.tick(clk).unwrap();
+                assert_eq!(
+                    sim.get(sim.signal("q")),
+                    (first..=end).step_by(2).sum::<u8>().into()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn runtime_starts_reject_unproven_ranges_and_counter_overflow() {
+    for (start_type, end_type, step, reason) in [
+        ("signed logic<8>", "logic<4>", 1u32, "non-negative"),
+        ("logic<32>", "logic<4>", 1, "non-negative"),
+        ("logic<4>", "logic<32>", 1, "termination is not proven"),
+        ("logic<4>", "logic<4>", 2_147_483_647, "overflow"),
+    ] {
+        let source = format!(
+            "module Top(start: input {start_type}, limit: input {end_type}, q: output logic<8>) {{
+                always_comb {{ q = 0; for i in start..limit step += {step} {{ q += 1; }} }}
+             }}"
+        );
+        let error = analyze_and_lower(&source, "unproven_runtime_start", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains(reason)),
+            "{error}"
+        );
+    }
+    let source = "module Top(start: input logic<4>, q: output logic<8>) {
+        always_comb { q = 0; for i in $signed(start)..8 { q += 1; } }
+    }";
+    let error = analyze_and_lower(source, "signed_runtime_start", "Top").unwrap_err();
+    assert!(
+        matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains("non-negative")),
+        "{error}"
+    );
+}
+
+#[test]
+fn runtime_start_packed_select_remains_unsigned() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input signed logic<8>, q: output logic<8>) {
+            always_comb {
+                q = 0;
+                for i in d[3:0]..8 { q += i as 8; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    for start in 0..16u8 {
+        sim.modify(|io| io.set(d, 0xf0u8 | start)).unwrap();
+        assert_eq!(sim.get(sim.signal("q")), (start..8).sum::<u8>().into());
+    }
+}
