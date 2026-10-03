@@ -14,10 +14,7 @@ cases = [
 [[ignore]]
 reason = "Exceeds the 60-second per-case budget on the CI runner."
 cases = [
-  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
-  "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
-  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
   "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
   "signed_divrem::signed_divrem_i128",
   "wide_operators::test_wide_comb_div",
@@ -337,4 +334,13 @@ cases = [
   "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
   "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
   "signed_divrem::signed_divrem_i64",
+]
+
+[[timeout]]
+seconds = 600
+reason = "Dynamic FF array round trips and loop-boundary behavior are verified but require extended native simulator construction time."
+cases = [
+  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
+  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
+  "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
 ]
