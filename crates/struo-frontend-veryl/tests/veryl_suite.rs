@@ -2175,7 +2175,7 @@ fn runtime_values_do_not_prove_unconditional_loop_breaks() {
                     q = 0;
                     for i in 0..count {{
                         if {condition} {{ break; }}
-                        q += 1;
+                        q += i as 8;
                     }}
                 }}
             }}
