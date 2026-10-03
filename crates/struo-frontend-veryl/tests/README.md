@@ -59,16 +59,44 @@ The typed reverse-bound case also passes with the mapped simulator policy
 above (about 121 seconds). The wide FF checkpoint passes in about 91 seconds.
 Both use the existing 300-second CI budget group.
 
+## Remaining exclusions
+
+The 187 named ignores are distinct from the 13 cases excluded by expectation
+tags. A bounded recheck of all 186 non-resource ignores confirmed the current
+failure reasons; none passed or timed out. These cases are not counted as
+successful synthesis tests.
+
+| Count | Reason for retaining the ignore |
+| --- | --- |
+| 112 | Explicit four-state execution is outside the mapped two-state adapter. |
+| 6 | Tests observe internal or hierarchical signals that synthesis does not preserve. |
+| 36 | Veryl rejects function output/non-local writes in `always_ff`; this restriction is retained. |
+| 9 | Other Veryl analysis errors: negative constant loop bounds (2), runtime operands to compile-time system functions (4), scalar bit-select (1), tri function formal (1), and incomplete array assignment (1). |
+| 15 | Loop inputs admit nontermination; finite test vectors do not justify a hardware expansion. |
+| 4 | Invalid connection fixtures: procedural function effects in module input expressions (2) and implicit packed/unpacked conversion (2). |
+| 2 | Celox rejects shared asynchronous reset across distinct clock domains after successful ECP5 mapping. |
+| 1 | The upstream onehot implementation has an undriven output in its width-one base case. |
+| 1 | The oracle observes a previous `always_comb` evaluation instead of settled combinational hardware. |
+| 1 | The large sparse FF array exceeds the worker memory limit described below. |
+
+The tag policies exclude deferred FF function effects, eager assertion-message
+side effects, and promised zero initialization. Other tags remain visible in
+reports and are not blanket exclusions. In particular, tagged two-state
+division uses the adapter's existing two-state convention; this is not a claim
+that SV four-state division by zero produces zero.
+
 ## Remaining resource limitations
 
 Timeout exceptions enable verified slow cases in CI without weakening their
-assertions. The remaining performance ignores have not demonstrated a complete
-passing run within the diagnostic budgets:
+assertions. One performance ignore remains without a demonstrated complete passing run.
 
-The large sparse FF line-write array remains resource-limited. A prior
-600-second run completed lowering in about 201 seconds, then timed out during
-synthesis. It has not demonstrated a complete passing run under the worker
-memory limit.
+The large sparse FF line-write array (`logic<32> [1048576]`) remains
+resource-limited. With the current optimizations, a worker under the hard
+4096 MiB address-space limit fails a 1.5 GiB allocation before lowering
+completes. An older unrestricted diagnostic reached synthesis and timed out at
+600 seconds; it does not establish feasibility under the enforced limit.
+No passing run has been demonstrated, and the memory limit is not raised to
+accommodate this case.
 
 These limits do not establish a semantic mismatch or an unsynthesizable source.
 They remain separate from tagged expectation exclusions, frontend restrictions,
@@ -79,10 +107,18 @@ the bounded launcher; raising timeouts alone does not address memory growth.
 
 ```sh
 python3 scripts/check-veryl-suite.py
-python3 scripts/check-veryl-suite.py --filter context_width:: --jobs 4
-python3 scripts/check-veryl-suite.py --include-ignored --timeout 180 --report target/veryl-suite.json
+python3 scripts/check-veryl-suite.py --filter context_width:: --jobs 1
+python3 scripts/check-veryl-suite.py --include-ignored --filter std_onehot::test_onehot_8bit_exhaustive --timeout 180
 python3 scripts/check-veryl-suite.py --timing --filter wide_shift_mem::test_512bit_shift
-cargo test --locked -p struo-frontend-veryl --test veryl_suite
+```
+
+To run the ordinary Rust integration tests under the same memory limit:
+
+```sh
+cargo test --locked -p struo-frontend-veryl --test veryl_suite \
+  --no-run --message-format=json > /tmp/struo-veryl-tests.json
+veryl_test_binary=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "veryl_suite" and .executable != null) | .executable' /tmp/struo-veryl-tests.json)
+python3 scripts/limited-worker.py --memory-mib 4096 "$veryl_test_binary" --test-threads=1
 ```
 
 `--timing` records seconds spent in lowering, synthesis, mapping, simulation IR

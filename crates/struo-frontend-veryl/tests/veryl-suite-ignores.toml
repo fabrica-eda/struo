@@ -12,7 +12,7 @@ cases = [
 ]
 
 [[ignore]]
-reason = "A 600-second diagnostic completed lowering (about 201 seconds) but not synthesis; the large sparse FF array remains resource-limited."
+reason = "The 1,048,576-by-32-bit FF array exceeds the 4096 MiB worker address-space limit before lowering completes; a 1.5 GiB allocation fails."
 cases = [
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
 ]
