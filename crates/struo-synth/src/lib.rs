@@ -1,5 +1,7 @@
 //! Technology-independent synthesis for Struo.
 
+mod ranges;
+
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -145,6 +147,7 @@ struct Lowering<'a> {
     signal_bits: Vec<Vec<Option<NetId>>>,
     drivers: Vec<Vec<Option<Driver>>>,
     expression_bits: Vec<Option<Vec<NetId>>>,
+    adder_widths: Vec<Option<usize>>,
     resolving: HashSet<(SignalId, usize)>,
     resolve_observable_dependencies: bool,
 }
@@ -167,6 +170,7 @@ impl<'a> Lowering<'a> {
             signal_bits,
             drivers,
             expression_bits: vec![None; module.expressions().len()],
+            adder_widths: ranges::adder_widths(module),
             resolving: HashSet::new(),
             resolve_observable_dependencies: false,
         }
@@ -455,15 +459,24 @@ impl<'a> Lowering<'a> {
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                if op == BinaryOp::Add
-                    && let Some(bits) = self.lower_add_with_carry(lhs, rhs)?
+                let narrow = self.adder_widths[index];
+                let mut bits = if op == BinaryOp::Add
+                    && let Some(bits) = self.lower_add_with_carry(lhs, rhs, narrow)?
                 {
                     bits
                 } else {
-                    let lhs = self.lower_expression(lhs)?;
-                    let rhs = self.lower_expression(rhs)?;
+                    let mut lhs = self.lower_expression(lhs)?;
+                    let mut rhs = self.lower_expression(rhs)?;
+                    if let Some(width) = narrow {
+                        lhs.truncate(width);
+                        rhs.truncate(width);
+                    }
                     self.lower_binary(op, &lhs, &rhs)
+                };
+                if narrow.is_some() {
+                    bits.resize(width, self.netlist.add_constant(false));
                 }
+                bits
             }
             ExprKind::Mux {
                 condition,
@@ -506,6 +519,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         lhs: ExprId,
         rhs: ExprId,
+        width: Option<usize>,
     ) -> Result<Option<Vec<NetId>>, SynthesisError> {
         let Some((add_lhs, add_rhs, carry)) = self
             .add_operands(lhs)
@@ -520,9 +534,13 @@ impl<'a> Lowering<'a> {
         else {
             return Ok(None);
         };
-        let lhs = self.lower_expression(add_lhs)?;
-        let rhs = self.lower_expression(add_rhs)?;
+        let mut lhs = self.lower_expression(add_lhs)?;
+        let mut rhs = self.lower_expression(add_rhs)?;
         let carry = self.lower_expression(carry)?[0];
+        if let Some(width) = width {
+            lhs.truncate(width);
+            rhs.truncate(width);
+        }
         Ok(Some(
             self.netlist
                 .add_arithmetic_with_carry(&lhs, &rhs, carry)
@@ -1648,16 +1666,20 @@ mod tests {
     }
 
     fn add_with_carry_design(width: u32) -> Design {
+        padded_carry_design(width, width)
+    }
+
+    fn padded_carry_design(input_width: u32, width: u32) -> Design {
         let mut module = Module::new("AddWithCarry");
         let lhs = module.add_port(Port {
             name: "lhs".into(),
             direction: PortDirection::Input,
-            r#type: bits(width),
+            r#type: bits(input_width),
         });
         let rhs = module.add_port(Port {
             name: "rhs".into(),
             direction: PortDirection::Input,
-            r#type: bits(width),
+            r#type: bits(input_width),
         });
         let carry = module.add_port(Port {
             name: "carry".into(),
@@ -1669,8 +1691,16 @@ mod tests {
             direction: PortDirection::Output,
             r#type: bits(width),
         });
-        let lhs = module.read(lhs).unwrap();
-        let rhs = module.read(rhs).unwrap();
+        let mut lhs = module.read(lhs).unwrap();
+        let mut rhs = module.read(rhs).unwrap();
+        if input_width < width {
+            let zeros = module.constant(Constant::from_u64(
+                BitWidth::new(width - input_width).unwrap(),
+                0,
+            ));
+            lhs = module.concat(vec![zeros, lhs]).unwrap();
+            rhs = module.concat(vec![zeros, rhs]).unwrap();
+        }
         let carry = module.read(carry).unwrap();
         let zeros = module.constant(Constant::from_u64(BitWidth::new(width - 1).unwrap(), 0));
         let carry = module.concat(vec![zeros, carry]).unwrap();
@@ -1749,6 +1779,96 @@ mod tests {
         assert_eq!(memory.read_data().len(), 8);
         assert_eq!(memory.write_data().len(), 8);
         assert_eq!(synthesized.netlist.registers().len(), 0);
+    }
+
+    #[test]
+    fn narrows_guarded_accumulation_without_changing_declared_outputs() {
+        let mut module = Module::new("GuardedCount");
+        let flags = module.add_port(Port {
+            name: "flags".into(),
+            direction: PortDirection::Input,
+            r#type: bits(8),
+        });
+        let output = module.add_port(Port {
+            name: "count".into(),
+            direction: PortDirection::Output,
+            r#type: bits(32),
+        });
+        let mut value = module.constant(Constant::from_u64(BitWidth::new(32).unwrap(), 0));
+        let one = module.constant(Constant::from_u64(BitWidth::new(32).unwrap(), 1));
+        for bit in 0..8 {
+            let slice = module.slice(flags, bit, BitWidth::new(1).unwrap()).unwrap();
+            let condition = module.read_slice(slice).unwrap();
+            let next = module.binary(BinaryOp::Add, value, one).unwrap();
+            value = module.mux(condition, next, value).unwrap();
+        }
+        module.assign(module.whole(output).unwrap(), value).unwrap();
+        let mut design = Design::new("GuardedCount");
+        design.add_module(module);
+        let netlist = synthesize(&design).unwrap().netlist;
+        assert!(!netlist.arithmetic().is_empty());
+        assert!(
+            netlist
+                .arithmetic()
+                .iter()
+                .all(|cell| cell.outputs().len() <= 4)
+        );
+        for flags in 0..256u64 {
+            let outputs = evaluate_combinational(&netlist, &input_word("flags", 8, flags));
+            assert_eq!(
+                output_word(&outputs, "count", 32),
+                u64::from(flags.count_ones())
+            );
+        }
+    }
+
+    #[test]
+    fn narrows_fused_carry_additions_and_preserves_wrapping_values() {
+        let mut design = padded_carry_design(3, 32);
+        let netlist = synthesize(&design).unwrap().netlist;
+        assert_eq!(netlist.arithmetic().len(), 1);
+        assert_eq!(netlist.arithmetic()[0].outputs().len(), 4);
+        for lhs in 0..8 {
+            for rhs in 0..8 {
+                for carry in 0..2 {
+                    let inputs = input_word("lhs", 3, lhs)
+                        .into_iter()
+                        .chain(input_word("rhs", 3, rhs))
+                        .chain([(String::from("carry"), carry != 0)])
+                        .collect();
+                    let outputs = evaluate_combinational(&netlist, &inputs);
+                    assert_eq!(output_word(&outputs, "sum", 32), lhs + rhs + carry);
+                }
+            }
+        }
+        let mut module = Module::new("WideWrap");
+        let flag = module.add_port(Port {
+            name: "flag".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let output = module.add_port(Port {
+            name: "sum".into(),
+            direction: PortDirection::Output,
+            r#type: bits(64),
+        });
+        let flag = module.read(flag).unwrap();
+        let zero = module.constant(Constant::from_u64(BitWidth::new(63).unwrap(), 0));
+        let increment = module.concat(vec![zero, flag]).unwrap();
+        let maximum = module.constant(Constant::from_u64(BitWidth::new(64).unwrap(), u64::MAX));
+        let sum = module.binary(BinaryOp::Add, maximum, increment).unwrap();
+        module.assign(module.whole(output).unwrap(), sum).unwrap();
+        design = Design::new("WideWrap");
+        design.add_module(module);
+        let netlist = synthesize(&design).unwrap().netlist;
+        assert_eq!(netlist.arithmetic()[0].outputs().len(), 64);
+        for flag in [false, true] {
+            let outputs = evaluate_combinational(&netlist, &HashMap::from([("flag".into(), flag)]));
+            assert_eq!(
+                output_word(&outputs, "sum", 64),
+                if flag { 0 } else { u64::MAX }
+            );
+        }
     }
 
     #[test]
