@@ -24,6 +24,7 @@ mod multiply;
 mod replicate;
 use multiply::map_multiply;
 pub use replicate::{
+    LogicBranchReplication, LogicBranchReplicationError, LogicBranchReplicationReport,
     RegisterBranchReplication, RegisterBranchReplicationError, RegisterBranchReplicationReport,
 };
 

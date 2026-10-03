@@ -17,6 +17,42 @@ pub struct RegisterBranchReplication {
     pub sinks: Vec<String>,
 }
 
+/// One ordinary mapped LUT4 and the data consumers of an identical copy.
+/// This names connectivity only; it makes no claim about physical timing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LogicBranchReplication {
+    /// Exact mapped LUT4 name. Wide-mux and carry outputs are not eligible.
+    pub driver: String,
+    /// Exact mapped LUT4 or CCU2C data consumers to move to the copy.
+    pub sinks: Vec<String>,
+}
+
+/// Equivalent combinational copies actually applied to the mapped graph.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LogicBranchReplicationReport {
+    /// Added LUT4 cells with identical INIT and inputs.
+    pub replicas: usize,
+    /// Consumer data pins moved to those copies.
+    pub rewired_pins: usize,
+}
+
+/// An invalid logic request; the original mapped netlist remains unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicBranchReplicationError(String);
+
+impl fmt::Display for LogicBranchReplicationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl Error for LogicBranchReplicationError {}
+
+#[derive(Clone, Copy)]
+enum BranchDriverKind {
+    Register,
+    Logic,
+}
+
 /// Equivalent changes actually applied to the mapped graph.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RegisterBranchReplicationReport {
@@ -47,10 +83,47 @@ impl Ecp5Netlist {
     /// # Errors
     /// Rejects missing or ineligible cells, empty/overlapping branches, absent
     /// connections, wire exhaustion, duplicate names and failed equivalence.
-    #[allow(clippy::too_many_lines)]
     pub fn replicate_register_branches(
         &mut self,
         branches: &[RegisterBranchReplication],
+    ) -> Result<RegisterBranchReplicationReport, RegisterBranchReplicationError> {
+        self.replicate_named_branches(branches, BranchDriverKind::Register)
+    }
+
+    /// Clone ordinary LUT4 branches without adding register stages.
+    ///
+    /// Each copy retains its driver's exact truth table and input wires. Only
+    /// named LUT4/CCU2C data inputs move; clock, reset, enable, IO and dedicated
+    /// wide-mux connections cannot be selected. Requests are atomic and can be
+    /// repeated. Placement and routed STA must be recomputed after this change.
+    ///
+    /// # Errors
+    /// Rejects missing/ineligible drivers or sinks, empty/overlapping branches,
+    /// absent connections, wire exhaustion, duplicate names and failed proof.
+    pub fn replicate_logic_branches(
+        &mut self,
+        branches: &[LogicBranchReplication],
+    ) -> Result<LogicBranchReplicationReport, LogicBranchReplicationError> {
+        let requests = branches
+            .iter()
+            .map(|branch| RegisterBranchReplication {
+                driver: branch.driver.clone(),
+                sinks: branch.sinks.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.replicate_named_branches(&requests, BranchDriverKind::Logic)
+            .map(|report| LogicBranchReplicationReport {
+                replicas: report.replicas,
+                rewired_pins: report.rewired_pins,
+            })
+            .map_err(|error| LogicBranchReplicationError(error.0))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn replicate_named_branches(
+        &mut self,
+        branches: &[RegisterBranchReplication],
+        kind: BranchDriverKind,
     ) -> Result<RegisterBranchReplicationReport, RegisterBranchReplicationError> {
         if branches.is_empty() {
             return Ok(RegisterBranchReplicationReport::default());
@@ -75,18 +148,25 @@ impl Ecp5Netlist {
                 .find(|c| mapped_cell_name(c) == branch.driver)
                 .cloned()
                 .ok_or_else(|| {
-                    RegisterBranchReplicationError(format!("missing register {}", branch.driver))
+                    RegisterBranchReplicationError(format!("missing driver {}", branch.driver))
                 })?;
-            let Ecp5Cell::FlipFlop { output, .. } = &replica else {
-                return Err(RegisterBranchReplicationError(format!(
-                    "{} is not a flip-flop",
-                    branch.driver
-                )));
+            let original_wire = match (&replica, kind) {
+                (Ecp5Cell::FlipFlop { output, .. }, BranchDriverKind::Register)
+                | (Ecp5Cell::Lut4 { output, .. }, BranchDriverKind::Logic) => *output,
+                _ => {
+                    let expected = match kind {
+                        BranchDriverKind::Register => "flip-flop",
+                        BranchDriverKind::Logic => "LUT4",
+                    };
+                    return Err(RegisterBranchReplicationError(format!(
+                        "{} is not a {expected}",
+                        branch.driver
+                    )));
+                }
             };
-            let original_wire = *output;
             if branch.sinks.is_empty() {
                 return Err(RegisterBranchReplicationError(
-                    "empty register branch".into(),
+                    "empty replication branch".into(),
                 ));
             }
             let clone_wire = next_wire;
@@ -130,9 +210,12 @@ impl Ecp5Netlist {
                 }
                 serial += 1;
             };
-            if let Ecp5Cell::FlipFlop { name, output, .. } = &mut replica {
-                *name = clone_name;
-                *output = clone_wire;
+            match &mut replica {
+                Ecp5Cell::FlipFlop { name, output, .. } | Ecp5Cell::Lut4 { name, output, .. } => {
+                    *name = clone_name;
+                    *output = clone_wire;
+                }
+                _ => unreachable!("driver kind was validated before rewiring"),
             }
             candidate.cells.push(replica);
             report.replicas += 1;
@@ -153,7 +236,7 @@ impl Ecp5Netlist {
             verify_mapped_equivalence_proof(&candidate, candidate.retiming.applied);
         if !candidate.retiming.equivalence_signed_off {
             return Err(RegisterBranchReplicationError(
-                "register branch equivalence failed".into(),
+                "branch replication equivalence failed".into(),
             ));
         }
         *self = candidate;
@@ -214,6 +297,260 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(sinks.len(), 3);
         (mapped, driver, sinks)
+    }
+
+    fn logic_fixture() -> (Ecp5Netlist, String, Vec<String>) {
+        let (mut mapped, driver, sinks) = fixture();
+        let extras = ["in0", "in1"].map(|name| {
+            mapped
+                .ports
+                .iter()
+                .find(|port| port.name == name)
+                .unwrap()
+                .bits[0]
+        });
+        let cell = mapped
+            .cells
+            .iter_mut()
+            .find(|cell| mapped_cell_name(cell) == driver)
+            .unwrap();
+        let Ecp5Cell::FlipFlop {
+            data,
+            clock,
+            output,
+            ..
+        } = cell.clone()
+        else {
+            unreachable!()
+        };
+        // Primitive-level fixture: out[i] = ((data & clock) | (in0 ^ in1)) ^ in[i].
+        // Retain the original wire numbering and three distinct consumers.
+        *cell = Ecp5Cell::Lut4 {
+            name: "logic_driver".into(),
+            inputs: [data, clock, extras[0], extras[1]],
+            init: 0x8ff8,
+            output,
+        };
+        (mapped, "logic_driver".into(), sinks)
+    }
+
+    fn check_logic_oracle(mapped: &Ecp5Netlist) {
+        use crate::mapped::PortDirection;
+        use std::collections::BTreeMap;
+        for pattern in 0..32_u32 {
+            let mut wires = BTreeMap::<u32, bool>::new();
+            for port in &mapped.ports {
+                if port.direction != PortDirection::Input {
+                    continue;
+                }
+                let index = match port.name.as_str() {
+                    "data" => 0,
+                    "clock" => 1,
+                    name => name.strip_prefix("in").unwrap().parse::<u32>().unwrap() + 2,
+                };
+                let Bit::Wire(wire) = port.bits[0] else {
+                    panic!("fixture inputs are wires")
+                };
+                wires.insert(wire, pattern & (1 << index) != 0);
+            }
+            let value = |bit, wires: &BTreeMap<u32, bool>| match bit {
+                Bit::Zero => Some(false),
+                Bit::One => Some(true),
+                Bit::Wire(wire) => wires.get(&wire).copied(),
+            };
+            let mut pending = mapped.cells.iter().collect::<Vec<_>>();
+            while !pending.is_empty() {
+                let before = pending.len();
+                pending.retain(|cell| {
+                    let Ecp5Cell::Lut4 {
+                        inputs,
+                        init,
+                        output,
+                        ..
+                    } = cell
+                    else {
+                        panic!("logic fixture only contains LUTs")
+                    };
+                    let Some(bits) = inputs
+                        .iter()
+                        .map(|bit| value(*bit, &wires))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return true;
+                    };
+                    let address = bits
+                        .iter()
+                        .enumerate()
+                        .fold(0, |sum, (index, bit)| sum | (usize::from(*bit) << index));
+                    wires.insert(*output, (init >> address) & 1 != 0);
+                    false
+                });
+                assert!(pending.len() < before, "unresolved or cyclic fixture");
+            }
+            for port in &mapped.ports {
+                if port.direction == PortDirection::Output {
+                    let index = port
+                        .name
+                        .strip_prefix("out")
+                        .unwrap()
+                        .parse::<u32>()
+                        .unwrap()
+                        + 2;
+                    let shared = (pattern & 3 == 3) || (((pattern >> 2) ^ (pattern >> 3)) & 1 != 0);
+                    let expected = shared ^ (pattern & (1 << index) != 0);
+                    assert_eq!(
+                        value(port.bits[0], &wires),
+                        Some(expected),
+                        "{} pattern {pattern}",
+                        port.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logic_branches_preserve_every_input_combination_and_unselected_consumers() {
+        let (mut mapped, driver, sinks) = logic_fixture();
+        check_logic_oracle(&mapped);
+        let original = mapped.clone();
+        for sink in &sinks[..2] {
+            let report = mapped
+                .replicate_logic_branches(&[LogicBranchReplication {
+                    driver: driver.clone(),
+                    sinks: vec![sink.clone()],
+                }])
+                .unwrap();
+            assert_eq!(
+                report,
+                LogicBranchReplicationReport {
+                    replicas: 1,
+                    rewired_pins: 1
+                }
+            );
+            check_logic_oracle(&mapped);
+            assert!(mapped.retiming.equivalence_signed_off);
+            assert_eq!(mapped.retiming.selected_registers, 0);
+        }
+        mapped.validate_export_names().unwrap();
+        assert_eq!(mapped.cells.len(), original.cells.len() + 2);
+        let untouched = |net: &Ecp5Netlist| {
+            net.cells
+                .iter()
+                .find(|cell| mapped_cell_name(cell) == sinks[2])
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(untouched(&mapped), untouched(&original));
+    }
+
+    #[test]
+    fn logic_requests_are_atomic_and_reject_invalid_connections() {
+        let (mut mapped, driver, sinks) = logic_fixture();
+        let before = mapped.clone();
+        let valid = LogicBranchReplication {
+            driver: driver.clone(),
+            sinks: vec![sinks[0].clone()],
+        };
+        for bad in [
+            LogicBranchReplication {
+                driver: "missing".into(),
+                sinks: vec![sinks[1].clone()],
+            },
+            LogicBranchReplication {
+                driver: driver.clone(),
+                sinks: vec![],
+            },
+            LogicBranchReplication {
+                driver: driver.clone(),
+                sinks: vec!["missing".into()],
+            },
+            LogicBranchReplication {
+                driver: sinks[1].clone(),
+                sinks: vec![sinks[2].clone()],
+            },
+            valid.clone(),
+        ] {
+            assert!(
+                mapped
+                    .replicate_logic_branches(&[valid.clone(), bad])
+                    .is_err()
+            );
+            assert_eq!(mapped, before);
+        }
+        mapped
+            .replicate_logic_branches(std::slice::from_ref(&valid))
+            .unwrap();
+        let once = mapped.clone();
+        assert!(mapped.replicate_logic_branches(&[valid]).is_err());
+        assert_eq!(mapped, once);
+        let (mut mapped, register, sinks) = fixture();
+        let before = mapped.clone();
+        assert!(
+            mapped
+                .replicate_logic_branches(&[LogicBranchReplication {
+                    driver: register,
+                    sinks
+                }])
+                .is_err()
+        );
+        assert_eq!(mapped, before);
+    }
+
+    #[test]
+    fn logic_requests_cannot_rewire_register_controls_or_dedicated_muxes() {
+        let (mut mapped, driver, sinks) = logic_fixture();
+        let wire = mapped
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Ecp5Cell::Lut4 { name, output, .. } if name == &driver => Some(*output),
+                _ => None,
+            })
+            .unwrap();
+        let next_wire = maximum_mapped_wire(&mapped).unwrap() + 1;
+        let (register_fixture, _, _) = fixture();
+        let mut register = register_fixture
+            .cells
+            .into_iter()
+            .find(|cell| matches!(cell, Ecp5Cell::FlipFlop { .. }))
+            .unwrap();
+        if let Ecp5Cell::FlipFlop {
+            name,
+            clock,
+            data,
+            output,
+            ..
+        } = &mut register
+        {
+            *name = "control_sink".into();
+            *clock = Bit::Wire(wire);
+            *data = Bit::Wire(wire);
+            *output = next_wire;
+        }
+        mapped.cells.push(register);
+        mapped.cells.push(Ecp5Cell::PfuMux {
+            name: "wide_sink".into(),
+            lut_true: Bit::Wire(wire),
+            lut_false: Bit::Zero,
+            select: Bit::One,
+            output: next_wire + 1,
+        });
+        let before = mapped.clone();
+        for sink in ["control_sink", "wide_sink"] {
+            let requests = [
+                LogicBranchReplication {
+                    driver: driver.clone(),
+                    sinks: vec![sinks[0].clone()],
+                },
+                LogicBranchReplication {
+                    driver: driver.clone(),
+                    sinks: vec![sink.into()],
+                },
+            ];
+            assert!(mapped.replicate_logic_branches(&requests).is_err());
+            assert_eq!(mapped, before);
+        }
     }
 
     #[test]
