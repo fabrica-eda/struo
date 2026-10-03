@@ -3631,3 +3631,89 @@ fn constant_driven_reverse_bounds_do_not_assume_mutable_or_registered_values() {
     }";
     assert!(analyze_and_lower(source, "mutable_local_bound", "Top").is_err());
 }
+
+#[test]
+fn additive_reductions_preserve_modular_widths_and_signed_increments() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<32>, count: input logic<32>,
+                   sum: output logic<32>, narrow: output logic<8>,
+                   signed_sum: output signed logic<64>, mixed_sum: output logic<64>) {
+            always_comb {
+                sum = seed;
+                for i in 0..count { sum += 3; }
+                narrow = seed as 8;
+                for i in 0..count { narrow = 5 + narrow; }
+                signed_sum = 0;
+                for i in 0..count { signed_sum += 8'shff; }
+                mixed_sum = 0;
+                for i in 0..count { mixed_sum += 8'shff; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    for count in [
+        0u32,
+        1,
+        2,
+        255,
+        256,
+        512,
+        65_535,
+        0x7fff_ffff,
+        0x8000_0000,
+        u32::MAX,
+    ] {
+        for seed in [0u32, 1, 255, 0x8000_0000, u32::MAX] {
+            let count_signal = sim.signal("count");
+            let seed_signal = sim.signal("seed");
+            sim.modify(|io| {
+                io.set(count_signal, count);
+                io.set(seed_signal, seed);
+            })
+            .unwrap();
+            assert_eq!(
+                sim.get(sim.signal("sum")),
+                seed.wrapping_add(count.wrapping_mul(3)).into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("narrow")),
+                (seed.wrapping_add(count.wrapping_mul(5)) & 255).into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("signed_sum")),
+                0u64.wrapping_sub(u64::from(count)).into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("mixed_sum")),
+                (u64::from(count) * 255).into()
+            );
+        }
+    }
+}
+
+#[test]
+fn additive_reductions_reject_unproven_bounds_and_dependent_bodies() {
+    for (bound_type, range, body) in [
+        ("logic<64>", "0..count", "out += 1;"),
+        ("signed logic<32>", "0..count", "out += 1;"),
+        ("logic<32>", "0..=count", "out += 1;"),
+        ("logic<32>", "0..count step += 2", "out += 1;"),
+        ("logic<32>", "0..count", "out += i as 32;"),
+        ("logic<32>", "0..count", "out += seed;"),
+        ("logic<32>", "0..out", "out += 1;"),
+    ] {
+        let source = format!(
+            "module Top(count: input {bound_type}, seed: input logic<32>, out: output logic<32>) {{
+            always_comb {{ out = seed; for i in {range} {{ {body} }} }}
+        }}"
+        );
+        assert!(
+            analyze_and_lower(&source, "unproven_reduction", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
