@@ -53,9 +53,10 @@ pub(super) fn literal_repetitions(
 
 impl super::ModuleLowerer<'_> {
     pub(super) fn is_constant_variable(&self, id: super::VarId) -> bool {
-        self.source.variables.get(&id).is_some_and(|variable| {
-            matches!(variable.kind, super::VarKind::Const | super::VarKind::Param)
-        })
+        !self.runtime_loop_variables.contains(&id)
+            && self.source.variables.get(&id).is_some_and(|variable| {
+                matches!(variable.kind, super::VarKind::Const | super::VarKind::Param)
+            })
     }
 
     pub(super) fn lower_constant_variable_read(

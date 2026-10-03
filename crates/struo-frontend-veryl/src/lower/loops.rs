@@ -7,7 +7,7 @@ use veryl_analyzer::ir::{
 use super::{ImportError, concrete_width, context_width, evaluated_u64, substitute_statements};
 
 /// Resource budget for newly supported runtime-bound loops, not a runtime cap.
-const GUARDED_ITERATION_BUDGET: usize = 256;
+pub(super) const GUARDED_ITERATION_BUDGET: usize = 256;
 
 pub(super) struct LoopPlan {
     pub iterations: Vec<usize>,
@@ -206,7 +206,7 @@ fn past_end(value: usize, maximum: Option<usize>, inclusive: bool) -> bool {
     })
 }
 
-fn always_breaks(statements: &[Statement], source: &Module) -> bool {
+pub(super) fn always_breaks(statements: &[Statement], source: &Module) -> bool {
     statements.iter().any(|statement| match statement {
         Statement::Break => true,
         Statement::If(branch) => match known_condition(&branch.cond, source) {
