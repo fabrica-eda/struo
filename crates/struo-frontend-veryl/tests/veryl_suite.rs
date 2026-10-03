@@ -1317,7 +1317,6 @@ fn unsigned_parent_reaches_ternary_but_not_concatenation_operands() {
 }
 
 #[test]
-#[ignore = "Veryl 0.21.0 folds signed size-cast division with incorrect signedness"]
 fn upstream_constant_size_cast_regression() {
     let stage = Rc::new(RefCell::new(String::new()));
     celox_test_suite_veryl::case(
@@ -1328,7 +1327,6 @@ fn upstream_constant_size_cast_regression() {
 }
 
 #[test]
-#[ignore = "Veryl 0.21.0 folds the actual before applying the function formal width"]
 fn upstream_constant_function_actual_regression() {
     let stage = Rc::new(RefCell::new(String::new()));
     celox_test_suite_veryl::case("flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion")

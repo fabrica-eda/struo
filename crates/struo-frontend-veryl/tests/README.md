@@ -128,9 +128,10 @@ For backend details, also set `CELOX_PASS_TIMING=1 RUST_LOG=debug`.
 
 The ordinary Rust tests cover selected corpus regressions and focused boundary
 checks. The ignored worker/catalogue tests are entry points for the full runner;
-`cargo test` alone does not run the complete corpus. The two known upstream
-constant-folding regressions have explicit Rust `#[ignore]` reasons and can be
-rerun by name with `-- --ignored`. Other regular regressions remain enabled.
+`cargo test` alone does not run the complete corpus. The earlier constant
+size-cast and function-argument regressions pass with the pinned Veryl 0.22.0
+frontend and remain enabled in the ordinary integration tests. Only the
+worker/catalogue entry points are ignored by the default Rust test invocation.
 
 For diagnostic comparison with Celox's source frontend:
 
