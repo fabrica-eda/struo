@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn runtime_loop_budget_requires_a_proof_for_every_input() {
         for body in [
-            "q += 1;",
+            "q += i as 16;",
             "if stop { break; } q += 1;",
             "for j in 0..2 { break; } q += 1;",
             "if i == 512 { break; } q += 1;",
