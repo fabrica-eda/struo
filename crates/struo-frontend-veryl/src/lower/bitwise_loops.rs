@@ -1,9 +1,8 @@
 //! Prove finite bitwise-counter traces from a known procedural initializer.
-use veryl_analyzer::ir::{ForBound, ForRange, ForStatement};
+use veryl_analyzer::ir::{ForRange, ForStatement};
 
 use super::{
-    Env, ExprKind, HashSet, ImportError, ModuleLowerer, Op, concrete_width, loops,
-    substitute_statements,
+    Env, HashSet, ImportError, ModuleLowerer, Op, concrete_width, loops, substitute_statements,
 };
 
 impl ModuleLowerer<'_> {
@@ -61,52 +60,5 @@ impl ModuleLowerer<'_> {
             } & mask;
         }
         Ok(None)
-    }
-
-    fn known_loop_initializer(
-        &mut self,
-        start: &ForBound,
-        reads: &Env,
-        writes: &Env,
-        sequential: bool,
-        width: u32,
-    ) -> Result<Option<usize>, ImportError> {
-        match start {
-            ForBound::Const(value, signed) => {
-                let saturation = if *signed {
-                    usize::try_from(i64::MAX).unwrap_or(usize::MAX)
-                } else {
-                    usize::MAX
-                };
-                Ok((*value != saturation).then_some(*value))
-            }
-            ForBound::Expression(expression) => {
-                let snapshot = if sequential {
-                    self.sequential_reads(reads, writes)
-                } else {
-                    writes.clone()
-                };
-                // Read-only lowering rejects initializer writes; skipping its
-                // later evaluation is safe only for an effect-free constant.
-                let value = self.lower_expression(expression, &snapshot)?;
-                let ExprKind::Constant(constant) =
-                    self.rtl.expressions()[value.id.index() as usize].kind()
-                else {
-                    return Ok(None);
-                };
-                let mut bits = 0usize;
-                for bit in 0..width {
-                    let set = if bit < value.width {
-                        constant.bit(bit)
-                    } else {
-                        value.signed && constant.bit(value.width - 1)
-                    };
-                    if set {
-                        bits |= 1usize << bit;
-                    }
-                }
-                Ok(Some(bits))
-            }
-        }
     }
 }

@@ -304,7 +304,6 @@ cases = [
 [[ignore]]
 reason = "Runtime loop bounds fall outside the proven non-negative range and 256-iteration synthesis policy."
 cases = [
-  "veryl_context_regressions::runtime_for_with_negative_bound",
   "veryl_context_regressions::runtime_for_bound_keeps_its_type",
   "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
 ]

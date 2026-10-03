@@ -1,6 +1,8 @@
+mod additive_loops;
 mod arrays;
 mod bitwise_loops;
 mod comparisons;
+mod constant_values;
 mod loops;
 mod members;
 mod single_iteration;
@@ -1667,6 +1669,20 @@ impl<'a> ModuleLowerer<'a> {
         Ok(changed)
     }
 
+    fn plan_known_loop(
+        &mut self,
+        statement: &veryl_analyzer::ir::ForStatement,
+        reads: &Env,
+        writes: &Env,
+        sequential: bool,
+    ) -> Result<Option<loops::LoopPlan>, ImportError> {
+        if let Some(plan) = self.plan_constant_bitwise_loop(statement, reads, writes, sequential)? {
+            Ok(Some(plan))
+        } else {
+            self.plan_known_additive_loop(statement, reads, writes, sequential)
+        }
+    }
+
     fn lower_for(
         &mut self,
         statement: &veryl_analyzer::ir::ForStatement,
@@ -1679,12 +1695,9 @@ impl<'a> ModuleLowerer<'a> {
             Err(_) if loops::always_breaks(&statement.body, self.source) => {
                 return self.lower_single_iteration(statement, reads, writes, sequential);
             }
-            Err(error) => {
-                match self.plan_constant_bitwise_loop(statement, reads, writes, sequential)? {
-                    Some(plan) => plan,
-                    None => return Err(error),
-                }
-            }
+            Err(error) => self
+                .plan_known_loop(statement, reads, writes, sequential)?
+                .ok_or(error)?,
         };
         let mut changed = DrivenBits::default();
         let mut cursor =

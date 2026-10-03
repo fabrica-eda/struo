@@ -3336,3 +3336,76 @@ fn bitwise_loop_proof_observes_blocking_ff_local_initialization() {
         assert_eq!(sim.get(sim.signal("q")), expected.into());
     }
 }
+
+#[test]
+fn corpus_known_negative_additive_loop() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("veryl_context_regressions::runtime_for_with_negative_bound")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn known_additive_loops_preserve_typed_bounds_and_capture_initializers() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(a: input logic<8>, signed_hits: output logic<8>, unsigned_hits: output logic<8>,
+                   wrap_hits: output logic<8>, total: output logic<32>) {
+            always_comb {
+                var seed: i32;
+                seed = -2;
+                signed_hits = 0;
+                total = 0;
+                for i in (seed - 1)..=2 {
+                    signed_hits += 1;
+                    total += a;
+                    seed = 100;
+                }
+                seed = -2;
+                unsigned_hits = 0;
+                for i in seed..32'd2 { unsigned_hits += 1; }
+                seed = 2147483646;
+                wrap_hits = 0;
+                for i in seed..=32'd2147483647 { wrap_hits += 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let a = sim.signal("a");
+    for value in 0..256u16 {
+        sim.modify(|io| io.set(a, value)).unwrap();
+        assert_eq!(sim.get(sim.signal("signed_hits")), 6u8.into());
+        assert_eq!(sim.get(sim.signal("unsigned_hits")), 0u8.into());
+        assert_eq!(sim.get(sim.signal("wrap_hits")), 2u8.into());
+        assert_eq!(sim.get(sim.signal("total")), (6 * value).into());
+    }
+}
+
+#[test]
+fn known_additive_loops_reject_mutable_bounds_and_signed_wraparound() {
+    for (setup, range, body) in [
+        ("seed = 2147483646;", "seed..=2147483647", "q += 1;"),
+        (
+            "seed = -2; limit = 2;",
+            "seed..limit",
+            "limit += 1; q += 1;",
+        ),
+        ("seed = value;", "seed..2", "q += 1;"),
+    ] {
+        let source = format!(
+            "module Top(value: input i32, q: output logic<32>) {{
+                always_comb {{ var seed: i32; var limit: i32; limit = 0;
+                    {setup} q = 0; for i in {range} {{ {body} }}
+                }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "unproven_additive_loop", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{error}"
+        );
+    }
+}

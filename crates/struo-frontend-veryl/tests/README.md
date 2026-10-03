@@ -1,12 +1,12 @@
 # Veryl corpus tests
 
-The pinned `celox-test-suite-veryl` 0.8.1 corpus exercises:
+The pinned `celox-test-suite-veryl` 0.9.0 corpus exercises:
 
 ```text
-Veryl -> Struo RTL -> synthesis -> ECP5 mapping -> Celox 0.8.1 native simulation
+Veryl -> Struo RTL -> synthesis -> ECP5 mapping -> Celox 0.9.0 native simulation
 ```
 
-CI enumerates every corpus case in the `Veryl corpus (Celox 0.8.1)` job on
+CI enumerates every corpus case in the `Veryl corpus (Celox 0.9.0)` job on
 pull requests and pushes to main. `Required CI` depends on this job. Known
 unsupported/failing cases are skipped using exact names and reasons in
 [veryl-suite-ignores.toml](veryl-suite-ignores.toml). They are reported as
@@ -66,7 +66,7 @@ around by globally disabling AIR constant folding.
 The pinned corpus also requires an uninitialized constant-driven FF to start at
 zero before its first clock. This is the suite's explicit two-state contract;
 synthesis treats the unspecified source initialization as a don't-care.
-Celox 0.8.1 separates that check into
+Celox 0.9.0 separates that check into
 `operators::test_ff_constant_two_state_initialization`, which remains explicitly
 ignored. The original constant-folding case runs in CI again.
 
@@ -210,6 +210,17 @@ counter value or the expansion budget; every actual bound comparison remains in
 the circuit. Initializer writes and unknown initializers are rejected by this
 proof. FF-local blocking initialization is visible, while a scheduled module FF
 write cannot supply the current initializer.
+
+`src/lower/additive_loops.rs` proves short forward additive traces with known
+initializers and immutable constant bounds, including negative initial values
+and bounds computed by enclosing loop substitution. Comparisons use the actual
+operand widths and common signedness; updates wrap at the counter width. The
+proof rejects cycles and traces exceeding 256 iterations. It does not treat a
+mutable bound's initial constant value as an invariant. The shared read-only
+RTL evaluator in `constant_values.rs` recognizes scalar arithmetic and bit
+operations without trusting cached AIR numeric values or rewriting the circuit.
+Regression tests include nested negative bounds, initializer capture, mixed
+signed/unsigned comparisons, finite wraparound, and rejection of signed cycles.
 
 The remaining reverse/bitwise corpus ignores have concrete non-terminating input
 values. They are not excluded merely because their loops are dynamic:
