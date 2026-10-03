@@ -10,6 +10,7 @@ mod members;
 mod reductions;
 mod single_iteration;
 mod small_state_loops;
+mod sparse_index_loops;
 mod system_tasks;
 mod types;
 

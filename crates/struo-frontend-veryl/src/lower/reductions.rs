@@ -16,8 +16,10 @@ impl ModuleLowerer<'_> {
             Ok(Some(changed))
         } else if let Some(changed) = self.lower_idempotent_loop(statement, writes)? {
             Ok(Some(changed))
+        } else if let Some(changed) = self.lower_small_state_loop(statement, writes)? {
+            Ok(Some(changed))
         } else {
-            self.lower_small_state_loop(statement, writes)
+            self.lower_sparse_index_loop(statement, writes)
         }
     }
 

@@ -368,3 +368,21 @@ written variables are excluded. All enumerated results must be proven constant
 by the typed RTL evaluator; unsupported operations fail closed. These are bounds
 on analysis and circuit size, not on the number of runtime iterations. Existing
 expansion, additive-reduction, and idempotence proofs retain priority.
+
+`src/lower/sparse_index_loops.rs` provides a separate fallback for scalar packed
+bit writes addressed by a unit affine counter expression. For each destination
+bit it solves `+/-counter + offset == bit` modulo the actual index width, then
+emits only the feasible write iterations in counter order. This includes writes
+near counter wrap; it does not assume that only an initial prefix can matter.
+Multiple assignments retain their source order, and each event is guarded by
+the original exclusive bound. Pure assignments that cannot write an in-range
+bit at that event are omitted (IEEE 1800-2023 11.5.1).
+
+The loop must start at zero, advance by one, and have an invariant unsigned
+exclusive bound no wider than its counter. Only scalar bit-select destinations
+and exact-width additions/subtractions of literal offsets qualify. Narrow
+casts, widened arithmetic, part-selects, arrays, effects, control flow, and
+writes to the bound or counter remain outside this proof. Analysis is limited
+to 32 assignments, 512 bits per destination, and 512 distinct write events;
+the runtime trip count is not capped. RHS reads use the normal typed lowering
+and may depend on state written by earlier assignments and events.

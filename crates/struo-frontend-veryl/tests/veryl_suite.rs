@@ -3843,7 +3843,7 @@ fn idempotent_loops_preserve_partial_writes_order_and_empty_ranges() {
 #[test]
 fn idempotent_loops_reject_unproven_state_and_counter_dependencies() {
     for body in [
-        "x[i] = 0;",
+        "x[i as 8] = 0;",
         "x[0] = i as 1;",
         "x[0] = x[index];",
         "y = x[index]; x[0] = 0;",
@@ -3938,6 +3938,116 @@ fn small_state_loops_reject_external_dependencies_and_large_tables() {
         }}");
         assert!(
             analyze_and_lower(&source, "unproven_state_transition", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn sparse_index_loops_preserve_order_and_late_wrapped_writes() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<4>, count: input logic<32>,
+                   chain: output logic<4>, reverse: output logic<4>, wrapped: output logic<4>,
+                   middle: output logic<4>) {
+            always_comb {
+                chain = seed;
+                for i in 0..count { chain[i + 1] = chain[i]; chain[i] = ~chain[i]; }
+                reverse = 0;
+                for i in 0..count { reverse[3 - i] = seed[i]; }
+                wrapped = seed;
+                for i in 0..count { wrapped[i + 3] = 1; }
+                middle = seed;
+                for i in 0..count { middle[i + 32'h8000_0000] = 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    for count in [
+        0u32,
+        1,
+        2,
+        3,
+        4,
+        5,
+        256,
+        0x7fff_ffff,
+        0x8000_0000,
+        0x8000_0001,
+        0x8000_0004,
+        u32::MAX - 2,
+        u32::MAX - 1,
+        u32::MAX,
+    ] {
+        for seed in 0..16u8 {
+            sim.modify(|io| {
+                io.set(seed_signal, seed);
+                io.set(count_signal, count);
+            })
+            .unwrap();
+            let mut chain = seed;
+            let mut reverse = 0u8;
+            for i in 0..count.min(4) {
+                if i < 3 {
+                    chain = (chain & !(1 << (i + 1))) | (((chain >> i) & 1) << (i + 1));
+                }
+                chain ^= 1 << i;
+                reverse |= ((seed >> i) & 1) << (3 - i);
+            }
+            let wrapped = seed
+                | if count > 0 { 8 } else { 0 }
+                | u8::from(count >= u32::MAX - 1)
+                | if count == u32::MAX { 2 } else { 0 };
+            assert_eq!(
+                sim.get(sim.signal("chain")),
+                chain.into(),
+                "chain: seed={seed}, count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("reverse")),
+                reverse.into(),
+                "reverse: seed={seed}, count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("wrapped")),
+                wrapped.into(),
+                "wrapped: seed={seed}, count={count}"
+            );
+            let middle = seed | ((1 << count.saturating_sub(0x8000_0000).min(4)) - 1);
+            assert_eq!(
+                sim.get(sim.signal("middle")),
+                middle.into(),
+                "middle: seed={seed}, count={count}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sparse_index_loops_reject_unproven_indices_and_skipped_effects() {
+    for body in [
+        "x[i as 8] = 0;",
+        "x[(i as 64) + 1] = 0;",
+        "x[i + gate] = 0;",
+        "x[i * 2] = 0;",
+        "x[i] = effect(calls);",
+        "x[i] = 0; calls += 1;",
+        "x[i] = 0; limit -= 1;",
+        "x[i] = 0; if gate { break; }",
+    ] {
+        let source = format!("module Top(count: input logic<32>, gate: input logic<32>, x: output logic<4>, calls: output logic<32>) {{
+            function effect(n: inout logic<32>) -> logic {{ n += 1; return 1; }}
+            always_comb {{ var limit: logic<32>; limit = count; x = 0; calls = 0;
+                for i in 0..limit {{ {body} }}
+            }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_sparse_loop", "Top").is_err(),
             "{source}"
         );
     }
