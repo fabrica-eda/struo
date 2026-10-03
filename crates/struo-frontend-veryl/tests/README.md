@@ -233,7 +233,17 @@ initial truncation remain rejected. Regression tests cover all 256 narrow
 bound/break combinations, non-unit steps, initializer effects even for empty
 ranges, blocking FF-local writes, and the 512/513-candidate boundary.
 
-The remaining reverse/bitwise corpus ignores have concrete non-terminating input
+`constant_driven_loops.rs` can also prove a signed reverse lower bound from an
+already-lowered whole-signal constant combinational driver, including negative
+bounds. It retains typed counter values and rejects final-update overflow.
+The existing process-ownership validation rejects any later overlapping writer,
+including a loop body that attempts to modify this bound. Register outputs,
+partial drivers, variable drivers, and mutable local constants cannot provide
+this proof. This is a fallback using emitted RTL; a producer not yet lowered is
+not available to it. Tests exercise signed negative iterations, empty and
+non-empty prefixes, non-unit steps, FF reads, and conflicting drivers.
+
+The remaining nonterminating-loop corpus ignores have concrete non-terminating input
 values. They are not excluded merely because their loops are dynamic:
 
 | Fixture family | Counterexample to termination |
@@ -242,6 +252,7 @@ values. They are not excluded merely because their loops are dynamic:
 | Bitwise step operands with bits above the i32 counter | Start 0 and endpoints 8 make OR stall at 6 and XOR cycle between 0 and 6, missing breaks at 7/5. |
 | FF signed XOR with external initial value | Start 0 and a large positive endpoint cycle between 0 and i32 minimum, never reaching the break at 2147483640. |
 | Signed inclusive dynamic endpoints | An endpoint equal to i32 maximum keeps the condition true even after the counter wraps. |
+| Combined runtime-bounds fixtures (comb and FF) | `step_start = 0` and `count = 4` make their multiply-by-two loop stay at zero forever. |
 | Multiplicative stalled step | Start 0, count 4, and `sel = 0` repeat 0 without breaking. |
 | Unsigned reverse singleton fixtures | Start/count 0 let the counter wrap under an unsigned comparison with zero. |
 | Signed wide reverse fixtures without guaranteed breaks | An i64-minimum lower bound is below every i32 counter value, including values after wrap. |

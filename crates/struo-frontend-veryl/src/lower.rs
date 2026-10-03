@@ -2,6 +2,7 @@ mod additive_loops;
 mod arrays;
 mod bitwise_loops;
 mod comparisons;
+mod constant_driven_loops;
 mod constant_values;
 mod loops;
 mod members;
@@ -1678,8 +1679,12 @@ impl<'a> ModuleLowerer<'a> {
     ) -> Result<Option<loops::LoopPlan>, ImportError> {
         if let Some(plan) = self.plan_constant_bitwise_loop(statement, reads, writes, sequential)? {
             Ok(Some(plan))
+        } else if let Some(plan) =
+            self.plan_known_additive_loop(statement, reads, writes, sequential)?
+        {
+            Ok(Some(plan))
         } else {
-            self.plan_known_additive_loop(statement, reads, writes, sequential)
+            self.plan_constant_driven_reverse_loop(statement, reads, writes, sequential)
         }
     }
 

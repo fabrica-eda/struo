@@ -17,6 +17,13 @@ pub(super) struct LoopPlan {
     pub runtime_start: Option<(ForBound, usize)>,
 }
 
+pub(super) fn plan_reverse_with_lower(
+    statement: &ForStatement,
+    lower: i128,
+) -> Result<LoopPlan, ImportError> {
+    reverse::plan_with_lower(statement, lower)
+}
+
 pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan, ImportError> {
     let mut context = veryl_analyzer::Context::default();
     if let Some(mut iterations) = statement.range.eval_iter(&mut context) {

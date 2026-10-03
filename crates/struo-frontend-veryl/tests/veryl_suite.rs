@@ -3546,3 +3546,88 @@ fn arithmetic_loop_ranges_enforce_the_expansion_budget() {
         }
     }
 }
+
+#[test]
+fn constant_driven_reverse_bounds_preserve_negative_counters_and_ff_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for (floor, kind) in [(-2i32, "i32"), (2, "i32"), (-2, "signed logic<64>")] {
+        let source = r"
+        module Top(clk: input clock, b: input logic<4>, hits: output logic<8>,
+                   sum: output logic<32>, stepped: output logic<32>, q: output logic<32>) {
+            var floor: i32;
+            always_comb { floor = -2; }
+            always_comb {
+                hits = 0;
+                sum = 0;
+                for i in rev floor..b { hits += 1; sum += i as 32; }
+                stepped = 0;
+                for i in rev floor..b step += 3 { stepped += i as 32; }
+            }
+            always_ff (clk) {
+                var total: logic<32>;
+                total = 0;
+                for i in rev floor..=b { total += i as 32; }
+                q = total;
+            }
+        }
+        "
+        .replace("floor = -2;", &format!("floor = {floor};"))
+        .replace("var floor: i32;", &format!("var floor: {kind};"));
+        let design = Design::new(&source, "Top");
+        let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+        let b = sim.signal("b");
+        let clk = sim.event("clk");
+        for bound in 0..16i32 {
+            sim.modify(|io| io.set(b, bound.cast_unsigned())).unwrap();
+            sim.tick(clk).unwrap();
+            let sum: i32 = (floor..bound).sum();
+            let stepped: i32 = (floor..bound).rev().step_by(3).sum();
+            assert_eq!(
+                sim.get(sim.signal("hits")),
+                (bound - floor).max(0).cast_unsigned().into()
+            );
+            assert_eq!(sim.get(sim.signal("sum")), sum.cast_unsigned().into());
+            assert_eq!(
+                sim.get(sim.signal("q")),
+                (floor..=bound).sum::<i32>().cast_unsigned().into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("stepped")),
+                stepped.cast_unsigned().into()
+            );
+        }
+    }
+}
+
+#[test]
+fn constant_driven_reverse_bounds_do_not_assume_mutable_or_registered_values() {
+    for (provider, body, suffix) in [
+        ("always_comb { floor = input_floor; }", "q += 1;", ""),
+        ("always_ff (clk) { floor = -2; }", "q += 1;", ""),
+        ("always_comb { floor = -2147483648; }", "q += 1;", ""),
+        ("always_comb { floor = -2; }", "floor -= 1; q += 1;", ""),
+        (
+            "always_comb { floor = -2; }",
+            "q += 1;",
+            "always_comb { floor = 0; }",
+        ),
+    ] {
+        let source = format!(
+            "module Top(clk: input clock, b: input logic<4>, input_floor: input i32, q: output logic<8>) {{
+                var floor: i32; {provider}
+                always_comb {{ q = 0; for i in rev floor..b {{ {body} }} }}
+                {suffix}
+            }}"
+        );
+        assert!(
+            analyze_and_lower(&source, "unproven_constant_driver", "Top").is_err(),
+            "{source}"
+        );
+    }
+    let source = "module Top(b: input logic<4>, q: output logic<8>) {
+        always_comb { var floor: i32; floor = -2; q = 0;
+            for i in rev floor..b { floor -= 1; q += 1; }
+        }
+    }";
+    assert!(analyze_and_lower(source, "mutable_local_bound", "Top").is_err());
+}

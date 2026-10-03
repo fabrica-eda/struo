@@ -241,8 +241,6 @@ cases = [
 [[ignore]]
 reason = "Struo cannot prove termination within its 512-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
 cases = [
-  "flip_flop::test_ff_runtime_for_bounds",
-  "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
   "synth_dynamic_loop::test_runtime_bounds_preserve_loop_carried_state_for_indexed_reads",
   "synth_dynamic_loop::test_runtime_bounds_preserve_pre_loop_bits_for_partial_updates",
   "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
@@ -259,6 +257,8 @@ reason = "These runtime loops admit non-terminating input values (bitwise/stalle
 cases = [
   "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
   "synth_dynamic_loop::test_runtime_bounds_signed_inclusive_range_preserves_negative_bounds",
+  "flip_flop::test_ff_runtime_for_bounds",
+  "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
   "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
   "flip_flop::test_ff_runtime_for_bitwise_steps",
   "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
@@ -302,14 +302,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "The reverse lower bound is a variable assigned in a separate combinational block; its constant value is not available to the current loop proof."
-cases = [
-  "veryl_context_regressions::runtime_for_bound_keeps_its_type",
-]
-
-
-
-[[ignore]]
 reason = "Veryl 0.22.0 rejects scalar x[0] (InvalidSelect::Scalar); the suite expects acceptance of a scalar bit-select."
 cases = [
   "flip_flop::test_ff_function_call_bit_select_on_nonvariable_one_bit_formal",
@@ -331,4 +323,5 @@ cases = [
 reason = "Bounded arithmetic forward/reverse loops lower successfully but exceed the 60-second case budget during mapping and native simulator construction."
 cases = [
   "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
+  "veryl_context_regressions::runtime_for_bound_keeps_its_type",
 ]
