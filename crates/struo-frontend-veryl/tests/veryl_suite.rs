@@ -3843,8 +3843,6 @@ fn idempotent_loops_preserve_partial_writes_order_and_empty_ranges() {
 #[test]
 fn idempotent_loops_reject_unproven_state_and_counter_dependencies() {
     for body in [
-        "x[0] = ~x[0];",
-        "x[0] = x == 2'b10;",
         "x[i] = 0;",
         "x[0] = i as 1;",
         "x[0] = x[index];",
@@ -3862,6 +3860,84 @@ fn idempotent_loops_reject_unproven_state_and_counter_dependencies() {
         }}");
         assert!(
             analyze_and_lower(&source, "unproven_idempotence", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn small_state_loops_preserve_cycles_transients_and_full_counts() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<3>, count: input logic<32>,
+                   partial: output logic<2>, rot: output logic<3>, mix: output logic<3>,
+                   down: output logic<3>) {
+            always_comb {
+                partial = seed as 2;
+                for i in 0..count { partial[0] = partial == 2'b10; }
+                rot = seed;
+                for i in 0..count { rot = {rot[1:0], ~rot[2]}; }
+                mix = seed;
+                for i in 0..count { mix = (mix * 3) as 3; mix += 1; }
+                down = seed;
+                for i in 0..count { down = if down == 0 ? 3 : down - 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    for count in [0u32, 1, 2, 3, 4, 5, 6, 255, 256, 0x8000_0000, u32::MAX] {
+        for seed in 0..8u8 {
+            sim.modify(|io| {
+                io.set(seed_signal, seed);
+                io.set(count_signal, count);
+            })
+            .unwrap();
+            let partial = if count == 0 {
+                seed & 3
+            } else if seed & 2 == 0 {
+                0
+            } else {
+                (seed & 3) ^ u8::from(count & 1 != 0)
+            };
+            let mut rot = seed;
+            for _ in 0..count % 6 {
+                rot = ((rot << 1) | ((!rot >> 2) & 1)) & 7;
+            }
+            let mut mix = seed;
+            for _ in 0..count % 4 {
+                mix = (mix * 3 + 1) & 7;
+            }
+            assert_eq!(sim.get(sim.signal("partial")), partial.into());
+            assert_eq!(sim.get(sim.signal("rot")), rot.into());
+            assert_eq!(sim.get(sim.signal("mix")), mix.into());
+            let down = if count <= u32::from(seed) {
+                u32::from(seed) - count
+            } else {
+                (4 - (count - u32::from(seed)) % 4) % 4
+            };
+            assert_eq!(sim.get(sim.signal("down")), down.into());
+        }
+    }
+}
+
+#[test]
+fn small_state_loops_reject_external_dependencies_and_large_tables() {
+    for (width, body) in [
+        (5, "x[0] = ~x[0];"),
+        (3, "x = x ^ seed;"),
+        (3, "x = x ^ count as 3;"),
+        (3, "x = x ^ i as 3;"),
+    ] {
+        let source = format!("module Top(count: input logic<32>, seed: input logic<{width}>, x: output logic<{width}>) {{
+            always_comb {{ x = seed; for i in 0..count {{ {body} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_state_transition", "Top").is_err(),
             "{source}"
         );
     }

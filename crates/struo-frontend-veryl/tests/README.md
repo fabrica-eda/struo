@@ -350,3 +350,21 @@ on their selector expressions. Calls, array destinations, control statements,
 induction-variable reads, and writes to the bound cannot supply this proof.
 It is conservative: an unproven body is not assumed to be non-idempotent.
 FF behavior and existing successful expansion plans are unchanged.
+
+
+For autonomous scalar states of at most four bits, `src/lower/small_state_loops.rs`
+also handles non-idempotent transitions. It enumerates every initial state by
+lowering the original blocking assignments in order, then composes powers of
+that transition using every bit of the runtime trip count. Zero iterations
+preserve the initial value; cycles and transient states do not require unrolling
+the runtime count. This follows the test-before-body ordering in IEEE 1800-2023
+12.7.1. Only finite zero-based unit-step loops with an unsigned exclusive bound
+no wider than the counter qualify.
+
+The analysis accepts up to 32 assignments to one scalar, a count of at most 64
+bits, static destination selects, and expressions using only that state and
+constants. Calls, external dependencies, induction-variable reads, and multiple
+written variables are excluded. All enumerated results must be proven constant
+by the typed RTL evaluator; unsupported operations fail closed. These are bounds
+on analysis and circuit size, not on the number of runtime iterations. Existing
+expansion, additive-reduction, and idempotence proofs retain priority.

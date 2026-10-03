@@ -14,8 +14,10 @@ impl ModuleLowerer<'_> {
     ) -> Result<Option<DrivenBits>, ImportError> {
         if let Some(changed) = self.lower_additive_reduction(statement, writes)? {
             Ok(Some(changed))
+        } else if let Some(changed) = self.lower_idempotent_loop(statement, writes)? {
+            Ok(Some(changed))
         } else {
-            self.lower_idempotent_loop(statement, writes)
+            self.lower_small_state_loop(statement, writes)
         }
     }
 

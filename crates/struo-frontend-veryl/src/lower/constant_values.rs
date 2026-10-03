@@ -30,6 +30,8 @@ impl ModuleLowerer<'_> {
                             match op {
                                 BinaryOp::Add => lhs.wrapping_add(rhs),
                                 BinaryOp::Sub => lhs.wrapping_sub(rhs),
+                                BinaryOp::Mul => lhs.wrapping_mul(rhs),
+                                BinaryOp::Equal => u64::from(lhs == rhs),
                                 BinaryOp::And => lhs & rhs,
                                 BinaryOp::Or => lhs | rhs,
                                 BinaryOp::Xor => lhs ^ rhs,
@@ -40,6 +42,17 @@ impl ModuleLowerer<'_> {
                             op: UnaryOp::BitNot,
                             input,
                         } => !get(*input)?,
+                        ExprKind::Mux {
+                            condition,
+                            then_expr,
+                            else_expr,
+                        } => {
+                            if get(*condition)? == 0 {
+                                get(*else_expr)?
+                            } else {
+                                get(*then_expr)?
+                            }
+                        }
                         ExprKind::Slice { input, lsb } => get(*input)?.checked_shr(*lsb)?,
                         ExprKind::Concat(parts) => {
                             let mut bits = 0u64;

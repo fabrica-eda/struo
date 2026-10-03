@@ -279,3 +279,35 @@ fn known_condition(expression: &Expression, source: &Module) -> Option<u64> {
         value
     })
 }
+
+pub(super) fn unsigned_unit_range<'a>(
+    statement: &'a ForStatement,
+    source: &Module,
+) -> Option<&'a Expression> {
+    let ForRange::Forward {
+        start: ForBound::Const(0, _),
+        end: ForBound::Expression(bound),
+        inclusive: false,
+        step: 1,
+    } = &statement.range
+    else {
+        return None;
+    };
+    let Expression::Term(factor) = bound.as_ref() else {
+        return None;
+    };
+    let Factor::Variable(id, index, select, _) = factor.as_ref() else {
+        return None;
+    };
+    let ty = &source.variables.get(id)?.r#type;
+    if !index.0.is_empty()
+        || !select.is_empty()
+        || ty.signed
+        || !ty.array.is_empty()
+        || concrete_width(ty, "unsigned loop bound").ok()?
+            > concrete_width(&statement.var_type, "unit-step loop counter").ok()?
+    {
+        return None;
+    }
+    Some(bound)
+}

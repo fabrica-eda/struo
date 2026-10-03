@@ -1,7 +1,7 @@
 //! Prove that a straight-line loop body forgets every bit it overwrites.
 use std::collections::HashMap;
 
-use veryl_analyzer::ir::{AssignStatement, ForBound, ForRange, ForStatement, Module};
+use veryl_analyzer::ir::{AssignStatement, ForStatement, Module};
 
 use super::{
     DrivenBits, Env, Expression, Factor, ImportError, ModuleLowerer, Op, Statement, VarId,
@@ -16,7 +16,7 @@ impl ModuleLowerer<'_> {
         statement: &ForStatement,
         writes: &mut Env,
     ) -> Result<Option<DrivenBits>, ImportError> {
-        let Some(bound) = idempotent_bound(statement, self.source) else {
+        let Some(bound) = super::loops::unsigned_unit_range(statement, self.source) else {
             return Ok(None);
         };
         let Expression::Term(factor) = bound else {
@@ -42,35 +42,6 @@ impl ModuleLowerer<'_> {
         *writes = self.merge_values(empty, &before, writes)?;
         Ok(Some(changed))
     }
-}
-
-fn idempotent_bound<'a>(statement: &'a ForStatement, source: &Module) -> Option<&'a Expression> {
-    let ForRange::Forward {
-        start: ForBound::Const(0, _),
-        end: ForBound::Expression(bound),
-        inclusive: false,
-        step: 1,
-    } = &statement.range
-    else {
-        return None;
-    };
-    let Expression::Term(factor) = bound.as_ref() else {
-        return None;
-    };
-    let Factor::Variable(id, index, select, _) = factor.as_ref() else {
-        return None;
-    };
-    let ty = &source.variables.get(id)?.r#type;
-    if !index.0.is_empty()
-        || !select.is_empty()
-        || ty.signed
-        || !ty.array.is_empty()
-        || concrete_width(ty, "idempotent bound").ok()?
-            > concrete_width(&statement.var_type, "idempotent counter").ok()?
-    {
-        return None;
-    }
-    Some(bound)
 }
 
 fn destination(assign: &AssignStatement, source: &Module) -> Option<(VarId, usize, usize, usize)> {
@@ -175,7 +146,7 @@ fn expression_dependency(expr: &Expression, deps: &Dependencies, counter: VarId)
     }
 }
 
-fn literal_select(select: &VarSelect) -> bool {
+pub(super) fn literal_select(select: &VarSelect) -> bool {
     select
         .0
         .iter()
