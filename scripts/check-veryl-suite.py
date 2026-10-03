@@ -30,12 +30,29 @@ def load_ignores(catalogue):
     return ignored
 
 
+def load_tag_exclusions(catalogue):
+    policies = {}
+    known = {tag for case in catalogue.values() for tag in case['tags']}
+    for policy in tomllib.loads(IGNORE_FILE.read_text()).get('exclude_tag', []):
+        tag, reason = policy['tag'], policy['reason'].strip()
+        if tag not in known:
+            raise ValueError(f'unknown or unused corpus tag: {tag}')
+        if tag in policies or not reason:
+            raise ValueError(f'duplicate tag or empty exclusion reason: {tag}')
+        policies[tag] = reason
+    return {
+        name: '; '.join(policies[tag] for tag in case['tags'] if tag in policies)
+        for name, case in catalogue.items()
+        if any(tag in policies for tag in case['tags'])
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--timing', action='store_true', help='record stage timings for each executed case')
     parser.add_argument('--reference', action='store_true', help='compare with direct Celox source simulation')
     parser.add_argument('--filter', default='')
-    parser.add_argument('--include-ignored', action='store_true', help='execute known unsupported/failing cases too')
+    parser.add_argument('--include-ignored', action='store_true', help='execute ignored cases and tag-excluded expectations too')
     parser.add_argument('--jobs', type=int, default=4)
     parser.add_argument('--timeout', type=int, default=60)
     parser.add_argument('--report', type=Path, default=Path('target/veryl-suite.json'))
@@ -57,16 +74,25 @@ def main():
         shutil.copy2(binary, snapshot)
         binary = str(snapshot)
         listing = subprocess.check_output([binary, '--ignored', '--exact', 'corpus_list', '--nocapture'], text=True)
-        catalogue = [line.removeprefix('STRUO_CASE ') for line in listing.splitlines()
-                     if line.startswith('STRUO_CASE ')]
+        catalogue = {item['name']: item for line in listing.splitlines()
+                     if line.startswith('STRUO_CASE ')
+                     for item in [json.loads(line.removeprefix('STRUO_CASE '))]}
         ignored = load_ignores(set(catalogue))
+        excluded = load_tag_exclusions(catalogue)
+        overlap = ignored.keys() & excluded.keys()
+        if overlap:
+            raise ValueError(f'tag-excluded cases must not also be ignored: {sorted(overlap)}')
         names = [name for name in catalogue if args.filter in name]
         if not names:
             parser.error('no matching cases')
 
         def run(name):
+            if name in excluded and not args.include_ignored and not args.reference:
+                result = {**catalogue[name], 'status': 'excluded', 'reason': excluded[name]}
+                print(f"{'excluded':24} {name}: {excluded[name]}", flush=True)
+                return result
             if name in ignored and not args.include_ignored and not args.reference:
-                result = {'name': name, 'status': 'ignored', 'reason': ignored[name]}
+                result = {**catalogue[name], 'status': 'ignored', 'reason': ignored[name]}
                 print(f"{'ignored':24} {name}: {ignored[name]}", flush=True)
                 return result
             env = dict(os.environ, STRUO_VERYL_CASE=name)
@@ -100,6 +126,7 @@ def main():
                         _, stage, seconds = line.split()
                         timings[stage] = timings.get(stage, 0.0) + float(seconds)
                 result['timings_seconds'] = timings
+            result.update(catalogue[name])
             print(f"{result['status']:24} {name}", flush=True)
             return result
 
@@ -108,14 +135,14 @@ def main():
         counts = {}
         for result in results:
             counts[result['status']] = counts.get(result['status'], 0) + 1
-        report = {'celox_version': '0.8.1', 'suite_version': '0.8.1',
+        report = {'celox_version': '0.9.0', 'suite_version': '0.9.0',
                   'pipeline': 'Veryl -> Celox native' if args.reference else 'Veryl -> Struo RTL -> synthesis -> ECP5 -> Celox native',
                   'timeout_seconds': args.timeout, 'include_ignored': args.include_ignored or args.reference,
                   'counts': counts, 'cases': results}
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + '\n')
         print(json.dumps(counts, sort_keys=True))
-        return int(any(r['status'] not in ('passed', 'rejected', 'ignored') for r in results))
+        return int(any(r['status'] not in ('passed', 'rejected', 'ignored', 'excluded') for r in results))
 
 
 if __name__ == '__main__':
