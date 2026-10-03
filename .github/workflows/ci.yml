@@ -336,8 +336,11 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-veryl-corpus-v1-
 
+      - name: Test corpus runner policies
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Run Veryl corpus with explicit ignores and expectation policies
-        run: python3 scripts/check-veryl-suite.py --timing --jobs 4 --timeout 60 --report target/veryl-corpus/results.json
+        run: python3 scripts/check-veryl-suite.py --timing --jobs 1 --memory-mib 4096 --report target/veryl-corpus/results.json
 
       - name: Summarize corpus results
         if: ${{ always() }}
@@ -356,6 +359,12 @@ jobs:
                   for status, count in sorted(data["counts"].items()):
                       summary.write(f"| `{status}` | {count} |\n")
                   summary.write(f"| Total | {len(data['cases'])} |\n\n")
+                  extended = [case for case in data["cases"] if case.get("timeout_seconds", 60) > 60]
+                  if extended:
+                      summary.write("| Extended-budget case | Budget (s) | Outcome |\n| --- | ---: | --- |\n")
+                      for case in extended:
+                          summary.write(f"| `{case['name']}` | {case['timeout_seconds']} | `{case['status']}` |\n")
+                      summary.write("\n")
                   summary.write("Ignored cases are known limitations; excluded cases require incompatible tagged expectations. Neither counts as a pass. Per-case diagnostics and upstream tags are in the veryl-corpus-results artifact.\n")
               else:
                   summary.write("The runner did not produce a report; inspect the build/run logs.\n")

@@ -1317,7 +1317,6 @@ fn unsigned_parent_reaches_ternary_but_not_concatenation_operands() {
 }
 
 #[test]
-#[ignore = "Veryl 0.21.0 folds signed size-cast division with incorrect signedness"]
 fn upstream_constant_size_cast_regression() {
     let stage = Rc::new(RefCell::new(String::new()));
     celox_test_suite_veryl::case(
@@ -1328,7 +1327,6 @@ fn upstream_constant_size_cast_regression() {
 }
 
 #[test]
-#[ignore = "Veryl 0.21.0 folds the actual before applying the function formal width"]
 fn upstream_constant_function_actual_regression() {
     let stage = Rc::new(RefCell::new(String::new()));
     celox_test_suite_veryl::case("flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion")
@@ -2175,7 +2173,7 @@ fn runtime_values_do_not_prove_unconditional_loop_breaks() {
                     q = 0;
                     for i in 0..count {{
                         if {condition} {{ break; }}
-                        q += 1;
+                        q += i as 8;
                     }}
                 }}
             }}
@@ -3334,5 +3332,1064 @@ fn bitwise_loop_proof_observes_blocking_ff_local_initialization() {
         sim.tick(clk).unwrap();
         let expected = [3u16, 7].into_iter().take_while(|i| *i < n).count();
         assert_eq!(sim.get(sim.signal("q")), expected.into());
+    }
+}
+
+#[test]
+fn corpus_known_negative_additive_loop() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("veryl_context_regressions::runtime_for_with_negative_bound")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn known_additive_loops_preserve_typed_bounds_and_capture_initializers() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(a: input logic<8>, signed_hits: output logic<8>, unsigned_hits: output logic<8>,
+                   wrap_hits: output logic<8>, total: output logic<32>) {
+            always_comb {
+                var seed: i32;
+                seed = -2;
+                signed_hits = 0;
+                total = 0;
+                for i in (seed - 1)..=2 {
+                    signed_hits += 1;
+                    total += a;
+                    seed = 100;
+                }
+                seed = -2;
+                unsigned_hits = 0;
+                for i in seed..32'd2 { unsigned_hits += 1; }
+                seed = 2147483646;
+                wrap_hits = 0;
+                for i in seed..=32'd2147483647 { wrap_hits += 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let a = sim.signal("a");
+    for value in 0..256u16 {
+        sim.modify(|io| io.set(a, value)).unwrap();
+        assert_eq!(sim.get(sim.signal("signed_hits")), 6u8.into());
+        assert_eq!(sim.get(sim.signal("unsigned_hits")), 0u8.into());
+        assert_eq!(sim.get(sim.signal("wrap_hits")), 2u8.into());
+        assert_eq!(sim.get(sim.signal("total")), (6 * value).into());
+    }
+}
+
+#[test]
+fn known_additive_loops_reject_mutable_bounds_and_signed_wraparound() {
+    for (setup, range, body) in [
+        ("seed = 2147483646;", "seed..=2147483647", "q += 1;"),
+        (
+            "seed = -2; limit = 2;",
+            "seed..limit",
+            "limit += 1; q += 1;",
+        ),
+    ] {
+        let source = format!(
+            "module Top(value: input i32, q: output logic<32>) {{
+                always_comb {{ var seed: i32; var limit: i32; limit = 0;
+                    {setup} q = 0; for i in {range} {{ {body} }}
+                }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "unproven_additive_loop", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn bounded_reverse_loops_capture_starts_and_preserve_steps_and_breaks() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(b: input logic<4>, stop: input logic<4>, exclusive: output logic<16>,
+                   inclusive: output logic<16>, stepped: output logic<16>, forward: output logic<8>) {
+            always_comb {
+                var upper: logic<4>;
+                upper = b;
+                exclusive = 0;
+                for i in rev 0..upper {
+                    exclusive += (i + 1) as 16;
+                    upper = 0;
+                    if i == stop { break; }
+                }
+                inclusive = 0;
+                for i in rev 0..=(b + 4'd1) { inclusive += (i + 1) as 16; }
+                stepped = 0;
+                for i in rev 0..b step += 3 { stepped += (i + 1) as 16; }
+                forward = 0;
+                for i in 0..=(b + 4'd1) { forward += 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let b = sim.signal("b");
+    let stop = sim.signal("stop");
+    for bound in 0..16u16 {
+        for stop_value in 0..16u16 {
+            sim.modify(|io| {
+                io.set(b, bound);
+                io.set(stop, stop_value);
+            })
+            .unwrap();
+            let mut exclusive = 0u16;
+            for i in (0..bound).rev() {
+                exclusive += i + 1;
+                if i == stop_value {
+                    break;
+                }
+            }
+            let stepped: u16 = (0..bound).rev().step_by(3).map(|i| i + 1).sum();
+            assert_eq!(sim.get(sim.signal("exclusive")), exclusive.into());
+            assert_eq!(
+                sim.get(sim.signal("inclusive")),
+                ((bound + 2) * (bound + 3) / 2).into()
+            );
+            assert_eq!(sim.get(sim.signal("stepped")), stepped.into());
+            assert_eq!(sim.get(sim.signal("forward")), (bound + 2).into());
+        }
+    }
+}
+
+#[test]
+fn bounded_reverse_loops_reject_unsigned_conditions_and_unproven_initializers() {
+    for range in ["rev 8'd0..b", "rev 0..wide", "rev 0..signed_bound"] {
+        let source = format!(
+            "module Top(b: input logic<4>, wide: input logic<32>, signed_bound: input i32, q: output logic<32>) {{
+                always_comb {{ q = 0; for i in {range} {{ q += 1; }} }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "unproven_reverse_loop", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn bounded_reverse_initialization_effects_and_ff_local_writes() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, b: input logic<4>, q: output logic<16>,
+                   calls: output logic<8>, comb: output logic<16>) {
+            function upper(v: input logic<4>, n: inout logic<8>) -> logic<4> {
+                n += 1; return v;
+            }
+            always_comb {
+                calls = 0;
+                comb = 0;
+                for i in rev 2..upper(b, calls) step += 3 { comb += (i + 1) as 16; }
+            }
+            always_ff (clk) {
+                var bound: logic<4>;
+                var total: logic<16>;
+                bound = b;
+                total = 0;
+                for i in rev 0..=bound { total += (i + 1) as 16; bound = 0; }
+                q = total;
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let b = sim.signal("b");
+    let clk = sim.event("clk");
+    for bound in 0..16u16 {
+        sim.modify(|io| io.set(b, bound)).unwrap();
+        sim.tick(clk).unwrap();
+        let comb: u16 = (2..bound).rev().step_by(3).map(|i| i + 1).sum();
+        assert_eq!(
+            sim.get(sim.signal("q")),
+            ((bound + 1) * (bound + 2) / 2).into()
+        );
+        assert_eq!(sim.get(sim.signal("comb")), comb.into());
+        assert_eq!(sim.get(sim.signal("calls")), 1u8.into());
+    }
+}
+
+#[test]
+fn arithmetic_loop_ranges_enforce_the_expansion_budget() {
+    for (range, accepted) in [
+        ("0..(b + 9'd1)", true),
+        ("0..=(b + 9'd1)", false),
+        ("rev 0..(b + 9'd1)", true),
+        ("rev 0..=(b + 9'd1)", false),
+    ] {
+        let source = format!(
+            "module Top(b: input logic<9>, q: output logic<32>) {{
+                always_comb {{ q = 0; for i in {range} {{ q = i as 32; }} }}
+            }}"
+        );
+        let result = analyze_and_lower(&source, "arithmetic_loop_budget", "Top");
+        if accepted {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(ImportError::UnsupportedBehavior(_))));
+        }
+    }
+}
+
+#[test]
+fn constant_driven_reverse_bounds_preserve_negative_counters_and_ff_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for (floor, kind) in [(-2i32, "i32"), (2, "i32"), (-2, "signed logic<64>")] {
+        let source = r"
+        module Top(clk: input clock, b: input logic<4>, hits: output logic<8>,
+                   sum: output logic<32>, stepped: output logic<32>, q: output logic<32>) {
+            var floor: i32;
+            always_comb { floor = -2; }
+            always_comb {
+                hits = 0;
+                sum = 0;
+                for i in rev floor..b { hits += 1; sum += i as 32; }
+                stepped = 0;
+                for i in rev floor..b step += 3 { stepped += i as 32; }
+            }
+            always_ff (clk) {
+                var total: logic<32>;
+                total = 0;
+                for i in rev floor..=b { total += i as 32; }
+                q = total;
+            }
+        }
+        "
+        .replace("floor = -2;", &format!("floor = {floor};"))
+        .replace("var floor: i32;", &format!("var floor: {kind};"));
+        let design = Design::new(&source, "Top");
+        let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+        let b = sim.signal("b");
+        let clk = sim.event("clk");
+        for bound in 0..16i32 {
+            sim.modify(|io| io.set(b, bound.cast_unsigned())).unwrap();
+            sim.tick(clk).unwrap();
+            let sum: i32 = (floor..bound).sum();
+            let stepped: i32 = (floor..bound).rev().step_by(3).sum();
+            assert_eq!(
+                sim.get(sim.signal("hits")),
+                (bound - floor).max(0).cast_unsigned().into()
+            );
+            assert_eq!(sim.get(sim.signal("sum")), sum.cast_unsigned().into());
+            assert_eq!(
+                sim.get(sim.signal("q")),
+                (floor..=bound).sum::<i32>().cast_unsigned().into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("stepped")),
+                stepped.cast_unsigned().into()
+            );
+        }
+    }
+}
+
+#[test]
+fn constant_driven_reverse_bounds_do_not_assume_mutable_or_registered_values() {
+    for (provider, body, suffix) in [
+        ("always_comb { floor = input_floor; }", "q += 1;", ""),
+        ("always_ff (clk) { floor = -2; }", "q += 1;", ""),
+        ("always_comb { floor = -2147483648; }", "q += 1;", ""),
+        ("always_comb { floor = -2; }", "floor -= 1; q += 1;", ""),
+        (
+            "always_comb { floor = -2; }",
+            "q += 1;",
+            "always_comb { floor = 0; }",
+        ),
+    ] {
+        let source = format!(
+            "module Top(clk: input clock, b: input logic<4>, input_floor: input i32, q: output logic<8>) {{
+                var floor: i32; {provider}
+                always_comb {{ q = 0; for i in rev floor..b {{ {body} }} }}
+                {suffix}
+            }}"
+        );
+        assert!(
+            analyze_and_lower(&source, "unproven_constant_driver", "Top").is_err(),
+            "{source}"
+        );
+    }
+    let source = "module Top(b: input logic<4>, q: output logic<8>) {
+        always_comb { var floor: i32; floor = -2; q = 0;
+            for i in rev floor..b { floor -= 1; q += 1; }
+        }
+    }";
+    assert!(analyze_and_lower(source, "mutable_local_bound", "Top").is_err());
+}
+
+#[test]
+fn additive_reductions_preserve_modular_widths_and_signed_increments() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<32>, count: input logic<32>,
+                   sum: output logic<32>, narrow: output logic<8>,
+                   signed_sum: output signed logic<64>, mixed_sum: output logic<64>) {
+            always_comb {
+                sum = seed;
+                for i in 0..count { sum += 3; }
+                narrow = seed as 8;
+                for i in 0..count { narrow = 5 + narrow; }
+                signed_sum = 0;
+                for i in 0..count { signed_sum += 8'shff; }
+                mixed_sum = 0;
+                for i in 0..count { mixed_sum += 8'shff; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    for count in [
+        0u32,
+        1,
+        2,
+        255,
+        256,
+        512,
+        65_535,
+        0x7fff_ffff,
+        0x8000_0000,
+        u32::MAX,
+    ] {
+        for seed in [0u32, 1, 255, 0x8000_0000, u32::MAX] {
+            let count_signal = sim.signal("count");
+            let seed_signal = sim.signal("seed");
+            sim.modify(|io| {
+                io.set(count_signal, count);
+                io.set(seed_signal, seed);
+            })
+            .unwrap();
+            assert_eq!(
+                sim.get(sim.signal("sum")),
+                seed.wrapping_add(count.wrapping_mul(3)).into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("narrow")),
+                (seed.wrapping_add(count.wrapping_mul(5)) & 255).into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("signed_sum")),
+                0u64.wrapping_sub(u64::from(count)).into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("mixed_sum")),
+                (u64::from(count) * 255).into()
+            );
+        }
+    }
+}
+
+#[test]
+fn additive_reductions_reject_unproven_bounds_and_dependent_bodies() {
+    for (bound_type, range, body) in [
+        ("logic<64>", "0..count", "out += 1;"),
+        ("signed logic<32>", "0..count", "out += 1;"),
+        ("logic<32>", "0..=count", "out += 1;"),
+        ("logic<32>", "0..count step += 2", "out += 1;"),
+        ("logic<32>", "0..count", "out += i as 32;"),
+        ("logic<32>", "0..count", "out += seed;"),
+        ("logic<32>", "0..out", "out += 1;"),
+    ] {
+        let source = format!(
+            "module Top(count: input {bound_type}, seed: input logic<32>, out: output logic<32>) {{
+            always_comb {{ out = seed; for i in {range} {{ {body} }} }}
+        }}"
+        );
+        assert!(
+            analyze_and_lower(&source, "unproven_reduction", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn invariant_additive_reductions_preserve_empty_ranges_and_boolean_guards() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<8>, count: input logic<32>, gate: input logic<8>,
+                   enabled: output logic<8>, stopped: output logic<8>) {
+            always_comb {
+                enabled = seed;
+                for i in 0..count { if gate { enabled += 3; } }
+                stopped = seed;
+                for i in 0..count { stopped += 5; if gate { break; } }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    let gate_signal = sim.signal("gate");
+    for count in [0u32, 1, 255, 256, 512, 0x8000_0000, u32::MAX] {
+        for gate in [0u8, 1, 2, 128] {
+            for seed in [0u8, 17, 255] {
+                sim.modify(|io| {
+                    io.set(seed_signal, seed);
+                    io.set(count_signal, count);
+                    io.set(gate_signal, gate);
+                })
+                .unwrap();
+                let enabled_count = if gate == 0 { 0 } else { count };
+                let stopped_count = if gate == 0 {
+                    count
+                } else {
+                    u32::from(count != 0)
+                };
+                assert_eq!(
+                    sim.get(sim.signal("enabled")),
+                    ((u32::from(seed).wrapping_add(enabled_count.wrapping_mul(3))) & 255).into()
+                );
+                assert_eq!(
+                    sim.get(sim.signal("stopped")),
+                    ((u32::from(seed).wrapping_add(stopped_count.wrapping_mul(5))) & 255).into()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn invariant_additive_reductions_reject_changing_or_effectful_guards() {
+    for body in [
+        "if out { out += 1; }",
+        "if i { out += 1; }",
+        "out += 1; if out { break; }",
+        "out += 1; if i == 2147483646 { break; }",
+        "if gate { out += 1; } else { out += 2; }",
+        "if effect(gate, calls) { out += 1; }",
+        "out += 1; if effect(gate, calls) { break; }",
+    ] {
+        let source = format!("module Top(count: input logic<32>, gate: input logic, out: output logic<32>, calls: output logic<32>) {{
+            function effect(x: input logic, n: inout logic<32>) -> logic {{ n += 1; return x; }}
+            always_comb {{ out = 0; calls = 0; for i in 0..count {{ {body} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "dependent_reduction_guard", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn idempotent_loops_preserve_partial_writes_order_and_empty_ranges() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<3>, count: input logic<32>, idx: input logic<32>,
+                   copied: output logic<3>, selected: output logic) {
+            var x: logic<2>;
+            always_comb {
+                copied = seed;
+                for i in 0..count { copied[0] = copied[1]; }
+                x = seed as 2;
+                selected = 1;
+                for i in 0..count { x[0] = 0; selected = x[idx]; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    let index_signal = sim.signal("idx");
+    for count in [0u32, 1, 2, 256, 0x8000_0000, u32::MAX] {
+        for seed in 0..8u8 {
+            for index in [0u32, 1, 2, 3, u32::MAX] {
+                sim.modify(|io| {
+                    io.set(seed_signal, seed);
+                    io.set(count_signal, count);
+                    io.set(index_signal, index);
+                })
+                .unwrap();
+                let copied = if count == 0 {
+                    seed
+                } else {
+                    (seed & 6) | ((seed >> 1) & 1)
+                };
+                let selected = if count == 0 {
+                    1
+                } else if index == 1 {
+                    (seed >> 1) & 1
+                } else {
+                    0
+                };
+                assert_eq!(sim.get(sim.signal("copied")), copied.into());
+                assert_eq!(sim.get(sim.signal("selected")), selected.into());
+            }
+        }
+    }
+}
+
+#[test]
+fn idempotent_loops_reject_unproven_state_and_counter_dependencies() {
+    for body in [
+        "x[i as 8] = 0;",
+        "x[0] = i as 1;",
+        "x[0] = x[index];",
+        "y = x[index]; x[0] = 0;",
+        "x[0] = effect(calls);",
+        "x[effect(calls)] = 0;",
+        "x[0] = x[effect(calls)];",
+        "limit = 0;",
+    ] {
+        let source = format!("module Top(count: input logic<32>, seed: input logic<2>, index: input logic<32>, x: output logic<2>, y: output logic, calls: output logic<32>) {{
+            function effect(n: inout logic<32>) -> logic {{ n += 1; return 0; }}
+            always_comb {{ var limit: logic<32>; limit = count; x = seed; y = 0; calls = 0;
+                for i in 0..limit {{ {body} }}
+            }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_idempotence", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn small_state_loops_preserve_cycles_transients_and_full_counts() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<3>, count: input logic<32>,
+                   partial: output logic<2>, rot: output logic<3>, mix: output logic<3>,
+                   down: output logic<3>) {
+            always_comb {
+                partial = seed as 2;
+                for i in 0..count { partial[0] = partial == 2'b10; }
+                rot = seed;
+                for i in 0..count { rot = {rot[1:0], ~rot[2]}; }
+                mix = seed;
+                for i in 0..count { mix = (mix * 3) as 3; mix += 1; }
+                down = seed;
+                for i in 0..count { down = if down == 0 ? 3 : down - 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    for count in [0u32, 1, 2, 3, 4, 5, 6, 255, 256, 0x8000_0000, u32::MAX] {
+        for seed in 0..8u8 {
+            sim.modify(|io| {
+                io.set(seed_signal, seed);
+                io.set(count_signal, count);
+            })
+            .unwrap();
+            let partial = if count == 0 {
+                seed & 3
+            } else if seed & 2 == 0 {
+                0
+            } else {
+                (seed & 3) ^ u8::from(count & 1 != 0)
+            };
+            let mut rot = seed;
+            for _ in 0..count % 6 {
+                rot = ((rot << 1) | ((!rot >> 2) & 1)) & 7;
+            }
+            let mut mix = seed;
+            for _ in 0..count % 4 {
+                mix = (mix * 3 + 1) & 7;
+            }
+            assert_eq!(sim.get(sim.signal("partial")), partial.into());
+            assert_eq!(sim.get(sim.signal("rot")), rot.into());
+            assert_eq!(sim.get(sim.signal("mix")), mix.into());
+            let down = if count <= u32::from(seed) {
+                u32::from(seed) - count
+            } else {
+                (4 - (count - u32::from(seed)) % 4) % 4
+            };
+            assert_eq!(sim.get(sim.signal("down")), down.into());
+        }
+    }
+}
+
+#[test]
+fn small_state_loops_reject_external_dependencies_and_large_tables() {
+    for (width, body) in [
+        (5, "x[0] = ~x[0];"),
+        (3, "x = x ^ seed;"),
+        (3, "x = x ^ count as 3;"),
+        (3, "x = x ^ i as 3;"),
+    ] {
+        let source = format!("module Top(count: input logic<32>, seed: input logic<{width}>, x: output logic<{width}>) {{
+            always_comb {{ x = seed; for i in 0..count {{ {body} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_state_transition", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn sparse_index_loops_preserve_order_and_late_wrapped_writes() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<4>, count: input logic<32>,
+                   chain: output logic<4>, reverse: output logic<4>, wrapped: output logic<4>,
+                   middle: output logic<4>) {
+            always_comb {
+                chain = seed;
+                for i in 0..count { chain[i + 1] = chain[i]; chain[i] = ~chain[i]; }
+                reverse = 0;
+                for i in 0..count { reverse[3 - i] = seed[i]; }
+                wrapped = seed;
+                for i in 0..count { wrapped[i + 3] = 1; }
+                middle = seed;
+                for i in 0..count { middle[i + 32'h8000_0000] = 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    for count in [
+        0u32,
+        1,
+        2,
+        3,
+        4,
+        5,
+        256,
+        0x7fff_ffff,
+        0x8000_0000,
+        0x8000_0001,
+        0x8000_0004,
+        u32::MAX - 2,
+        u32::MAX - 1,
+        u32::MAX,
+    ] {
+        for seed in 0..16u8 {
+            sim.modify(|io| {
+                io.set(seed_signal, seed);
+                io.set(count_signal, count);
+            })
+            .unwrap();
+            let mut chain = seed;
+            let mut reverse = 0u8;
+            for i in 0..count.min(4) {
+                if i < 3 {
+                    chain = (chain & !(1 << (i + 1))) | (((chain >> i) & 1) << (i + 1));
+                }
+                chain ^= 1 << i;
+                reverse |= ((seed >> i) & 1) << (3 - i);
+            }
+            let wrapped = seed
+                | if count > 0 { 8 } else { 0 }
+                | u8::from(count >= u32::MAX - 1)
+                | if count == u32::MAX { 2 } else { 0 };
+            assert_eq!(
+                sim.get(sim.signal("chain")),
+                chain.into(),
+                "chain: seed={seed}, count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("reverse")),
+                reverse.into(),
+                "reverse: seed={seed}, count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("wrapped")),
+                wrapped.into(),
+                "wrapped: seed={seed}, count={count}"
+            );
+            let middle = seed | ((1 << count.saturating_sub(0x8000_0000).min(4)) - 1);
+            assert_eq!(
+                sim.get(sim.signal("middle")),
+                middle.into(),
+                "middle: seed={seed}, count={count}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sparse_index_loops_reject_unproven_indices_and_skipped_effects() {
+    for body in [
+        "x[i as 8] = 0;",
+        "x[(i as 64) + 1] = 0;",
+        "x[i + gate] = 0;",
+        "x[i * 2] = 0;",
+        "x[i] = effect(calls);",
+        "x[i] = 0; calls += 1;",
+        "x[i] = 0; limit -= 1;",
+        "x[i] = 0; if gate { break; }",
+    ] {
+        let source = format!("module Top(count: input logic<32>, gate: input logic<32>, x: output logic<4>, calls: output logic<32>) {{
+            function effect(n: inout logic<32>) -> logic {{ n += 1; return 1; }}
+            always_comb {{ var limit: logic<32>; limit = count; x = 0; calls = 0;
+                for i in 0..limit {{ {body} }}
+            }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_sparse_loop", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn periodic_reductions_preserve_offsets_signed_casts_and_modular_counts() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<8>, count: input logic<32>,
+                   hits: output logic<32>, masked: output logic<8>,
+                   negative: output signed logic<64>, mixed: output logic<64>) {
+            always_comb {
+                hits = seed;
+                for i in 254..count { if (i as u8) <: 8'd4 { hits += 3; } }
+                masked = seed;
+                for i in 5..count { if ((i as u8) & 8'd3) == 8'd1 { masked += 5; } }
+                negative = 0;
+                for i in 128..count { if (i as i8) <: 0 { negative += 8'shff; } }
+                mixed = 0;
+                for i in 254..count { if (i as u8) <: 8'd4 { mixed += 8'shff; } }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    for count in [
+        0u32,
+        1,
+        4,
+        5,
+        6,
+        127,
+        128,
+        129,
+        254,
+        255,
+        256,
+        257,
+        260,
+        511,
+        512,
+        0x8000_0000,
+        u32::MAX,
+    ] {
+        for seed in [0u8, 17, 255] {
+            sim.modify(|io| {
+                io.set(seed_signal, seed);
+                io.set(count_signal, count);
+            })
+            .unwrap();
+            let n = u64::from(count);
+            let hits = (n / 256 * 4 + (n % 256).min(4)).saturating_sub(4);
+            let masked = ((n + 2) / 4).saturating_sub(1);
+            let negative = n / 256 * 128 + (n % 256).saturating_sub(128);
+            assert_eq!(
+                sim.get(sim.signal("hits")),
+                ((u64::from(seed) + hits * 3) & u64::from(u32::MAX)).into(),
+                "count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("masked")),
+                ((u64::from(seed) + masked * 5) & 255).into(),
+                "count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("negative")),
+                0u64.wrapping_sub(negative).into(),
+                "count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("mixed")),
+                (hits * 255).into(),
+                "count={count}"
+            );
+        }
+    }
+}
+
+#[test]
+fn periodic_reductions_reject_nonperiodic_or_effectful_conditions() {
+    for body in [
+        "if i <: 4 { out += 1; }",
+        "if (i as u16) <: 4 { out += 1; }",
+        "if (i as u8) <: count { out += 1; }",
+        "if (i as u8) <: out { out += 1; }",
+        "if (i as u8) <: 4 { out += i as 32; }",
+        "if (i as u8) <: 4 { out += seed; }",
+        "if effect(calls) { out += 1; }",
+        "if (i as u8) <: 4 { out += 1; calls += 1; }",
+        "if (i as u8) <: 4 { out += 1; } else { out += 2; }",
+    ] {
+        let source = format!("module Top(count: input logic<32>, seed: input logic<32>, out: output logic<32>, calls: output logic<32>) {{
+            function effect(n: inout logic<32>) -> logic {{ n += 1; return 1; }}
+            always_comb {{ out = seed; calls = 0; for i in 254..count {{ {body} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_periodic_reduction", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn signed_periodic_starts_preserve_conversion_and_capture() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(start: input logic<64>, short_start: input signed logic<8>, seed: input logic<8>,
+                   hits: output logic<32>, narrow: output logic<8>,
+                   mixed: output logic<64>, captured: output logic<32>) {
+            always_comb {
+                hits = seed;
+                for i in start..260 { if (i as u8) <: 8'd4 { hits += 3; } }
+                narrow = seed;
+                for i in short_start..260 { if (i as u8) <: 8'd4 { narrow += 5; } }
+                mixed = 0;
+                for i in start..260 { if (i as i8) <: 0 { mixed += 8'shff; } }
+                captured = start as 32;
+                for i in captured..260 { if (i as u8) <: 8'd4 { captured += 1; } }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let start_signal = sim.signal("start");
+    let small_signal = sim.signal("short_start");
+    let seed_signal = sim.signal("seed");
+    let prefix = |n: i64| n.div_euclid(256) * 4 + n.rem_euclid(256).min(4);
+    let signed_prefix = |n: i64| n.div_euclid(256) * 128 + (n.rem_euclid(256) - 128).max(0);
+    for start in [
+        0u64,
+        1,
+        3,
+        4,
+        127,
+        128,
+        254,
+        255,
+        256,
+        259,
+        260,
+        261,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_ff00,
+        0xffff_ff80,
+        0xffff_fffe,
+        0xffff_ffff,
+        0x1_0000_00fe,
+        0xffff_ffff_8000_0000,
+        u64::MAX,
+    ] {
+        let bytes = start.to_le_bytes();
+        let bits = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let signed_start = i64::from(i32::from_le_bytes(bits.to_le_bytes()));
+        let small = bytes[0];
+        let small_start = i64::from(i8::from_le_bytes([small]));
+        let hits = u64::try_from((prefix(260) - prefix(signed_start)).max(0)).unwrap();
+        let narrow = u64::try_from((prefix(260) - prefix(small_start)).max(0)).unwrap();
+        let mixed =
+            u64::try_from((signed_prefix(260) - signed_prefix(signed_start)).max(0)).unwrap();
+        for seed in [0u8, 17, 255] {
+            sim.modify(|io| {
+                io.set(start_signal, start);
+                io.set(small_signal, small);
+                io.set(seed_signal, seed);
+            })
+            .unwrap();
+            assert_eq!(
+                sim.get(sim.signal("hits")),
+                ((u64::from(seed) + hits * 3) & u64::from(u32::MAX)).into(),
+                "start={start}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("narrow")),
+                ((u64::from(seed) + narrow * 5) & 255).into(),
+                "start={start}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("mixed")),
+                (mixed * 255).into(),
+                "start={start}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("captured")),
+                ((u64::from(bits) + hits) & u64::from(u32::MAX)).into(),
+                "start={start}"
+            );
+        }
+    }
+}
+
+#[test]
+fn signed_periodic_starts_reject_unproven_ranges_and_effects() {
+    for range in [
+        "start..32'd260",
+        "start..64'sd2147483648",
+        "start..=260",
+        "start..260 step += 2",
+        "start..finish",
+        "effect(start, calls)..260",
+    ] {
+        let source = format!("module Top(start: input logic<32>, finish: input logic<32>, out: output logic<32>, calls: output logic<32>) {{
+            function effect(x: input logic<32>, n: inout logic<32>) -> logic<32> {{ n += 1; return x; }}
+            always_comb {{ out = 0; calls = 0; for i in {range} {{ if (i as u8) <: 4 {{ out += 1; }} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_signed_periodic_range", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn linear_reductions_preserve_steps_last_values_and_captured_starts() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(start: input logic<64>, seed: input logic<8>,
+                   hits10: output logic<32>, last10: output logic<8>, narrow: output logic<8>,
+                   hits300: output signed logic<64>, last300: output signed logic<64>, captured: output logic<32>,
+                   full: output logic<64>) {
+            always_comb {
+                var local_start: i32;
+                local_start = start as i32;
+                hits10 = seed; last10 = 8'hee; narrow = seed;
+                for i in start..255 step += 10 { hits10 += 3; last10 = i; narrow += 5; }
+                hits300 = seed; last300 = -99; captured = start as 32;
+                for i in captured..255 step += 300 { captured += 1; hits300 += 8'shff; last300 = i; }
+                full = 0;
+                for i in local_start..2147483647 { full += 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let start_signal = sim.signal("start");
+    let seed_signal = sim.signal("seed");
+    for start in [
+        0u64,
+        1,
+        9,
+        10,
+        127,
+        245,
+        249,
+        250,
+        254,
+        255,
+        256,
+        0x7fff_ffff,
+        0x8000_0000,
+        0x8000_0001,
+        0xffff_ff00,
+        0xffff_ffd2,
+        0xffff_ffd3,
+        0xffff_fffe,
+        0xffff_ffff,
+        0x1_0000_00fa,
+        u64::MAX,
+    ] {
+        let bytes = start.to_le_bytes();
+        let initial_bits = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let initial = i64::from(i32::from_le_bytes(initial_bits.to_le_bytes()));
+        let trip_count = |step| {
+            if initial >= 255 {
+                0
+            } else {
+                (254 - initial) / step + 1
+            }
+        };
+        let n10 = trip_count(10);
+        let n300 = trip_count(300);
+        let last10 = if n10 == 0 {
+            238
+        } else {
+            initial + (n10 - 1) * 10
+        };
+        let last300 = if n300 == 0 {
+            -99
+        } else {
+            initial + (n300 - 1) * 300
+        };
+        let n10 = u64::try_from(n10).unwrap();
+        let n300 = u64::try_from(n300).unwrap();
+        for seed in [0u8, 17, 255] {
+            sim.modify(|io| {
+                io.set(start_signal, start);
+                io.set(seed_signal, seed);
+            })
+            .unwrap();
+            for (name, expected) in [
+                (
+                    "full",
+                    u64::try_from(i64::from(i32::MAX) - initial).unwrap(),
+                ),
+                ("hits10", (u64::from(seed) + n10 * 3) & u64::from(u32::MAX)),
+                ("last10", u64::from_le_bytes(last10.to_le_bytes()) & 255),
+                ("narrow", (u64::from(seed) + n10 * 5) & 255),
+                ("hits300", u64::from(seed).wrapping_sub(n300)),
+                ("last300", u64::from_le_bytes(last300.to_le_bytes())),
+                (
+                    "captured",
+                    (u64::from(initial_bits) + n300) & u64::from(u32::MAX),
+                ),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: start={start}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn linear_reductions_reject_dependent_updates_and_wrapping_exit_steps() {
+    for (range, body) in [
+        ("start..255 step += 10", "hits += i as 32;"),
+        ("start..255 step += 10", "last = i; hits += last;"),
+        ("start..255 step += 10", "hits += 1; hits += 2;"),
+        ("start..255 step += 10", "hits += effect(calls);"),
+        ("start..255 step += 10", "if hits { break; } hits += 1;"),
+        ("start..2147483647 step += 2", "hits += 1;"),
+        ("start..=2147483647", "hits += 1;"),
+        ("start..64'sd2147483648", "hits += 1;"),
+        ("start..32'd255 step += 10", "hits += 1;"),
+        ("start..255 step += 2147483648", "hits += 1;"),
+        ("start..255 step *= 2", "hits += 1;"),
+    ] {
+        let source = format!("module Top(start: input logic<32>, hits: output logic<32>, last: output logic<32>, calls: output logic<32>) {{
+            function effect(n: inout logic<32>) -> logic<32> {{ n += 1; return 1; }}
+            always_comb {{ hits = 0; last = 0; calls = 0; for i in {range} {{ {body} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_linear_loop", "Top").is_err(),
+            "{source}"
+        );
     }
 }

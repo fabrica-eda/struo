@@ -9,7 +9,9 @@ pub(super) fn simplify(
     constants: BitConstants,
 ) -> Rewrite {
     let BitConstants { zero, one } = constants;
-    if when_true == when_false {
+    if select == zero {
+        Rewrite::Value(when_false)
+    } else if select == one || when_true == when_false {
         Rewrite::Value(when_true)
     } else if when_false == zero && when_true == one {
         Rewrite::Value(select)
@@ -46,6 +48,8 @@ mod tests {
         let a = input("a");
         let b = input("b");
         let constants = BitConstants { zero, one };
+        assert_eq!(simplify(zero, a, b, constants), Rewrite::Value(b));
+        assert_eq!(simplify(one, a, b, constants), Rewrite::Value(a));
         for (yes, no, expected) in [
             (a, a, Rewrite::Value(a)),
             (zero, zero, Rewrite::Value(zero)),

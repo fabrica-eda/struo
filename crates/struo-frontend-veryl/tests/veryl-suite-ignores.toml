@@ -12,19 +12,9 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Exceeds the 60-second per-case budget on the CI runner."
+reason = "The 1,048,576-by-32-bit FF array exceeds the 4096 MiB worker address-space limit before lowering completes; a 1.5 GiB allocation fails."
 cases = [
-  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
-  "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
-  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
-  "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
-  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
-  "signed_divrem::signed_divrem_i128",
-  "signed_divrem::signed_divrem_i64",
-  "wide_operators::test_wide_comb_div",
-  "wide_operators::test_wide_comb_rem",
 ]
 
 [[ignore]]
@@ -231,34 +221,12 @@ cases = [
 ]
 
 [[ignore]]
-reason = "The runtime start is not proven non-negative without truncation, or the counter can overflow before termination."
+reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles, signed inclusive maximum endpoints, or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
 cases = [
   "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
-  "synth_dynamic_loop::test_constant_bounds_preserve_wide_limit_above_loop_width",
-  "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
   "synth_dynamic_loop::test_runtime_bounds_signed_inclusive_range_preserves_negative_bounds",
-]
-
-[[ignore]]
-reason = "Struo cannot prove termination within its 256-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
-cases = [
   "flip_flop::test_ff_runtime_for_bounds",
   "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_loop_carried_state_for_indexed_reads",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_pre_loop_bits_for_partial_updates",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
-  "synth_dynamic_loop::test_runtime_bounds_reconstruct_wide_loop_carried_reads_from_partial_state",
-  "synth_dynamic_loop::test_runtime_bounds_track_initial_seed_dependency",
-  "synth_dynamic_loop::test_runtime_bounds_track_initial_seed_dependency_across_module_boundary",
-  "synth_dynamic_loop::test_runtime_bounds_truncate_loop_var_to_declared_width",
-  "synth_dynamic_loop::test_runtime_break_condition_dependency_across_module_boundary",
-  "synth_dynamic_loop::test_runtime_if_without_break_in_synth_comb_loop",
-]
-
-[[ignore]]
-reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
-cases = [
   "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
   "flip_flop::test_ff_runtime_for_bitwise_steps",
   "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
@@ -296,22 +264,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Packed scatter store exceeds the 60-second case budget during synthesis."
-cases = [
-  "packed_scatter_store::packed_scatter_last_lane_does_not_touch_adjacent_storage",
-]
-
-[[ignore]]
-reason = "Runtime loop bounds fall outside the proven non-negative range and 256-iteration synthesis policy."
-cases = [
-  "veryl_context_regressions::runtime_for_with_negative_bound",
-  "veryl_context_regressions::runtime_for_bound_keeps_its_type",
-  "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
-]
-
-
-
-[[ignore]]
 reason = "Veryl 0.22.0 rejects scalar x[0] (InvalidSelect::Scalar); the suite expects acceptance of a scalar bit-select."
 cases = [
   "flip_flop::test_ff_function_call_bit_select_on_nonvariable_one_bit_formal",
@@ -327,4 +279,41 @@ cases = [
 reason = "Veryl 0.22.0 reports CombinationalLoop for cand: the runtime-bounded write leaves array entries unassigned."
 cases = [
   "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
+]
+
+# Execute verified slow cases in CI with bounded native compilation time.
+[[timeout]]
+seconds = 600
+reason = "Bounded arithmetic expansion is correct but native simulator compilation exceeds the default budget."
+cases = [
+  "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
+]
+
+[[timeout]]
+seconds = 300
+reason = "Verified mapped circuits require longer native simulator construction, especially on CI runners."
+cases = [
+  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
+  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
+  "signed_divrem::signed_divrem_i64",
+  "veryl_context_regressions::runtime_for_bound_keeps_its_type",
+  "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
+]
+
+[[timeout]]
+seconds = 600
+reason = "Dynamic FF array round trips and loop-boundary behavior are verified but require extended native simulator construction time."
+cases = [
+  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
+  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
+  "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
+]
+
+[[timeout]]
+seconds = 180
+reason = "Wide division/remainder passes with gate-level mux branchification disabled, but native construction needs a larger CI budget."
+cases = [
+  "signed_divrem::signed_divrem_i128",
+  "wide_operators::test_wide_comb_div",
+  "wide_operators::test_wide_comb_rem",
 ]
