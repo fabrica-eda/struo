@@ -257,7 +257,7 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Struo has no bounded expansion proof for reverse or non-additive runtime loops; this is a synthesis support limit, not a universal language prohibition."
+reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
 cases = [
   "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
   "flip_flop::test_ff_runtime_for_bitwise_steps",
@@ -270,7 +270,6 @@ cases = [
   "synth_dynamic_loop::test_runtime_bounds_reverse_singleton_exits_cleanly",
   "synth_dynamic_loop::test_runtime_bounds_stalled_step_with_break_exits_cleanly",
   "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
-  "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
 ]
 
 

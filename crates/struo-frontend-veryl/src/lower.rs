@@ -1,4 +1,5 @@
 mod arrays;
+mod bitwise_loops;
 mod comparisons;
 mod loops;
 mod members;
@@ -1678,7 +1679,12 @@ impl<'a> ModuleLowerer<'a> {
             Err(_) if loops::always_breaks(&statement.body, self.source) => {
                 return self.lower_single_iteration(statement, reads, writes, sequential);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                match self.plan_constant_bitwise_loop(statement, reads, writes, sequential)? {
+                    Some(plan) => plan,
+                    None => return Err(error),
+                }
+            }
         };
         let mut changed = DrivenBits::default();
         let mut cursor =
