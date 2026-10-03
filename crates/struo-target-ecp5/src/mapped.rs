@@ -2777,7 +2777,7 @@ fn map_to_ecp5_with_period(
     // This is the last mapped-netlist normalization point.  Keep it before
     // the final depth/timing/fanout profile and before serialization so the
     // same physical object drives QoR scoring and nextpnr JSON.
-    cleanup_lut4_dynamic_inputs(&mut selected);
+    propagate_lut4_constants(&mut selected);
     let mapped_selected_profile = mapped_lut_profile(&selected);
     let equivalence_signed_off = verify_mapped_equivalence_proof(&selected, applied);
     selected.retiming = RetimingSelection {
@@ -3634,7 +3634,8 @@ fn mapped_emitted_comb_count(netlist: &Ecp5Netlist) -> usize {
 /// Removes routed inputs from LUT4 pins which do not affect the LUT truth
 /// table.  ECP5 numbers the LUT INIT address with A as bit zero, followed by
 /// B, C, and D, so a pin is unused when every pair of INIT entries that only
-/// differs in that address bit is equal.
+/// differs in that address bit is equal. Constant inputs restrict the truth
+/// table first: for example, a majority LUT with A=C=0 cannot depend on B.
 ///
 /// This is deliberately limited to ordinary [`Ecp5Cell::Lut4`] cells.  The
 /// input fields on PFUMX/L6MUX21 and CCU2C have different physical semantics,
@@ -3647,14 +3648,94 @@ fn cleanup_lut4_dynamic_inputs(netlist: &mut Ecp5Netlist) -> usize {
         let Ecp5Cell::Lut4 { inputs, init, .. } = cell else {
             continue;
         };
+        let (constant_mask, constant_value) =
+            inputs
+                .iter()
+                .enumerate()
+                .fold(
+                    (0_usize, 0_usize),
+                    |(mask, value), (pin, input)| match input {
+                        Bit::Zero => (mask | (1 << pin), value),
+                        Bit::One => (mask | (1 << pin), value | (1 << pin)),
+                        Bit::Wire(_) => (mask, value),
+                    },
+                );
+        let restricted_init = if constant_mask == 0 {
+            *init
+        } else {
+            (0..16).fold(0_u16, |table, assignment| {
+                let source = (assignment & !constant_mask) | constant_value;
+                table | (((*init >> source) & 1) << assignment)
+            })
+        };
         for (pin, input) in inputs.iter_mut().enumerate() {
-            if matches!(input, Bit::Wire(_)) && lut4_input_is_independent(*init, pin) {
+            if matches!(input, Bit::Wire(_)) && lut4_input_is_independent(restricted_init, pin) {
                 *input = Bit::Zero;
                 cleaned += 1;
             }
         }
     }
     cleaned
+}
+
+/// Propagates constant LUT outputs through ordinary LUT inputs after retiming.
+/// A locally constant LUT can mask inputs in another LUT; stopping at the first
+/// cell leaves those false dependencies in the emitted routing problem. Iterate
+/// to a fixed point because retiming does not preserve topological cell order.
+/// Keep the constant drivers themselves and all non-LUT inputs intact: dedicated
+/// mux data pins still require their physical LUT drivers.
+fn propagate_lut4_constants(netlist: &mut Ecp5Netlist) {
+    loop {
+        cleanup_lut4_dynamic_inputs(netlist);
+        let constants = netlist
+            .cells
+            .iter()
+            .filter_map(|cell| {
+                let Ecp5Cell::Lut4 {
+                    inputs,
+                    output,
+                    init,
+                    ..
+                } = cell
+                else {
+                    return None;
+                };
+                let mut assignment = 0;
+                for (pin, input) in inputs.iter().enumerate() {
+                    match input {
+                        Bit::Zero => {}
+                        Bit::One => assignment |= 1 << pin,
+                        Bit::Wire(_) => return None,
+                    }
+                }
+                Some((
+                    *output,
+                    if (*init >> assignment) & 1 == 0 {
+                        Bit::Zero
+                    } else {
+                        Bit::One
+                    },
+                ))
+            })
+            .collect::<WireMap<_>>();
+        let mut changed = false;
+        for cell in &mut netlist.cells {
+            let Ecp5Cell::Lut4 { inputs, .. } = cell else {
+                continue;
+            };
+            for input in inputs {
+                if let Bit::Wire(wire) = input
+                    && let Some(constant) = constants.get(wire)
+                {
+                    *input = *constant;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 fn lut4_input_is_independent(init: u16, pin: usize) -> bool {
@@ -11459,6 +11540,187 @@ mod tests {
             "B-sensitive control must remain routed"
         );
         assert!(inputs[0] == Bit::Zero && inputs[2] == Bit::Zero && inputs[3] == Bit::Zero);
+    }
+
+    #[test]
+    fn lut4_cleanup_removes_inputs_masked_by_constant_pins() {
+        for constant in [Bit::Zero, Bit::One] {
+            let mut mapped = direct_lut_fixture(0xe8e8); // majority(A, B, C)
+            let Ecp5Cell::Lut4 { inputs, .. } = &mut mapped.cells[0] else {
+                unreachable!();
+            };
+            *inputs = [constant, Bit::Wire(11), constant, Bit::Zero];
+            assert_eq!(cleanup_lut4_dynamic_inputs(&mut mapped), 1);
+            let Ecp5Cell::Lut4 { inputs, init, .. } = &mapped.cells[0] else {
+                unreachable!();
+            };
+            assert_eq!(*inputs, [constant, Bit::Zero, constant, Bit::Zero]);
+            assert_eq!(*init, 0xe8e8, "retain the original INIT");
+        }
+    }
+
+    #[test]
+    fn lut4_constants_propagate_through_reordered_cones() {
+        for constant in [Bit::Zero, Bit::One] {
+            for reverse in [false, true] {
+                let mut mapped = direct_lut_fixture(0xe8e8);
+                mapped.cells = vec![
+                    Ecp5Cell::Lut4 {
+                        name: "constant".into(),
+                        inputs: [constant, Bit::Wire(10), constant, Bit::Zero],
+                        output: 20,
+                        init: 0xe8e8,
+                    },
+                    Ecp5Cell::Lut4 {
+                        name: "invert".into(),
+                        inputs: [Bit::Wire(20), Bit::Zero, Bit::Zero, Bit::Zero],
+                        output: 21,
+                        init: 0x5555,
+                    },
+                    Ecp5Cell::Lut4 {
+                        name: "masked".into(),
+                        inputs: [Bit::Wire(21), Bit::Wire(11), Bit::Wire(21), Bit::Zero],
+                        output: 22,
+                        init: 0xe8e8,
+                    },
+                    Ecp5Cell::Lut4 {
+                        name: "result".into(),
+                        inputs: [Bit::Wire(22), Bit::Wire(12), Bit::Zero, Bit::Zero],
+                        output: 23,
+                        init: 0x8888,
+                    },
+                ];
+                if reverse {
+                    mapped.cells.reverse();
+                }
+                let original = mapped.cells.clone();
+                super::propagate_lut4_constants(&mut mapped);
+                assert_eq!(mapped.cells.len(), original.len());
+                for wire in 20..=22 {
+                    assert!(mapped.cells.iter().any(|cell| matches!(cell,
+                        Ecp5Cell::Lut4 { inputs, output, .. }
+                        if *output == wire && inputs.iter().all(|bit| !matches!(bit, Bit::Wire(_)))
+                    )));
+                }
+                // Evaluate the original and transformed cones independently of
+                // cleanup's cofactor calculation, for every primary input.
+                let evaluate = |cells: &[Ecp5Cell], assignment: u32| {
+                    let mut values = (10..14)
+                        .map(|wire| (wire, (assignment >> (wire - 10)) & 1))
+                        .collect::<BTreeMap<_, _>>();
+                    for wire in 20..=23 {
+                        let cell = cells.iter().find(|cell| matches!(cell, Ecp5Cell::Lut4 { output, .. } if *output == wire)).unwrap();
+                        let Ecp5Cell::Lut4 { inputs, init, .. } = cell else {
+                            unreachable!()
+                        };
+                        let index = inputs.iter().enumerate().fold(0, |index, (pin, bit)| {
+                            let value = match bit {
+                                Bit::Zero => 0,
+                                Bit::One => 1,
+                                Bit::Wire(wire) => values[wire],
+                            };
+                            index | (value << pin)
+                        });
+                        values.insert(wire, u32::from((init >> index) & 1));
+                    }
+                    values[&23]
+                };
+                for assignment in 0..16 {
+                    assert_eq!(
+                        evaluate(&original, assignment),
+                        evaluate(&mapped.cells, assignment)
+                    );
+                }
+                let normalized = mapped.cells.clone();
+                super::propagate_lut4_constants(&mut mapped);
+                assert_eq!(mapped.cells, normalized, "normalization is idempotent");
+            }
+        }
+    }
+
+    #[test]
+    fn lut4_constant_propagation_preserves_dedicated_connections() {
+        let mut mapped = direct_lut_fixture(0);
+        let dedicated = vec![
+            Ecp5Cell::PfuMux {
+                name: "mux".into(),
+                lut_true: Bit::Wire(20),
+                lut_false: Bit::Wire(20),
+                select: Bit::Wire(10),
+                output: 21,
+            },
+            Ecp5Cell::L6Mux21 {
+                name: "wide_mux".into(),
+                data_zero: Bit::Wire(21),
+                data_one: Bit::Wire(21),
+                select: Bit::Wire(20),
+                output: 22,
+            },
+            Ecp5Cell::Ccu2c {
+                name: "carry".into(),
+                inputs: [[Bit::Wire(20); 4]; 2],
+                carry_in: Bit::Wire(20),
+                sums: [23, 24],
+                carry_out: 25,
+                init: [0; 2],
+                inject: [false; 2],
+            },
+        ];
+        mapped.cells.extend(dedicated.clone());
+        let ports = mapped.ports.clone();
+        super::propagate_lut4_constants(&mut mapped);
+        assert_eq!(&mapped.cells[1..], &dedicated);
+        assert!(matches!(mapped.cells[0], Ecp5Cell::Lut4 { output: 20, .. }));
+        assert_eq!(mapped.ports, ports);
+    }
+
+    #[test]
+    fn lut4_constant_cleanup_preserves_every_truth_table() {
+        let mut mapped = direct_lut_fixture(0);
+        // Exercise every INIT with constant-low and constant-high controls in
+        // different pin positions. Evaluate actual original/rewritten inputs,
+        // independently of the cofactor calculation used by cleanup.
+        for init in 0..=u16::MAX {
+            for original in [
+                [Bit::Zero, Bit::Wire(11), Bit::Wire(12), Bit::One],
+                [Bit::Wire(10), Bit::One, Bit::Zero, Bit::Wire(13)],
+            ] {
+                let Ecp5Cell::Lut4 {
+                    inputs,
+                    init: truth,
+                    ..
+                } = &mut mapped.cells[0]
+                else {
+                    unreachable!();
+                };
+                *inputs = original;
+                *truth = init;
+                cleanup_lut4_dynamic_inputs(&mut mapped);
+                let Ecp5Cell::Lut4 {
+                    inputs,
+                    init: truth,
+                    ..
+                } = &mapped.cells[0]
+                else {
+                    unreachable!();
+                };
+                assert_eq!(*truth, init);
+                for assignment in 0..16_usize {
+                    let evaluate = |pins: [Bit; 4]| {
+                        let index = pins.iter().enumerate().fold(0, |index, (pin, bit)| {
+                            let value = match bit {
+                                Bit::Zero => 0,
+                                Bit::One => 1,
+                                Bit::Wire(wire) => (assignment >> (*wire - 10)) & 1,
+                            };
+                            index | (value << pin)
+                        });
+                        (init >> index) & 1
+                    };
+                    assert_eq!(evaluate(original), evaluate(*inputs), "INIT {init:04x}");
+                }
+            }
+        }
     }
 
     #[test]
