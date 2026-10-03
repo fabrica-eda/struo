@@ -7,7 +7,8 @@ mod physical;
 
 pub use mapped::{
     ArithmeticMapping, Bit, Control, Ecp5Cell, Ecp5MemoryImplementation, Ecp5Netlist,
-    IoTimingConstraints, JtaggBinding, MappedPort, MappingError, MappingOptions,
+    IoTimingConstraints, JtaggBinding, LogicBranchReplication, LogicBranchReplicationError,
+    LogicBranchReplicationReport, MappedPort, MappingError, MappingOptions,
     MulticyclePathConstraint, NextpnrJsonError, OocClockConstraint, OocPortConstraint,
     OocTimingConstraints, OpenDrainIo, PllBinding, PllOutput, PortDirection as MappedPortDirection,
     RegisterBranchReplication, RegisterBranchReplicationError, RegisterBranchReplicationReport,
