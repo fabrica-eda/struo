@@ -48,8 +48,8 @@ jobs:
 
       - name: Install Veryl
         env:
-          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.21.0/veryl-x86_64-linux.zip
-          VERYL_SHA256: cdc71da21801418aceed129b5c8e5ab2ac30f3ff86827d031c79bd8a4af5e92f
+          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.22.0/veryl-x86_64-linux.zip
+          VERYL_SHA256: 5a955bd395a09e8a611d70d7e6850ed930fa268e83b6a89238ad2670f616016a
         run: |
           curl --fail --location --silent --show-error \
             "$VERYL_URL" --output "$RUNNER_TEMP/veryl.zip"
@@ -228,8 +228,8 @@ jobs:
 
       - name: Install Veryl
         env:
-          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.21.0/veryl-x86_64-linux.zip
-          VERYL_SHA256: cdc71da21801418aceed129b5c8e5ab2ac30f3ff86827d031c79bd8a4af5e92f
+          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.22.0/veryl-x86_64-linux.zip
+          VERYL_SHA256: 5a955bd395a09e8a611d70d7e6850ed930fa268e83b6a89238ad2670f616016a
         run: |
           curl --fail --location --silent --show-error \
             "$VERYL_URL" --output "$RUNNER_TEMP/veryl.zip"
@@ -308,7 +308,7 @@ jobs:
           if-no-files-found: warn
 
   veryl-corpus:
-    name: Veryl corpus (Celox 0.8.1)
+    name: Veryl corpus (Celox 0.9.0)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -336,8 +336,11 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-veryl-corpus-v1-
 
-      - name: Run Veryl corpus with explicit known-case ignores
-        run: python3 scripts/check-veryl-suite.py --timing --jobs 4 --timeout 60 --report target/veryl-corpus/results.json
+      - name: Test corpus runner policies
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Run Veryl corpus with explicit ignores and expectation policies
+        run: python3 scripts/check-veryl-suite.py --timing --jobs 1 --memory-mib 4096 --report target/veryl-corpus/results.json
 
       - name: Summarize corpus results
         if: ${{ always() }}
@@ -356,7 +359,13 @@ jobs:
                   for status, count in sorted(data["counts"].items()):
                       summary.write(f"| `{status}` | {count} |\n")
                   summary.write(f"| Total | {len(data['cases'])} |\n\n")
-                  summary.write("Per-case diagnostics are in the veryl-corpus-results artifact.\n")
+                  extended = [case for case in data["cases"] if case.get("timeout_seconds", 60) > 60]
+                  if extended:
+                      summary.write("| Extended-budget case | Budget (s) | Outcome |\n| --- | ---: | --- |\n")
+                      for case in extended:
+                          summary.write(f"| `{case['name']}` | {case['timeout_seconds']} | `{case['status']}` |\n")
+                      summary.write("\n")
+                  summary.write("Ignored cases are known limitations; excluded cases require incompatible tagged expectations. Neither counts as a pass. Per-case diagnostics and upstream tags are in the veryl-corpus-results artifact.\n")
               else:
                   summary.write("The runner did not produce a report; inspect the build/run logs.\n")
           PYTHON

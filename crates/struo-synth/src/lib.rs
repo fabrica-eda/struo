@@ -1,5 +1,8 @@
 //! Technology-independent synthesis for Struo.
 
+mod ranges;
+mod word_cells;
+
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -57,7 +60,8 @@ impl Default for SynthesisOptions {
 
 /// Synthesizes the selected top module into a bit-level logic netlist.
 ///
-/// Construction performs constant folding and structural hashing. Word-level
+/// Construction performs constant folding and structural hashing, including
+/// sharing identical word operations after resolving their inputs. Word-level
 /// addition, subtraction, and ordering comparisons are retained for target-specific carry mapping.
 /// Synchronous simple-dual-port memories are retained for block-RAM mapping. Hierarchy
 /// and inout ports are rejected until their semantics have dedicated passes.
@@ -85,13 +89,23 @@ pub fn synthesize_with_options(
         .ok_or_else(|| SynthesisError::InvalidRtl(RtlError::MissingTop(design.top().into())))?;
     reject_unsupported(module)?;
 
-    let mut lowering = Lowering::new(module);
-    lowering.reserve_sources();
-    lowering.index_assignments();
-    lowering.connect_memories()?;
-    lowering.connect_registers()?;
-    lowering.connect_outputs()?;
-    let mut netlist = lowering.netlist;
+    // Keep the established whole-expression construction order for ordinary
+    // acyclic designs. Always resolving individual bits changes netlist sharing
+    // and node order, which can regress downstream placement and timing.
+    // A vector-level cycle may be acyclic at bit granularity, and an inactive
+    // constant-mux arm can contain unobservable feedback or undriven bits.
+    // Retry those failures using only observable dependencies. Active feedback
+    // and undriven inputs still fail; no state or default drivers are invented.
+    let mut netlist = match Lowering::new(module).lower() {
+        Err(
+            SynthesisError::CombinationalLoop { .. } | SynthesisError::UndrivenSignalBit { .. },
+        ) => {
+            let mut lowering = Lowering::new(module);
+            lowering.resolve_observable_dependencies = true;
+            lowering.lower()?
+        }
+        result => result?,
+    };
     let mut reports = vec![PassReport {
         pass: "lower-rtl",
         message: format!(
@@ -135,7 +149,11 @@ struct Lowering<'a> {
     signal_bits: Vec<Vec<Option<NetId>>>,
     drivers: Vec<Vec<Option<Driver>>>,
     expression_bits: Vec<Option<Vec<NetId>>>,
+    expression_ranges: HashMap<(ExprId, usize, usize), Vec<NetId>>,
+    adder_widths: Vec<Option<usize>>,
+    word_cells: word_cells::WordCells,
     resolving: HashSet<(SignalId, usize)>,
+    resolve_observable_dependencies: bool,
 }
 
 impl<'a> Lowering<'a> {
@@ -156,8 +174,21 @@ impl<'a> Lowering<'a> {
             signal_bits,
             drivers,
             expression_bits: vec![None; module.expressions().len()],
+            expression_ranges: HashMap::new(),
+            adder_widths: ranges::adder_widths(module),
+            word_cells: word_cells::WordCells::default(),
             resolving: HashSet::new(),
+            resolve_observable_dependencies: false,
         }
+    }
+
+    fn lower(mut self) -> Result<Netlist, SynthesisError> {
+        self.reserve_sources();
+        self.index_assignments();
+        self.connect_memories()?;
+        self.connect_registers()?;
+        self.connect_outputs()?;
+        Ok(self.netlist)
     }
 
     fn reserve_sources(&mut self) {
@@ -388,7 +419,15 @@ impl<'a> Lowering<'a> {
                 bit,
             });
         }
-        let result = self.lower_expression(driver.0).map(|bits| bits[driver.1]);
+        // Follow only this bit's dependency cone. A whole-vector connection
+        // can contain unrelated bits that lead back to the current signal,
+        // especially after flattening module ports.
+        let result = if self.resolve_observable_dependencies {
+            self.lower_expression_range(driver.0, driver.1, 1)
+                .map(|bits| bits[0])
+        } else {
+            self.lower_expression(driver.0).map(|bits| bits[driver.1])
+        };
         self.resolving.remove(&(signal, bit));
         let net = result?;
         self.signal_bits[signal_index][bit] = Some(net);
@@ -426,15 +465,24 @@ impl<'a> Lowering<'a> {
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                if op == BinaryOp::Add
-                    && let Some(bits) = self.lower_add_with_carry(lhs, rhs)?
+                let narrow = self.adder_widths[index];
+                let mut bits = if op == BinaryOp::Add
+                    && let Some(bits) = self.lower_add_with_carry(lhs, rhs, narrow)?
                 {
                     bits
                 } else {
-                    let lhs = self.lower_expression(lhs)?;
-                    let rhs = self.lower_expression(rhs)?;
+                    let mut lhs = self.lower_expression(lhs)?;
+                    let mut rhs = self.lower_expression(rhs)?;
+                    if let Some(width) = narrow {
+                        lhs.truncate(width);
+                        rhs.truncate(width);
+                    }
                     self.lower_binary(op, &lhs, &rhs)
+                };
+                if narrow.is_some() {
+                    bits.resize(width, self.netlist.add_constant(false));
                 }
+                bits
             }
             ExprKind::Mux {
                 condition,
@@ -442,6 +490,14 @@ impl<'a> Lowering<'a> {
                 else_expr,
             } => {
                 let condition = self.lower_expression(condition)?[0];
+                if self.resolve_observable_dependencies
+                    && let Some(selected) = self.netlist.constant_value(condition)
+                {
+                    let bits =
+                        self.lower_expression(if selected { then_expr } else { else_expr })?;
+                    self.expression_bits[index] = Some(bits.clone());
+                    return Ok(bits);
+                }
                 let then_bits = self.lower_expression(then_expr)?;
                 let else_bits = self.lower_expression(else_expr)?;
                 then_bits
@@ -469,6 +525,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         lhs: ExprId,
         rhs: ExprId,
+        width: Option<usize>,
     ) -> Result<Option<Vec<NetId>>, SynthesisError> {
         let Some((add_lhs, add_rhs, carry)) = self
             .add_operands(lhs)
@@ -483,14 +540,20 @@ impl<'a> Lowering<'a> {
         else {
             return Ok(None);
         };
-        let lhs = self.lower_expression(add_lhs)?;
-        let rhs = self.lower_expression(add_rhs)?;
+        let mut lhs = self.lower_expression(add_lhs)?;
+        let mut rhs = self.lower_expression(add_rhs)?;
         let carry = self.lower_expression(carry)?[0];
-        Ok(Some(
-            self.netlist
-                .add_arithmetic_with_carry(&lhs, &rhs, carry)
-                .expect("validated RTL carry addition has equal, non-zero widths"),
-        ))
+        if let Some(width) = width {
+            lhs.truncate(width);
+            rhs.truncate(width);
+        }
+        Ok(Some(self.word_cells.arithmetic(
+            &mut self.netlist,
+            ArithmeticOp::Add,
+            &lhs,
+            &rhs,
+            Some(carry),
+        )))
     }
 
     fn add_operands(&self, id: ExprId) -> Option<(ExprId, ExprId)> {
@@ -543,6 +606,25 @@ impl<'a> Lowering<'a> {
         if let Some(bits) = &self.expression_bits[id.index() as usize] {
             return Ok(bits[lsb..lsb + width].to_vec());
         }
+        let key = (id, lsb, width);
+        if let Some(bits) = self.expression_ranges.get(&key) {
+            return Ok(bits.clone());
+        }
+        // Cache only completed ranges. Recursion still resolves signal bits
+        // normally, so a genuine feedback edge cannot hide in a partial entry.
+        // Each lowering attempt owns its cache; the observable-only retry
+        // starts from a new Lowering rather than reusing strict-mode results.
+        let bits = self.lower_expression_range_uncached(id, lsb, width)?;
+        self.expression_ranges.insert(key, bits.clone());
+        Ok(bits)
+    }
+
+    fn lower_expression_range_uncached(
+        &mut self,
+        id: ExprId,
+        lsb: usize,
+        width: usize,
+    ) -> Result<Vec<NetId>, SynthesisError> {
         let expression = &self.module.expressions()[id.index() as usize];
         debug_assert!(lsb + width <= expression.r#type().width.get() as usize);
         // Keep bitwise expressions lazy across slices. Procedural partial
@@ -582,6 +664,15 @@ impl<'a> Lowering<'a> {
                 else_expr,
             } => {
                 let condition = self.lower_expression(condition)?[0];
+                if self.resolve_observable_dependencies
+                    && let Some(selected) = self.netlist.constant_value(condition)
+                {
+                    return self.lower_expression_range(
+                        if selected { then_expr } else { else_expr },
+                        lsb,
+                        width,
+                    );
+                }
                 let then_bits = self.lower_expression_range(then_expr, lsb, width)?;
                 let else_bits = self.lower_expression_range(else_expr, lsb, width)?;
                 Ok(then_bits
@@ -632,18 +723,24 @@ impl<'a> Lowering<'a> {
             BinaryOp::And => self.bitwise(lhs, rhs, Netlist::add_and),
             BinaryOp::Or => self.bitwise(lhs, rhs, Netlist::add_or),
             BinaryOp::Xor => self.bitwise(lhs, rhs, Netlist::add_xor),
-            BinaryOp::Add => self
-                .netlist
-                .add_arithmetic(ArithmeticOp::Add, lhs, rhs)
-                .expect("validated RTL arithmetic has equal, non-zero widths"),
-            BinaryOp::Sub => self
-                .netlist
-                .add_arithmetic(ArithmeticOp::Subtract, lhs, rhs)
-                .expect("validated RTL arithmetic has equal, non-zero widths"),
-            BinaryOp::Mul => self
-                .netlist
-                .add_arithmetic(ArithmeticOp::Multiply, lhs, rhs)
-                .expect("validated RTL multiplication has equal, non-zero widths"),
+            BinaryOp::Add => {
+                self.word_cells
+                    .arithmetic(&mut self.netlist, ArithmeticOp::Add, lhs, rhs, None)
+            }
+            BinaryOp::Sub => self.word_cells.arithmetic(
+                &mut self.netlist,
+                ArithmeticOp::Subtract,
+                lhs,
+                rhs,
+                None,
+            ),
+            BinaryOp::Mul => self.word_cells.arithmetic(
+                &mut self.netlist,
+                ArithmeticOp::Multiply,
+                lhs,
+                rhs,
+                None,
+            ),
             BinaryOp::Equal => vec![self.equal_words(lhs, rhs)],
             BinaryOp::NotEqual => {
                 let equal = self.equal_words(lhs, rhs);
@@ -683,9 +780,8 @@ impl<'a> Lowering<'a> {
 
     fn compare(&mut self, operation: ComparisonOp, lhs: &[NetId], rhs: &[NetId]) -> Vec<NetId> {
         vec![
-            self.netlist
-                .add_comparison(operation, lhs, rhs)
-                .expect("validated RTL comparisons have equal, non-zero widths"),
+            self.word_cells
+                .comparison(&mut self.netlist, operation, lhs, rhs),
         ]
     }
 
@@ -1602,16 +1698,20 @@ mod tests {
     }
 
     fn add_with_carry_design(width: u32) -> Design {
+        padded_carry_design(width, width)
+    }
+
+    fn padded_carry_design(input_width: u32, width: u32) -> Design {
         let mut module = Module::new("AddWithCarry");
         let lhs = module.add_port(Port {
             name: "lhs".into(),
             direction: PortDirection::Input,
-            r#type: bits(width),
+            r#type: bits(input_width),
         });
         let rhs = module.add_port(Port {
             name: "rhs".into(),
             direction: PortDirection::Input,
-            r#type: bits(width),
+            r#type: bits(input_width),
         });
         let carry = module.add_port(Port {
             name: "carry".into(),
@@ -1623,8 +1723,16 @@ mod tests {
             direction: PortDirection::Output,
             r#type: bits(width),
         });
-        let lhs = module.read(lhs).unwrap();
-        let rhs = module.read(rhs).unwrap();
+        let mut lhs = module.read(lhs).unwrap();
+        let mut rhs = module.read(rhs).unwrap();
+        if input_width < width {
+            let zeros = module.constant(Constant::from_u64(
+                BitWidth::new(width - input_width).unwrap(),
+                0,
+            ));
+            lhs = module.concat(vec![zeros, lhs]).unwrap();
+            rhs = module.concat(vec![zeros, rhs]).unwrap();
+        }
         let carry = module.read(carry).unwrap();
         let zeros = module.constant(Constant::from_u64(BitWidth::new(width - 1).unwrap(), 0));
         let carry = module.concat(vec![zeros, carry]).unwrap();
@@ -1706,6 +1814,96 @@ mod tests {
     }
 
     #[test]
+    fn narrows_guarded_accumulation_without_changing_declared_outputs() {
+        let mut module = Module::new("GuardedCount");
+        let flags = module.add_port(Port {
+            name: "flags".into(),
+            direction: PortDirection::Input,
+            r#type: bits(8),
+        });
+        let output = module.add_port(Port {
+            name: "count".into(),
+            direction: PortDirection::Output,
+            r#type: bits(32),
+        });
+        let mut value = module.constant(Constant::from_u64(BitWidth::new(32).unwrap(), 0));
+        let one = module.constant(Constant::from_u64(BitWidth::new(32).unwrap(), 1));
+        for bit in 0..8 {
+            let slice = module.slice(flags, bit, BitWidth::new(1).unwrap()).unwrap();
+            let condition = module.read_slice(slice).unwrap();
+            let next = module.binary(BinaryOp::Add, value, one).unwrap();
+            value = module.mux(condition, next, value).unwrap();
+        }
+        module.assign(module.whole(output).unwrap(), value).unwrap();
+        let mut design = Design::new("GuardedCount");
+        design.add_module(module);
+        let netlist = synthesize(&design).unwrap().netlist;
+        assert!(!netlist.arithmetic().is_empty());
+        assert!(
+            netlist
+                .arithmetic()
+                .iter()
+                .all(|cell| cell.outputs().len() <= 4)
+        );
+        for flags in 0..256u64 {
+            let outputs = evaluate_combinational(&netlist, &input_word("flags", 8, flags));
+            assert_eq!(
+                output_word(&outputs, "count", 32),
+                u64::from(flags.count_ones())
+            );
+        }
+    }
+
+    #[test]
+    fn narrows_fused_carry_additions_and_preserves_wrapping_values() {
+        let mut design = padded_carry_design(3, 32);
+        let netlist = synthesize(&design).unwrap().netlist;
+        assert_eq!(netlist.arithmetic().len(), 1);
+        assert_eq!(netlist.arithmetic()[0].outputs().len(), 4);
+        for lhs in 0..8 {
+            for rhs in 0..8 {
+                for carry in 0..2 {
+                    let inputs = input_word("lhs", 3, lhs)
+                        .into_iter()
+                        .chain(input_word("rhs", 3, rhs))
+                        .chain([(String::from("carry"), carry != 0)])
+                        .collect();
+                    let outputs = evaluate_combinational(&netlist, &inputs);
+                    assert_eq!(output_word(&outputs, "sum", 32), lhs + rhs + carry);
+                }
+            }
+        }
+        let mut module = Module::new("WideWrap");
+        let flag = module.add_port(Port {
+            name: "flag".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let output = module.add_port(Port {
+            name: "sum".into(),
+            direction: PortDirection::Output,
+            r#type: bits(64),
+        });
+        let flag = module.read(flag).unwrap();
+        let zero = module.constant(Constant::from_u64(BitWidth::new(63).unwrap(), 0));
+        let increment = module.concat(vec![zero, flag]).unwrap();
+        let maximum = module.constant(Constant::from_u64(BitWidth::new(64).unwrap(), u64::MAX));
+        let sum = module.binary(BinaryOp::Add, maximum, increment).unwrap();
+        module.assign(module.whole(output).unwrap(), sum).unwrap();
+        design = Design::new("WideWrap");
+        design.add_module(module);
+        let netlist = synthesize(&design).unwrap().netlist;
+        assert_eq!(netlist.arithmetic()[0].outputs().len(), 64);
+        for flag in [false, true] {
+            let outputs = evaluate_combinational(&netlist, &HashMap::from([("flag".into(), flag)]));
+            assert_eq!(
+                output_word(&outputs, "sum", 64),
+                if flag { 0 } else { u64::MAX }
+            );
+        }
+    }
+
+    #[test]
     fn lowers_wrapping_adder() {
         let synthesized = synthesize(&arithmetic_design(4, BinaryOp::Add)).unwrap();
         assert_eq!(synthesized.netlist.registers().len(), 0);
@@ -1757,6 +1955,233 @@ mod tests {
     }
 
     #[test]
+    fn shares_word_cells_across_distinct_rtl_expressions() {
+        let mut module = Module::new("SharedWords");
+        let a = module.add_port(Port {
+            name: "a".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        let b = module.add_port(Port {
+            name: "b".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        for copy in 0..2 {
+            // Separate read and operator IDs must still share resolved word cells.
+            let a = module.read(a).unwrap();
+            let b = module.read(b).unwrap();
+            let sub = module.binary(BinaryOp::Sub, a, b).unwrap();
+            let reverse = module.binary(BinaryOp::Sub, b, a).unwrap();
+            let product = module.binary(BinaryOp::Mul, sub, b).unwrap();
+            let unsigned = module
+                .binary(BinaryOp::LessThanUnsigned, product, reverse)
+                .unwrap();
+            let signed = module
+                .binary(BinaryOp::LessThanSigned, product, reverse)
+                .unwrap();
+            for (name, value, width) in [
+                ("sub", sub, 4),
+                ("reverse", reverse, 4),
+                ("product", product, 4),
+                ("unsigned", unsigned, 1),
+                ("signed", signed, 1),
+            ] {
+                let output = module.add_port(Port {
+                    name: format!("{name}{copy}"),
+                    direction: PortDirection::Output,
+                    r#type: bits(width),
+                });
+                let target = module.whole(output).unwrap();
+                module.assign(target, value).unwrap();
+            }
+        }
+        let mut design = Design::new("SharedWords");
+        design.add_module(module);
+        let result = synthesize(&design).unwrap();
+        assert_eq!(result.netlist.arithmetic().len(), 3);
+        assert_eq!(result.netlist.comparisons().len(), 2);
+        for a in 0u64..16 {
+            for b in 0u64..16 {
+                let inputs = input_word("a", 4, a)
+                    .into_iter()
+                    .chain(input_word("b", 4, b))
+                    .collect();
+                let outputs = evaluate_combinational(&result.netlist, &inputs);
+                let sub = a.wrapping_sub(b) & 15;
+                let reverse = b.wrapping_sub(a) & 15;
+                let product = (sub * b) & 15;
+                for copy in 0..2 {
+                    for (name, width, expected) in [
+                        ("sub", 4, sub),
+                        ("reverse", 4, reverse),
+                        ("product", 4, product),
+                        ("unsigned", 1, u64::from(product < reverse)),
+                        ("signed", 1, u64::from((product ^ 8) < (reverse ^ 8))),
+                    ] {
+                        let name = format!("{name}{copy}");
+                        let actual = if width == 1 {
+                            u64::from(outputs[&name])
+                        } else {
+                            output_word(&outputs, &name, width)
+                        };
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_adders_preserve_widths_and_distinct_carries() {
+        let mut module = Module::new("SharedAdders");
+        let inputs = [("a", 3), ("b", 3), ("c", 1), ("d", 1)].map(|(name, width)| {
+            module.add_port(Port {
+                name: name.into(),
+                direction: PortDirection::Input,
+                r#type: bits(width),
+            })
+        });
+        for copy in 0..2 {
+            for width in [2, 3] {
+                for carry in 0..3 {
+                    let a = module.read(inputs[0]).unwrap();
+                    let b = module.read(inputs[1]).unwrap();
+                    let a = module
+                        .expression_slice(a, 0, BitWidth::new(width).unwrap())
+                        .unwrap();
+                    let b = module
+                        .expression_slice(b, 0, BitWidth::new(width).unwrap())
+                        .unwrap();
+                    let mut sum = module.binary(BinaryOp::Add, a, b).unwrap();
+                    if carry != 0 {
+                        let c = module.read(inputs[carry + 1]).unwrap();
+                        let zero = module
+                            .constant(Constant::from_u64(BitWidth::new(width - 1).unwrap(), 0));
+                        let c = module.concat(vec![zero, c]).unwrap();
+                        sum = module.binary(BinaryOp::Add, sum, c).unwrap();
+                    }
+                    let output = module.add_port(Port {
+                        name: format!("sum_{copy}_{width}_{carry}"),
+                        direction: PortDirection::Output,
+                        r#type: bits(width),
+                    });
+                    module.assign(module.whole(output).unwrap(), sum).unwrap();
+                }
+            }
+        }
+        let mut design = Design::new("SharedAdders");
+        design.add_module(module);
+        let result = synthesize(&design).unwrap();
+        assert_eq!(result.netlist.arithmetic().len(), 6);
+        for a in 0..8 {
+            for b in 0..8 {
+                for carries in 0..4 {
+                    let c = carries & 1;
+                    let d = carries >> 1;
+                    let inputs = input_word("a", 3, a)
+                        .into_iter()
+                        .chain(input_word("b", 3, b))
+                        .chain([("c".into(), c != 0), ("d".into(), d != 0)])
+                        .collect();
+                    let outputs = evaluate_combinational(&result.netlist, &inputs);
+                    for copy in 0..2 {
+                        for width in [2, 3] {
+                            for (carry, value) in [0, c, d].into_iter().enumerate() {
+                                assert_eq!(
+                                    output_word(
+                                        &outputs,
+                                        &format!("sum_{copy}_{width}_{carry}"),
+                                        width
+                                    ),
+                                    (a + b + value) & ((1 << width) - 1)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lowers_repeated_partial_writes_without_rewalking_shared_ranges() {
+        let mut module = Module::new("Scatter");
+        let base = module.add_port(Port {
+            name: "base".into(),
+            direction: PortDirection::Input,
+            r#type: bits(32),
+        });
+        let selector = module.add_port(Port {
+            name: "selector".into(),
+            direction: PortDirection::Input,
+            r#type: bits(5),
+        });
+        let value = module.add_port(Port {
+            name: "value".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let output = module.add_port(Port {
+            name: "result".into(),
+            direction: PortDirection::Output,
+            r#type: bits(32),
+        });
+        let mut current = module.read(base).unwrap();
+        let selector = module.read(selector).unwrap();
+        let value = module.read(value).unwrap();
+        for lane in 0..32 {
+            let lane_value = module.constant(Constant::from_u64(
+                BitWidth::new(5).unwrap(),
+                u64::from(lane),
+            ));
+            let selected = module
+                .binary(BinaryOp::Equal, selector, lane_value)
+                .unwrap();
+            let mut parts = Vec::new();
+            if lane < 31 {
+                parts.push(
+                    module
+                        .expression_slice(current, lane + 1, BitWidth::new(31 - lane).unwrap())
+                        .unwrap(),
+                );
+            }
+            parts.push(value);
+            if lane > 0 {
+                parts.push(
+                    module
+                        .expression_slice(current, 0, BitWidth::new(lane).unwrap())
+                        .unwrap(),
+                );
+            }
+            let replacement = module.concat(parts).unwrap();
+            current = module.mux(selected, replacement, current).unwrap();
+        }
+        module
+            .assign(module.whole(output).unwrap(), current)
+            .unwrap();
+        let mut design = Design::new("Scatter");
+        design.add_module(module);
+        let result = synthesize(&design).unwrap();
+        for base in [0, u64::from(u32::MAX), 0xa55a_c33c] {
+            for selector in 0..32 {
+                for value in 0..2 {
+                    let inputs = input_word("base", 32, base)
+                        .into_iter()
+                        .chain(input_word("selector", 5, selector))
+                        .chain([("value".into(), value != 0)])
+                        .collect();
+                    let outputs = evaluate_combinational(&result.netlist, &inputs);
+                    assert_eq!(
+                        output_word(&outputs, "result", 32),
+                        (base & !(1 << selector)) | (value << selector)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn retains_wrapping_subtraction() {
         let synthesized = synthesize(&arithmetic_design(4, BinaryOp::Sub)).unwrap();
         assert_eq!(synthesized.netlist.arithmetic().len(), 1);
@@ -1772,6 +2197,143 @@ mod tests {
                     .collect();
                 let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
                 assert_eq!(output_word(&outputs, "sum", 4), lhs.wrapping_sub(rhs) & 0xf);
+            }
+        }
+    }
+
+    #[test]
+    fn ignores_only_proven_inactive_mux_dependencies() {
+        for selected in [None, Some(false), Some(true)] {
+            for invalid_on_true in [false, true] {
+                for undriven in [false, true] {
+                    for ranged in [false, true] {
+                        let mut module = Module::new("ObservableMux");
+                        let width = if ranged { 4 } else { 2 };
+                        let input = module.add_port(Port {
+                            name: "input".into(),
+                            direction: PortDirection::Input,
+                            r#type: bits(width),
+                        });
+                        let output = module.add_port(Port {
+                            name: "output".into(),
+                            direction: PortDirection::Output,
+                            r#type: bits(2),
+                        });
+                        let condition = if let Some(selected) = selected {
+                            module.constant(Constant::from_u64(
+                                BitWidth::new(1).unwrap(),
+                                u64::from(selected),
+                            ))
+                        } else {
+                            let select = module.add_port(Port {
+                                name: "select".into(),
+                                direction: PortDirection::Input,
+                                r#type: bits(1),
+                            });
+                            module.read(select).unwrap()
+                        };
+                        let good = module.read(input).unwrap();
+                        let bad = if undriven {
+                            let floating = module.add_signal("floating", bits(width));
+                            module.read(floating).unwrap()
+                        } else {
+                            let feedback = module.read(output).unwrap();
+                            if ranged {
+                                module.concat(vec![feedback, feedback]).unwrap()
+                            } else {
+                                feedback
+                            }
+                        };
+                        let (yes, no) = if invalid_on_true {
+                            (bad, good)
+                        } else {
+                            (good, bad)
+                        };
+                        let value = module.mux(condition, yes, no).unwrap();
+                        let value = if ranged {
+                            module
+                                .expression_slice(value, 0, BitWidth::new(2).unwrap())
+                                .unwrap()
+                        } else {
+                            value
+                        };
+                        module.assign(module.whole(output).unwrap(), value).unwrap();
+                        let mut design = Design::new("ObservableMux");
+                        design.add_module(module);
+                        let result = synthesize(&design);
+                        if selected.is_none_or(|selected| selected == invalid_on_true) {
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(super::SynthesisError::CombinationalLoop { .. }
+                                        | super::SynthesisError::UndrivenSignalBit { .. })
+                                ),
+                                "selected={selected:?}, invalid_on_true={invalid_on_true}, undriven={undriven}, ranged={ranged}: {result:?}"
+                            );
+                        } else {
+                            let result = result.unwrap();
+                            for value in 0..(1u64 << width) {
+                                let output = evaluate_combinational(
+                                    &result.netlist,
+                                    &input_word("input", width as usize, value),
+                                );
+                                assert_eq!(output_word(&output, "output", 2), value & 3);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolves_whole_vector_aliases_by_bit_without_masking_real_loops() {
+        for feedback_bit in [1, 0] {
+            let mut module = Module::new("BitDependencies");
+            let input = module.add_port(Port {
+                name: "input".into(),
+                direction: PortDirection::Input,
+                r#type: bits(1),
+            });
+            let output = module.add_port(Port {
+                name: "output".into(),
+                direction: PortDirection::Output,
+                r#type: bits(2),
+            });
+            let alias = module.add_signal("alias", bits(2));
+            let whole = module.read(output).unwrap();
+            module.assign(module.whole(alias).unwrap(), whole).unwrap();
+            let whole_alias = module.read(alias).unwrap();
+            let feedback = module
+                .expression_slice(whole_alias, feedback_bit, BitWidth::new(1).unwrap())
+                .unwrap();
+            module
+                .assign(
+                    module.slice(output, 0, BitWidth::new(1).unwrap()).unwrap(),
+                    feedback,
+                )
+                .unwrap();
+            let value = module.read(input).unwrap();
+            module
+                .assign(
+                    module.slice(output, 1, BitWidth::new(1).unwrap()).unwrap(),
+                    value,
+                )
+                .unwrap();
+            let mut design = Design::new("BitDependencies");
+            design.add_module(module);
+            if feedback_bit == 0 {
+                assert!(matches!(
+                    synthesize(&design),
+                    Err(super::SynthesisError::CombinationalLoop { .. })
+                ));
+            } else {
+                let synthesized = synthesize(&design).unwrap();
+                for value in 0..2 {
+                    let inputs = HashMap::from([("input".into(), value != 0)]);
+                    let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
+                    assert_eq!(output_word(&outputs, "output", 2), value * 3);
+                }
             }
         }
     }

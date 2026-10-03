@@ -1,4 +1,25 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+mod additive_loops;
+mod arrays;
+mod bitwise_loops;
+mod comparisons;
+mod constant_driven_loops;
+mod constant_values;
+mod idempotent_loops;
+mod linear_reductions;
+mod loops;
+mod members;
+mod periodic_reductions;
+mod reductions;
+mod single_iteration;
+mod small_state_loops;
+mod sparse_index_loops;
+mod system_tasks;
+mod types;
+
+use comparisons::PreparedCaseTarget;
+use types::{repair_expression_signedness, variable_signedness};
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use struo_rtl::{
     BinaryOp, BitWidth, ClockEdge, Constant, Design, Enable, ExprId, ExprKind, Memory, MemoryPort,
@@ -7,8 +28,9 @@ use struo_rtl::{
 };
 use veryl_analyzer::ir::{
     ArrayLiteralItem, AssignDestination, CasePattern, CaseStatement, Component, Comptime,
-    Declaration, Expression, Factor, FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module,
-    Op, Statement, Type, TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
+    Declaration, Expression, Factor, FfDeclaration, ForRange, IfResetStatement, InstDeclaration,
+    Ir, Module, Op, Statement, Type, TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect,
+    VarSelectOp,
 };
 use veryl_analyzer::{attribute::Attribute as VerylAttribute, attribute_table};
 use veryl_parser::resource_table::StrId;
@@ -19,6 +41,18 @@ use crate::{ImportError, MemoryInferencePolicy, resolve_name};
 struct SignalKey {
     id: VarId,
     index: Vec<usize>,
+}
+
+struct PreparedSelect {
+    select: VarSelect,
+    offset: Option<(ExprId, ExprId)>,
+    domain: Option<veryl_analyzer::ir::MemberSelectDomain>,
+}
+
+struct PreparedDestination {
+    elements: Vec<(SignalKey, Option<LoweredExpr>)>,
+    packed: PreparedSelect,
+    width: u32,
 }
 
 type Env = HashMap<SignalKey, LoweredExpr>;
@@ -152,6 +186,7 @@ struct ModuleLowerer<'a> {
     signed: HashMap<SignalKey, bool>,
     inferred_memories: HashSet<VarId>,
     memory_policies: HashMap<VarId, MemoryInferencePolicy>,
+    runtime_loop_variables: HashSet<VarId>,
 }
 
 #[derive(Clone)]
@@ -223,13 +258,21 @@ pub fn lower_analyzed_ir(ir: &Ir, top: &str) -> Result<Design, ImportError> {
 
 impl<'a> ModuleLowerer<'a> {
     fn new(source: &'a Module) -> Result<Self, ImportError> {
+        Self::new_without_memories(source, &HashSet::new())
+    }
+
+    fn new_without_memories(
+        source: &'a Module,
+        excluded: &HashSet<VarId>,
+    ) -> Result<Self, ImportError> {
         let mut rtl = RtlModule::new(resolve_name(source.name)?);
         let mut signals = HashMap::new();
         let mut signal_order = Vec::new();
         let mut widths = HashMap::new();
         let mut signed = HashMap::new();
         let memory_policies = memory_inference_policies(source)?;
-        let inferred_memories = memory_candidates(source, &memory_policies);
+        let mut inferred_memories = memory_candidates(source, &memory_policies);
+        inferred_memories.retain(|memory| !excluded.contains(memory));
 
         let mut ports = source.ports.iter().collect::<Vec<_>>();
         ports.sort_by_key(|(path, _)| path.to_string());
@@ -272,7 +315,12 @@ impl<'a> ModuleLowerer<'a> {
                     && !inferred_memories.contains(&variable.id)
             })
             .collect::<Vec<_>>();
-        internals.sort_by_key(|variable| variable.path.to_string());
+        internals.sort_by_key(|variable| (variable.path.to_string(), variable.id));
+        let mut names = rtl
+            .signals()
+            .iter()
+            .map(|signal| signal.name().to_owned())
+            .collect::<HashSet<_>>();
         for variable in internals {
             let base_name = variable.path.to_string();
             let r#type = value_type(&variable.r#type, &base_name)?;
@@ -281,7 +329,14 @@ impl<'a> ModuleLowerer<'a> {
                     id: variable.id,
                     index,
                 };
-                let signal = rtl.add_signal(indexed_name(&base_name, &key.index), r#type);
+                let base = indexed_name(&base_name, &key.index);
+                let mut name = base.clone();
+                let mut suffix = 0usize;
+                while !names.insert(name.clone()) {
+                    suffix += 1;
+                    name = format!("{base}$scope{suffix}");
+                }
+                let signal = rtl.add_signal(name, r#type);
                 signals.insert(key.clone(), signal);
                 signal_order.push(key.clone());
                 widths.insert(key.clone(), r#type.width.get());
@@ -299,64 +354,96 @@ impl<'a> ModuleLowerer<'a> {
             signed,
             inferred_memories,
             memory_policies,
+            runtime_loop_variables: HashSet::new(),
         })
     }
 
     fn infer_memories(&mut self) -> Result<(), ImportError> {
-        let mut candidates = self.inferred_memories.iter().copied().collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok(());
-        }
-        candidates.sort_by_key(|memory| self.variable_name(*memory));
-
-        let mut patterns = self.collect_memory_patterns(&self.inferred_memories)?;
-        for memory_id in candidates {
-            let mut pattern = patterns.remove(&memory_id).unwrap_or_default();
-            if self.memory_policy(memory_id) == MemoryInferencePolicy::Distributed {
-                if let Err(error) = self.lower_distributed_memory(memory_id, pattern) {
-                    return Err(self.requirement_failure(memory_id, error));
+        let mut excluded = HashSet::new();
+        loop {
+            let mut candidates = self.inferred_memories.iter().copied().collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            candidates.sort_by_key(|memory| (self.variable_name(*memory), *memory));
+            let mut patterns = self.collect_memory_patterns(&self.inferred_memories)?;
+            let mut retry = false;
+            for memory in candidates {
+                let pattern = patterns.remove(&memory).unwrap_or_default();
+                if let Err(error) = self.infer_memory(memory, pattern) {
+                    if self.memory_policy(memory) != MemoryInferencePolicy::Preferred {
+                        return Err(error);
+                    }
+                    excluded.insert(memory);
+                    // Inference can already have emitted ports and expressions.
+                    // Rebuild from AIR so ordinary lowering sees every original
+                    // statement, with no leftover drivers from the failed attempt.
+                    *self = Self::new_without_memories(self.source, &excluded)?;
+                    retry = true;
+                    break;
                 }
-                continue;
             }
-            if pattern.writes.is_empty() || pattern.reads.is_empty() {
-                let missing = if pattern.writes.is_empty() && pattern.reads.is_empty() {
-                    "no supported synchronous read or write port was found"
-                } else if pattern.writes.is_empty() {
-                    "no supported synchronous write port was found"
-                } else {
-                    "no supported synchronous read port was found"
-                };
-                return Err(self.memory_inference_failure(memory_id, missing));
+            if !retry {
+                return Ok(());
             }
-            if pattern.writes.len() > 2 || pattern.reads.len() > 2 {
-                return Err(self.memory_inference_failure(
-                    memory_id,
-                    "more than two read/write ports are not supported",
-                ));
-            }
-            let mut ports = Vec::new();
-            for write in pattern.writes {
-                let Some(index) = pattern
-                    .reads
-                    .iter()
-                    .position(|read| read.clock == write.clock && read.edge == write.edge)
-                else {
-                    return Err(self.memory_inference_failure(
-                        memory_id,
-                        "each write port requires a read port on the same clock edge",
-                    ));
-                };
-                ports.push((write, pattern.reads.remove(index)));
-            }
-            if !pattern.reads.is_empty() {
-                return Err(self.memory_inference_failure(
-                    memory_id,
-                    "each read port requires a write port on the same clock edge",
-                ));
-            }
-            if let Err(error) = self.lower_inferred_memory(memory_id, ports) {
+        }
+    }
+
+    fn infer_memory(
+        &mut self,
+        memory_id: VarId,
+        mut pattern: PartialMemoryPattern,
+    ) -> Result<(), ImportError> {
+        if self.source.variables[&memory_id].affiliation
+            == veryl_analyzer::symbol::Affiliation::AlwaysFf
+        {
+            return Err(self.memory_inference_failure(memory_id,
+                "blocking always_ff-local accesses cannot use the synchronous read-first memory template"));
+        }
+        if self.memory_policy(memory_id) == MemoryInferencePolicy::Distributed {
+            if let Err(error) = self.lower_distributed_memory(memory_id, pattern) {
                 return Err(self.requirement_failure(memory_id, error));
             }
+            return Ok(());
+        }
+        if pattern.writes.is_empty() || pattern.reads.is_empty() {
+            let missing = if pattern.writes.is_empty() && pattern.reads.is_empty() {
+                "no supported synchronous read or write port was found"
+            } else if pattern.writes.is_empty() {
+                "no supported synchronous write port was found"
+            } else {
+                "no supported synchronous read port was found"
+            };
+            return Err(self.memory_inference_failure(memory_id, missing));
+        }
+        if pattern.writes.len() > 2 || pattern.reads.len() > 2 {
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "more than two read/write ports are not supported",
+            ));
+        }
+        let mut ports = Vec::new();
+        for write in pattern.writes {
+            let Some(index) = pattern
+                .reads
+                .iter()
+                .position(|read| read.clock == write.clock && read.edge == write.edge)
+            else {
+                return Err(self.memory_inference_failure(
+                    memory_id,
+                    "each write port requires a read port on the same clock edge",
+                ));
+            };
+            ports.push((write, pattern.reads.remove(index)));
+        }
+        if !pattern.reads.is_empty() {
+            return Err(self.memory_inference_failure(
+                memory_id,
+                "each read port requires a write port on the same clock edge",
+            ));
+        }
+        if let Err(error) = self.lower_inferred_memory(memory_id, ports) {
+            return Err(self.requirement_failure(memory_id, error));
         }
         Ok(())
     }
@@ -791,7 +878,7 @@ impl<'a> ModuleLowerer<'a> {
         // real pass can then emit every ordinary register at its original
         // declaration position, preserving stable IDs and mapped QoR.
         let owners = self.ff_owners()?;
-        let mut driven_comb = BTreeSet::new();
+        let mut driven_comb = DrivenBits::default();
         let mut driven_ff = DrivenBits::default();
         for declaration in &self.source.declarations {
             match declaration {
@@ -812,8 +899,14 @@ impl<'a> ModuleLowerer<'a> {
                         changed
                             .extend(self.lower_statement(statement, &snapshot, &mut env, false)?);
                     }
+                    if let Some(key) = driven_comb.first_overlap(&changed) {
+                        return Err(ImportError::UnsupportedBehavior(format!(
+                            "multiple procedural drivers for {}",
+                            self.signal_name(key)
+                        )));
+                    }
                     for key in changed.keys() {
-                        if !driven_comb.insert(key.clone()) || driven_ff.contains_key(key) {
+                        if driven_ff.contains_key(key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
                                 "multiple procedural drivers for {}",
                                 self.signal_name(key)
@@ -821,13 +914,27 @@ impl<'a> ModuleLowerer<'a> {
                         }
                         let signal = self.signal(key)?;
                         let value = env[key];
-                        self.rtl.assign(self.rtl.whole(signal)?, value.id)?;
+                        // The environment holds a whole value so subsequent blocking
+                        // reads see prior writes. Only the written ranges belong to
+                        // this process; emitting the untouched bits would introduce
+                        // extra drivers and artificial combinational feedback.
+                        for (lsb, width) in changed.ranges(key) {
+                            let width = BitWidth::new(width)?;
+                            let target = self.rtl.slice(signal, lsb, width)?;
+                            let value = if lsb == 0 && width.get() == value.width {
+                                value.id
+                            } else {
+                                self.rtl.expression_slice(value.id, lsb, width)?
+                            };
+                            self.rtl.assign(target, value)?;
+                        }
                     }
+                    driven_comb.extend(changed);
                 }
                 Declaration::Ff(ff) => {
                     let block = self.lower_ff(ff)?;
                     for key in block.changed.keys() {
-                        if driven_comb.contains(key) {
+                        if driven_comb.contains_key(key) {
                             return Err(ImportError::UnsupportedBehavior(format!(
                                 "multiple procedural drivers for {}",
                                 self.signal_name(key)
@@ -866,6 +973,22 @@ impl<'a> ModuleLowerer<'a> {
     }
 
     fn lower_instance(&mut self, instance: &InstDeclaration) -> Result<(), ImportError> {
+        // Instance outputs are implicit continuous assignments (IEEE 1800
+        // 10.2): every selected destination must have constant addressing.
+        for destination in instance.outputs.iter().flat_map(|output| &output.dst) {
+            let dynamic = destination
+                .index
+                .0
+                .iter()
+                .chain(&destination.select.0)
+                .chain(destination.select.1.iter().map(|(_, bound)| bound))
+                .any(|index| !index.comptime().is_const && evaluated_u64(index).is_none());
+            if dynamic {
+                return Err(ImportError::AnalysisFailed(
+                    "instance output destination requires constant indices and bounds".into(),
+                ));
+            }
+        }
         let Component::Module(child_source) = instance.component.as_ref() else {
             return Err(ImportError::UnsupportedBehavior(
                 "only synthesizable module instances can be flattened".into(),
@@ -885,6 +1008,7 @@ impl<'a> ModuleLowerer<'a> {
         let inline_signals = self.inline_module(&child.rtl, &prefix)?;
         let parent_env = self.read_env()?;
         self.lower_instance_inputs(instance, &child, &inline_signals, &parent_env)?;
+        self.lower_instance_input_defaults(instance, &child, &inline_signals)?;
         self.lower_instance_outputs(instance, &child, &inline_signals)?;
         Ok(())
     }
@@ -942,6 +1066,45 @@ impl<'a> ModuleLowerer<'a> {
         Ok(())
     }
 
+    fn lower_instance_input_defaults(
+        &mut self,
+        instance: &InstDeclaration,
+        child: &ModuleLowerer<'_>,
+        inline_signals: &HashMap<SignalId, SignalId>,
+    ) -> Result<(), ImportError> {
+        // Explicit connections, including empty ones, suppress defaults
+        // (IEEE 1800-2023 23.3.2.2). AIR stores input defaults in the port's
+        // initial value while keeping the shared child IR runtime-dependent.
+        let explicit = instance
+            .inputs
+            .iter()
+            .map(|input| input.id)
+            .collect::<HashSet<_>>();
+        for key in &child.signal_order {
+            let variable = &child.source.variables[&key.id];
+            if variable.kind != VarKind::Input || explicit.contains(&key.id) {
+                continue;
+            }
+            let Some(value) = variable.get_value(&key.index) else {
+                continue;
+            };
+            // Ports without defaults have an X template. Preserve undriven
+            // diagnostics; never invent a zero driver or erase unknown bits.
+            if value.is_xz() {
+                continue;
+            }
+            let width = child.width(key)?;
+            let value = value.expand(width as usize, child.is_signed(key));
+            let value = self.rtl.constant(Constant::new(
+                BitWidth::new(width)?,
+                value.payload().to_u64_digits(),
+            ));
+            let target = inline_signals[&child.signal(key)?];
+            self.rtl.assign(self.rtl.whole(target)?, value)?;
+        }
+        Ok(())
+    }
+
     fn lower_instance_outputs(
         &mut self,
         instance: &InstDeclaration,
@@ -950,6 +1113,12 @@ impl<'a> ModuleLowerer<'a> {
     ) -> Result<(), ImportError> {
         let mut output_elements = HashMap::new();
         for output in &instance.outputs {
+            // An explicit anonymous connection (`port: _`) has no destinations.
+            // The child still drives its own signal; only parent wiring is absent
+            // (IEEE 1800-2023 23.3.2.2, empty named port connections).
+            if output.dst.is_empty() {
+                continue;
+            }
             if let [destination] = output.dst.as_slice()
                 && destination.index.0.is_empty()
                 && destination.select.is_empty()
@@ -983,6 +1152,38 @@ impl<'a> ModuleLowerer<'a> {
                     continue;
                 }
             }
+            let destinations = output
+                .dst
+                .iter()
+                .map(|destination| self.destination_slice(destination))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !child.variable_type(output.id)?.array.is_empty() {
+                // AIR expands an unpacked slice into destinations in element
+                // order. These are separate element assignments, not the
+                // high-to-low pieces of a packed concatenation.
+                let child_keys = child.keys_for_id(output.id);
+                if child_keys.len() != destinations.len() {
+                    return Err(ImportError::UnsupportedBehavior(format!(
+                        "array instance output {} has {} child elements and {} destinations",
+                        child.variable_name(output.id),
+                        child_keys.len(),
+                        destinations.len()
+                    )));
+                }
+                for (child_key, destination) in child_keys.iter().zip(destinations) {
+                    if child.width(child_key)? != destination.width.get() {
+                        return Err(ImportError::UnsupportedBehavior(format!(
+                            "array instance output {} element width mismatch",
+                            child.variable_name(output.id)
+                        )));
+                    }
+                    let source = inline_signals[&child.signal(child_key)?];
+                    let value = self.rtl.read(source)?;
+                    self.rtl.assign(destination, value)?;
+                }
+                output_elements.insert(output.id, child_keys.len());
+                continue;
+            }
             let element = output_elements.entry(output.id).or_insert(0);
             let child_key = child.port_element_key(output.id, *element)?;
             *element += 1;
@@ -990,17 +1191,9 @@ impl<'a> ModuleLowerer<'a> {
             let source = inline_signals[&child_signal];
             let source_width = child.width(&child_key)?;
             let source_expr = self.rtl.read(source)?;
-            let destinations = output
-                .dst
-                .iter()
-                .map(|destination| {
-                    self.destination_slice(destination)
-                        .map(|slice| (destination, slice))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
             let destination_width = destinations
                 .iter()
-                .map(|(_, slice)| slice.width.get())
+                .map(|slice| slice.width.get())
                 .sum::<u32>();
             if destination_width != source_width {
                 return Err(ImportError::UnsupportedBehavior(format!(
@@ -1009,7 +1202,7 @@ impl<'a> ModuleLowerer<'a> {
                 )));
             }
             let mut remaining = source_width;
-            for (_, destination) in destinations {
+            for destination in destinations {
                 remaining -= destination.width.get();
                 let value = if remaining == 0 && destination.width.get() == source_width {
                     source_expr
@@ -1334,12 +1527,10 @@ impl<'a> ModuleLowerer<'a> {
     fn sequential_reads(&self, reads: &Env, writes: &Env) -> Env {
         let mut result = reads.clone();
         for (key, value) in writes {
-            if self
-                .source
-                .variables
-                .get(&key.id)
-                .is_some_and(|v| v.kind == VarKind::Let)
-            {
+            if self.source.variables.get(&key.id).is_some_and(|v| {
+                v.kind == VarKind::Let
+                    || v.affiliation == veryl_analyzer::symbol::Affiliation::AlwaysFf
+            }) {
                 result.insert(key.clone(), *value);
             }
         }
@@ -1361,38 +1552,14 @@ impl<'a> ModuleLowerer<'a> {
             reads
         };
         match statement {
-            Statement::Assign(assign) => {
-                if let [destination] = assign.dst.as_slice()
-                    && destination.index.0.len()
-                        < self.source.variables[&destination.id].r#type.array.dims()
-                {
-                    return self.lower_array_assignment(destination, &assign.expr, reads, writes);
-                }
-                // Reads observe the pre-edge register value, but a partial
-                // write composes over the value already scheduled for this
-                // edge (later writes win per bit).
-                let (value, mut changed) = if let Expression::Term(factor) = &assign.expr
-                    && let Factor::FunctionCall(call) = factor.as_ref()
-                {
-                    let (value, outputs) = self.lower_function_call(call, reads)?;
-                    let changed = self.copy_function_outputs(outputs, reads, writes)?;
-                    (
-                        value.ok_or_else(|| {
-                            ImportError::UnsupportedBehavior("void function assignment".into())
-                        })?,
-                        changed,
-                    )
-                } else {
-                    (
-                        self.lower_expression(&assign.expr, reads)?,
-                        DrivenBits::default(),
-                    )
-                };
-                changed.extend(self.assign_destinations(&assign.dst, value, reads, writes)?);
-                Ok(changed)
-            }
+            Statement::Assign(assign) => self.lower_assignment(assign, reads, writes, sequential),
             Statement::If(branch) => {
-                let condition = self.lower_expression(&branch.cond, reads)?;
+                let mut effects = DrivenBits::default();
+                let condition = if sequential {
+                    self.lower_expression(&branch.cond, reads)?
+                } else {
+                    self.lower_comb_expression(&branch.cond, writes, &mut effects)?
+                };
                 let condition = self.boolean(condition)?;
                 let base = writes.clone();
                 let mut true_env = base.clone();
@@ -1421,6 +1588,7 @@ impl<'a> ModuleLowerer<'a> {
                         },
                     );
                 }
+                changed.extend(effects);
                 Ok(changed)
             }
             Statement::IfReset(_) if sequential => Err(ImportError::UnsupportedBehavior(
@@ -1432,12 +1600,22 @@ impl<'a> ModuleLowerer<'a> {
             }
             Statement::For(statement) => self.lower_for(statement, reads, writes, sequential),
             Statement::FunctionCall(call) => {
-                let (_, outputs) = self.lower_function_call(call, reads)?;
-                self.copy_function_outputs(outputs, reads, writes)
+                if sequential {
+                    let (_, outputs) = self.lower_function_call(call, reads)?;
+                    self.validate_ff_function_outputs(&outputs)?;
+                    self.copy_function_outputs(outputs, reads, writes)
+                } else {
+                    let mut effects = DrivenBits::default();
+                    let (_, outputs) =
+                        self.lower_function_call_effects(call, writes, &mut effects)?;
+                    let reads = writes.clone();
+                    effects.extend(self.copy_function_outputs(outputs, &reads, writes)?);
+                    Ok(effects)
+                }
             }
-            Statement::SystemFunctionCall(_) => Err(ImportError::UnsupportedBehavior(
-                "statement-level function calls".into(),
-            )),
+            Statement::SystemFunctionCall(call) => {
+                self.lower_system_statement(call, reads, writes, sequential)
+            }
             Statement::TbMethodCall(_) => Err(ImportError::UnsupportedBehavior(
                 "testbench method calls are not synthesizable".into(),
             )),
@@ -1453,6 +1631,70 @@ impl<'a> ModuleLowerer<'a> {
         }
     }
 
+    fn lower_assignment(
+        &mut self,
+        assign: &veryl_analyzer::ir::AssignStatement,
+        reads: &Env,
+        writes: &mut Env,
+        sequential: bool,
+    ) -> Result<DrivenBits, ImportError> {
+        if let [destination] = assign.dst.as_slice()
+            && destination.index.0.len()
+                < self.source.variables[&destination.id].r#type.array.dims()
+        {
+            return self.lower_array_assignment(destination, &assign.expr, reads, writes);
+        }
+        // Reads observe the pre-edge register value, but a partial
+        // write composes over the value already scheduled for this
+        // edge (later writes win per bit).
+        let (value, mut changed) = if !sequential {
+            let mut effects = DrivenBits::default();
+            let value = self.lower_comb_expression(&assign.expr, writes, &mut effects)?;
+            (value, effects)
+        } else if let Expression::Term(factor) = &assign.expr
+            && let Factor::FunctionCall(call) = factor.as_ref()
+        {
+            let (value, outputs) = self.lower_function_call(call, reads)?;
+            self.validate_ff_function_outputs(&outputs)?;
+            let changed = self.copy_function_outputs(outputs, reads, writes)?;
+            (
+                value.ok_or_else(|| {
+                    ImportError::UnsupportedBehavior("void function assignment".into())
+                })?,
+                changed,
+            )
+        } else {
+            (
+                self.lower_expression(&assign.expr, reads)?,
+                DrivenBits::default(),
+            )
+        };
+        if sequential {
+            changed.extend(self.assign_destinations(&assign.dst, value, reads, writes)?);
+        } else {
+            changed.extend(self.assign_destinations_effects(&assign.dst, value, writes)?);
+        }
+        Ok(changed)
+    }
+
+    fn plan_known_loop(
+        &mut self,
+        statement: &veryl_analyzer::ir::ForStatement,
+        reads: &Env,
+        writes: &Env,
+        sequential: bool,
+    ) -> Result<Option<loops::LoopPlan>, ImportError> {
+        if let Some(plan) = self.plan_constant_bitwise_loop(statement, reads, writes, sequential)? {
+            Ok(Some(plan))
+        } else if let Some(plan) =
+            self.plan_known_additive_loop(statement, reads, writes, sequential)?
+        {
+            Ok(Some(plan))
+        } else {
+            self.plan_constant_driven_reverse_loop(statement, reads, writes, sequential)
+        }
+    }
+
     fn lower_for(
         &mut self,
         statement: &veryl_analyzer::ir::ForStatement,
@@ -1460,24 +1702,174 @@ impl<'a> ModuleLowerer<'a> {
         writes: &mut Env,
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
-        let mut context = veryl_analyzer::Context::default();
-        let iterations = statement.range.eval_iter(&mut context).ok_or_else(|| {
-            ImportError::UnsupportedBehavior(
-                "loop bounds are dynamic or exceed the static unroll limit".into(),
-            )
-        })?;
+        let plan = match loops::plan(statement, self.source) {
+            Ok(plan) => plan,
+            Err(_) if loops::always_breaks(&statement.body, self.source) => {
+                return self.lower_single_iteration(statement, reads, writes, sequential);
+            }
+            Err(error) => {
+                if let Some(plan) = self.plan_known_loop(statement, reads, writes, sequential)? {
+                    plan
+                } else if !sequential
+                    && let Some(changed) = self.lower_reduction(statement, writes)?
+                {
+                    return Ok(changed);
+                } else {
+                    return Err(error);
+                }
+            }
+        };
+        let reverse = matches!(statement.range, ForRange::Reverse { .. });
         let mut changed = DrivenBits::default();
+        let mut cursor =
+            self.lower_loop_start(&plan, statement, reads, writes, sequential, &mut changed)?;
+        if plan.iterations.is_empty()
+            && let Some((veryl_analyzer::ir::ForBound::Expression(end), _)) = &plan.guard
+        {
+            // Even an empty range evaluates its first condition. Until condition
+            // effects are supported, reject them rather than dropping them.
+            let snapshot = if sequential {
+                self.sequential_reads(reads, writes)
+            } else {
+                writes.clone()
+            };
+            self.lower_expression(end, &snapshot)?;
+        }
         let mut stopped = self.constant(1, 0);
-        for iteration in iterations {
+        for iteration in plan.iterations {
+            if let Some((bound, inclusive)) = &plan.guard {
+                let snapshot = if sequential {
+                    self.sequential_reads(reads, writes)
+                } else {
+                    writes.clone()
+                };
+                let end = match bound {
+                    veryl_analyzer::ir::ForBound::Const(value, signed) => LoweredExpr {
+                        signed: *signed,
+                        ..self.constant(64, *value as u64)
+                    },
+                    veryl_analyzer::ir::ForBound::Expression(expression) => {
+                        self.lower_expression(expression, &snapshot)?
+                    }
+                };
+                let width = concrete_width(&statement.var_type, "loop induction variable")?;
+                let index = LoweredExpr {
+                    signed: statement.var_type.signed,
+                    ..self.constant(width, iteration as u64)
+                };
+                let op = if reverse {
+                    Op::Less
+                } else if *inclusive {
+                    Op::Greater
+                } else {
+                    Op::GreaterEq
+                };
+                let finished = self.lower_binary(op, index, end, 1, false)?;
+                stopped = self.lower_binary(Op::LogicOr, stopped, finished, 1, false)?;
+            }
+            // Candidates before initialization or skipped by the step are
+            // inactive. In particular, their breaks must not stop later work.
+            let skip = if let Some(cursor) = cursor {
+                let candidate = LoweredExpr {
+                    signed: reverse && cursor.signed,
+                    ..self.constant(cursor.width, iteration as u64)
+                };
+                // Unit stride reaches candidates on the advancing side of
+                // the captured start, without counter adders/muxes.
+                let op = if plan
+                    .runtime_start
+                    .as_ref()
+                    .is_some_and(|(_, step)| *step == 1)
+                {
+                    if reverse { Op::Less } else { Op::Greater }
+                } else {
+                    Op::Ne
+                };
+                let differs = self.lower_binary(op, cursor, candidate, 1, false)?;
+                self.lower_binary(Op::LogicOr, stopped, differs, 1, false)?
+            } else {
+                stopped
+            };
             let mut body = statement.body.clone();
             substitute_statements(&mut body, statement.var_id, iteration)?;
             let before = writes.clone();
-            let (written, stop) = self.lower_loop_body(&body, reads, writes, sequential)?;
-            *writes = self.merge_values(stopped, &before, writes)?;
+            let (written, mut stop) = self.lower_loop_body(&body, reads, writes, sequential)?;
+            *writes = self.merge_values(skip, &before, writes)?;
+            if let (Some(current), Some((_, step))) = (cursor, &plan.runtime_start) {
+                if *step != 1 {
+                    cursor = Some(self.advance_loop_cursor(current, skip, *step, reverse)?);
+                }
+                let zero = self.constant(1, 0);
+                stop.id = self.rtl.mux(skip.id, zero.id, stop.id)?;
+            }
             stopped = self.lower_binary(Op::LogicOr, stopped, stop, 1, false)?;
             changed.extend(written);
         }
         Ok(changed)
+    }
+
+    fn advance_loop_cursor(
+        &mut self,
+        current: LoweredExpr,
+        skip: LoweredExpr,
+        step: usize,
+        reverse: bool,
+    ) -> Result<LoweredExpr, ImportError> {
+        let increment = self.constant(current.width, step as u64);
+        let next = self.lower_binary(
+            if reverse { Op::Sub } else { Op::Add },
+            current,
+            increment,
+            current.width,
+            current.signed,
+        )?;
+        Ok(LoweredExpr {
+            id: self.rtl.mux(skip.id, current.id, next.id)?,
+            ..current
+        })
+    }
+
+    fn lower_loop_start(
+        &mut self,
+        plan: &loops::LoopPlan,
+        statement: &veryl_analyzer::ir::ForStatement,
+        reads: &Env,
+        writes: &mut Env,
+        sequential: bool,
+        changed: &mut DrivenBits,
+    ) -> Result<Option<LoweredExpr>, ImportError> {
+        let Some((veryl_analyzer::ir::ForBound::Expression(start), _)) = &plan.runtime_start else {
+            return Ok(None);
+        };
+        // Initialization precedes the first condition, including empty ranges
+        // (IEEE 1800-2023 12.7.1). Preserve output-argument writes exactly once.
+        let value = if sequential {
+            self.lower_expression(start, &self.sequential_reads(reads, writes))?
+        } else {
+            self.lower_comb_expression(start, writes, changed)?
+        };
+        let value = if matches!(
+            statement.range,
+            ForRange::Reverse {
+                inclusive: false,
+                ..
+            }
+        ) {
+            let width = value.width.max(concrete_width(
+                &statement.var_type,
+                "loop induction variable",
+            )?);
+            let one = self.constant(width, 1);
+            self.lower_binary(Op::Sub, value, one, width, value.signed)?
+        } else {
+            value
+        };
+        self.resize(
+            value,
+            concrete_width(&statement.var_type, "loop induction variable")?,
+            statement.var_type.signed,
+        )
+        .map(Some)
     }
 
     fn lower_loop_body(
@@ -1499,15 +1891,21 @@ impl<'a> ModuleLowerer<'a> {
             let (written, stop) = match statement {
                 Statement::Break => (DrivenBits::default(), self.constant(1, 1)),
                 Statement::If(branch) => {
-                    let condition = self.lower_expression(&branch.cond, &snapshot)?;
+                    let mut effects = DrivenBits::default();
+                    let condition = if sequential {
+                        self.lower_expression(&branch.cond, &snapshot)?
+                    } else {
+                        self.lower_comb_expression(&branch.cond, writes, &mut effects)?
+                    };
                     let condition = self.boolean(condition)?;
-                    let mut yes = before.clone();
-                    let mut no = before.clone();
+                    let mut yes = writes.clone();
+                    let mut no = writes.clone();
                     let (mut written, yes_stop) =
                         self.lower_loop_body(&branch.true_side, reads, &mut yes, sequential)?;
                     let (no_written, no_stop) =
                         self.lower_loop_body(&branch.false_side, reads, &mut no, sequential)?;
                     written.extend(no_written);
+                    written.extend(effects);
                     *writes = self.merge_values(condition, &yes, &no)?;
                     (
                         written,
@@ -1519,14 +1917,22 @@ impl<'a> ModuleLowerer<'a> {
                     )
                 }
                 Statement::Case(case) => {
-                    let target = self.lower_expression(&case.case_target, &snapshot)?;
-                    let mut result = before.clone();
+                    let mut effects = DrivenBits::default();
+                    let target = self.prepare_case_target(
+                        &case.case_target,
+                        &snapshot,
+                        writes,
+                        sequential,
+                        &mut effects,
+                    )?;
+                    let mut result = writes.clone();
                     let (mut written, mut stop) =
                         self.lower_loop_body(&case.default, reads, &mut result, sequential)?;
+                    written.extend(effects);
                     for arm in case.arms.iter().rev() {
                         let condition =
-                            self.lower_case_patterns(target, &arm.patterns, &snapshot)?;
-                        let mut yes = before.clone();
+                            self.lower_case_patterns(&target, &arm.patterns, &snapshot)?;
+                        let mut yes = writes.clone();
                         let (yes_written, yes_stop) =
                             self.lower_loop_body(&arm.body, reads, &mut yes, sequential)?;
                         written.extend(yes_written);
@@ -1559,11 +1965,19 @@ impl<'a> ModuleLowerer<'a> {
         writes: &mut Env,
         sequential: bool,
     ) -> Result<DrivenBits, ImportError> {
-        let target = self.lower_expression(&statement.case_target, reads)?;
+        let mut effects = DrivenBits::default();
+        let target = self.prepare_case_target(
+            &statement.case_target,
+            reads,
+            writes,
+            sequential,
+            &mut effects,
+        )?;
         let base = writes.clone();
         let mut else_env = base.clone();
         let mut changed =
             self.lower_statements(&statement.default, reads, &mut else_env, sequential)?;
+        changed.extend(effects);
 
         // A balanced first-match tree does not reduce the mux depth below four
         // arms: the final default selection replaces the level saved in the
@@ -1575,7 +1989,7 @@ impl<'a> ModuleLowerer<'a> {
                 let mut then_env = base.clone();
                 let arm_changed =
                     self.lower_statements(&arm.body, reads, &mut then_env, sequential)?;
-                let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
+                let condition = self.lower_case_patterns(&target, &arm.patterns, &base)?;
                 let mut merged_changed = changed.clone();
                 merged_changed.extend(arm_changed);
                 let mut merged_env = base.clone();
@@ -1611,7 +2025,7 @@ impl<'a> ModuleLowerer<'a> {
         for arm in statement.arms.iter().rev() {
             let mut then_env = base.clone();
             let arm_changed = self.lower_statements(&arm.body, reads, &mut then_env, sequential)?;
-            let condition = self.lower_case_patterns(target, &arm.patterns, &base)?;
+            let condition = self.lower_case_patterns(&target, &arm.patterns, &base)?;
             changed.extend(arm_changed);
             lowered_arms.push((condition, then_env));
         }
@@ -1704,7 +2118,7 @@ impl<'a> ModuleLowerer<'a> {
 
     fn lower_case_patterns(
         &mut self,
-        target: LoweredExpr,
+        target: &PreparedCaseTarget,
         patterns: &[CasePattern],
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
@@ -1712,15 +2126,22 @@ impl<'a> ModuleLowerer<'a> {
         for pattern in patterns {
             let matches = match pattern {
                 CasePattern::Eq(value) => {
-                    let value = self.lower_expression(value, env)?;
-                    self.lower_binary(Op::Eq, target, value, 1, false)?
+                    let target = self.lower_case_operand(target, value)?;
+                    if let Some(ct) = comparisons::wildcard_pattern(value) {
+                        self.lower_wildcard_pattern(target, Op::EqWildcard, &ct)?
+                    } else {
+                        let value = self.lower_case_label(value, env)?;
+                        self.lower_binary(Op::Eq, target, value, 1, false)?
+                    }
                 }
                 CasePattern::Range { lo, hi, inclusive } => {
-                    let lo = self.lower_expression(lo, env)?;
-                    let hi = self.lower_expression(hi, env)?;
-                    let lower = self.lower_binary(Op::LessEq, lo, target, 1, false)?;
+                    let lo_target = self.lower_case_operand(target, lo)?;
+                    let hi_target = self.lower_case_operand(target, hi)?;
+                    let lo = self.lower_case_label(lo, env)?;
+                    let hi = self.lower_case_label(hi, env)?;
+                    let lower = self.lower_binary(Op::LessEq, lo, lo_target, 1, false)?;
                     let upper_op = if *inclusive { Op::LessEq } else { Op::Less };
-                    let upper = self.lower_binary(upper_op, target, hi, 1, false)?;
+                    let upper = self.lower_binary(upper_op, hi_target, hi, 1, false)?;
                     self.lower_binary(Op::LogicAnd, lower, upper, 1, false)?
                 }
             };
@@ -1738,6 +2159,23 @@ impl<'a> ModuleLowerer<'a> {
         call: &veryl_analyzer::ir::FunctionCall,
         reads: &Env,
     ) -> Result<FunctionResult, ImportError> {
+        let mut caller = reads.clone();
+        let mut effects = DrivenBits::default();
+        let result = self.lower_function_call_effects(call, &mut caller, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "function input effects in a read-only call".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn lower_function_call_effects(
+        &mut self,
+        call: &veryl_analyzer::ir::FunctionCall,
+        caller: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<FunctionResult, ImportError> {
         if self.call_depth >= 64 {
             return Err(ImportError::UnsupportedBehavior(
                 "recursive function expansion exceeds 64 calls".into(),
@@ -1753,7 +2191,34 @@ impl<'a> ModuleLowerer<'a> {
             .ok_or_else(|| {
                 ImportError::UnsupportedBehavior("unresolved function specialization".into())
             })?;
-        let mut env = reads.clone();
+        // Choose AIR argument order (source order), without implying that SV
+        // requires this order: IEEE 1800-2023 13.5 leaves it undefined. Freeze
+        // each value after its evaluation, while exposing its writes to later
+        // arguments. Only then create the callee's automatic frame (13.5.1).
+        let mut inputs = Vec::new();
+        for (path, expression) in &call.inputs {
+            let id = *body.arg_map.get(path).ok_or_else(|| {
+                ImportError::UnsupportedBehavior("missing function formal".into())
+            })?;
+            let mut ty = self.source.variables[&id].r#type.clone();
+            let dimensions = ty
+                .array
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| ImportError::NonConcreteWidth("function argument".into()))?;
+            ty.array.clear();
+            let values =
+                self.lower_array_argument_effects(expression, &dimensions, &ty, caller, effects)?;
+            for (index, value) in
+                array_indices(&self.source.variables[&id].r#type, "function argument")?
+                    .into_iter()
+                    .zip(values)
+            {
+                inputs.push((SignalKey { id, index }, value));
+            }
+        }
+        let mut env = caller.clone();
         // Function storage is an automatic frame, never a hardware register.
         let locals = self
             .source
@@ -1779,36 +2244,22 @@ impl<'a> ModuleLowerer<'a> {
                 env.insert(key, value);
             }
         }
-        // Freeze every actual in the caller frame before mutating any formal.
-        for (path, expression) in &call.inputs {
-            let id = *body.arg_map.get(path).ok_or_else(|| {
-                ImportError::UnsupportedBehavior("missing function formal".into())
-            })?;
-            let ty = self.source.variables[&id].r#type.clone();
-            let dimensions = ty
-                .array
-                .iter()
-                .copied()
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| ImportError::NonConcreteWidth("function argument".into()))?;
-            let values = self.lower_array_argument(
-                expression,
-                &dimensions,
-                concrete_width(&ty, "function argument")?,
-                ty.signed,
-                reads,
-            )?;
-            for (index, value) in array_indices(&ty, "function argument")?
-                .into_iter()
-                .zip(values)
-            {
-                env.insert(SignalKey { id, index }, value);
-            }
-        }
+        env.extend(inputs);
         self.call_depth += 1;
         let result = self.lower_function_statements(&body.statements, &mut env, body.ret);
         self.call_depth -= 1;
         result?;
+        // Explicit output formals are copied below. A write directly to module
+        // storage must not disappear when this automatic frame is discarded.
+        if caller.iter().any(|(key, before)| {
+            self.source.variables.get(&key.id).is_some_and(|variable| {
+                variable.affiliation != veryl_analyzer::symbol::Affiliation::Function
+            }) && env.get(key).is_some_and(|after| after.id != before.id)
+        }) {
+            return Err(ImportError::UnsupportedBehavior(
+                "function writes to non-local storage require caller writeback".into(),
+            ));
+        }
         let returned = body
             .ret
             .map(|id| self.pack_function_return(id, &env))
@@ -1884,10 +2335,11 @@ impl<'a> ModuleLowerer<'a> {
             let before = env.clone();
             let this_return = match statement {
                 Statement::If(branch) => {
-                    let condition = self.lower_expression(&branch.cond, &before)?;
+                    let condition =
+                        self.lower_comb_expression(&branch.cond, env, &mut DrivenBits::default())?;
                     let condition = self.boolean(condition)?;
-                    let mut yes = before.clone();
-                    let mut no = before.clone();
+                    let mut yes = env.clone();
+                    let mut no = env.clone();
                     let yes_return =
                         self.lower_function_statements(&branch.true_side, &mut yes, ret)?;
                     let no_return =
@@ -1900,13 +2352,20 @@ impl<'a> ModuleLowerer<'a> {
                     }
                 }
                 Statement::Case(case) => {
-                    let target = self.lower_expression(&case.case_target, &before)?;
-                    let mut result = before.clone();
+                    let target = self.prepare_case_target(
+                        &case.case_target,
+                        &before,
+                        env,
+                        false,
+                        &mut DrivenBits::default(),
+                    )?;
+                    let mut result = env.clone();
                     let mut flag =
                         self.lower_function_statements(&case.default, &mut result, ret)?;
                     for arm in case.arms.iter().rev() {
-                        let condition = self.lower_case_patterns(target, &arm.patterns, &before)?;
-                        let mut yes = before.clone();
+                        let condition =
+                            self.lower_case_patterns(&target, &arm.patterns, &before)?;
+                        let mut yes = env.clone();
                         let yes_return =
                             self.lower_function_statements(&arm.body, &mut yes, ret)?;
                         result = self.merge_values(condition, &yes, &result)?;
@@ -1936,6 +2395,22 @@ impl<'a> ModuleLowerer<'a> {
             returned = self.lower_binary(Op::LogicOr, returned, this_return, 1, false)?;
         }
         Ok(returned)
+    }
+
+    fn validate_ff_function_outputs(&self, outputs: &FunctionOutputs) -> Result<(), ImportError> {
+        // Veryl 0.22 now converts inout formals. Do not let that bypass the
+        // retained restriction on function copy-out to module state in always_ff.
+        if outputs.iter().any(|(destinations, _)| {
+            destinations.iter().any(|dst| {
+                self.source.variables[&dst.id].affiliation
+                    != veryl_analyzer::symbol::Affiliation::AlwaysFf
+            })
+        }) {
+            return Err(ImportError::UnsupportedBehavior(
+                "function output/inout copy-out to module state in always_ff".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn copy_function_outputs(
@@ -1989,6 +2464,102 @@ impl<'a> ModuleLowerer<'a> {
         Ok(changed)
     }
 
+    fn prepare_destination(
+        &mut self,
+        destination: &AssignDestination,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<PreparedDestination, ImportError> {
+        let elements = if has_dynamic_array_index(&destination.index) {
+            self.lower_array_elements_effects(destination.id, &destination.index, env, effects)?
+                .into_iter()
+                .map(|(key, condition)| (key, Some(condition)))
+                .collect()
+        } else {
+            vec![(self.destination_key(destination)?, None)]
+        };
+        let width = selected_width(&destination.select, self.width(&elements[0].0)?)?;
+        let offset = if dynamic_packed_select(&destination.select) {
+            Some(self.lower_select_offset_effects(
+                &destination.select,
+                width,
+                env,
+                effects,
+                destination.comptime.member_select_domain.is_some(),
+            )?)
+        } else {
+            None
+        };
+        Ok(PreparedDestination {
+            elements,
+            packed: PreparedSelect {
+                select: destination.select.clone(),
+                offset,
+                domain: destination.comptime.member_select_domain,
+            },
+            width,
+        })
+    }
+
+    fn assign_destinations_effects(
+        &mut self,
+        destinations: &[AssignDestination],
+        value: LoweredExpr,
+        env: &mut Env,
+    ) -> Result<DrivenBits, ImportError> {
+        let mut changed = DrivenBits::default();
+        // The RHS is already frozen. Evaluate all LHS addresses in AIR order
+        // before storing any parts; IEEE 1800-2023 10.4.1 leaves RHS/LHS
+        // evaluation order unspecified for blocking assignments without timing.
+        let prepared = destinations
+            .iter()
+            .map(|dst| self.prepare_destination(dst, env, &mut changed))
+            .collect::<Result<Vec<_>, _>>()?;
+        let total = prepared
+            .iter()
+            .try_fold(0u32, |sum, dst| sum.checked_add(dst.width))
+            .ok_or_else(|| ImportError::WidthTooLarge("concatenated assignment".into()))?;
+        let value = if prepared.len() == 1 {
+            value
+        } else {
+            self.resize(value, total, value.signed)?
+        };
+        let mut remaining = total;
+        for dst in &prepared {
+            remaining -= dst.width;
+            let part = if prepared.len() == 1 {
+                value
+            } else {
+                LoweredExpr {
+                    id: self.rtl.expression_slice(
+                        value.id,
+                        remaining,
+                        BitWidth::new(dst.width)?,
+                    )?,
+                    width: dst.width,
+                    signed: false,
+                }
+            };
+            for (key, condition) in &dst.elements {
+                let (lsb, width) = driven_select(&dst.packed.select, self.width(key)?)?;
+                let current = env[key];
+                self.assign_key_prepared(key, &dst.packed, part, env)?;
+                if let Some(condition) = condition {
+                    let assigned = env[key];
+                    env.insert(
+                        key.clone(),
+                        LoweredExpr {
+                            id: self.rtl.mux(condition.id, assigned.id, current.id)?,
+                            ..current
+                        },
+                    );
+                }
+                changed.insert_range(key.clone(), lsb, width);
+            }
+        }
+        Ok(changed)
+    }
+
     fn lower_array_assignment(
         &mut self,
         destination: &AssignDestination,
@@ -2001,7 +2572,7 @@ impl<'a> ModuleLowerer<'a> {
                 "packed select on array assignment".into(),
             ));
         }
-        let ty = self.source.variables[&destination.id].r#type.clone();
+        let mut ty = self.source.variables[&destination.id].r#type.clone();
         let shape = ty
             .array
             .iter()
@@ -2013,13 +2584,8 @@ impl<'a> ModuleLowerer<'a> {
             .copied()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| ImportError::NonConcreteWidth("array assignment".into()))?;
-        let values = self.lower_array_argument(
-            expression,
-            &dimensions,
-            concrete_width(&ty, "array assignment")?,
-            ty.signed,
-            reads,
-        )?;
+        ty.array.clear();
+        let values = self.lower_array_argument(expression, &dimensions, &ty, reads)?;
         let mut changed = DrivenBits::default();
         for (flat, value) in values.into_iter().enumerate() {
             let mut element = destination.clone();
@@ -2038,59 +2604,81 @@ impl<'a> ModuleLowerer<'a> {
         &mut self,
         expression: &Expression,
         dimensions: &[usize],
-        width: u32,
-        signed: bool,
+        element_type: &Type,
         env: &Env,
     ) -> Result<Vec<LoweredExpr>, ImportError> {
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let values = self.lower_array_argument_effects(
+            expression,
+            dimensions,
+            element_type,
+            &mut temporary,
+            &mut effects,
+        )?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "array argument effects in a read-only expression".into(),
+            ));
+        }
+        Ok(values)
+    }
+
+    fn lower_array_argument_effects(
+        &mut self,
+        expression: &Expression,
+        dimensions: &[usize],
+        element_type: &Type,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<Vec<LoweredExpr>, ImportError> {
+        let width = concrete_width(element_type, "array element")?;
+        let signed = element_type.signed;
         let Some((&length, tail)) = dimensions.split_first() else {
-            return Ok(vec![
-                self.lower_assignment_value(expression, env, width, signed)?,
-            ]);
+            if let Expression::ArrayLiteral(items, _) = expression {
+                return Ok(vec![self.lower_packed_array_literal(
+                    items,
+                    element_type,
+                    env,
+                    effects,
+                )?]);
+            }
+            return Ok(vec![self.lower_assignment_value_effects(
+                expression, env, width, signed, effects,
+            )?]);
         };
         if let Expression::ArrayLiteral(items, _) = expression {
+            let repetitions = arrays::literal_repetitions(items, length)?;
             let mut values = Vec::new();
-            let mut count = 0;
             let mut default = None;
-            for item in items {
-                match item {
-                    ArrayLiteralItem::Value(value, repeat) => {
-                        let repeat = repeat
-                            .as_ref()
-                            .map(|x| constant_value(x))
-                            .transpose()?
-                            .unwrap_or(1);
-                        let repeat = usize::try_from(repeat).map_err(|_| {
-                            ImportError::UnsupportedBehavior("array repetition overflow".into())
-                        })?;
-                        if repeat > length.saturating_sub(count) {
-                            return Err(ImportError::UnsupportedBehavior(
-                                "array literal shape mismatch".into(),
-                            ));
-                        }
-                        for _ in 0..repeat {
-                            values.extend(
-                                self.lower_array_argument(value, tail, width, signed, env)?,
-                            );
-                        }
-                        count += repeat;
+            for (item, repeat) in items.iter().zip(repetitions) {
+                if repeat == 0 {
+                    continue;
+                }
+                let value = match item {
+                    ArrayLiteralItem::Value(value, _) | ArrayLiteralItem::Defaul(value) => value,
+                };
+                let elements = if matches!(item, ArrayLiteralItem::Defaul(_))
+                    && !matches!(value.as_ref(), Expression::ArrayLiteral(_, _))
+                    && value.comptime().r#type.array.is_empty()
+                {
+                    let leaf =
+                        self.lower_assignment_value_effects(value, env, width, signed, effects)?;
+                    vec![leaf; tail.iter().product()]
+                } else {
+                    self.lower_array_argument_effects(value, tail, element_type, env, effects)?
+                };
+                if matches!(item, ArrayLiteralItem::Defaul(_)) {
+                    default = Some((elements, repeat));
+                } else {
+                    for _ in 0..repeat {
+                        values.extend_from_slice(&elements);
                     }
-                    ArrayLiteralItem::Defaul(value) => default = Some(value),
                 }
             }
-            if count < length {
-                let default = default.ok_or_else(|| {
-                    ImportError::UnsupportedBehavior("incomplete array literal".into())
-                })?;
-                for _ in count..length {
-                    if !matches!(default.as_ref(), Expression::ArrayLiteral(_, _))
-                        && default.comptime().r#type.array.is_empty()
-                    {
-                        let leaf = self.lower_assignment_value(default, env, width, signed)?;
-                        values.extend(std::iter::repeat_n(leaf, tail.iter().product()));
-                    } else {
-                        values
-                            .extend(self.lower_array_argument(default, tail, width, signed, env)?);
-                    }
+            if let Some((elements, repeat)) = default {
+                for _ in 0..repeat {
+                    values.extend_from_slice(&elements);
                 }
             }
             return Ok(values);
@@ -2102,8 +2690,9 @@ impl<'a> ModuleLowerer<'a> {
                 call,
                 &expression.comptime().r#type,
                 dimensions,
-                (width, signed),
+                element_type,
                 env,
+                effects,
             );
         }
         if let Expression::Term(factor) = expression
@@ -2148,10 +2737,12 @@ impl<'a> ModuleLowerer<'a> {
         call: &veryl_analyzer::ir::FunctionCall,
         ty: &Type,
         dimensions: &[usize],
-        target: (u32, bool),
-        env: &Env,
+        target: &Type,
+        env: &mut Env,
+        effects: &mut DrivenBits,
     ) -> Result<Vec<LoweredExpr>, ImportError> {
-        let (width, signed) = target;
+        let width = concrete_width(target, "array return target")?;
+        let signed = target.signed;
         let shape = dimensions.iter().copied().map(Some).collect::<Vec<_>>();
         if ty.array.iter().copied().collect::<Vec<_>>() != shape {
             return Err(ImportError::UnsupportedBehavior(
@@ -2160,12 +2751,9 @@ impl<'a> ModuleLowerer<'a> {
         }
         let element_width = concrete_width(ty, "array return")?;
         let element_signed = ty.signed;
-        let (value, outputs) = self.lower_function_call(call, env)?;
-        if !outputs.is_empty() {
-            return Err(ImportError::UnsupportedBehavior(
-                "array call with output side effects".into(),
-            ));
-        }
+        let (value, outputs) = self.lower_function_call_effects(call, env, effects)?;
+        let reads = env.clone();
+        effects.extend(self.copy_function_outputs(outputs, &reads, env)?);
         let value =
             value.ok_or_else(|| ImportError::UnsupportedBehavior("void array call".into()))?;
         let mut values = Vec::new();
@@ -2189,6 +2777,79 @@ impl<'a> ModuleLowerer<'a> {
         Ok(values)
     }
 
+    fn lower_packed_array_literal(
+        &mut self,
+        items: &[ArrayLiteralItem],
+        ty: &Type,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        if matches!(ty.kind, TypeKind::Unknown) {
+            return Err(ImportError::NonConcreteWidth(
+                "packed array literal type".into(),
+            ));
+        }
+        if !ty.array.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "unpacked array literal in a scalar expression".into(),
+            ));
+        }
+        let width = concrete_width(ty, "packed array literal")?;
+        let length = if ty.width().is_empty() {
+            width as usize
+        } else {
+            ty.width()[0]
+                .ok_or_else(|| ImportError::NonConcreteWidth("packed array literal".into()))?
+        };
+        if length == 0 || !(width as usize).is_multiple_of(length) {
+            return Err(ImportError::UnsupportedBehavior(
+                "packed array literal shape mismatch".into(),
+            ));
+        }
+        let element_width = width
+            / u32::try_from(length)
+                .map_err(|_| ImportError::WidthTooLarge("packed array literal dimension".into()))?;
+        let mut element_type = ty.clone();
+        element_type.signed = false;
+        if element_type.width().is_empty() {
+            element_type.kind = TypeKind::Logic;
+        } else {
+            element_type.width_mut().drain(0..1);
+        }
+        let repetitions = arrays::literal_repetitions(items, length)?;
+        let mut parts = Vec::new();
+        let mut default = None;
+        // Evaluate active items once in AIR order, then replicate their values.
+        // IEEE 1800-2023 10.9.1 leaves evaluation counts for defaults and
+        // repetitions with side effects undefined; this is our chosen policy.
+        for (item, repeat) in items.iter().zip(repetitions) {
+            if repeat == 0 {
+                continue;
+            }
+            let expression = match item {
+                ArrayLiteralItem::Value(value, _) | ArrayLiteralItem::Defaul(value) => value,
+            };
+            let value = if let Expression::ArrayLiteral(nested, _) = expression.as_ref() {
+                self.lower_packed_array_literal(nested, &element_type, env, effects)?
+            } else {
+                self.lower_assignment_value_effects(expression, env, element_width, false, effects)?
+            };
+            if matches!(item, ArrayLiteralItem::Defaul(_)) {
+                default = Some((value.id, repeat));
+            } else {
+                parts.extend(std::iter::repeat_n(value.id, repeat));
+            }
+        }
+        if let Some((value, repeat)) = default {
+            parts.extend(std::iter::repeat_n(value, repeat));
+        }
+        Ok(LoweredExpr {
+            id: self.rtl.concat(parts)?,
+            width,
+            signed: ty.signed,
+        })
+    }
+
     fn lower_assignment_value(
         &mut self,
         expression: &Expression,
@@ -2201,6 +2862,21 @@ impl<'a> ModuleLowerer<'a> {
             contextual.comptime().expr_context.width.max(width as usize);
         let expression = &contextual;
         let value = self.lower_expression(expression, env)?;
+        self.resize(value, width, signed)
+    }
+
+    fn lower_assignment_value_effects(
+        &mut self,
+        expression: &Expression,
+        env: &mut Env,
+        width: u32,
+        signed: bool,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut contextual = expression.clone();
+        contextual.comptime_mut().expr_context.width =
+            contextual.comptime().expr_context.width.max(width as usize);
+        let value = self.lower_comb_expression(&contextual, env, effects)?;
         self.resize(value, width, signed)
     }
 
@@ -2219,12 +2895,49 @@ impl<'a> ModuleLowerer<'a> {
         expression: &Expression,
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let value = self.lower_expression_effects(expression, &mut temporary, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "function output effects in a read-only expression".into(),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn lower_comb_expression(
+        &mut self,
+        expression: &Expression,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        let mut expression = expression.clone();
+        repair_expression_signedness(&mut expression, None);
+        self.lower_expression_effects(&expression, env, effects)
+    }
+
+    fn lower_expression_effects(
+        &mut self,
+        expression: &Expression,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
         match expression {
-            Expression::Term(factor) => self.lower_factor(factor, env),
-            Expression::Unary(op, input, comptime) => self.lower_unary(*op, input, comptime, env),
+            Expression::Term(factor) => self.lower_factor_effects(factor, env, effects),
+            Expression::Unary(op, input, comptime) => {
+                let input = self.lower_expression_effects(input, env, effects)?;
+                self.lower_unary(*op, input, comptime)
+            }
             Expression::Binary(lhs, op, rhs, comptime) => {
+                if matches!(op, Op::EqWildcard | Op::NeWildcard)
+                    && let Some(ct) = comparisons::wildcard_pattern(rhs)
+                {
+                    let lhs = self.lower_expression_effects(lhs, env, effects)?;
+                    return self.lower_wildcard_pattern(lhs, *op, &ct);
+                }
                 if *op == Op::As {
-                    let lhs = self.lower_prepared_expression(lhs, env)?;
+                    let lhs = self.lower_expression_effects(lhs, env, effects)?;
                     let width = concrete_width(&comptime.r#type, "cast expression")?;
                     let signed = if matches!(rhs.comptime().value, ValueVariant::Type(_)) {
                         comptime.r#type.signed
@@ -2233,57 +2946,50 @@ impl<'a> ModuleLowerer<'a> {
                     };
                     return self.resize(lhs, width, signed);
                 }
-                let lhs = self.lower_prepared_expression(lhs, env)?;
-                let rhs = self.lower_prepared_expression(rhs, env)?;
+                let skip_rhs = lhs.comptime().is_const
+                    && evaluated_u64(lhs).is_some_and(|value| {
+                        (*op == Op::LogicAnd && value == 0) || (*op == Op::LogicOr && value != 0)
+                    });
+                let lhs = self.lower_expression_effects(lhs, env, effects)?;
+                if skip_rhs {
+                    return self.boolean(lhs);
+                }
+                let before_rhs = env.clone();
+                let rhs = self.lower_expression_effects(rhs, env, effects)?;
+                if matches!(op, Op::LogicAnd | Op::LogicOr) {
+                    let condition = self.boolean(lhs)?;
+                    *env = if *op == Op::LogicAnd {
+                        self.merge_values(condition, env, &before_rhs)?
+                    } else {
+                        self.merge_values(condition, &before_rhs, env)?
+                    };
+                }
                 let result_width = binary_width(*op, comptime)?;
                 let signed = binary_signed(*op, comptime);
                 self.lower_binary(*op, lhs, rhs, result_width, signed)
             }
             Expression::Ternary(condition, then_expr, else_expr, comptime) => {
-                let condition = self.lower_prepared_expression(condition, env)?;
-                let condition = self.boolean(condition)?;
-                let then_expr = self.lower_prepared_expression(then_expr, env)?;
-                let else_expr = self.lower_prepared_expression(else_expr, env)?;
-                let width = context_width(comptime)?
-                    .max(then_expr.width)
-                    .max(else_expr.width);
-                let signed = comptime.expr_context.signed;
-                let then_expr = self.resize(
-                    LoweredExpr {
-                        signed,
-                        ..then_expr
-                    },
-                    width,
-                    signed,
-                )?;
-                let else_expr = self.resize(
-                    LoweredExpr {
-                        signed,
-                        ..else_expr
-                    },
-                    width,
-                    signed,
-                )?;
-                Ok(LoweredExpr {
-                    id: self.rtl.mux(condition.id, then_expr.id, else_expr.id)?,
-                    width,
-                    signed,
-                })
+                self.lower_ternary_effects(condition, then_expr, else_expr, comptime, env, effects)
             }
-            Expression::Concatenation(parts, comptime) => {
+            Expression::Concatenation(parts, _) => {
                 let mut lowered = Vec::new();
+                let mut width = 0u32;
                 for (part, repeat) in parts {
-                    let part = self.lower_prepared_expression(part, env)?;
+                    let part = self.lower_expression_effects(part, env, effects)?;
                     let count = if let Some(repeat) = repeat {
                         constant_value(repeat)?
                     } else {
                         1
                     };
+                    width = count
+                        .checked_mul(u64::from(part.width))
+                        .and_then(|bits| bits.checked_add(u64::from(width)))
+                        .and_then(|bits| u32::try_from(bits).ok())
+                        .ok_or_else(|| ImportError::WidthTooLarge("concatenation".into()))?;
                     for _ in 0..count {
                         lowered.push(part.id);
                     }
                 }
-                let width = concrete_width(&comptime.r#type, "concatenation")?;
                 Ok(LoweredExpr {
                     id: self.rtl.concat(lowered)?,
                     width,
@@ -2293,20 +2999,96 @@ impl<'a> ModuleLowerer<'a> {
             Expression::StructConstructor(r#type, fields, _) => {
                 self.lower_struct_constructor(r#type, fields, env)
             }
-            Expression::ArrayLiteral(_, _) => Err(ImportError::UnsupportedBehavior(
-                "array literal expression".into(),
-            )),
+            Expression::ArrayLiteral(items, comptime) => {
+                self.lower_packed_array_literal(items, &comptime.r#type, env, effects)
+            }
+        }
+    }
+
+    fn lower_ternary_effects(
+        &mut self,
+        condition: &Expression,
+        then_expr: &Expression,
+        else_expr: &Expression,
+        comptime: &Comptime,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        let selected = condition
+            .comptime()
+            .is_const
+            .then(|| evaluated_u64(condition))
+            .flatten();
+        let condition = self.lower_expression_effects(condition, env, effects)?;
+        if let Some(selected) = selected {
+            let value = self.lower_expression_effects(
+                if selected != 0 { then_expr } else { else_expr },
+                env,
+                effects,
+            )?;
+            let width = context_width(comptime)?.max(value.width);
+            let signed = comptime.expr_context.signed;
+            return self.resize(LoweredExpr { signed, ..value }, width, signed);
+        }
+        let condition = self.boolean(condition)?;
+        let mut yes = env.clone();
+        let mut no = env.clone();
+        let then_expr = self.lower_expression_effects(then_expr, &mut yes, effects)?;
+        let else_expr = self.lower_expression_effects(else_expr, &mut no, effects)?;
+        *env = self.merge_values(condition, &yes, &no)?;
+        let width = context_width(comptime)?
+            .max(then_expr.width)
+            .max(else_expr.width);
+        let signed = comptime.expr_context.signed;
+        let then_expr = self.resize(
+            LoweredExpr {
+                signed,
+                ..then_expr
+            },
+            width,
+            signed,
+        )?;
+        let else_expr = self.resize(
+            LoweredExpr {
+                signed,
+                ..else_expr
+            },
+            width,
+            signed,
+        )?;
+        Ok(LoweredExpr {
+            id: self.rtl.mux(condition.id, then_expr.id, else_expr.id)?,
+            width,
+            signed,
+        })
+    }
+
+    fn lower_factor_effects(
+        &mut self,
+        factor: &Factor,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        if let Factor::FunctionCall(call) = factor {
+            let (value, outputs) = self.lower_function_call_effects(call, env, effects)?;
+            let reads = env.clone();
+            effects.extend(self.copy_function_outputs(outputs, &reads, env)?);
+            value.ok_or_else(|| ImportError::UnsupportedBehavior("void function expression".into()))
+        } else if let Factor::Variable(id, index, select, comptime) = factor {
+            self.lower_variable_effects(*id, index, select, comptime, env, effects)
+        } else if let Factor::SystemFunctionCall(call) = factor {
+            self.lower_system_function_effects(call, env, effects)
+        } else {
+            self.lower_factor(factor, env)
         }
     }
 
     fn lower_unary(
         &mut self,
         op: Op,
-        input: &Expression,
+        input: LoweredExpr,
         comptime: &Comptime,
-        env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
-        let input = self.lower_prepared_expression(input, env)?;
         let sized = matches!(op, Op::Add | Op::Sub | Op::BitNot);
         let width = if sized { context_width(comptime)? } else { 1 };
         let signed = sized && comptime.expr_context.signed;
@@ -2401,6 +3183,9 @@ impl<'a> ModuleLowerer<'a> {
         result_width: u32,
         result_signed: bool,
     ) -> Result<LoweredExpr, ImportError> {
+        if op == Op::Pow {
+            return self.lower_power(lhs, rhs, result_width, result_signed);
+        }
         if matches!(op, Op::LogicAnd | Op::LogicOr) {
             let lhs = self.boolean(lhs)?;
             let rhs = self.boolean(rhs)?;
@@ -2434,7 +3219,14 @@ impl<'a> ModuleLowerer<'a> {
         }
         let comparison = matches!(
             op,
-            Op::Eq | Op::Ne | Op::Less | Op::LessEq | Op::Greater | Op::GreaterEq
+            Op::Eq
+                | Op::Ne
+                | Op::EqWildcard
+                | Op::NeWildcard
+                | Op::Less
+                | Op::LessEq
+                | Op::Greater
+                | Op::GreaterEq
         );
         // Widen arithmetic operands before evaluation; widening the result
         // afterwards cannot recover lost carry, borrow or product bits.
@@ -2471,8 +3263,8 @@ impl<'a> ModuleLowerer<'a> {
             Op::BitAnd => BinaryOp::And,
             Op::BitOr => BinaryOp::Or,
             Op::BitXor | Op::BitXnor => BinaryOp::Xor,
-            Op::Eq => BinaryOp::Equal,
-            Op::Ne => BinaryOp::NotEqual,
+            Op::Eq | Op::EqWildcard => BinaryOp::Equal,
+            Op::Ne | Op::NeWildcard => BinaryOp::NotEqual,
             Op::Less if signed_compare => BinaryOp::LessThanSigned,
             Op::Less => BinaryOp::LessThanUnsigned,
             Op::LessEq if signed_compare => BinaryOp::LessOrEqualSigned,
@@ -2493,6 +3285,82 @@ impl<'a> ModuleLowerer<'a> {
             signed: !comparison && result_signed,
         };
         self.resize(value, result_width, result_signed)
+    }
+
+    // IEEE 1800-2023 11.4.3 and 11.6.1: the exponent is self-determined,
+    // while the base is widened to the result context before multiplication.
+    // Repeated squaring keeps the circuit size linear in the exponent width.
+    fn lower_power(
+        &mut self,
+        base: LoweredExpr,
+        exponent: LoweredExpr,
+        width: u32,
+        signed: bool,
+    ) -> Result<LoweredExpr, ImportError> {
+        let base = self.resize(LoweredExpr { signed, ..base }, width, signed)?;
+        let known = match self.rtl.expressions()[exponent.id.index() as usize].kind() {
+            ExprKind::Constant(value) => Some(value.clone()),
+            _ => None,
+        };
+        let negative = if exponent.signed {
+            Some(
+                self.rtl
+                    .expression_slice(exponent.id, exponent.width - 1, BitWidth::new(1)?)?,
+            )
+        } else {
+            None
+        };
+        let one = self.constant(width, 1).id;
+        let mut result = one;
+        let mut power = base.id;
+        let bits = known.as_ref().map_or(exponent.width, |value| {
+            if exponent.signed && value.bit(exponent.width - 1) {
+                0
+            } else {
+                (0..exponent.width)
+                    .rev()
+                    .find(|bit| value.bit(*bit))
+                    .map_or(0, |bit| bit + 1)
+            }
+        });
+        for bit in 0..bits {
+            if known.as_ref().is_none_or(|value| value.bit(bit)) {
+                let product = self.rtl.binary(BinaryOp::Mul, result, power)?;
+                result = if known.is_some() {
+                    product
+                } else {
+                    let enabled = self
+                        .rtl
+                        .expression_slice(exponent.id, bit, BitWidth::new(1)?)?;
+                    self.rtl.mux(enabled, product, result)?
+                };
+            }
+            if bit + 1 < bits {
+                power = self.rtl.binary(BinaryOp::Mul, power, power)?;
+            }
+        }
+        if let Some(negative) = negative {
+            let zero = self.constant(width, 0).id;
+            let is_one = self.rtl.binary(BinaryOp::Equal, base.id, one)?;
+            let mut reciprocal = self.rtl.mux(is_one, one, zero)?;
+            if signed {
+                let minus_one = self.rtl.unary(UnaryOp::BitNot, zero)?;
+                let is_minus_one = self.rtl.binary(BinaryOp::Equal, base.id, minus_one)?;
+                let odd = self
+                    .rtl
+                    .expression_slice(exponent.id, 0, BitWidth::new(1)?)?;
+                let unit = self.rtl.mux(odd, minus_one, one)?;
+                reciprocal = self.rtl.mux(is_minus_one, unit, reciprocal)?;
+            }
+            // Zero raised to a negative exponent is X in four-state SV.
+            // This two-state RTL follows the adapter's zero convention.
+            result = self.rtl.mux(negative, reciprocal, result)?;
+        }
+        Ok(LoweredExpr {
+            id: result,
+            width,
+            signed,
+        })
     }
 
     // Restoring division uses an extra remainder bit so the trial shift cannot
@@ -2572,58 +3440,22 @@ impl<'a> ModuleLowerer<'a> {
     fn lower_factor(&mut self, factor: &Factor, env: &Env) -> Result<LoweredExpr, ImportError> {
         match factor {
             Factor::Variable(id, index, select, comptime) => {
-                let source = if has_dynamic_array_index(index) {
-                    self.lower_dynamic_array_read(*id, index, env)?
-                } else {
-                    let key = self.key_from_index(*id, index)?;
-                    if let Some(source) = env.get(&key).copied() {
-                        source
-                    } else if comptime.is_const {
-                        self.lower_comptime(comptime, "constant variable")?
-                    } else {
-                        return Err(ImportError::UnsupportedBehavior(format!(
-                            "reference to non-runtime variable {}",
-                            self.signal_name(&key)
-                        )));
-                    }
-                };
-                if dynamic_packed_select(select) {
-                    let width = selected_width(select, source.width)?;
-                    let (offset, negative) = self.lower_select_offset(select, width, env)?;
-                    let shifted = self.shift_selected(source.id, offset, negative, false)?;
-                    return Ok(LoweredExpr {
-                        id: self
-                            .rtl
-                            .expression_slice(shifted, 0, BitWidth::new(width)?)?,
-                        width,
-                        signed: false,
-                    });
+                let mut temporary = env.clone();
+                let mut effects = DrivenBits::default();
+                let value = self.lower_variable_effects(
+                    *id,
+                    index,
+                    select,
+                    comptime,
+                    &mut temporary,
+                    &mut effects,
+                )?;
+                if !effects.ranges.is_empty() {
+                    return Err(ImportError::UnsupportedBehavior(
+                        "index effects in a read-only expression".into(),
+                    ));
                 }
-                let (lsb, width) = static_select(select, source.width)?;
-                let signed = if select.is_empty() {
-                    source.signed
-                } else if matches!(
-                    self.variable_type(*id)?.kind,
-                    TypeKind::Bit | TypeKind::Logic
-                ) {
-                    false
-                } else {
-                    match &comptime.value {
-                        ValueVariant::Numeric(value) => value.signed(),
-                        _ => comptime.r#type.signed,
-                    }
-                };
-                if lsb == 0 && width == source.width {
-                    Ok(LoweredExpr { signed, ..source })
-                } else {
-                    Ok(LoweredExpr {
-                        id: self
-                            .rtl
-                            .expression_slice(source.id, lsb, BitWidth::new(width)?)?,
-                        width,
-                        signed,
-                    })
-                }
+                Ok(value)
             }
             Factor::Value(comptime) | Factor::Anonymous(comptime) => {
                 self.lower_comptime(comptime, "literal")
@@ -2649,21 +3481,125 @@ impl<'a> ModuleLowerer<'a> {
         }
     }
 
+    fn lower_variable_effects(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        select: &VarSelect,
+        comptime: &Comptime,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
+        let constant = if self.is_constant_variable(id) {
+            Some(self.lower_constant_variable_read(id, index, env, effects)?)
+        } else {
+            None
+        };
+        // Freeze each address component once, in source order, before reading data.
+        let elements = if constant.is_none() && has_dynamic_array_index(index) {
+            Some(self.lower_array_elements_effects(id, index, env, effects)?)
+        } else {
+            None
+        };
+        let offset = if dynamic_packed_select(select) {
+            let width = selected_width(
+                select,
+                concrete_width(self.variable_type(id)?, "indexed variable")?,
+            )?;
+            Some(self.lower_select_offset_effects(
+                select,
+                width,
+                env,
+                effects,
+                comptime.member_select_domain.is_some(),
+            )?)
+        } else {
+            None
+        };
+        let source = if let Some(value) = constant {
+            value
+        } else if let Some(elements) = elements {
+            self.lower_dynamic_array_read(elements, env)?
+        } else {
+            let key = self.key_from_index(id, index)?;
+            if let Some(source) = env.get(&key).copied() {
+                source
+            } else if comptime.is_const {
+                self.lower_comptime(comptime, "constant variable")?
+            } else {
+                return Err(ImportError::UnsupportedBehavior(format!(
+                    "reference to non-runtime variable {}",
+                    self.signal_name(&key)
+                )));
+            }
+        };
+        let source = if let Some(domain) = comptime.member_select_domain {
+            let mask = self.member_mask(source.width, domain)?;
+            LoweredExpr {
+                id: self.rtl.binary(BinaryOp::And, source.id, mask)?,
+                ..source
+            }
+        } else {
+            source
+        };
+        if let Some((offset, negative)) = offset {
+            let width = selected_width(select, source.width)?;
+            let shifted = self.shift_selected(source.id, offset, negative, false)?;
+            return Ok(LoweredExpr {
+                id: self
+                    .rtl
+                    .expression_slice(shifted, 0, BitWidth::new(width)?)?,
+                width,
+                signed: false,
+            });
+        }
+        let (lsb, width) = static_select(select, source.width)?;
+        let signed = variable_signedness(select, comptime);
+        if lsb == 0 && width == source.width {
+            Ok(LoweredExpr { signed, ..source })
+        } else {
+            Ok(LoweredExpr {
+                id: self
+                    .rtl
+                    .expression_slice(source.id, lsb, BitWidth::new(width)?)?,
+                width,
+                signed,
+            })
+        }
+    }
+
     fn lower_system_function(
         &mut self,
         call: &veryl_analyzer::ir::SystemFunctionCall,
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let value = self.lower_system_function_effects(call, &mut temporary, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "function output effects in a read-only system function".into(),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn lower_system_function_effects(
+        &mut self,
+        call: &veryl_analyzer::ir::SystemFunctionCall,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<LoweredExpr, ImportError> {
         use veryl_analyzer::ir::SystemFunctionKind;
         let value = match &call.kind {
             SystemFunctionKind::Signed(input) | SystemFunctionKind::Unsigned(input) => {
-                let value = self.lower_expression(&input.0, env)?;
+                let value = self.lower_comb_expression(&input.0, env, effects)?;
                 LoweredExpr {
                     signed: matches!(call.kind, SystemFunctionKind::Signed(_)),
                     ..value
                 }
             }
-            SystemFunctionKind::Bits(input) | SystemFunctionKind::Size(input) => {
+            SystemFunctionKind::Bits(input) | SystemFunctionKind::Size(input, _) => {
                 let comptime = input.0.comptime();
                 let ty = if let ValueVariant::Type(ty) = &comptime.value {
                     ty
@@ -2677,9 +3613,24 @@ impl<'a> ModuleLowerer<'a> {
                             .try_fold(width, |total, dim| total.checked_mul((*dim)?))
                     })
                 } else {
+                    let dimension = match &call.kind {
+                        SystemFunctionKind::Size(_, Some(dimension)) => {
+                            constant_value(&dimension.0)?
+                        }
+                        _ => 1,
+                    };
+                    let dimension = usize::try_from(dimension)
+                        .ok()
+                        .and_then(|dimension| dimension.checked_sub(1))
+                        .ok_or_else(|| {
+                            ImportError::UnsupportedBehavior(
+                                "$size dimension must be a positive constant".into(),
+                            )
+                        })?;
                     ty.array
-                        .first()
-                        .or_else(|| ty.width().first())
+                        .iter()
+                        .chain(ty.width().iter())
+                        .nth(dimension)
                         .copied()
                         .flatten()
                 }
@@ -2691,7 +3642,7 @@ impl<'a> ModuleLowerer<'a> {
                 }
             }
             SystemFunctionKind::Onehot(input) => {
-                let value = self.lower_expression(&input.0, env)?;
+                let value = self.lower_comb_expression(&input.0, env, effects)?;
                 let one = self.constant(value.width, 1);
                 let zero = self.constant(value.width, 0);
                 let less = self.rtl.binary(BinaryOp::Sub, value.id, one.id)?;
@@ -2705,7 +3656,7 @@ impl<'a> ModuleLowerer<'a> {
                 }
             }
             SystemFunctionKind::Clog2(input) => {
-                let value = self.lower_expression(&input.0, env)?;
+                let value = self.lower_comb_expression(&input.0, env, effects)?;
                 let one = self.constant(value.width, 1);
                 let zero = self.constant(value.width, 0);
                 let less = self.rtl.binary(BinaryOp::Sub, value.id, one.id)?;
@@ -2726,7 +3677,12 @@ impl<'a> ModuleLowerer<'a> {
                 ));
             }
         };
-        self.resize(value, context_width(&call.comptime)?, value.signed)
+        let signed = call.comptime.expr_context.signed;
+        self.resize(
+            LoweredExpr { signed, ..value },
+            context_width(&call.comptime)?,
+            signed,
+        )
     }
 
     fn lower_comptime(
@@ -2768,16 +3724,29 @@ impl<'a> ModuleLowerer<'a> {
 
     fn lower_dynamic_array_read(
         &mut self,
-        id: VarId,
-        index: &VarIndex,
+        elements: Vec<(SignalKey, LoweredExpr)>,
         env: &Env,
     ) -> Result<LoweredExpr, ImportError> {
-        let elements = self.lower_array_elements(id, index, env)?;
         let first = &elements[0].0;
         let width = self.width(first)?;
         let signed = self.is_signed(first);
         let mut result = self.constant(width, 0);
         result.signed = signed;
+        if elements.len() >= 4 {
+            let mut entries = Vec::with_capacity(elements.len());
+            for (key, condition) in elements {
+                let value = env.get(&key).copied().ok_or_else(|| {
+                    ImportError::UnsupportedBehavior(format!(
+                        "reference to non-runtime variable {}",
+                        self.signal_name(&key)
+                    ))
+                })?;
+                entries.push((condition, value));
+            }
+            let (matched, value) = self.lower_array_read_tree(&entries)?;
+            result.id = self.rtl.mux(matched.id, value.id, result.id)?;
+            return Ok(result);
+        }
         for (key, condition) in elements.into_iter().rev() {
             let value = env.get(&key).copied().ok_or_else(|| {
                 ImportError::UnsupportedBehavior(format!(
@@ -2794,6 +3763,27 @@ impl<'a> ModuleLowerer<'a> {
         Ok(result)
     }
 
+    /// Balance the selected value and its match predicate together. Retaining
+    /// first-match priority also preserves behavior if index predicates overlap;
+    /// the caller supplies the existing zero result when no element matches.
+    fn lower_array_read_tree(
+        &mut self,
+        entries: &[(LoweredExpr, LoweredExpr)],
+    ) -> Result<(LoweredExpr, LoweredExpr), ImportError> {
+        if entries.len() == 1 {
+            return Ok(entries[0]);
+        }
+        let split = entries.len() / 2;
+        let (left_match, left_value) = self.lower_array_read_tree(&entries[..split])?;
+        let (right_match, right_value) = self.lower_array_read_tree(&entries[split..])?;
+        let matched = self.lower_binary(Op::LogicOr, left_match, right_match, 1, false)?;
+        let value = LoweredExpr {
+            id: self.rtl.mux(left_match.id, left_value.id, right_value.id)?,
+            ..left_value
+        };
+        Ok((matched, value))
+    }
+
     fn assign_destination(
         &mut self,
         destination: &AssignDestination,
@@ -2804,7 +3794,7 @@ impl<'a> ModuleLowerer<'a> {
         if !has_dynamic_array_index(&destination.index) {
             let key = self.destination_key(destination)?;
             let (lsb, width) = driven_select(&destination.select, self.width(&key)?)?;
-            self.assign_key(&key, &destination.select, value, reads, writes)?;
+            self.assign_key(&key, destination, value, reads, writes)?;
             let mut changed = DrivenBits::default();
             changed.insert_range(key, lsb, width);
             return Ok(changed);
@@ -2815,7 +3805,7 @@ impl<'a> ModuleLowerer<'a> {
         for (key, condition) in elements {
             let (lsb, width) = driven_select(&destination.select, self.width(&key)?)?;
             let current = writes[&key];
-            self.assign_key(&key, &destination.select, value, reads, writes)?;
+            self.assign_key(&key, destination, value, reads, writes)?;
             let assigned = writes[&key];
             writes.insert(
                 key.clone(),
@@ -2838,8 +3828,33 @@ impl<'a> ModuleLowerer<'a> {
         select: &VarSelect,
         width: u32,
         env: &Env,
+        member: bool,
     ) -> Result<(ExprId, ExprId), ImportError> {
-        let index = self.lower_expression(&select.0[0], env)?;
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let offset =
+            self.lower_select_offset_effects(select, width, &mut temporary, &mut effects, member)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "index effects in a read-only select".into(),
+            ));
+        }
+        Ok(offset)
+    }
+
+    fn lower_select_offset_effects(
+        &mut self,
+        select: &VarSelect,
+        width: u32,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+        member: bool,
+    ) -> Result<(ExprId, ExprId), ImportError> {
+        let index = if member {
+            self.lower_member_index(&select.0[0], env, effects)?
+        } else {
+            self.lower_comb_expression(&select.0[0], env, effects)?
+        };
         let offset_width = index
             .width
             .checked_add(u32::BITS - width.leading_zeros() + 1)
@@ -2886,15 +3901,72 @@ impl<'a> ModuleLowerer<'a> {
     fn assign_key(
         &mut self,
         key: &SignalKey,
-        select: &VarSelect,
+        destination: &AssignDestination,
         value: LoweredExpr,
         reads: &Env,
         env: &mut Env,
     ) -> Result<(), ImportError> {
+        let select = &destination.select;
+        let offset = if dynamic_packed_select(select) {
+            let width = selected_width(select, self.width(key)?)?;
+            Some(self.lower_select_offset(
+                select,
+                width,
+                reads,
+                destination.comptime.member_select_domain.is_some(),
+            )?)
+        } else {
+            None
+        };
+        self.assign_key_prepared(
+            key,
+            &PreparedSelect {
+                select: select.clone(),
+                offset,
+                domain: destination.comptime.member_select_domain,
+            },
+            value,
+            env,
+        )
+    }
+
+    fn assign_key_prepared(
+        &mut self,
+        key: &SignalKey,
+        packed: &PreparedSelect,
+        value: LoweredExpr,
+        env: &mut Env,
+    ) -> Result<(), ImportError> {
+        let previous = env[key];
+        self.assign_key_bits(key, &packed.select, packed.offset, value, env)?;
+        if let Some(domain) = packed.domain {
+            let assigned = env[key];
+            let mask = self.member_mask(previous.width, domain)?;
+            let inverse = self.rtl.unary(UnaryOp::BitNot, mask)?;
+            let held = self.rtl.binary(BinaryOp::And, previous.id, inverse)?;
+            let written = self.rtl.binary(BinaryOp::And, assigned.id, mask)?;
+            env.insert(
+                key.clone(),
+                LoweredExpr {
+                    id: self.rtl.binary(BinaryOp::Or, held, written)?,
+                    ..assigned
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn assign_key_bits(
+        &mut self,
+        key: &SignalKey,
+        select: &VarSelect,
+        offset: Option<(ExprId, ExprId)>,
+        value: LoweredExpr,
+        env: &mut Env,
+    ) -> Result<(), ImportError> {
         let total_width = self.width(key)?;
-        if dynamic_packed_select(select) {
+        if let Some((offset, negative)) = offset {
             let width = selected_width(select, total_width)?;
-            let (offset, negative) = self.lower_select_offset(select, width, reads)?;
             let value = self.resize(value, width, false)?;
             let value = self.resize(
                 LoweredExpr {
@@ -3171,6 +4243,36 @@ impl<'a> ModuleLowerer<'a> {
         index: &VarIndex,
         env: &Env,
     ) -> Result<Vec<(SignalKey, LoweredExpr)>, ImportError> {
+        let mut temporary = env.clone();
+        let mut effects = DrivenBits::default();
+        let elements =
+            self.lower_array_elements_effects(id, index, &mut temporary, &mut effects)?;
+        if !effects.ranges.is_empty() {
+            return Err(ImportError::UnsupportedBehavior(
+                "array index effects in a read-only expression".into(),
+            ));
+        }
+        Ok(elements)
+    }
+
+    fn lower_array_elements_effects(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<Vec<(SignalKey, LoweredExpr)>, ImportError> {
+        self.lower_array_candidates_effects(id, index, self.keys_for_id(id), env, effects)
+    }
+
+    fn lower_array_candidates_effects(
+        &mut self,
+        id: VarId,
+        index: &VarIndex,
+        candidates: Vec<SignalKey>,
+        env: &mut Env,
+        effects: &mut DrivenBits,
+    ) -> Result<Vec<(SignalKey, LoweredExpr)>, ImportError> {
         let variable = self
             .source
             .variables
@@ -3206,13 +4308,13 @@ impl<'a> ModuleLowerer<'a> {
                 indices.push(LoweredArrayIndex::Static(value));
             } else {
                 indices.push(LoweredArrayIndex::Dynamic(
-                    self.lower_expression(expression, env)?,
+                    self.lower_comb_expression(expression, env, effects)?,
                 ));
             }
         }
 
         let mut elements = Vec::new();
-        for key in self.keys_for_id(id) {
+        for key in candidates {
             let mut condition = None;
             let mut matches = true;
             for (index, candidate) in indices.iter().zip(&key.index) {
@@ -3222,7 +4324,10 @@ impl<'a> ModuleLowerer<'a> {
                         let candidate = u64::try_from(*candidate).map_err(|_| {
                             ImportError::UnsupportedBehavior("unpacked array index overflow".into())
                         })?;
-                        if value.width < u64::BITS && candidate >= (1_u64 << value.width) {
+                        // A signed address has one fewer non-negative magnitude bit.
+                        // Do not alias a negative index to an upper array element.
+                        let magnitude = value.width - u32::from(value.signed);
+                        if magnitude < u64::BITS && candidate >= (1_u64 << magnitude) {
                             matches = false;
                             break;
                         }
@@ -3317,7 +4422,14 @@ impl<'a> ModuleLowerer<'a> {
     }
 
     fn signal_name(&self, key: &SignalKey) -> String {
-        indexed_name(&self.variable_name(key.id), &key.index)
+        self.signals.get(key).map_or_else(
+            || indexed_name(&self.variable_name(key.id), &key.index),
+            |signal| {
+                self.rtl.signals()[signal.index() as usize]
+                    .name()
+                    .to_owned()
+            },
+        )
     }
 
     fn unsupported_expression(op: Op) -> ImportError {
@@ -3332,7 +4444,11 @@ fn memory_candidates(
     let arrays = source
         .variables
         .values()
-        .filter(|variable| variable.kind == VarKind::Variable && !variable.r#type.array.is_empty())
+        .filter(|variable| {
+            variable.kind == VarKind::Variable
+                && variable.affiliation != veryl_analyzer::symbol::Affiliation::AlwaysFf
+                && !variable.r#type.array.is_empty()
+        })
         .map(|variable| variable.id)
         .collect::<HashSet<_>>();
     let mut candidates = policies
@@ -3652,103 +4768,6 @@ fn concrete_width(r#type: &Type, name: &str) -> Result<u32, ImportError> {
     u32::try_from(width).map_err(|_| ImportError::WidthTooLarge(name.into()))
 }
 
-// AIR keeps intrinsic types separate from the propagated expression context.
-// IEEE 1800-2023 11.8.2 requires widening operands before applying the operator.
-// Numeric size casts preserve source signedness, which is not reliably
-// reflected in AIR's propagated expression context. Recompute the common
-// type before lowering, including unsigned context inherited from a parent.
-fn expression_signedness(expression: &Expression) -> bool {
-    match expression {
-        Expression::Binary(lhs, Op::As, rhs, comptime) => {
-            if matches!(rhs.comptime().value, ValueVariant::Type(_)) {
-                comptime.r#type.signed
-            } else {
-                expression_signedness(lhs)
-            }
-        }
-        Expression::Binary(_, op, _, _) if is_boolean_operator(*op) => false,
-        Expression::Binary(lhs, op, rhs, _) => {
-            expression_signedness(lhs)
-                && (matches!(
-                    op,
-                    Op::LogicShiftL | Op::LogicShiftR | Op::ArithShiftL | Op::ArithShiftR | Op::Pow
-                ) || expression_signedness(rhs))
-        }
-        Expression::Unary(op, input, _) => {
-            matches!(op, Op::Add | Op::Sub | Op::BitNot) && expression_signedness(input)
-        }
-        Expression::Ternary(_, yes, no, _) => {
-            expression_signedness(yes) && expression_signedness(no)
-        }
-        Expression::Concatenation(..) => false,
-        Expression::Term(factor) => match factor.as_ref() {
-            Factor::SystemFunctionCall(call) => {
-                use veryl_analyzer::ir::SystemFunctionKind;
-                match call.kind {
-                    SystemFunctionKind::Bits(_)
-                    | SystemFunctionKind::Size(_)
-                    | SystemFunctionKind::Clog2(_)
-                    | SystemFunctionKind::Signed(_) => true,
-                    SystemFunctionKind::Unsigned(_) | SystemFunctionKind::Onehot(_) => false,
-                    _ => expression.comptime().r#type.signed,
-                }
-            }
-            Factor::Variable(_, _, select, ct)
-                if !select.is_empty()
-                    && matches!(ct.r#type.kind, TypeKind::Bit | TypeKind::Logic) =>
-            {
-                false
-            }
-            _ => expression.comptime().r#type.signed,
-        },
-        _ => expression.comptime().r#type.signed,
-    }
-}
-
-fn repair_expression_signedness(expression: &mut Expression, inherited: Option<bool>) {
-    let signed = inherited.unwrap_or_else(|| expression_signedness(expression));
-    expression.comptime_mut().expr_context.signed = signed;
-    match expression {
-        Expression::Binary(lhs, Op::As, _, _) => repair_expression_signedness(lhs, None),
-        Expression::Binary(lhs, op, rhs, _) => {
-            if matches!(op, Op::LogicAnd | Op::LogicOr) {
-                repair_expression_signedness(lhs, None);
-                repair_expression_signedness(rhs, None);
-            } else if is_boolean_operator(*op) {
-                let common = expression_signedness(lhs) && expression_signedness(rhs);
-                repair_expression_signedness(lhs, Some(common));
-                repair_expression_signedness(rhs, Some(common));
-            } else {
-                repair_expression_signedness(lhs, Some(signed));
-                let shift = matches!(
-                    op,
-                    Op::LogicShiftL | Op::LogicShiftR | Op::ArithShiftL | Op::ArithShiftR | Op::Pow
-                );
-                repair_expression_signedness(rhs, if shift { None } else { Some(signed) });
-            }
-        }
-        Expression::Unary(op, input, _) => repair_expression_signedness(
-            input,
-            if matches!(op, Op::Add | Op::Sub | Op::BitNot) {
-                Some(signed)
-            } else {
-                None
-            },
-        ),
-        Expression::Concatenation(parts, _) => {
-            for (part, _) in parts {
-                repair_expression_signedness(part, None);
-            }
-        }
-        Expression::Ternary(cond, yes, no, _) => {
-            repair_expression_signedness(cond, None);
-            repair_expression_signedness(yes, Some(signed));
-            repair_expression_signedness(no, Some(signed));
-        }
-        _ => {}
-    }
-}
-
 fn binary_signed(op: Op, comptime: &Comptime) -> bool {
     !is_boolean_operator(op) && comptime.expr_context.signed
 }
@@ -3758,6 +4777,8 @@ fn is_boolean_operator(op: Op) -> bool {
         op,
         Op::Eq
             | Op::Ne
+            | Op::EqWildcard
+            | Op::NeWildcard
             | Op::Less
             | Op::LessEq
             | Op::Greater
@@ -3832,11 +4853,7 @@ fn substitute_induction(
                 }
             }
             Factor::FunctionCall(call) => substitute_call(call, id, value)?,
-            Factor::SystemFunctionCall(_) => {
-                return Err(ImportError::UnsupportedBehavior(
-                    "system function in unrolled loop".into(),
-                ));
-            }
+            Factor::SystemFunctionCall(call) => substitute_system_call(call, id, value)?,
             _ => (),
         },
         Expression::Unary(_, a, _) => substitute_induction(a, id, value)?,
@@ -3862,10 +4879,20 @@ fn substitute_induction(
                 substitute_induction(field, id, value)?;
             }
         }
-        Expression::ArrayLiteral(_, _) => {
-            return Err(ImportError::UnsupportedBehavior(
-                "array literal in unrolled loop".into(),
-            ));
+        Expression::ArrayLiteral(items, _) => {
+            for item in items {
+                match item {
+                    ArrayLiteralItem::Value(expression, repeat) => {
+                        substitute_induction(expression, id, value)?;
+                        if let Some(repeat) = repeat {
+                            substitute_induction(repeat, id, value)?;
+                        }
+                    }
+                    ArrayLiteralItem::Defaul(expression) => {
+                        substitute_induction(expression, id, value)?;
+                    }
+                }
+            }
         }
     }
     // eval_value never invents values for unresolved runtime variables. Only
@@ -3874,6 +4901,7 @@ fn substitute_induction(
         && !number.is_xz()
     {
         expression.comptime_mut().value = ValueVariant::Numeric(number);
+        expression.comptime_mut().is_const = true;
     }
     Ok(())
 }
@@ -3891,6 +4919,37 @@ fn substitute_access(
         substitute_induction(expression, id, value)?;
     }
     Ok(())
+}
+
+fn substitute_system_call(
+    call: &mut veryl_analyzer::ir::SystemFunctionCall,
+    id: VarId,
+    value: usize,
+) -> Result<(), ImportError> {
+    use veryl_analyzer::ir::SystemFunctionKind;
+    match &mut call.kind {
+        SystemFunctionKind::Signed(input)
+        | SystemFunctionKind::Unsigned(input)
+        | SystemFunctionKind::Onehot(input)
+        | SystemFunctionKind::Clog2(input)
+        | SystemFunctionKind::Bits(input) => substitute_induction(&mut input.0, id, value),
+        SystemFunctionKind::Size(input, dimension) => {
+            substitute_induction(&mut input.0, id, value)?;
+            if let Some(dimension) = dimension {
+                substitute_induction(&mut dimension.0, id, value)?;
+            }
+            Ok(())
+        }
+        SystemFunctionKind::Display(args) | SystemFunctionKind::Write(args) => {
+            for arg in args {
+                substitute_induction(&mut arg.0, id, value)?;
+            }
+            Ok(())
+        }
+        _ => Err(ImportError::UnsupportedBehavior(
+            "system task in unrolled loop".into(),
+        )),
+    }
 }
 
 fn substitute_call(
@@ -3956,6 +5015,7 @@ fn substitute_statements(
                 substitute_statements(&mut nested.body, id, value)?;
             }
             Statement::FunctionCall(call) => substitute_call(call, id, value)?,
+            Statement::SystemFunctionCall(call) => substitute_system_call(call, id, value)?,
             Statement::Null | Statement::Break => (),
             _ => {
                 return Err(ImportError::UnsupportedBehavior(
@@ -3982,6 +5042,11 @@ fn has_dynamic_array_index(index: &VarIndex) -> bool {
 }
 
 fn evaluated_u64(expression: &Expression) -> Option<u64> {
+    // AIR can retain a representative numeric value for a runtime expression,
+    // notably A[index] with a constant array. It is not a compile-time address.
+    if !expression.comptime().is_const {
+        return None;
+    }
     expression
         .comptime()
         .get_value()
@@ -4983,6 +6048,56 @@ module WideLiteralTop (
         // levels (seventeen operations including its leaf equality) here.
         assert_eq!(expression_depth(top, *condition), 5);
         assert_eq!(case_data_mux_depth(top, value), 5);
+    }
+
+    #[test]
+    fn dynamic_array_reads_have_logarithmic_depth_and_preserve_bounds() {
+        for count in [3_u32, 5, 16, 17] {
+            let source = format!(
+                "module ArrayReadTop (values: input logic<8> [{count}], \
+                 index: input logic<6>, result: output logic<8>) {{ \
+                 assign result = values[index]; }}"
+            );
+            let design = analyze_and_lower(&source, "balanced_array", "ArrayReadTop").unwrap();
+            let top = design.top_module().unwrap();
+            let output = top
+                .signals()
+                .iter()
+                .find(|s| s.name() == "result")
+                .unwrap()
+                .id();
+            let value = top
+                .assignments()
+                .iter()
+                .find(|a| a.target.signal == output)
+                .unwrap()
+                .value;
+            let bound = (count.next_power_of_two().ilog2() + 1) as usize;
+            assert!(
+                case_data_mux_depth(top, value) <= bound,
+                "{count} entries exceed logarithmic mux depth {bound}"
+            );
+
+            let synthesized = synthesize(&design).unwrap();
+            let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+            let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+            for pattern in [0_u8, 0x31, 0x80, 0xff] {
+                let bytes = (0..count)
+                    .map(|i| pattern.wrapping_add(u8::try_from(i).unwrap().wrapping_mul(19)))
+                    .collect::<Vec<_>>();
+                for (i, &byte) in bytes.iter().enumerate() {
+                    set(&mut simulator, &format!("values[{i}]"), byte);
+                }
+                for index in 0_u8..64 {
+                    set(&mut simulator, "index", index);
+                    assert_value(
+                        &mut simulator,
+                        "result",
+                        u64::from(bytes.get(usize::from(index)).copied().unwrap_or(0)),
+                    );
+                }
+            }
+        }
     }
 
     #[test]

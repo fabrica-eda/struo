@@ -1,113 +1,40 @@
-# Explicit exclusions for celox-test-suite-veryl 0.8.1.
-# These are skipped cases, not passing observations. Remove entries as support is fixed.
+# Explicit exclusions for celox-test-suite-veryl 0.9.0.
+# Skipped cases are not passes. Remove entries only after validation.
+# Tag exclusions below describe incompatible oracles, not frontend gaps.
+# Untagged cases are not automatically proof of portable SV conformance.
 # Recheck with scripts/check-veryl-suite.py --include-ignored --filter <case>.
 
 [[ignore]]
-reason = "Celox 0.8.1 rejects an asynchronous reset shared across distinct clock domains."
+reason = "Celox 0.9.0 rejects an asynchronous reset shared across distinct clock domains."
 cases = [
   "multi_clock::test_clock_domain_crossing_pattern",
   "multi_clock::test_independent_clock_domains",
 ]
 
 [[ignore]]
-reason = "Exceeds the 60-second per-case budget on the CI runner."
+reason = "The 1,048,576-by-32-bit FF array exceeds the 4096 MiB worker address-space limit before lowering completes; a 1.5 GiB allocation fails."
 cases = [
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
-  "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
-  "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
-  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
-  "signed_divrem::signed_divrem_i128",
-  "signed_divrem::signed_divrem_i64",
-  "wide_operators::test_wide_comb_div",
-  "wide_operators::test_wide_comb_rem",
 ]
 
 [[ignore]]
-reason = "Passes locally after LUT simplification; CI headroom under the 60-second limit is not yet validated."
+reason = "The upstream veryl-std 0.21 onehot leaves o_gt_one undriven in its W=1 base case; filling it with zero would change the supplied RTL."
 cases = [
-  "wide_shift_mem::test_1024bit_sar_sign_extension",
-]
-
-[[ignore]]
-reason = "Synthesis currently reports a combinational loop or an undriven signal."
-cases = [
-  "hierarchy::test_hierarchical_concat_feedback_runtime",
-  "hierarchy::test_hierarchical_concat_feedback_runtime_multi_observe",
-  "hierarchy::test_hierarchical_concat_feedback_with_constant_middle_bit",
-  "hierarchy::test_hierarchical_concat_then_overlap_dynamic_index_runtime",
   "std_onehot::test_onehot_8bit_exhaustive",
 ]
 
 [[ignore]]
-reason = "The frontend does not yet lower this construct; retain the upstream expectation."
+reason = "The fixture calls a function with output arguments in a module input connection, outside a procedural statement; IEEE 1800-2023 13.4 prohibits this."
 cases = [
-  "basic::test_comb_case_target_output_call_is_evaluated_once",
-  "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
-  "basic::test_comb_effectful_if_condition_after_dynamic_break_stays_inactive",
-  "basic::test_comb_function_call_expression_output_is_guarded_by_ternary",
-  "basic::test_comb_function_call_expression_output_is_visible_to_later_operand",
-  "basic::test_comb_function_call_expression_output_respects_short_circuit",
-  "basic::test_comb_function_call_expression_with_constant_input_keeps_output_write",
-  "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
-  "basic::test_comb_value_system_function_statement_applies_argument_outputs",
-  "basic::test_mixed_selects_execution",
-  "basic::test_statement_call_inputs_follow_output_writeback_order",
-  "comb_observer::test_comb_function_packed_array_literal_preserves_source_order",
-  "comb_observer::test_named_function_inputs_evaluate_in_source_order",
-  "data_access::test_partial_write_merging",
-  "duplicate_varpath::test_duplicate_scoped_var_in_always_comb",
-  "expression_semantics::short_circuit_operators_skip_effectful_operands",
-  "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
-  "false_loop::test_read_then_overwrite_convergence",
-  "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
-  "flip_flop::test_ff_runtime_for_bitwise_steps",
-  "flip_flop::test_ff_runtime_for_bounds",
-  "flip_flop::test_ff_runtime_for_break",
-  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
-  "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
-  "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
-  "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
-  "flip_flop::test_ff_runtime_reverse_exclusive_i32_upper_sentinel",
-  "flip_flop::test_ff_runtime_reverse_min_i32_end_wraps_before_range_check",
-  "flip_flop::test_ff_runtime_reverse_step_matches_emitted_sv_order",
-  "flip_flop::test_ff_signed_xor_step_uses_loop_counter_width",
-  "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
-  "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
-  "function_arguments::test_ff_inout_expression_copyout_commits_with_nonblocking_assignments",
-  "hierarchy::test_dynamic_minus_colon_output_port_rmw",
-  "hierarchy::test_dynamic_output_port_converts_four_state_child_to_two_state_parent",
-  "hierarchy::test_dynamic_output_port_rmw_preserves_unselected_bits",
-  "hierarchy::test_dynamic_step_output_port_rmw",
-  "hierarchy::test_hierarchical_dual_dynamic_readers_feedback_runtime",
-  "hierarchy::test_hierarchical_dynamic_index_feedback_runtime",
-  "hierarchy::test_hierarchical_overlapping_partial_write_dynamic_index_runtime",
-  "hierarchy::test_instance_output_concat_advances_each_destination",
-  "hierarchy::test_instance_output_dynamic_index_composes_aliasing_writeback",
-  "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
-  "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
-  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
-  "operators::test_pow_operator_constant_exponent",
-  "operators::test_pow_operator_constant_exponent_ff",
-  "std_binary_codec::test_binary_codec_roundtrip",
-  "std_binary_codec::test_binary_encoder",
-  "std_binary_codec::test_binary_encoder_disabled",
-  "std_lfsr::test_lfsr_basic_shift",
-  "std_lfsr::test_lfsr_deterministic_cycle",
-  "std_lfsr::test_lfsr_enable_hold",
-  "synth_dynamic_loop::test_constant_bounds_preserve_wide_limit_above_loop_width",
-  "synth_dynamic_loop::test_i32_bitwise_steps_discard_bits_above_the_counter_width",
-  "synth_dynamic_loop::test_runtime_bitwise_steps_in_synth_for_loops",
-  "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
-  "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_loop_carried_state_for_indexed_reads",
-  "synth_dynamic_loop::test_runtime_bounds_reverse_singleton_exits_cleanly",
-  "synth_dynamic_loop::test_runtime_bounds_signed_inclusive_range_preserves_negative_bounds",
-  "synth_dynamic_loop::test_runtime_bounds_truncate_loop_var_to_declared_width",
-  "synth_dynamic_loop::test_runtime_break_after_assign_in_synth_comb_loop",
-  "synth_dynamic_loop::test_runtime_break_in_synth_comb_loop",
-  "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
-  "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
+  "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
+  "hierarchy::test_instance_input_function_output_writeback",
+]
+
+[[ignore]]
+reason = "The fixture connects an unpacked array to a packed port without an explicit cast (IEEE 1800-2023 7.6 and 23.3.3.3); implicit layout reinterpretation is not supported."
+cases = [
+  "std_mux::test_demux_build_smoke",
+  "std_mux::test_mux_build_smoke",
 ]
 
 [[ignore]]
@@ -231,74 +158,27 @@ cases = [
 ]
 
 [[ignore]]
-reason = "The suite requires zero-start storage; synthesis folds the constant FF. See celox-sim/celox#917."
+reason = "Requires previous-evaluation state from an always_comb read before write; the mapped combinational circuit settles to the current input."
 cases = [
-  "operators::test_ff_constant_two_state_initialization",
-]
-
-[[ignore]]
-reason = "Veryl 0.21.0 folds $size of packed dimensions to total width instead of the first dimension."
-cases = [
-  "system_function::test_direct_ff_size_packed_multidimensional_system_function",
-  "system_function::test_direct_ff_size_packed_multidimensional_type_system_function",
-]
-
-[[ignore]]
-reason = "Veryl 0.21.0 folds a function actual before the formal width is applied."
-cases = [
-  "flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion",
-]
-
-[[ignore]]
-reason = "Veryl 0.21.0 folds signed size-cast division/remainder with incorrect signedness."
-cases = [
-  "expression_semantics::constant_and_runtime_casts_use_the_same_resize_rule",
-]
-
-[[ignore]]
-reason = "Veryl 0.21.0 rejects the input during analysis; lowering is not reached."
-cases = [
-  "advanced_interface::test_transitive_generics",
-  "advanced_interface::test_transitive_generics_two_level",
   "basic::test_always_comb_read_before_write_uses_previous_value",
-  "basic::test_comb_function_call_expression_output_survives_system_function_wrapper",
-  "basic::test_comb_function_call_statement_ignores_return_value",
-  "basic::test_comb_function_call_statement_preserves_conditional_return_control_flow",
-  "basic::test_comb_function_call_statement_preserves_return_control_flow",
-  "basic::test_comb_function_call_with_output_argument_in_case_target",
-  "basic::test_comb_function_call_with_output_argument_in_destination_index",
-  "basic::test_comb_function_call_with_output_argument_in_display_argument",
-  "basic::test_comb_function_call_with_output_argument_in_if_condition",
-  "basic::test_comb_function_call_with_output_argument_in_index_expression",
-  "basic::test_comb_function_call_with_output_argument_in_loop_condition",
-  "basic::test_comb_function_condition_output_is_guarded_after_early_return",
-  "basic::test_comb_loop_bound_output_call_writes_back_once",
-  "basic::test_comb_nested_function_output_call_in_function_condition",
-  "basic::test_comb_returning_output_function_allows_nested_output_call",
-  "basic::test_comb_returning_output_function_reads_current_caller_store",
-  "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",
-  "comb_observer::test_comb_function_loop_skips_conditions_after_break",
-  "comb_observer::test_named_function_outputs_apply_in_source_order",
-  "concat_operators::test_shift_in_concat",
-  "duplicate_varpath::test_duplicate_scoped_var_with_generate_for",
-  "flip_flop::test_ff_assert_message_output_argument_is_eager",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 forbids function output/non-local writes from always_ff; these corpus cases require non-default FF function effects."
+cases = [
   "flip_flop::test_ff_bits_and_size_array_dependencies_do_not_alias_later_write",
   "flip_flop::test_ff_bits_and_size_operands_do_not_alias_earlier_array_argument",
-  "flip_flop::test_ff_constant_signed_bounds_in_unrolled_loops",
   "flip_flop::test_ff_dynamic_nonlocal_store_follows_pending_whole_write",
   "flip_flop::test_ff_effectful_array_item_output_is_not_a_read_alias",
-  "flip_flop::test_ff_function_array_element_assignment_preserves_signedness",
   "flip_flop::test_ff_function_call_array_literal_branch_view_is_reused_after_merge",
   "flip_flop::test_ff_function_call_array_literal_effect_is_eager_in_short_circuit_rhs",
   "flip_flop::test_ff_function_call_array_literal_effect_is_eager_in_ternary_arm",
   "flip_flop::test_ff_function_call_array_literal_snapshots_scalar_before_callee_write",
-  "flip_flop::test_ff_function_call_array_literal_snapshots_scalar_before_later_write",
   "flip_flop::test_ff_function_call_array_literal_view_preserves_expression_order",
   "flip_flop::test_ff_function_call_array_literal_view_preserves_source_order",
   "flip_flop::test_ff_function_call_bits_and_size_evaluate_effectful_array_argument",
   "flip_flop::test_ff_function_call_carries_branch_local_static_array_item_cache",
   "flip_flop::test_ff_function_call_effectful_array_items_are_eager_before_conditional_access",
-  "flip_flop::test_ff_function_call_expression_with_output_argument_and_return_value",
   "flip_flop::test_ff_function_call_keeps_array_view_active_for_output_index",
   "flip_flop::test_ff_function_call_merges_directly_forwarded_array_cache",
   "flip_flop::test_ff_function_call_merges_nested_array_state_at_cache_completion",
@@ -306,10 +186,6 @@ cases = [
   "flip_flop::test_ff_function_call_merges_outer_array_view_across_nested_short_circuit",
   "flip_flop::test_ff_function_call_nested_bits_evaluates_effectful_array_argument",
   "flip_flop::test_ff_function_call_nested_output_statement_in_function_body",
-  "flip_flop::test_ff_function_call_preserves_unsigned_formal_signedness_for_nonvariable_actual",
-  "flip_flop::test_ff_function_call_snapshots_pure_array_items_before_later_effect",
-  "flip_flop::test_ff_function_call_statement_with_output_argument",
-  "flip_flop::test_ff_function_call_statement_with_output_argument_and_return_value",
   "flip_flop::test_ff_function_call_tracks_array_reads_in_output_indices",
   "flip_flop::test_ff_function_call_tracks_array_view_hidden_in_bound_literal",
   "flip_flop::test_ff_function_call_tracks_nested_array_reads_in_output_indices",
@@ -321,37 +197,123 @@ cases = [
   "flip_flop::test_ff_outputless_wrapper_expression_copyout_to_nonlocal_is_observable",
   "flip_flop::test_ff_outputless_wrapper_indexed_copyout_to_nonlocal_is_observable",
   "flip_flop::test_ff_outputless_wrapper_nested_copyout_to_nonlocal_is_observable",
-  "flip_flop::test_ff_pure_input_is_snapshotted_before_later_effectful_input",
   "flip_flop::test_ff_runtime_function_snapshots_helper_input_before_callee_nonlocal_write",
   "flip_flop::test_ff_runtime_function_snapshots_input_before_callee_nonlocal_write",
-  "flip_flop::test_ff_short_circuit_runtime_write_preserves_later_state_source",
   "flip_flop::test_ff_skipped_conditional_nonlocal_write_preserves_prior_ff_assignment",
   "flip_flop::test_ff_statement_function_direct_nonlocal_assignment_is_observable",
-  "function_arguments::test_ff_nested_output_copyout_is_visible_before_outer_copyout",
-  "function_arguments::test_ff_output_copyout_to_dynamic_slice_preserves_other_bits",
-  "function_arguments::test_ff_statement_output_copyout_freezes_all_inputs",
-  "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
-  "hierarchy::test_instance_input_function_output_writeback",
-  "hierarchy::test_instance_unpacked_array_slice_output",
-  "hierarchy::test_unconnected_child_output_needs_no_parent_glue",
   "operators::test_pow_operator_runtime_exponent_comb_and_ff",
-  "operators::test_shift_logical_vs_arithmetic",
-  "shift_signedness::test_shift_constant_folding_native",
-  "shift_signedness::test_shift_constant_folding_wide",
-  "std_mux::test_demux_build_smoke",
-  "std_mux::test_mux_build_smoke",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 rejects constant signed loop bounds (InvalidForRange)."
+cases = [
+  "flip_flop::test_ff_constant_signed_bounds_in_unrolled_loops",
   "synth_dynamic_loop::test_constant_signed_bounds_in_unrolled_synth_loops",
-  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_pre_loop_bits_for_partial_updates",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
-  "synth_dynamic_loop::test_runtime_bounds_reconstruct_wide_loop_carried_reads_from_partial_state",
-  "synth_dynamic_loop::test_runtime_bounds_stalled_step_with_break_exits_cleanly",
-  "synth_dynamic_loop::test_runtime_bounds_track_initial_seed_dependency",
-  "synth_dynamic_loop::test_runtime_bounds_track_initial_seed_dependency_across_module_boundary",
-  "synth_dynamic_loop::test_runtime_break_condition_dependency_across_module_boundary",
-  "synth_dynamic_loop::test_runtime_if_without_break_in_synth_comb_loop",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 requires a compile-time operand for this system-function use (UnevaluableValue)."
+cases = [
   "system_function::test_direct_comb_clog2_system_function",
   "system_function::test_direct_comb_onehot_system_function",
   "system_function::test_direct_ff_clog2_system_function",
   "system_function::test_direct_ff_onehot_system_function",
+]
+
+[[ignore]]
+reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles, signed inclusive maximum endpoints, or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
+cases = [
+  "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
+  "synth_dynamic_loop::test_runtime_bounds_signed_inclusive_range_preserves_negative_bounds",
+  "flip_flop::test_ff_runtime_for_bounds",
+  "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
+  "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
+  "flip_flop::test_ff_runtime_for_bitwise_steps",
+  "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
+  "flip_flop::test_ff_runtime_reverse_exclusive_i32_upper_sentinel",
+  "flip_flop::test_ff_runtime_reverse_step_matches_emitted_sv_order",
+  "flip_flop::test_ff_signed_xor_step_uses_loop_counter_width",
+  "synth_dynamic_loop::test_i32_bitwise_steps_discard_bits_above_the_counter_width",
+  "synth_dynamic_loop::test_runtime_bitwise_steps_in_synth_for_loops",
+  "synth_dynamic_loop::test_runtime_bounds_reverse_singleton_exits_cleanly",
+  "synth_dynamic_loop::test_runtime_bounds_stalled_step_with_break_exits_cleanly",
+  "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
+]
+
+
+# These oracles require behavior outside Struo's synthesis contract.
+# --include-ignored executes them too, retaining upstream tag metadata.
+[[exclude_tag]]
+tag = "deferred_function_effects"
+reason = "Celox-specific deferred function copy-out in FFs; Struo retains the Veryl always_ff function-effect restriction."
+
+[[exclude_tag]]
+tag = "eager_assertion_messages"
+reason = "Successful assertions do not execute failure-message effects; do not synthesize the suite's eager-message policy."
+
+[[exclude_tag]]
+tag = "two_state_initialization"
+reason = "Synthesis does not promise zero initialization of four-state storage or retain constant FFs to provide it."
+
+[[ignore]]
+reason = "Requires four-state storage/unknown masks; the mapped ECP5 adapter is two-state."
+cases = [
+  "ff_narrow_arrays::ff_captures_padded_elements_and_unknown_masks",
+  "veryl_regressions::wide_shift_count_preserves_unknowns_and_sign_fill",
+  "veryl_regressions::constant_arrays_initialize_comb_and_ff_reads",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 rejects scalar x[0] (InvalidSelect::Scalar); the suite expects acceptance of a scalar bit-select."
+cases = [
+  "flip_flop::test_ff_function_call_bit_select_on_nonvariable_one_bit_formal",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 rejects tri on a function formal (NetInFunction); legal inout variable formals are covered separately."
+cases = [
+  "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
+]
+
+[[ignore]]
+reason = "Veryl 0.22.0 reports CombinationalLoop for cand: the runtime-bounded write leaves array entries unassigned."
+cases = [
+  "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
+]
+
+# Execute verified slow cases in CI with bounded native compilation time.
+[[timeout]]
+seconds = 600
+reason = "Bounded arithmetic expansion is correct but native simulator compilation exceeds the default budget."
+cases = [
+  "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
+]
+
+[[timeout]]
+seconds = 300
+reason = "Verified mapped circuits require longer native simulator construction, especially on CI runners."
+cases = [
+  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
+  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
+  "signed_divrem::signed_divrem_i64",
+  "veryl_context_regressions::runtime_for_bound_keeps_its_type",
+  "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
+]
+
+[[timeout]]
+seconds = 600
+reason = "Dynamic FF array round trips and loop-boundary behavior are verified but require extended native simulator construction time."
+cases = [
+  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
+  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
+  "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
+]
+
+[[timeout]]
+seconds = 180
+reason = "Wide division/remainder passes with gate-level mux branchification disabled, but native construction needs a larger CI budget."
+cases = [
+  "signed_divrem::signed_divrem_i128",
+  "wide_operators::test_wide_comb_div",
+  "wide_operators::test_wide_comb_rem",
 ]

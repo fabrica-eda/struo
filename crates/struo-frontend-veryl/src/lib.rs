@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use struo_rtl::{BitWidth, Design, Module, Port, PortDirection, RtlError, StateDomain, ValueType};
 use veryl_analyzer::ir::{Component, Declaration, Ir, VarKind};
-use veryl_analyzer::{Analyzer, Context};
+use veryl_analyzer::{Analyzer, AnalyzerError, Context};
 use veryl_metadata::Metadata;
 use veryl_parser::{Parser, resource_table};
 
@@ -26,8 +26,8 @@ pub use lower::lower_analyzed_ir;
 ///
 /// # Errors
 ///
-/// Returns an error for parser or analyzer diagnostics, metadata setup, or
-/// semantic lowering failures.
+/// Analyzer warnings are non-fatal. Returns an error for parser or analyzer
+/// errors, metadata setup, or semantic lowering failures.
 pub fn analyze_and_lower(source: &str, project: &str, top: &str) -> Result<Design, ImportError> {
     let metadata = Metadata::create_default(project)
         .map_err(|error| ImportError::AnalysisFailed(error.to_string()))?;
@@ -110,35 +110,43 @@ fn analyze_parsed_and_lower(
     for (project, parser) in parsed {
         pass1.append(&mut analyzer.analyze_pass1(project, &parser.veryl));
     }
-    if !pass1.is_empty() {
-        return Err(ImportError::AnalysisFailed(format!("{pass1:?}")));
-    }
+    reject_analysis_errors(pass1)?;
     let post1 = Analyzer::analyze_post_pass1();
-    if !post1.is_empty() {
-        return Err(ImportError::AnalysisFailed(format!("{post1:?}")));
-    }
+    reject_analysis_errors(post1)?;
 
     let mut pass2 = Vec::new();
     for (project, parser) in parsed {
         context.set_project_name(project);
         pass2.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
     }
-    if !pass2.is_empty() {
-        return Err(ImportError::AnalysisFailed(format!("{pass2:?}")));
-    }
+    pass2.append(&mut context.drain_errors());
+    reject_analysis_errors(pass2)?;
     let post2 = Analyzer::analyze_post_pass2(&ir);
-    if !post2.is_empty() {
-        return Err(ImportError::AnalysisFailed(format!("{post2:?}")));
-    }
+    reject_analysis_errors(post2)?;
     lower_analyzed_ir(&ir, top)
 }
 
+// AnalyzerError includes warnings (e.g. unused variables and unsigned
+// arithmetic shifts). Respect Veryl's severity instead of turning every lint
+// into a language rejection. Unknown severity remains fatal via is_error().
+fn reject_analysis_errors(diagnostics: Vec<AnalyzerError>) -> Result<(), ImportError> {
+    let errors = diagnostics
+        .into_iter()
+        .filter(AnalyzerError::is_error)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ImportError::AnalysisFailed(format!("{errors:?}")))
+    }
+}
+
 /// Exact Veryl analyzer release supported by this adapter.
-pub const SUPPORTED_VERYL_VERSION: &str = "0.21.0";
+pub const SUPPORTED_VERYL_VERSION: &str = "0.22.0";
 
 /// Requested treatment of an unpacked Veryl array during memory inference.
 ///
-/// Veryl 0.21.0 does not accept tool-defined attribute names, so source code
+/// Veryl 0.22.0 does not accept tool-defined attribute names, so source code
 /// selects this policy through its portable `SystemVerilog` attribute escape:
 /// `#[sv("struo_memory = \"distributed\"")]`. The accepted values are
 /// `preferred`, `required`, `forbidden`, `block`, and `distributed`.
@@ -408,10 +416,124 @@ mod tests {
     use super::{SUPPORTED_VERYL_VERSION, analyze_project_and_lower, import_analyzed_shell};
 
     #[test]
+    fn analyzer_warnings_do_not_reject_valid_designs() {
+        let source = "module Top(a: input logic<8>, q: output logic<8>) {
+            var unused: logic<8>;
+            assign q = a >>> 1;
+        }";
+        super::analyze_and_lower(source, "warnings", "Top")
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn analyzer_errors_remain_fatal_alongside_warnings() {
+        let source = "module Top(a: input logic<8>, q: output logic<8>) {
+            var unused: logic<8>;
+            assign q = (a >>> 1) + missing;
+        }";
+        let error = super::analyze_and_lower(source, "errors", "Top").unwrap_err();
+        assert!(matches!(error, super::ImportError::AnalysisFailed(_)));
+        assert!(error.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn nonlocal_function_writes_are_not_silently_discarded() {
+        let source = "module Top(a: input logic<8>, q: output logic<8>, side: output logic<8>) {
+            function f(x: input logic<8>) -> logic<8> { side = x; return x; }
+            always_comb { side = 0; q = f(a); }
+        }";
+        let error = super::analyze_and_lower(source, "nonlocal", "Top").unwrap_err();
+        assert!(matches!(error, super::ImportError::UnsupportedBehavior(_)));
+        assert!(error.to_string().contains("non-local storage"));
+    }
+
+    #[test]
+    fn overlapping_combinational_drivers_remain_rejected() {
+        for (first, second) in [
+            ("v[3:0] = a[3:0];", "v[5:2] = a[3:0];"),
+            ("v = a;", "v[0] = a[0];"),
+            ("v[index] = a[0];", "v[7] = a[1];"),
+        ] {
+            let source = format!(
+                "module Top(a: input logic<8>, index: input logic<3>, q: output logic<8>) {{
+                    #[allow(multiple_assign)]
+                    var v: logic<8>;
+                    always_comb {{ {first} }}
+                    always_comb {{ {second} }}
+                    assign q = v;
+                }}"
+            );
+            let error = super::analyze_and_lower(&source, "overlap", "Top").unwrap_err();
+            assert!(
+                matches!(&error, super::ImportError::UnsupportedBehavior(message)
+                    if message.contains("multiple procedural drivers for v")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_loop_budget_requires_a_proof_for_every_input() {
+        for body in [
+            "q += i as 16;",
+            "if stop { break; } q += 1;",
+            "for j in 0..2 { break; } q += 1;",
+            "if i == 512 { break; } q += 1;",
+        ] {
+            let source = format!(
+                "module Top(count: input logic<32>, stop: input logic, q: output logic<16>) {{
+                    always_comb {{ q = 0; for i in 0..count {{ {body} }} }}
+                }}"
+            );
+            let error = super::analyze_and_lower(&source, "unproven_loop", "Top").unwrap_err();
+            assert!(
+                matches!(&error, super::ImportError::UnsupportedBehavior(message)
+                if message.contains("512-iteration synthesis budget")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_loop_start_truncation_is_not_mistaken_for_an_empty_range() {
+        let source = "module Top(count: input logic<3>, q: output logic<8>) {
+            always_comb { q = 0; for i in 64'd4294967296..count { q += 1; } }
+        }";
+        let error = super::analyze_and_lower(source, "truncated_start", "Top").unwrap_err();
+        assert!(
+            matches!(&error, super::ImportError::UnsupportedBehavior(message)
+            if message.contains("without truncation")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn empty_runtime_loop_does_not_discard_bound_output_effects() {
+        let source =
+            "module Top(count: input logic<3>, q: output logic<8>, side: output logic<8>) {
+            function end_value(x: input logic<3>, y: output logic<8>) -> logic<3> {
+                y = 1; return x;
+            }
+            always_comb {
+                q = 0; side = 0;
+                for i in 8..end_value(count, side) { q += 1; }
+            }
+        }";
+        let error = super::analyze_and_lower(source, "empty_bound_effect", "Top").unwrap_err();
+        assert!(
+            matches!(&error, super::ImportError::UnsupportedBehavior(message)
+            if message.contains("read-only expression")),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn empty_analyzer_ir_is_not_silently_made_valid() {
         let imported = import_analyzed_shell(&Ir::default(), "Top").unwrap();
 
-        assert_eq!(SUPPORTED_VERYL_VERSION, "0.21.0");
+        assert_eq!(SUPPORTED_VERYL_VERSION, "0.22.0");
         assert!(imported.design.validate().is_err());
     }
 

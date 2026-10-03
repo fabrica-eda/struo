@@ -1,35 +1,124 @@
 # Veryl corpus tests
 
-The pinned `celox-test-suite-veryl` 0.8.1 corpus exercises:
+The pinned `celox-test-suite-veryl` 0.9.0 corpus exercises:
 
 ```text
-Veryl -> Struo RTL -> synthesis -> ECP5 mapping -> Celox 0.8.1 native simulation
+Veryl -> Struo RTL -> synthesis -> ECP5 mapping -> Celox 0.9.0 native simulation
 ```
 
-CI enumerates every corpus case in the `Veryl corpus (Celox 0.8.1)` job on
+CI enumerates every corpus case in the `Veryl corpus (Celox 0.9.0)` job on
 pull requests and pushes to main. `Required CI` depends on this job. Known
 unsupported/failing cases are skipped using exact names and reasons in
 [veryl-suite-ignores.toml](veryl-suite-ignores.toml). They are reported as
 `ignored`, never as passes. New failures outside that list fail the job;
 there is no `continue-on-error`.
 
-Each executed case runs in a separate process with a 60-second limit. Ignore
+Each executed case runs in a separate process with a default 60-second limit.
+Verified slow cases have exact `[[timeout]]` entries with a reason and a bounded
+`seconds` budget in `veryl-suite-ignores.toml`; they execute in CI and must pass.
+`--timeout N` overrides all case budgets, including these exceptions. Executed
+cases record their effective `timeout_seconds` and `timeout_reason` in the report. Ignore
 entries must exist in the pinned catalogue and cannot be duplicated. Use
 `--include-ignored` to execute excluded cases and expose their actual outcomes.
+
+The runner defaults to one worker and a hard 4096 MiB address-space limit per
+worker (`--memory-mib`). The limit is applied before executing the native worker,
+inherited by its child processes, and cannot be raised by the worker. Allocation
+failure is a failed case, never a pass. Core dumps are disabled for workers.
+This limits virtual address space, not just resident memory; a large reservation
+can fail even without equivalent physical allocation. Multiple workers or runner
+invocations multiply the possible memory usage. CI uses one worker explicitly.
+The limit does not apply to the initial Cargo build.
 
 The Actions job summary shows outcome counts. Download the
 `veryl-corpus-results` artifact for per-case diagnostics, including after a
 failed run. Reports are generated under `target/` and retained by Actions for
 14 days; generated results and historical snapshots are not committed.
 
+## Mapped simulator optimization policy
+
+`struo_celox::ecp5_simulator` disables only Celox 0.9's `BranchifyMux`
+pass. Its profitability analysis repeatedly copies and analyzes instruction
+suffixes on large mapped gate networks. Constant folding and the other default
+optimizations remain enabled; callers can re-enable the pass on the returned
+builder when appropriate for their workload.
+
+Signed 128/65-bit division and remainder still exceeded 600 seconds with
+word-cell sharing alone. Sampling identified branchification analysis during
+native construction. With that pass disabled, the complete case passed in
+about 68 seconds; the wide division and remainder cases passed in about 39 and
+36 seconds. All three now execute in CI with a 180-second case budget. These
+measurements used one worker under a hard 4096 MiB address-space limit and do
+not establish a general simulation-throughput improvement.
+
+Partial-write synthesis memoizes completed expression ranges, preserving lazy
+bit dependencies and cycle detection. This avoids revisiting shared MUX and
+concatenation ranges exponentially. The packed scatter case now completes in
+about 0.12 seconds, including native execution, under the default case budget.
+The typed reverse-bound case also passes with the mapped simulator policy
+above (about 121 seconds). The wide FF checkpoint passes in about 91 seconds.
+Both use the existing 300-second CI budget group.
+
+## Remaining exclusions
+
+The 187 named ignores are distinct from the 13 cases excluded by expectation
+tags. A bounded recheck of all 186 non-resource ignores confirmed the current
+failure reasons; none passed or timed out. These cases are not counted as
+successful synthesis tests.
+
+| Count | Reason for retaining the ignore |
+| --- | --- |
+| 112 | Explicit four-state execution is outside the mapped two-state adapter. |
+| 6 | Tests observe internal or hierarchical signals that synthesis does not preserve. |
+| 36 | Veryl rejects function output/non-local writes in `always_ff`; this restriction is retained. |
+| 9 | Other Veryl analysis errors: negative constant loop bounds (2), runtime operands to compile-time system functions (4), scalar bit-select (1), tri function formal (1), and incomplete array assignment (1). |
+| 15 | Loop inputs admit nontermination; finite test vectors do not justify a hardware expansion. |
+| 4 | Invalid connection fixtures: procedural function effects in module input expressions (2) and implicit packed/unpacked conversion (2). |
+| 2 | Celox rejects shared asynchronous reset across distinct clock domains after successful ECP5 mapping. |
+| 1 | The upstream onehot implementation has an undriven output in its width-one base case. |
+| 1 | The oracle observes a previous `always_comb` evaluation instead of settled combinational hardware. |
+| 1 | The large sparse FF array exceeds the worker memory limit described below. |
+
+The tag policies exclude deferred FF function effects, eager assertion-message
+side effects, and promised zero initialization. Other tags remain visible in
+reports and are not blanket exclusions. In particular, tagged two-state
+division uses the adapter's existing two-state convention; this is not a claim
+that SV four-state division by zero produces zero.
+
+## Remaining resource limitations
+
+Timeout exceptions enable verified slow cases in CI without weakening their
+assertions. One performance ignore remains without a demonstrated complete passing run.
+
+The large sparse FF line-write array (`logic<32> [1048576]`) remains
+resource-limited. With the current optimizations, a worker under the hard
+4096 MiB address-space limit fails a 1.5 GiB allocation before lowering
+completes. An older unrestricted diagnostic reached synthesis and timed out at
+600 seconds; it does not establish feasibility under the enforced limit.
+No passing run has been demonstrated, and the memory limit is not raised to
+accommodate this case.
+
+These limits do not establish a semantic mismatch or an unsynthesizable source.
+They remain separate from tagged expectation exclusions, frontend restrictions,
+and loops with demonstrated nonterminating inputs. Further diagnostics must use
+the bounded launcher; raising timeouts alone does not address memory growth.
+
 ## Run locally
 
 ```sh
 python3 scripts/check-veryl-suite.py
-python3 scripts/check-veryl-suite.py --filter context_width:: --jobs 4
-python3 scripts/check-veryl-suite.py --include-ignored --timeout 180 --report target/veryl-suite.json
+python3 scripts/check-veryl-suite.py --filter context_width:: --jobs 1
+python3 scripts/check-veryl-suite.py --include-ignored --filter std_onehot::test_onehot_8bit_exhaustive --timeout 180
 python3 scripts/check-veryl-suite.py --timing --filter wide_shift_mem::test_512bit_shift
-cargo test --locked -p struo-frontend-veryl --test veryl_suite
+```
+
+To run the ordinary Rust integration tests under the same memory limit:
+
+```sh
+cargo test --locked -p struo-frontend-veryl --test veryl_suite \
+  --no-run --message-format=json > /tmp/struo-veryl-tests.json
+veryl_test_binary=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "veryl_suite" and .executable != null) | .executable' /tmp/struo-veryl-tests.json)
+python3 scripts/limited-worker.py --memory-mib 4096 "$veryl_test_binary" --test-threads=1
 ```
 
 `--timing` records seconds spent in lowering, synthesis, mapping, simulation IR
@@ -39,9 +128,10 @@ For backend details, also set `CELOX_PASS_TIMING=1 RUST_LOG=debug`.
 
 The ordinary Rust tests cover selected corpus regressions and focused boundary
 checks. The ignored worker/catalogue tests are entry points for the full runner;
-`cargo test` alone does not run the complete corpus. The two known upstream
-constant-folding regressions have explicit Rust `#[ignore]` reasons and can be
-rerun by name with `-- --ignored`. Other regular regressions remain enabled.
+`cargo test` alone does not run the complete corpus. The earlier constant
+size-cast and function-argument regressions pass with the pinned Veryl 0.22.0
+frontend and remain enabled in the ordinary integration tests. Only the
+worker/catalogue entry points are ignored by the default Rust test invocation.
 
 For diagnostic comparison with Celox's source frontend:
 
@@ -66,7 +156,7 @@ around by globally disabling AIR constant folding.
 The pinned corpus also requires an uninitialized constant-driven FF to start at
 zero before its first clock. This is the suite's explicit two-state contract;
 synthesis treats the unspecified source initialization as a don't-care.
-Celox 0.8.1 separates that check into
+Celox 0.9.0 separates that check into
 `operators::test_ff_constant_two_state_initialization`, which remains explicitly
 ignored. The original constant-folding case runs in CI again.
 
@@ -82,11 +172,328 @@ A no-op tick is permitted only for a source RTL register clock when the mapped
 design has no state cells or event handlers. Unknown clocks are not accepted as
 eliminated events. All output assertions still execute.
 
+Independent combinational processes may drive disjoint packed ranges of the
+same variable (IEEE 1800-2023 9.2.2.2 and 11.5.3). Driver checks and emitted RTL
+assignments use the actual written ranges, while blocking reads within each
+process still see its earlier writes. Overlapping ranges, including possible
+dynamic-index overlap, remain rejected. Synthesis resolves bit dependencies
+through whole-vector connections so flattened ports do not create false loops;
+actual combinational feedback remains an error. Ordinary acyclic designs keep
+the established whole-expression construction order. Bitwise resolution retries
+from a fresh state only when that path reports a loop, preserving existing
+netlist sharing and placement behavior.
+
 Dynamic packed `+:`, `-:`, and `step` selects support reads and writes.
 Offset arithmetic preserves signed indices without wrapping into the vector;
 partially overlapping writes affect only valid bits. Out-of-range read bits
 follow the mapped adapter's two-state zero convention. Regression tests cover
 negative indices, both vector boundaries, and step offsets beyond the vector.
 
+Integral `**` expressions support constant and runtime exponents in combinational
+and FF logic. The base is widened to the expression context before repeated
+squaring, and the exponent retains its own width and signedness (IEEE 1800-2023
+11.4.3 and 11.6.1). Zero exponents produce one, including `0 ** 0`. Negative
+exponents produce zero except for bases one and signed minus one; minus one
+preserves exponent parity. `0 ** negative` follows the adapter's two-state zero
+convention rather than preserving the four-state X result. Effectful exponent
+calls and four-state operands remain subject to the existing frontend/adapter
+limitations. Boundary regressions cover all four-bit bases and exponents,
+constant negative exponents, unsigned parent contexts, and 65-bit results.
+
 The corpus runner copies its worker executable into a temporary directory for
 each run, so concurrent Cargo builds cannot replace a worker mid-audit.
+
+Analyzer diagnostics are classified by Veryl's severity: warnings (including
+unused return values and unsigned arithmetic shifts) do not reject a design.
+Actual errors, including FF function-output restrictions, remain fatal. The
+ignore manifest distinguishes those restrictions, invalid signed loop ranges,
+and compile-time system-function operand requirements.
+
+Combinational function output effects are supported in arithmetic, concatenation,
+short-circuit and conditional expressions, and in if/case conditions. Value-returning
+system functions also preserve argument effects, including nested `$signed` /
+`$unsigned` wrappers and calls whose return value is discarded in statement position
+(IEEE 1800-2023 20.5). Type queries (`$bits` / `$size`) do not evaluate their operands. Effects
+are merged with the same condition as the expression value; early returns and
+static-loop break guards suppress subsequent writes. Non-local function writes
+are explicitly rejected until caller writeback is implemented. Array-valued
+expressions, nested argument effects and runtime loops still have limitations.
+
+`$display` and `$write` statements preserve function output/inout effects in
+argument expressions, including short-circuit and loop-break guards. Formatting
+and literal arguments produce no hardware or console output. This statement
+lowering lives in `src/lower/system_tasks.rs`; value-returning system functions
+keep their existing expression behavior and other unsupported tasks still fail.
+FF function-write restrictions are unchanged.
+
+Function output arguments in an instance input connection remain rejected:
+IEEE 1800-2023 13.4 prohibits those calls outside procedural statements. The
+suite's packed/unpacked mux-port mismatches also remain explicit ignores rather
+than being accepted through an implicit layout conversion (7.6 and 23.3.3.3).
+Missing drivers in a supplied library, such as the onehot W=1 base case, are not
+filled with invented constants. The manifest distinguishes these fixture issues
+from missing lowering support; absence of a suite tag does not prove valid SV.
+
+Dynamic addressing of an instance output is rejected as an invalid implicit
+continuous assignment, independently of analyzer warnings (IEEE 1800-2023
+Table 10-1). Procedural dynamic part-select assignments remain supported.
+
+Runtime-loop synthesis uses a separate planner in `src/lower/loops.rs`. Existing
+constant-range expansion of retained AIR loops is checked by
+`src/lower/loops/static_range.rs`: initialization and updates must fit the
+counter, and a negative reverse sentinel must not become a large unsigned
+comparison operand (IEEE 1800-2023 11.8.1). Guaranteed breaks need no final
+update. An exclusive zero upper bound with a larger reverse step is an empty
+signed range, even when the analyzer's host enumerator saturates it to zero.
+Runtime bounds are accepted for a
+non-negative constant start that fits the induction variable and a positive
+additive step, when either the bound's type or a guaranteed break proves that
+at most 512 candidate iterations are needed. This budget includes the iteration
+that executes a break; it is a compile-time resource policy, never a silent
+runtime truncation. An input-dependent break alone is not a termination proof,
+and a nested loop's break does not terminate its parent.
+The proof also accepts a `case` whose default and every arm terminate this loop.
+Case-target effects and guarded branch writes are still evaluated by ordinary
+lowering. A missing/non-terminating default or any non-terminating arm does not
+prove a bound, even if test inputs happen to select a terminating arm.
+
+A runtime start is also accepted when its unsigned leaf type fits the counter
+without truncation and the end range fits within 512 non-negative counter values.
+The initializer is evaluated exactly once, including output-argument writes and
+empty ranges. Lowering tracks the counter value reached by each positive additive
+step, suppressing both writes and breaks from skipped candidates. Unit-stride
+loops compare each candidate with the captured start directly, avoiding a chain
+of counter increments and muxes. Signed starts
+without a non-negative proof and possible counter overflow remain unsupported.
+
+Each candidate iteration retains the actual bound comparison and break guard.
+The bound is reevaluated against the current combinational environment (or the
+pre-edge FF reads), matching for-loop condition evaluation in IEEE 1800-2023
+12.7.1 and Veryl's emitted SV. No clock cycles are introduced. Tests cover the
+256-iteration boundary, signed bounds, stepped loops, changing bounds, FF writes,
+and proof rejection. Runtime-start tests also cover 4,096 start/end/break
+combinations, initialization effects, empty ranges, and unsigned packed selects.
+Output effects in the end condition remain unsupported and are rejected even
+for an empty range.
+
+When range expansion cannot prove a bound, `src/lower/single_iteration.rs` also
+accepts a body that exits through `break` on every path. It evaluates the actual
+initializer, assigns it into the counter's declared width, and then compares it
+with the condition bound. This supports wide or signed initializers and reverse
+ranges, including wrapped exclusive reverse initializers, without executing any
+step. A scoped runtime binding supplies the counter to expressions and nested
+loops; constant and parameter reads elsewhere keep their usual treatment.
+Initializer effects happen once even when the first condition is false. Body
+writes are guarded by that condition, and existing FF function-write restrictions
+remain in force. Tests cover 162 signed-bound/gate combinations and 48 FF cases
+with mixed signed/unsigned comparison contexts, dynamic packed selects, and
+constant-array reads. Veryl saturates constant range values at host integer
+limits; a constant initializer at that boundary is rejected because AIR cannot
+distinguish the exact boundary from a larger original value with different low
+bits. Runtime expressions retain their full initializer bits.
+
+`src/lower/bitwise_loops.rs` also proves OR/XOR counter traces when the initializer
+lowers to an effect-free constant in the current procedural environment. Each
+update is masked to the counter width, preserving signed interpretation when
+substituting the next value. A guaranteed break must be reached before a repeated
+counter value or the expansion budget; every actual bound comparison remains in
+the circuit. Initializer writes and unknown initializers are rejected by this
+proof. FF-local blocking initialization is visible, while a scheduled module FF
+write cannot supply the current initializer.
+
+`src/lower/additive_loops.rs` proves short forward additive traces with known
+initializers and immutable constant bounds, including negative initial values
+and bounds computed by enclosing loop substitution. Comparisons use the actual
+operand widths and common signedness; updates wrap at the counter width. The
+proof rejects cycles and traces exceeding 512 iterations. It does not treat a
+mutable bound's initial constant value as an invariant. The shared read-only
+RTL evaluator in `constant_values.rs` recognizes scalar arithmetic and bit
+operations without trusting cached AIR numeric values or rewriting the circuit.
+Regression tests include nested negative bounds, initializer capture, mixed
+signed/unsigned comparisons, finite wraparound, and rejection of signed cycles.
+
+The bound proof also recognizes non-negative additions without overflow in the
+actual expression context. Thus an 8-bit input plus `8'd1` has maximum 256 in a
+32-bit loop comparison. The 512-candidate policy includes its inclusive endpoint.
+`loops/reverse.rs` handles descending runtime loops with constant signed lower
+bounds and proven non-negative initial bounds. It captures the initializer once,
+subtracts one before counter conversion for exclusive ranges, and visits only
+reachable descending candidates. Unsigned lower comparisons and unproven
+initial truncation remain rejected. Regression tests cover all 256 narrow
+bound/break combinations, non-unit steps, initializer effects even for empty
+ranges, blocking FF-local writes, and the 512/513-candidate boundary.
+
+`constant_driven_loops.rs` can also prove a signed reverse lower bound from an
+already-lowered whole-signal constant combinational driver, including negative
+bounds. It retains typed counter values and rejects final-update overflow.
+The existing process-ownership validation rejects any later overlapping writer,
+including a loop body that attempts to modify this bound. Register outputs,
+partial drivers, variable drivers, and mutable local constants cannot provide
+this proof. This is a fallback using emitted RTL; a producer not yet lowered is
+not available to it. Tests exercise signed negative iterations, empty and
+non-empty prefixes, non-unit steps, FF reads, and conflicting drivers.
+
+The remaining nonterminating-loop corpus ignores have concrete non-terminating input
+values. They are not excluded merely because their loops are dynamic:
+
+| Fixture family | Counterexample to termination |
+| --- | --- |
+| OR/XOR loops starting at 3 with endpoint-dependent breaks | Endpoint 8 makes OR stall at 7 and XOR cycle between 3 and 5. |
+| Bitwise step operands with bits above the i32 counter | Start 0 and endpoints 8 make OR stall at 6 and XOR cycle between 0 and 6, missing breaks at 7/5. |
+| FF signed XOR with external initial value | Start 0 and a large positive endpoint cycle between 0 and i32 minimum, never reaching the break at 2147483640. |
+| Signed inclusive dynamic endpoints | An endpoint equal to i32 maximum keeps the condition true even after the counter wraps. |
+| Combined runtime-bounds fixtures (comb and FF) | `step_start = 0` and `count = 4` make their multiply-by-two loop stay at zero forever. |
+| Multiplicative stalled step | Start 0, count 4, and `sel = 0` repeat 0 without breaking. |
+| Unsigned reverse singleton fixtures | Start/count 0 let the counter wrap under an unsigned comparison with zero. |
+| Signed wide reverse fixtures without guaranteed breaks | An i64-minimum lower bound is below every i32 counter value, including values after wrap. |
+
+Finite test vectors do not constrain these full input domains for synthesis.
+
+Veryl 0.22 has an upstream static-unrolling limitation before this validation:
+when no `break` retains the loop in AIR, it already expands
+`for i in rev 8'd0..4 { q += 1; }` into four assignments. Its emitted SV instead
+uses `for (int i = 4 - 1; i >= 8'd0; i--)`, whose unsigned comparison does not
+terminate at -1. Likewise, a wide initializer can be truncated by the emitted
+`int` counter while host enumeration uses the original wide value. The original
+range is absent from this AIR, so the lowering check cannot repair these upstream
+expansions. Constant optimization remains enabled; this is an unresolved analyzer
+conformance issue, not a supported finite-loop interpretation.
+
+The remaining loop-proof ignores admit nonterminating input values. The guarded-expansion budget limits that planner;
+other proofs and reductions can handle finite loops without expanding every body.
+For example, a 32-bit input trip count may require billions of expanded bodies;
+a small sampled count in a simulator test does not justify truncating it. New
+proofs or algebraic transformations can extend support independently of the
+lowering path. The always_ff function-effect restrictions remain unchanged.
+
+
+When existing loop planners cannot produce a finite expansion,
+`src/lower/reductions.rs` recognizes scalar modular additive reductions in
+combinational processes: an exclusive `0..count` range with unit step, an unsigned
+whole-variable count no wider than the induction variable, and a single
+whole-variable accumulator assignment adding a literal constant. The count and
+counter cannot be the destination. IEEE 1800-2023 12.7.1 and 11.8.1 imply exactly
+`count` iterations before termination, including counts above the signed counter
+boundary under the unsigned comparison. The result is computed as
+`initial + count * increment` modulo the accumulator width, preserving the
+original addition's signedness when extending its increment. This avoids an
+unbounded expansion without changing accepted loop plans. Tests cover zero,
+`u32::MAX`, modular overflow, mixed signedness, and rejected dependent bodies.
+FFs, inclusive ranges, wider or signed bounds, and other bodies retain the
+existing proof requirements.
+
+
+The reduction recognizer also accepts one invariant whole-variable condition:
+`if gate { acc += C; }` performs either `count` or zero updates, while
+`acc += C; if gate { break; }` performs either `count` updates or one update for
+a nonempty range. The condition cannot read the accumulator or induction
+variable, and cannot contain calls or other effects. The nonempty test uses the
+full bound before truncating the effective count to the accumulator width.
+Other statements and else branches retain the existing loop proof requirements.
+
+
+`src/lower/idempotent_loops.rs` handles a separate class of finite zero-based
+unit-step loops with an unsigned exclusive bound: straight-line scalar writes
+whose final written bits do not depend on any pre-iteration bit the body writes.
+A bit-level dependency analysis follows blocking assignment order. Unwritten
+bits remain invariant, so this sufficient proof establishes `F(F(x)) = F(x)`:
+emit one body execution when the full count is nonzero, otherwise preserve the
+pre-loop environment. This supports partial copies and dynamic reads following
+an earlier clear, while preserving assignment order and untouched bits.
+
+Destinations use literal-derived, in-range packed selects and at most 4096 bits
+per variable. Dynamic reads conservatively depend on every candidate bit and
+on their selector expressions. Calls, array destinations, control statements,
+induction-variable reads, and writes to the bound cannot supply this proof.
+It is conservative: an unproven body is not assumed to be non-idempotent.
+FF behavior and existing successful expansion plans are unchanged.
+
+
+For autonomous scalar states of at most four bits, `src/lower/small_state_loops.rs`
+also handles non-idempotent transitions. It enumerates every initial state by
+lowering the original blocking assignments in order, then composes powers of
+that transition using every bit of the runtime trip count. Zero iterations
+preserve the initial value; cycles and transient states do not require unrolling
+the runtime count. This follows the test-before-body ordering in IEEE 1800-2023
+12.7.1. Only finite zero-based unit-step loops with an unsigned exclusive bound
+no wider than the counter qualify.
+
+The analysis accepts up to 32 assignments to one scalar, a count of at most 64
+bits, static destination selects, and expressions using only that state and
+constants. Calls, external dependencies, induction-variable reads, and multiple
+written variables are excluded. All enumerated results must be proven constant
+by the typed RTL evaluator; unsupported operations fail closed. These are bounds
+on analysis and circuit size, not on the number of runtime iterations. Existing
+expansion, additive-reduction, and idempotence proofs retain priority.
+
+`src/lower/sparse_index_loops.rs` provides a separate fallback for scalar packed
+bit writes addressed by a unit affine counter expression. For each destination
+bit it solves `+/-counter + offset == bit` modulo the actual index width, then
+emits only the feasible write iterations in counter order. This includes writes
+near counter wrap; it does not assume that only an initial prefix can matter.
+Multiple assignments retain their source order, and each event is guarded by
+the original exclusive bound. Pure assignments that cannot write an in-range
+bit at that event are omitted (IEEE 1800-2023 11.5.1).
+
+The loop must start at zero, advance by one, and have an invariant unsigned
+exclusive bound no wider than its counter. Only scalar bit-select destinations
+and exact-width additions/subtractions of literal offsets qualify. Narrow
+casts, widened arithmetic, part-selects, arrays, effects, control flow, and
+writes to the bound or counter remain outside this proof. Analysis is limited
+to 32 assignments, 512 bits per destination, and 512 distinct write events;
+the runtime trip count is not capped. RHS reads use the normal typed lowering
+and may depend on state written by earlier assignments and events.
+
+
+`src/lower/periodic_reductions.rs` counts scalar additive updates guarded by a
+predicate proven to depend only on at most eight low counter bits. Narrow casts
+directly on the counter establish that dependency; pure operators can combine
+those values and constants. Each residue is evaluated through normal typed
+lowering, and all predicate results must be proven constant. This preserves
+signed casts and comparisons instead of assuming an unsigned mathematical
+interpretation of the guard.
+
+For period `P`, the number of enabled iterations before an exclusive bound `n`
+is `(n / P) * hits_per_period + prefix[n % P]`. The implementation subtracts
+the prefix count at the constant start and returns zero for empty ranges. It
+extracts the quotient before narrowing to the accumulator width, preserving
+whole periods even for narrow modular results. In this constant-start form,
+the start must fit the counter without truncation, and the invariant unsigned
+exclusive bound must be no wider than the counter. Unit stride, one conditional scalar addition of a literal,
+and an empty else branch are required. Effects, changing predicates, wider
+periods, and unsupported constant operations fail closed. Existing expansion
+and reduction paths retain priority; 256 predicate residues bound analysis,
+not the runtime iteration count.
+
+Periodic reductions also accept a whole-variable runtime start and a constant,
+nonnegative signed exclusive end that fits the signed counter. Initialization
+uses the counter's assignment conversion, including truncation and sign
+extension, and is captured once even if the body updates the initializer's
+source variable (IEEE 1800-2023 12.7.1).
+
+Flipping the initialized counter's sign bit maps signed order to unsigned
+ordinals. When the predicate depends only on bits below the sign bit, this
+transformation preserves its phase; subtracting ordinal prefix counts then
+handles negative starts without unrolling. Starts at or beyond the end produce
+zero updates. Unsigned end comparisons, endpoints beyond the signed counter
+range, inclusive bounds, non-unit steps, and initializer effects remain outside
+this proof. Saturated endpoint encodings are also excluded.
+
+
+`src/lower/linear_reductions.rs` handles independent scalar updates in forward
+loops with a captured runtime start, a signed constant exclusive end, and a
+positive additive step. It requires `end - 1 + step` to fit the signed counter,
+so even the exit step cannot wrap. Initializer conversion is preserved; negative
+starts are ordered by flipping the sign bit, as in periodic reductions.
+
+For a nonempty range, the trip count is `(distance - 1) / step + 1`; the final
+active counter is `start + (count - 1) * step`. Constant additive accumulations
+use that count in the destination's modular width. Whole-scalar assignments of
+the counter, its casts, or a literal use the final value. Empty ranges preserve
+all initial destinations, including last-value outputs. A body may update its
+initializer source because the initialized counter is captured before updates.
+Destinations must be distinct and independent; effects, control flow, dependent
+updates, unsigned end comparisons, and possibly wrapping exit steps are excluded.
+The analysis handles up to 32 assignments and counters up to 64 bits without
+expanding the runtime iteration count. Existing successful lowering paths retain
+priority.
