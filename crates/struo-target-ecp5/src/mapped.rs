@@ -3633,7 +3633,8 @@ fn mapped_emitted_comb_count(netlist: &Ecp5Netlist) -> usize {
 /// Removes routed inputs from LUT4 pins which do not affect the LUT truth
 /// table.  ECP5 numbers the LUT INIT address with A as bit zero, followed by
 /// B, C, and D, so a pin is unused when every pair of INIT entries that only
-/// differs in that address bit is equal.
+/// differs in that address bit is equal. Constant inputs restrict the truth
+/// table first: for example, a majority LUT with A=C=0 cannot depend on B.
 ///
 /// This is deliberately limited to ordinary [`Ecp5Cell::Lut4`] cells.  The
 /// input fields on PFUMX/L6MUX21 and CCU2C have different physical semantics,
@@ -3646,8 +3647,28 @@ fn cleanup_lut4_dynamic_inputs(netlist: &mut Ecp5Netlist) -> usize {
         let Ecp5Cell::Lut4 { inputs, init, .. } = cell else {
             continue;
         };
+        let (constant_mask, constant_value) =
+            inputs
+                .iter()
+                .enumerate()
+                .fold(
+                    (0_usize, 0_usize),
+                    |(mask, value), (pin, input)| match input {
+                        Bit::Zero => (mask | (1 << pin), value),
+                        Bit::One => (mask | (1 << pin), value | (1 << pin)),
+                        Bit::Wire(_) => (mask, value),
+                    },
+                );
+        let restricted_init = if constant_mask == 0 {
+            *init
+        } else {
+            (0..16).fold(0_u16, |table, assignment| {
+                let source = (assignment & !constant_mask) | constant_value;
+                table | (((*init >> source) & 1) << assignment)
+            })
+        };
         for (pin, input) in inputs.iter_mut().enumerate() {
-            if matches!(input, Bit::Wire(_)) && lut4_input_is_independent(*init, pin) {
+            if matches!(input, Bit::Wire(_)) && lut4_input_is_independent(restricted_init, pin) {
                 *input = Bit::Zero;
                 cleaned += 1;
             }
@@ -11458,6 +11479,72 @@ mod tests {
             "B-sensitive control must remain routed"
         );
         assert!(inputs[0] == Bit::Zero && inputs[2] == Bit::Zero && inputs[3] == Bit::Zero);
+    }
+
+    #[test]
+    fn lut4_cleanup_removes_inputs_masked_by_constant_pins() {
+        for constant in [Bit::Zero, Bit::One] {
+            let mut mapped = direct_lut_fixture(0xe8e8); // majority(A, B, C)
+            let Ecp5Cell::Lut4 { inputs, .. } = &mut mapped.cells[0] else {
+                unreachable!();
+            };
+            *inputs = [constant, Bit::Wire(11), constant, Bit::Zero];
+            assert_eq!(cleanup_lut4_dynamic_inputs(&mut mapped), 1);
+            let Ecp5Cell::Lut4 { inputs, init, .. } = &mapped.cells[0] else {
+                unreachable!();
+            };
+            assert_eq!(*inputs, [constant, Bit::Zero, constant, Bit::Zero]);
+            assert_eq!(*init, 0xe8e8, "retain the original INIT");
+        }
+    }
+
+    #[test]
+    fn lut4_constant_cleanup_preserves_every_truth_table() {
+        let mut mapped = direct_lut_fixture(0);
+        // Exercise every INIT with constant-low and constant-high controls in
+        // different pin positions. Evaluate actual original/rewritten inputs,
+        // independently of the cofactor calculation used by cleanup.
+        for init in 0..=u16::MAX {
+            for original in [
+                [Bit::Zero, Bit::Wire(11), Bit::Wire(12), Bit::One],
+                [Bit::Wire(10), Bit::One, Bit::Zero, Bit::Wire(13)],
+            ] {
+                let Ecp5Cell::Lut4 {
+                    inputs,
+                    init: truth,
+                    ..
+                } = &mut mapped.cells[0]
+                else {
+                    unreachable!();
+                };
+                *inputs = original;
+                *truth = init;
+                cleanup_lut4_dynamic_inputs(&mut mapped);
+                let Ecp5Cell::Lut4 {
+                    inputs,
+                    init: truth,
+                    ..
+                } = &mapped.cells[0]
+                else {
+                    unreachable!();
+                };
+                assert_eq!(*truth, init);
+                for assignment in 0..16_usize {
+                    let evaluate = |pins: [Bit; 4]| {
+                        let index = pins.iter().enumerate().fold(0, |index, (pin, bit)| {
+                            let value = match bit {
+                                Bit::Zero => 0,
+                                Bit::One => 1,
+                                Bit::Wire(wire) => (assignment >> (*wire - 10)) & 1,
+                            };
+                            index | (value << pin)
+                        });
+                        (init >> index) & 1
+                    };
+                    assert_eq!(evaluate(original), evaluate(*inputs), "INIT {init:04x}");
+                }
+            }
+        }
     }
 
     #[test]
