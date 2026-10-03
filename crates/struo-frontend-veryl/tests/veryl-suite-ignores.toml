@@ -14,11 +14,21 @@ cases = [
 [[ignore]]
 reason = "Exceeds the 60-second per-case budget on the CI runner."
 cases = [
-  "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
-  "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
   "signed_divrem::signed_divrem_i128",
   "wide_operators::test_wide_comb_div",
   "wide_operators::test_wide_comb_rem",
+]
+
+[[ignore]]
+reason = "A 600-second diagnostic completed lowering (about 201 seconds) but not synthesis; the large sparse FF array remains resource-limited."
+cases = [
+  "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
+]
+
+[[ignore]]
+reason = "A 600-second diagnostic completed ECP5 mapping and simulation IR construction but not native simulator construction."
+cases = [
+  "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
 ]
 
 [[ignore]]

@@ -35,6 +35,25 @@ The Actions job summary shows outcome counts. Download the
 failed run. Reports are generated under `target/` and retained by Actions for
 14 days; generated results and historical snapshots are not committed.
 
+## Remaining resource limitations
+
+Timeout exceptions enable verified slow cases in CI without weakening their
+assertions. The remaining performance ignores have not demonstrated a complete
+passing run within the diagnostic budgets:
+
+| Case family | Evidence and current limitation |
+| --- | --- |
+| Large sparse FF line-write array | A 600-second run completed lowering in about 201 seconds, then timed out during synthesis. |
+| Wide dynamic FF checkpoint | A 600-second run completed mapping and simulation IR construction, then timed out during native simulator construction. |
+| Constant-driven typed reverse bound | A 240-second run completed mapping in about 51 seconds, then timed out during native simulator construction. |
+| Packed scatter store | The 60-second audit timed out during synthesis. |
+| Signed 128-bit and wide division/remainder | The 60-second audit timed out. Longer diagnostics were explicitly stopped after excessive local memory use was reported; they provide no completed correctness result. |
+
+These limits do not establish a semantic mismatch or an unsynthesizable source.
+They remain separate from tagged expectation exclusions, frontend restrictions,
+and loops with demonstrated nonterminating inputs. Further diagnostics must use
+the bounded launcher; raising timeouts alone does not address memory growth.
+
 ## Run locally
 
 ```sh
