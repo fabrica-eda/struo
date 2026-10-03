@@ -1,5 +1,8 @@
 mod arrays;
 mod loops;
+mod types;
+
+use types::{repair_expression_signedness, variable_signedness};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -2703,8 +2706,9 @@ impl<'a> ModuleLowerer<'a> {
                     signed,
                 })
             }
-            Expression::Concatenation(parts, comptime) => {
+            Expression::Concatenation(parts, _) => {
                 let mut lowered = Vec::new();
+                let mut width = 0u32;
                 for (part, repeat) in parts {
                     let part = self.lower_expression_effects(part, env, effects)?;
                     let count = if let Some(repeat) = repeat {
@@ -2712,11 +2716,15 @@ impl<'a> ModuleLowerer<'a> {
                     } else {
                         1
                     };
+                    width = count
+                        .checked_mul(u64::from(part.width))
+                        .and_then(|bits| bits.checked_add(u64::from(width)))
+                        .and_then(|bits| u32::try_from(bits).ok())
+                        .ok_or_else(|| ImportError::WidthTooLarge("concatenation".into()))?;
                     for _ in 0..count {
                         lowered.push(part.id);
                     }
                 }
-                let width = concrete_width(&comptime.r#type, "concatenation")?;
                 Ok(LoweredExpr {
                     id: self.rtl.concat(lowered)?,
                     width,
@@ -3194,19 +3202,7 @@ impl<'a> ModuleLowerer<'a> {
             });
         }
         let (lsb, width) = static_select(select, source.width)?;
-        let signed = if select.is_empty() {
-            source.signed
-        } else if matches!(
-            self.variable_type(id)?.kind,
-            TypeKind::Bit | TypeKind::Logic
-        ) {
-            false
-        } else {
-            match &comptime.value {
-                ValueVariant::Numeric(value) => value.signed(),
-                _ => comptime.r#type.signed,
-            }
-        };
+        let signed = variable_signedness(select, comptime);
         if lsb == 0 && width == source.width {
             Ok(LoweredExpr { signed, ..source })
         } else {
@@ -3314,7 +3310,12 @@ impl<'a> ModuleLowerer<'a> {
                 ));
             }
         };
-        self.resize(value, context_width(&call.comptime)?, value.signed)
+        let signed = call.comptime.expr_context.signed;
+        self.resize(
+            LoweredExpr { signed, ..value },
+            context_width(&call.comptime)?,
+            signed,
+        )
     }
 
     fn lower_comptime(
@@ -3364,6 +3365,21 @@ impl<'a> ModuleLowerer<'a> {
         let signed = self.is_signed(first);
         let mut result = self.constant(width, 0);
         result.signed = signed;
+        if elements.len() >= 4 {
+            let mut entries = Vec::with_capacity(elements.len());
+            for (key, condition) in elements {
+                let value = env.get(&key).copied().ok_or_else(|| {
+                    ImportError::UnsupportedBehavior(format!(
+                        "reference to non-runtime variable {}",
+                        self.signal_name(&key)
+                    ))
+                })?;
+                entries.push((condition, value));
+            }
+            let (matched, value) = self.lower_array_read_tree(&entries)?;
+            result.id = self.rtl.mux(matched.id, value.id, result.id)?;
+            return Ok(result);
+        }
         for (key, condition) in elements.into_iter().rev() {
             let value = env.get(&key).copied().ok_or_else(|| {
                 ImportError::UnsupportedBehavior(format!(
@@ -3378,6 +3394,27 @@ impl<'a> ModuleLowerer<'a> {
             };
         }
         Ok(result)
+    }
+
+    /// Balance the selected value and its match predicate together. Retaining
+    /// first-match priority also preserves behavior if index predicates overlap;
+    /// the caller supplies the existing zero result when no element matches.
+    fn lower_array_read_tree(
+        &mut self,
+        entries: &[(LoweredExpr, LoweredExpr)],
+    ) -> Result<(LoweredExpr, LoweredExpr), ImportError> {
+        if entries.len() == 1 {
+            return Ok(entries[0]);
+        }
+        let split = entries.len() / 2;
+        let (left_match, left_value) = self.lower_array_read_tree(&entries[..split])?;
+        let (right_match, right_value) = self.lower_array_read_tree(&entries[split..])?;
+        let matched = self.lower_binary(Op::LogicOr, left_match, right_match, 1, false)?;
+        let value = LoweredExpr {
+            id: self.rtl.mux(left_match.id, left_value.id, right_value.id)?,
+            ..left_value
+        };
+        Ok((matched, value))
     }
 
     fn assign_destination(
@@ -4290,103 +4327,6 @@ fn concrete_width(r#type: &Type, name: &str) -> Result<u32, ImportError> {
         .total_width()
         .ok_or_else(|| ImportError::NonConcreteWidth(name.into()))?;
     u32::try_from(width).map_err(|_| ImportError::WidthTooLarge(name.into()))
-}
-
-// AIR keeps intrinsic types separate from the propagated expression context.
-// IEEE 1800-2023 11.8.2 requires widening operands before applying the operator.
-// Numeric size casts preserve source signedness, which is not reliably
-// reflected in AIR's propagated expression context. Recompute the common
-// type before lowering, including unsigned context inherited from a parent.
-fn expression_signedness(expression: &Expression) -> bool {
-    match expression {
-        Expression::Binary(lhs, Op::As, rhs, comptime) => {
-            if matches!(rhs.comptime().value, ValueVariant::Type(_)) {
-                comptime.r#type.signed
-            } else {
-                expression_signedness(lhs)
-            }
-        }
-        Expression::Binary(_, op, _, _) if is_boolean_operator(*op) => false,
-        Expression::Binary(lhs, op, rhs, _) => {
-            expression_signedness(lhs)
-                && (matches!(
-                    op,
-                    Op::LogicShiftL | Op::LogicShiftR | Op::ArithShiftL | Op::ArithShiftR | Op::Pow
-                ) || expression_signedness(rhs))
-        }
-        Expression::Unary(op, input, _) => {
-            matches!(op, Op::Add | Op::Sub | Op::BitNot) && expression_signedness(input)
-        }
-        Expression::Ternary(_, yes, no, _) => {
-            expression_signedness(yes) && expression_signedness(no)
-        }
-        Expression::Concatenation(..) => false,
-        Expression::Term(factor) => match factor.as_ref() {
-            Factor::SystemFunctionCall(call) => {
-                use veryl_analyzer::ir::SystemFunctionKind;
-                match call.kind {
-                    SystemFunctionKind::Bits(_)
-                    | SystemFunctionKind::Size(_)
-                    | SystemFunctionKind::Clog2(_)
-                    | SystemFunctionKind::Signed(_) => true,
-                    SystemFunctionKind::Unsigned(_) | SystemFunctionKind::Onehot(_) => false,
-                    _ => expression.comptime().r#type.signed,
-                }
-            }
-            Factor::Variable(_, _, select, ct)
-                if !select.is_empty()
-                    && matches!(ct.r#type.kind, TypeKind::Bit | TypeKind::Logic) =>
-            {
-                false
-            }
-            _ => expression.comptime().r#type.signed,
-        },
-        _ => expression.comptime().r#type.signed,
-    }
-}
-
-fn repair_expression_signedness(expression: &mut Expression, inherited: Option<bool>) {
-    let signed = inherited.unwrap_or_else(|| expression_signedness(expression));
-    expression.comptime_mut().expr_context.signed = signed;
-    match expression {
-        Expression::Binary(lhs, Op::As, _, _) => repair_expression_signedness(lhs, None),
-        Expression::Binary(lhs, op, rhs, _) => {
-            if matches!(op, Op::LogicAnd | Op::LogicOr) {
-                repair_expression_signedness(lhs, None);
-                repair_expression_signedness(rhs, None);
-            } else if is_boolean_operator(*op) {
-                let common = expression_signedness(lhs) && expression_signedness(rhs);
-                repair_expression_signedness(lhs, Some(common));
-                repair_expression_signedness(rhs, Some(common));
-            } else {
-                repair_expression_signedness(lhs, Some(signed));
-                let shift = matches!(
-                    op,
-                    Op::LogicShiftL | Op::LogicShiftR | Op::ArithShiftL | Op::ArithShiftR | Op::Pow
-                );
-                repair_expression_signedness(rhs, if shift { None } else { Some(signed) });
-            }
-        }
-        Expression::Unary(op, input, _) => repair_expression_signedness(
-            input,
-            if matches!(op, Op::Add | Op::Sub | Op::BitNot) {
-                Some(signed)
-            } else {
-                None
-            },
-        ),
-        Expression::Concatenation(parts, _) => {
-            for (part, _) in parts {
-                repair_expression_signedness(part, None);
-            }
-        }
-        Expression::Ternary(cond, yes, no, _) => {
-            repair_expression_signedness(cond, None);
-            repair_expression_signedness(yes, Some(signed));
-            repair_expression_signedness(no, Some(signed));
-        }
-        _ => {}
-    }
 }
 
 fn binary_signed(op: Op, comptime: &Comptime) -> bool {
@@ -5649,6 +5589,56 @@ module WideLiteralTop (
         // levels (seventeen operations including its leaf equality) here.
         assert_eq!(expression_depth(top, *condition), 5);
         assert_eq!(case_data_mux_depth(top, value), 5);
+    }
+
+    #[test]
+    fn dynamic_array_reads_have_logarithmic_depth_and_preserve_bounds() {
+        for count in [3_u32, 5, 16, 17] {
+            let source = format!(
+                "module ArrayReadTop (values: input logic<8> [{count}], \
+                 index: input logic<6>, result: output logic<8>) {{ \
+                 assign result = values[index]; }}"
+            );
+            let design = analyze_and_lower(&source, "balanced_array", "ArrayReadTop").unwrap();
+            let top = design.top_module().unwrap();
+            let output = top
+                .signals()
+                .iter()
+                .find(|s| s.name() == "result")
+                .unwrap()
+                .id();
+            let value = top
+                .assignments()
+                .iter()
+                .find(|a| a.target.signal == output)
+                .unwrap()
+                .value;
+            let bound = (count.next_power_of_two().ilog2() + 1) as usize;
+            assert!(
+                case_data_mux_depth(top, value) <= bound,
+                "{count} entries exceed logarithmic mux depth {bound}"
+            );
+
+            let synthesized = synthesize(&design).unwrap();
+            let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+            let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+            for pattern in [0_u8, 0x31, 0x80, 0xff] {
+                let bytes = (0..count)
+                    .map(|i| pattern.wrapping_add(u8::try_from(i).unwrap().wrapping_mul(19)))
+                    .collect::<Vec<_>>();
+                for (i, &byte) in bytes.iter().enumerate() {
+                    set(&mut simulator, &format!("values[{i}]"), byte);
+                }
+                for index in 0_u8..64 {
+                    set(&mut simulator, "index", index);
+                    assert_value(
+                        &mut simulator,
+                        "result",
+                        u64::from(bytes.get(usize::from(index)).copied().unwrap_or(0)),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
