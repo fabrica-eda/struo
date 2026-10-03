@@ -400,10 +400,24 @@ For period `P`, the number of enabled iterations before an exclusive bound `n`
 is `(n / P) * hits_per_period + prefix[n % P]`. The implementation subtracts
 the prefix count at the constant start and returns zero for empty ranges. It
 extracts the quotient before narrowing to the accumulator width, preserving
-whole periods even for narrow modular results. Starts must fit the counter
-without truncation, and the invariant unsigned exclusive bound must be no wider
-than the counter. Unit stride, one conditional scalar addition of a literal,
+whole periods even for narrow modular results. In this constant-start form,
+the start must fit the counter without truncation, and the invariant unsigned
+exclusive bound must be no wider than the counter. Unit stride, one conditional scalar addition of a literal,
 and an empty else branch are required. Effects, changing predicates, wider
 periods, and unsupported constant operations fail closed. Existing expansion
 and reduction paths retain priority; 256 predicate residues bound analysis,
 not the runtime iteration count.
+
+Periodic reductions also accept a whole-variable runtime start and a constant,
+nonnegative signed exclusive end that fits the signed counter. Initialization
+uses the counter's assignment conversion, including truncation and sign
+extension, and is captured once even if the body updates the initializer's
+source variable (IEEE 1800-2023 12.7.1).
+
+Flipping the initialized counter's sign bit maps signed order to unsigned
+ordinals. When the predicate depends only on bits below the sign bit, this
+transformation preserves its phase; subtracting ordinal prefix counts then
+handles negative starts without unrolling. Starts at or beyond the end produce
+zero updates. Unsigned end comparisons, endpoints beyond the signed counter
+range, inclusive bounds, non-unit steps, and initializer effects remain outside
+this proof. Saturated endpoint encodings are also excluded.

@@ -237,7 +237,6 @@ cases = [
 [[ignore]]
 reason = "The runtime start is not proven non-negative without truncation, or the counter can overflow before termination."
 cases = [
-  "synth_dynamic_loop::test_constant_bounds_preserve_wide_limit_above_loop_width",
   "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
   "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
 ]

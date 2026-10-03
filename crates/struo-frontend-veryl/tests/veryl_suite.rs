@@ -4154,3 +4154,115 @@ fn periodic_reductions_reject_nonperiodic_or_effectful_conditions() {
         );
     }
 }
+
+#[test]
+fn signed_periodic_starts_preserve_conversion_and_capture() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(start: input logic<64>, short_start: input signed logic<8>, seed: input logic<8>,
+                   hits: output logic<32>, narrow: output logic<8>,
+                   mixed: output logic<64>, captured: output logic<32>) {
+            always_comb {
+                hits = seed;
+                for i in start..260 { if (i as u8) <: 8'd4 { hits += 3; } }
+                narrow = seed;
+                for i in short_start..260 { if (i as u8) <: 8'd4 { narrow += 5; } }
+                mixed = 0;
+                for i in start..260 { if (i as i8) <: 0 { mixed += 8'shff; } }
+                captured = start as 32;
+                for i in captured..260 { if (i as u8) <: 8'd4 { captured += 1; } }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let start_signal = sim.signal("start");
+    let small_signal = sim.signal("short_start");
+    let seed_signal = sim.signal("seed");
+    let prefix = |n: i64| n.div_euclid(256) * 4 + n.rem_euclid(256).min(4);
+    let signed_prefix = |n: i64| n.div_euclid(256) * 128 + (n.rem_euclid(256) - 128).max(0);
+    for start in [
+        0u64,
+        1,
+        3,
+        4,
+        127,
+        128,
+        254,
+        255,
+        256,
+        259,
+        260,
+        261,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_ff00,
+        0xffff_ff80,
+        0xffff_fffe,
+        0xffff_ffff,
+        0x1_0000_00fe,
+        0xffff_ffff_8000_0000,
+        u64::MAX,
+    ] {
+        let bytes = start.to_le_bytes();
+        let bits = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let signed_start = i64::from(i32::from_le_bytes(bits.to_le_bytes()));
+        let small = bytes[0];
+        let small_start = i64::from(i8::from_le_bytes([small]));
+        let hits = u64::try_from((prefix(260) - prefix(signed_start)).max(0)).unwrap();
+        let narrow = u64::try_from((prefix(260) - prefix(small_start)).max(0)).unwrap();
+        let mixed =
+            u64::try_from((signed_prefix(260) - signed_prefix(signed_start)).max(0)).unwrap();
+        for seed in [0u8, 17, 255] {
+            sim.modify(|io| {
+                io.set(start_signal, start);
+                io.set(small_signal, small);
+                io.set(seed_signal, seed);
+            })
+            .unwrap();
+            assert_eq!(
+                sim.get(sim.signal("hits")),
+                ((u64::from(seed) + hits * 3) & u64::from(u32::MAX)).into(),
+                "start={start}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("narrow")),
+                ((u64::from(seed) + narrow * 5) & 255).into(),
+                "start={start}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("mixed")),
+                (mixed * 255).into(),
+                "start={start}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("captured")),
+                ((u64::from(bits) + hits) & u64::from(u32::MAX)).into(),
+                "start={start}"
+            );
+        }
+    }
+}
+
+#[test]
+fn signed_periodic_starts_reject_unproven_ranges_and_effects() {
+    for range in [
+        "start..32'd260",
+        "start..64'sd2147483648",
+        "start..=260",
+        "start..260 step += 2",
+        "start..finish",
+        "effect(start, calls)..260",
+    ] {
+        let source = format!("module Top(start: input logic<32>, finish: input logic<32>, out: output logic<32>, calls: output logic<32>) {{
+            function effect(x: input logic<32>, n: inout logic<32>) -> logic<32> {{ n += 1; return x; }}
+            always_comb {{ out = 0; calls = 0; for i in {range} {{ if (i as u8) <: 4 {{ out += 1; }} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_signed_periodic_range", "Top").is_err(),
+            "{source}"
+        );
+    }
+}

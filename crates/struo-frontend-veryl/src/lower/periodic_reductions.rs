@@ -1,9 +1,9 @@
 //! Count a proven periodic predicate before applying a modular scalar reduction.
-use veryl_analyzer::ir::{AssignStatement, ForBound, ForRange, ForStatement};
+use veryl_analyzer::ir::{AssignStatement, ForBound, ForRange, ForStatement, Module};
 
 use super::{
-    BitWidth, DrivenBits, Env, Expression, Factor, ImportError, LoweredExpr, ModuleLowerer, Op,
-    Statement, VarId, concrete_width, loops,
+    BinaryOp, BitWidth, DrivenBits, Env, Expression, Factor, ImportError, LoweredExpr,
+    ModuleLowerer, Op, Statement, VarId, concrete_width, loops,
     reductions::{constant_addition, whole_variable},
     substitute_induction, types,
 };
@@ -14,31 +14,19 @@ impl ModuleLowerer<'_> {
         statement: &ForStatement,
         writes: &mut Env,
     ) -> Result<Option<DrivenBits>, ImportError> {
-        let Some(bound) = loops::unsigned_unit_bound(statement, self.source) else {
-            return Ok(None);
-        };
-        let ForRange::Forward {
-            start: ForBound::Const(start, _),
-            ..
-        } = statement.range
-        else {
-            return Ok(None);
-        };
         let counter_width = concrete_width(&statement.var_type, "periodic counter")?;
-        if !(1..=64).contains(&counter_width)
-            || start as u64
-                > ((u64::MAX >> (64 - counter_width)) >> u32::from(statement.var_type.signed))
-            || start == usize::MAX
-            || start as u64 == i64::MAX.unsigned_abs()
-        {
+        let Some(range) = periodic_range(statement, self.source, counter_width) else {
             return Ok(None);
-        }
+        };
         let Some((condition, assign)) = periodic_body(statement) else {
             return Ok(None);
         };
         let Some(bits @ 0..=8) = period_bits(condition, statement.var_id, counter_width) else {
             return Ok(None);
         };
+        if matches!(range, PeriodicRange::RuntimeStart { .. }) && bits >= counter_width {
+            return Ok(None);
+        }
         let Some((accumulator, increment)) = constant_addition(assign) else {
             return Ok(None);
         };
@@ -51,7 +39,7 @@ impl ModuleLowerer<'_> {
             || !destination.select.is_empty()
             || destination.comptime.member_select_domain.is_some()
             || !ty.array.is_empty()
-            || Some(destination.id) == whole_variable(bound)
+            || Some(destination.id) == range.mutable_bound()
             || destination.id == statement.var_id
         {
             return Ok(None);
@@ -64,19 +52,7 @@ impl ModuleLowerer<'_> {
         let mut increment = self.lower_expression(increment, writes)?;
         increment.signed = types::expression_signedness(&assign.expr);
         let increment = self.resize(increment, width, false)?;
-        let count = self.lower_expression(bound, writes)?;
-        let total = self.periodic_prefix(count, bits, &prefix, width)?;
-        let period = 1usize << bits;
-        let start_total = (start as u64 >> bits) * prefix[period] + prefix[start % period];
-        let start_total = self.constant(width, start_total);
-        let hits = self.lower_binary(Op::Sub, total, start_total, width, false)?;
-        let start = self.constant(counter_width, start as u64);
-        let empty = self.lower_binary(Op::LessEq, count, start, 1, false)?;
-        let zero = self.constant(width, 0);
-        let hits = LoweredExpr {
-            id: self.rtl.mux(empty.id, zero.id, hits.id)?,
-            ..hits
-        };
+        let hits = self.periodic_hits(range, counter_width, bits, &prefix, width, writes)?;
         let delta = self.lower_binary(Op::Mul, hits, increment, width, false)?;
         let initial = self.resize(initial, width, false)?;
         let value = self.lower_binary(Op::Add, initial, delta, width, false)?;
@@ -85,6 +61,54 @@ impl ModuleLowerer<'_> {
             value,
             writes,
         )?))
+    }
+
+    fn periodic_hits(
+        &mut self,
+        range: PeriodicRange<'_>,
+        counter_width: u32,
+        bits: u32,
+        prefix: &[u64],
+        width: u32,
+        writes: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let (hits, empty) = match range {
+            PeriodicRange::RuntimeEnd { start, end } => {
+                let count = self.lower_expression(end, writes)?;
+                let total = self.periodic_prefix(count, bits, prefix, width)?;
+                let start_total = self.constant(width, constant_prefix(start, bits, prefix));
+                let hits = self.lower_binary(Op::Sub, total, start_total, width, false)?;
+                let start = self.constant(counter_width, start);
+                let empty = self.lower_binary(Op::LessEq, count, start, 1, false)?;
+                (hits, empty)
+            }
+            PeriodicRange::RuntimeStart { start, end } => {
+                // Capture the initializer with the counter's assignment conversion.
+                let captured = self.lower_expression(start, writes)?;
+                let captured = self.resize(captured, counter_width, true)?;
+                // Bias signed order into unsigned ordinals. The predicate uses
+                // only lower bits, so flipping the sign bit preserves its phase.
+                let sign = 1u64 << (counter_width - 1);
+                let sign_mask = self.constant(counter_width, sign);
+                let ordinal = LoweredExpr {
+                    id: self.rtl.binary(BinaryOp::Xor, captured.id, sign_mask.id)?,
+                    signed: false,
+                    ..captured
+                };
+                let start_total = self.periodic_prefix(ordinal, bits, prefix, width)?;
+                let end_ordinal = end ^ sign;
+                let end_total = self.constant(width, constant_prefix(end_ordinal, bits, prefix));
+                let hits = self.lower_binary(Op::Sub, end_total, start_total, width, false)?;
+                let end = self.constant(counter_width, end_ordinal);
+                let empty = self.lower_binary(Op::GreaterEq, ordinal, end, 1, false)?;
+                (hits, empty)
+            }
+        };
+        let zero = self.constant(width, 0);
+        Ok(LoweredExpr {
+            id: self.rtl.mux(empty.id, zero.id, hits.id)?,
+            ..hits
+        })
     }
 
     fn predicate_prefix(
@@ -158,6 +182,69 @@ impl ModuleLowerer<'_> {
         };
         self.lower_binary(Op::Add, full, tail, width, false)
     }
+}
+
+#[derive(Clone, Copy)]
+enum PeriodicRange<'a> {
+    RuntimeEnd { start: u64, end: &'a Expression },
+    RuntimeStart { start: &'a Expression, end: u64 },
+}
+
+impl PeriodicRange<'_> {
+    fn mutable_bound(&self) -> Option<VarId> {
+        match self {
+            Self::RuntimeEnd { end, .. } => whole_variable(end),
+            Self::RuntimeStart { .. } => None,
+        }
+    }
+}
+
+fn periodic_range<'a>(
+    statement: &'a ForStatement,
+    source: &Module,
+    width: u32,
+) -> Option<PeriodicRange<'a>> {
+    if !(1..=64).contains(&width) {
+        return None;
+    }
+    let maximum = (u64::MAX >> (64 - width)) >> u32::from(statement.var_type.signed);
+    match &statement.range {
+        ForRange::Forward {
+            start: ForBound::Const(start, _),
+            ..
+        } if concrete_endpoint(*start, maximum) => {
+            let end = loops::unsigned_unit_bound(statement, source)?;
+            Some(PeriodicRange::RuntimeEnd {
+                start: *start as u64,
+                end,
+            })
+        }
+        ForRange::Forward {
+            start: ForBound::Expression(start),
+            end: ForBound::Const(end, true),
+            inclusive: false,
+            step: 1,
+        } if statement.var_type.signed && concrete_endpoint(*end, maximum) => {
+            let id = whole_variable(start)?;
+            if !source.variables.get(&id)?.r#type.array.is_empty() {
+                return None;
+            }
+            Some(PeriodicRange::RuntimeStart {
+                start,
+                end: *end as u64,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn concrete_endpoint(value: usize, maximum: u64) -> bool {
+    value as u64 <= maximum && value != usize::MAX && value as u64 != i64::MAX.unsigned_abs()
+}
+
+fn constant_prefix(point: u64, bits: u32, prefix: &[u64]) -> u64 {
+    let residue = usize::try_from(point & ((1u64 << bits) - 1)).expect("at most eight bits");
+    (point >> bits) * prefix[prefix.len() - 1] + prefix[residue]
 }
 
 fn periodic_body(statement: &ForStatement) -> Option<(&Expression, &AssignStatement)> {
