@@ -1,4 +1,4 @@
-//! Local optimizations applied while constructing one-bit simulation expressions.
+//! Local optimizations applied while constructing one-bit two-state simulation expressions.
 //!
 //! Cell conversion describes the hardware operation; this layer selects a
 //! reduced expression and emits it through the backend SDK. Rules live in
@@ -6,10 +6,13 @@
 //! operations here rather than embedding algebra in individual cell emitters.
 //!
 //! This is construction-time simplification, not a whole-IR optimization pass.
-//! It deliberately uses only expression identity and the two canonical constant
-//! IDs supplied by the caller. It neither inspects arbitrary expressions nor
-//! performs global constant propagation, and must not be used for word muxes.
+//! It uses expression identity, the two canonical constant IDs, and explicit
+//! LUT truth tables supplied by the caller. It neither inspects arbitrary
+//! expressions nor performs global constant propagation, and must not be used
+//! for word muxes.
 
+mod bitwise;
+mod lut;
 mod mux;
 
 use celox::frontend_sdk::{BinaryOp, BuildError, ExprId, ModuleBuilder, UnaryOp, ValueType};
@@ -28,6 +31,7 @@ enum Rewrite {
     Not(ExprId),
     And(ExprId, ExprId),
     Or(ExprId, ExprId),
+    Xor(ExprId, ExprId),
     AndNot(ExprId, ExprId),
     OrNot(ExprId, ExprId),
     Mux(ExprId, ExprId, ExprId),
@@ -54,6 +58,11 @@ impl<'a> BitOptimizer<'a> {
         self.emit(rewrite)
     }
 
+    pub fn xor(&mut self, lhs: ExprId, rhs: ExprId) -> Result<ExprId, BuildError> {
+        let rewrite = bitwise::simplify_xor(lhs, rhs, self.constants);
+        self.emit(rewrite)
+    }
+
     fn emit(&mut self, rewrite: Rewrite) -> Result<ExprId, BuildError> {
         let bit = ValueType::bits(1)?;
         match rewrite {
@@ -61,6 +70,7 @@ impl<'a> BitOptimizer<'a> {
             Rewrite::Not(value) => self.builder.unary(UnaryOp::LogicNot, value, bit),
             Rewrite::And(lhs, rhs) => self.builder.binary(BinaryOp::LogicAnd, lhs, rhs, bit),
             Rewrite::Or(lhs, rhs) => self.builder.binary(BinaryOp::LogicOr, lhs, rhs, bit),
+            Rewrite::Xor(lhs, rhs) => self.builder.binary(BinaryOp::Xor, lhs, rhs, bit),
             Rewrite::AndNot(lhs, rhs) | Rewrite::OrNot(lhs, rhs) => {
                 let inverted = self.builder.unary(UnaryOp::LogicNot, lhs, bit)?;
                 let op = if matches!(rewrite, Rewrite::AndNot(..)) {

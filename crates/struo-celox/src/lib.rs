@@ -24,7 +24,8 @@ use struo_target_ecp5::{
 
 /// Converts the exact ECP5 target object into Celox's external-frontend format.
 ///
-/// LUT truth tables are expanded as mux trees. `TRELLIS_FF` asynchronous resets
+/// LUT truth tables reduce fixed inputs and parity before MUX expansion.
+/// `TRELLIS_FF` asynchronous resets
 /// map directly to the SDK register reset, while synchronous resets are folded
 /// into next-state logic with reset-over-enable priority. A dedicated `JTAGG`
 /// has no package-pin interface in this artifact, so its fabric outputs use the
@@ -348,7 +349,7 @@ fn emit_cell(
                 .iter()
                 .map(|bit| bit_expression(builder, wires, constants, *bit))
                 .collect::<Result<Vec<_>, _>>()?;
-            let value = lut_expression(builder, &input_expressions, *init, 0, 0, constants)?;
+            let value = lut_expression(builder, &input_expressions, *init, constants)?;
             let target = builder.whole(wire_ref(wires, *output)?.signal)?;
             builder.assign(target, value)?;
             Ok(())
@@ -578,27 +579,26 @@ fn emit_ccu2c(
     init: [u16; 2],
     inject: [bool; 2],
 ) -> Result<(), CeloxAdapterError> {
-    let one_bit = ValueType::bits(1)?;
     let mut carry = bit_expression(builder, wires, constants, carry_in)?;
     for slice in 0..2 {
         let expressions = inputs[slice]
             .iter()
             .map(|bit| bit_expression(builder, wires, constants, *bit))
             .collect::<Result<Vec<_>, _>>()?;
-        let lut4 = lut_expression(builder, &expressions, init[slice], 0, 0, constants)?;
+        let lut4 = lut_expression(builder, &expressions, init[slice], constants)?;
         let lut2_inputs = [
             expressions[0],
             expressions[1],
             constants.zero_expression,
             constants.zero_expression,
         ];
-        let lut2 = lut_expression(builder, &lut2_inputs, init[slice], 0, 0, constants)?;
+        let lut2 = lut_expression(builder, &lut2_inputs, init[slice], constants)?;
         let gated_carry = if inject[slice] {
             constants.zero_expression
         } else {
             carry
         };
-        let sum = builder.binary(CeloxBinaryOp::Xor, lut4, gated_carry, one_bit)?;
+        let sum = BitOptimizer::new(builder, constants.bit_constants()).xor(lut4, gated_carry)?;
         builder.assign(builder.whole(wire_ref(wires, sums[slice])?.signal)?, sum)?;
         carry =
             BitOptimizer::new(builder, constants.bit_constants()).mux(lut4, gated_carry, lut2)?;
@@ -803,40 +803,9 @@ fn lut_expression(
     builder: &mut ModuleBuilder,
     inputs: &[ExprId],
     init: u16,
-    input_index: usize,
-    table_index: usize,
     constants: Constants,
 ) -> Result<ExprId, CeloxAdapterError> {
-    if input_index == 4 {
-        return Ok(if init & (1 << table_index) == 0 {
-            constants.zero_expression
-        } else {
-            constants.one_expression
-        });
-    }
-    let low = lut_expression(
-        builder,
-        inputs,
-        init,
-        input_index + 1,
-        table_index,
-        constants,
-    )?;
-    let high = lut_expression(
-        builder,
-        inputs,
-        init,
-        input_index + 1,
-        table_index | (1 << input_index),
-        constants,
-    )?;
-    Ok(
-        BitOptimizer::new(builder, constants.bit_constants()).mux(
-            inputs[input_index],
-            high,
-            low,
-        )?,
-    )
+    Ok(BitOptimizer::new(builder, constants.bit_constants()).lut(inputs, init)?)
 }
 
 fn emit_flip_flop_bank(
@@ -1378,13 +1347,24 @@ mod tests {
             0, 0xffff, 0xaaaa, 0x5555, 0x8888, 0xeeee, 0x2222, 0xbbbb, 0xcaca, 0x6996, 0x8000,
             0xfffe, 0x1234, 0xabcd, 0x9876,
         ];
-        for (index, table) in tables.iter().enumerate() {
-            let output = builder.output(format!("q{index}"), bit).unwrap();
-            let value =
-                super::lut_expression(&mut builder, &inputs, *table, 0, 0, constants).unwrap();
-            builder
-                .assign(builder.whole(output).unwrap(), value)
-                .unwrap();
+        for configuration in 0..81u32 {
+            let configured = (0..4)
+                .map(|bit| match (configuration / 3u32.pow(bit)) % 3 {
+                    0 => inputs[bit as usize],
+                    1 => zero,
+                    _ => one,
+                })
+                .collect::<Vec<_>>();
+            for (index, table) in tables.iter().enumerate() {
+                let output = builder
+                    .output(format!("q{configuration}_{index}"), bit)
+                    .unwrap();
+                let value =
+                    super::lut_expression(&mut builder, &configured, *table, constants).unwrap();
+                builder
+                    .assign(builder.whole(output).unwrap(), value)
+                    .unwrap();
+            }
         }
         let mut sim = celox::Simulator::from_frontend(super::finish_artifact(builder).unwrap())
             .build_native()
@@ -1392,12 +1372,22 @@ mod tests {
         let input = sim.signal("input");
         for value in 0..16u8 {
             sim.modify(|io| io.set(input, value)).unwrap();
-            for (index, table) in tables.iter().enumerate() {
-                assert_eq!(
-                    sim.get(sim.signal(&format!("q{index}"))),
-                    ((table >> value) & 1u16).into(),
-                    "table={table:04x}, input={value}"
-                );
+            for configuration in 0..81u32 {
+                let mut address = value;
+                for bit in 0..4 {
+                    match (configuration / 3u32.pow(bit)) % 3 {
+                        1 => address &= !(1 << bit),
+                        2 => address |= 1 << bit,
+                        _ => (),
+                    }
+                }
+                for (index, table) in tables.iter().enumerate() {
+                    assert_eq!(
+                        sim.get(sim.signal(&format!("q{configuration}_{index}"))),
+                        ((table >> address) & 1u16).into(),
+                        "table={table:04x}, input={value}, configuration={configuration}"
+                    );
+                }
             }
         }
     }

@@ -20,7 +20,6 @@ cases = [
   "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
   "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
-  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
   "signed_divrem::signed_divrem_i128",
   "signed_divrem::signed_divrem_i64",
   "wide_operators::test_wide_comb_div",
