@@ -202,6 +202,29 @@ limits; a constant initializer at that boundary is rejected because AIR cannot
 distinguish the exact boundary from a larger original value with different low
 bits. Runtime expressions retain their full initializer bits.
 
+`src/lower/bitwise_loops.rs` also proves OR/XOR counter traces when the initializer
+lowers to an effect-free constant in the current procedural environment. Each
+update is masked to the counter width, preserving signed interpretation when
+substituting the next value. A guaranteed break must be reached before a repeated
+counter value or the expansion budget; every actual bound comparison remains in
+the circuit. Initializer writes and unknown initializers are rejected by this
+proof. FF-local blocking initialization is visible, while a scheduled module FF
+write cannot supply the current initializer.
+
+The remaining reverse/bitwise corpus ignores have concrete non-terminating input
+values. They are not excluded merely because their loops are dynamic:
+
+| Fixture family | Counterexample to termination |
+| --- | --- |
+| OR/XOR loops starting at 3 with endpoint-dependent breaks | Endpoint 8 makes OR stall at 7 and XOR cycle between 3 and 5. |
+| Bitwise step operands with bits above the i32 counter | Start 0 and endpoints 8 make OR stall at 6 and XOR cycle between 0 and 6, missing breaks at 7/5. |
+| FF signed XOR with external initial value | Start 0 and a large positive endpoint cycle between 0 and i32 minimum, never reaching the break at 2147483640. |
+| Multiplicative stalled step | Start 0, count 4, and `sel = 0` repeat 0 without breaking. |
+| Unsigned reverse singleton fixtures | Start/count 0 let the counter wrap under an unsigned comparison with zero. |
+| Signed wide reverse fixtures without guaranteed breaks | An i64-minimum lower bound is below every i32 counter value, including values after wrap. |
+
+Finite test vectors do not constrain these full input domains for synthesis.
+
 Veryl 0.22 has an upstream static-unrolling limitation before this validation:
 when no `break` retains the loop in AIR, it already expands
 `for i in rev 8'd0..4 { q += 1; }` into four assignments. Its emitted SV instead

@@ -7,7 +7,7 @@ use veryl_analyzer::ir::{
 use super::{ImportError, concrete_width, context_width, evaluated_u64, substitute_statements};
 
 /// Resource budget for newly supported runtime-bound loops, not a runtime cap.
-const GUARDED_ITERATION_BUDGET: usize = 256;
+pub(super) const GUARDED_ITERATION_BUDGET: usize = 256;
 
 pub(super) struct LoopPlan {
     pub iterations: Vec<usize>,

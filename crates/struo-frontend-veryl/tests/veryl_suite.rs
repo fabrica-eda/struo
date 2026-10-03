@@ -3181,3 +3181,158 @@ fn single_iteration_loops_reject_lost_constant_initializer_bits() {
         );
     }
 }
+
+#[test]
+fn corpus_proven_signed_bitwise_loop() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case(
+        "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn known_bitwise_initializers_preserve_sign_step_width_and_condition_order() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(limit: input signed logic<128>, xor_hits: output logic<8>, xor_last: output logic<32>,
+                   or_hits: output logic<8>, or_last: output logic<32>,
+                   falling_hits: output logic<8>, falling_last: output logic<32>) {
+            always_comb {
+                var seed: signed logic<8>;
+                seed = 8'shf8;
+                xor_hits = 0;
+                xor_last = 32'heeeeeeee;
+                for i in seed..=limit step ^= 2147483648 {
+                    xor_hits += 1;
+                    xor_last = i as 32;
+                    seed = 0;
+                    if i == 2147483640 { break; }
+                }
+                var other: signed logic<32>;
+                other = (0 - 8) as 32;
+                or_hits = 0;
+                or_last = 32'heeeeeeee;
+                for i in other..=limit step |= 4294967300 {
+                    or_hits += 1;
+                    or_last = i as 32;
+                    if i == (0 - 4) { break; }
+                }
+                other = (0 - 5) as 32;
+                falling_hits = 0;
+                falling_last = 32'heeeeeeee;
+                for i in other..=limit step ^= 4294967299 {
+                    falling_hits += 1;
+                    falling_last = i as 32;
+                    if i == (0 - 8) { break; }
+                }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let limit = sim.signal("limit");
+    for bound in [
+        i128::MIN,
+        -9,
+        -8,
+        -7,
+        -5,
+        -4,
+        -3,
+        0,
+        2_147_483_639,
+        2_147_483_640,
+        i128::MAX,
+    ] {
+        sim.modify(|io| io.set(limit, bound.cast_unsigned()))
+            .unwrap();
+        for (hits, last, trace) in [
+            ("xor_hits", "xor_last", [-8i128, 2_147_483_640]),
+            ("or_hits", "or_last", [-8i128, -4]),
+            ("falling_hits", "falling_last", [-5i128, -8]),
+        ] {
+            let executed = trace
+                .into_iter()
+                .take_while(|i| *i <= bound)
+                .collect::<Vec<_>>();
+            let expected = executed.last().map_or(0xeeee_eeee, |n| {
+                u32::from_le_bytes(n.to_le_bytes()[..4].try_into().unwrap())
+            });
+            assert_eq!(sim.get(sim.signal(hits)), executed.len().into());
+            assert_eq!(sim.get(sim.signal(last)), expected.into());
+        }
+    }
+}
+
+#[test]
+fn bitwise_loop_proofs_reject_cycles_and_unknown_initializers() {
+    for (setup, range, condition) in [
+        ("seed = 3;", "seed..=limit step |= 6", "i == limit"),
+        ("seed = 3;", "seed..=limit step ^= 6", "i == 7"),
+        ("seed = value;", "seed..=limit step |= 4", "i == 7"),
+        ("seed = 0;", "seed_fn(calls)..=limit step |= 4", "i == 7"),
+    ] {
+        let source = format!(
+            "module Top(value: input logic<32>, limit: input logic<32>, q: output logic<32>, calls: output logic<8>) {{
+                function seed_fn(n: inout logic<8>) -> logic<32> {{ n += 1; return 3; }}
+                always_comb {{ var seed: logic<32>; calls = 0; {setup} q = 0;
+                    for i in {range} {{ q = i as 32; if {condition} {{ break; }} }}
+                }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "unproven_bitwise_loop", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{error}"
+        );
+    }
+    let source = "module Top(clk: input clock, limit: input logic<32>, q: output logic<32>) {
+        var seed: logic<32>;
+        always_ff (clk) {
+            seed = 3;
+            q = 0;
+            for i in seed..limit step |= 4 { q = i as 32; if i == 7 { break; } }
+        }
+    }";
+    let error = analyze_and_lower(source, "nba_bitwise_initializer", "Top").unwrap_err();
+    assert!(
+        matches!(error, ImportError::UnsupportedBehavior(_)),
+        "{error}"
+    );
+}
+
+#[test]
+fn bitwise_loop_proof_observes_blocking_ff_local_initialization() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, count: input logic<8>, q: output logic<8>) {
+            always_ff (clk) {
+                var seed: logic<32>;
+                var hits: logic<8>;
+                seed = 3;
+                hits = 0;
+                for i in seed..count step |= 4 {
+                    hits += 1;
+                    if i == 7 { break; }
+                }
+                q = hits;
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let clk = sim.event("clk");
+    let count = sim.signal("count");
+    for n in 0..256u16 {
+        sim.modify(|io| io.set(count, n)).unwrap();
+        sim.tick(clk).unwrap();
+        let expected = [3u16, 7].into_iter().take_while(|i| *i < n).count();
+        assert_eq!(sim.get(sim.signal("q")), expected.into());
+    }
+}
