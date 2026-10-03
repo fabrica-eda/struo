@@ -128,6 +128,12 @@ pub fn ecp5_frontend_artifact(
 /// The mapped object is converted directly into a [`FrontendArtifact`] and
 /// handed to Celox without JSON serialization or parsing.
 ///
+/// Keep gate muxes as dataflow: Celox 0.9's `BranchifyMux` profitability
+/// analysis repeatedly scans large instruction suffixes on mapped gate
+/// networks. Disable only that pass; constant folding and other default
+/// optimizations remain enabled. Callers can opt back in through the returned
+/// builder's [`SimulatorBuilder::enable_pass`] method.
+///
 /// # Errors
 ///
 /// Returns an error when the mapped object cannot be represented by the Celox
@@ -135,7 +141,8 @@ pub fn ecp5_frontend_artifact(
 pub fn ecp5_simulator(
     netlist: &Ecp5Netlist,
 ) -> Result<SimulatorBuilder<'static, Simulator>, CeloxAdapterError> {
-    Ok(Simulator::from_frontend(ecp5_frontend_artifact(netlist)?))
+    Ok(Simulator::from_frontend(ecp5_frontend_artifact(netlist)?)
+        .disable_pass(celox::SirPass::BranchifyMux))
 }
 
 fn finish_artifact(builder: ModuleBuilder) -> Result<FrontendArtifact, CeloxAdapterError> {

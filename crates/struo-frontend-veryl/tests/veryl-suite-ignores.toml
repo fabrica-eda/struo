@@ -12,14 +12,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Exceeds the 60-second per-case budget on the CI runner."
-cases = [
-  "signed_divrem::signed_divrem_i128",
-  "wide_operators::test_wide_comb_div",
-  "wide_operators::test_wide_comb_rem",
-]
-
-[[ignore]]
 reason = "A 600-second diagnostic completed lowering (about 201 seconds) but not synthesis; the large sparse FF array remains resource-limited."
 cases = [
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
@@ -331,4 +323,13 @@ cases = [
   "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
   "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
+]
+
+[[timeout]]
+seconds = 180
+reason = "Wide division/remainder passes with gate-level mux branchification disabled, but native construction needs a larger CI budget."
+cases = [
+  "signed_divrem::signed_divrem_i128",
+  "wide_operators::test_wide_comb_div",
+  "wide_operators::test_wide_comb_rem",
 ]

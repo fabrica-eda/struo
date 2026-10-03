@@ -35,6 +35,22 @@ The Actions job summary shows outcome counts. Download the
 failed run. Reports are generated under `target/` and retained by Actions for
 14 days; generated results and historical snapshots are not committed.
 
+## Mapped simulator optimization policy
+
+`struo_celox::ecp5_simulator` disables only Celox 0.9's `BranchifyMux`
+pass. Its profitability analysis repeatedly copies and analyzes instruction
+suffixes on large mapped gate networks. Constant folding and the other default
+optimizations remain enabled; callers can re-enable the pass on the returned
+builder when appropriate for their workload.
+
+Signed 128/65-bit division and remainder still exceeded 600 seconds with
+word-cell sharing alone. Sampling identified branchification analysis during
+native construction. With that pass disabled, the complete case passed in
+about 68 seconds; the wide division and remainder cases passed in about 39 and
+36 seconds. All three now execute in CI with a 180-second case budget. These
+measurements used one worker under a hard 4096 MiB address-space limit and do
+not establish a general simulation-throughput improvement.
+
 ## Remaining resource limitations
 
 Timeout exceptions enable verified slow cases in CI without weakening their
@@ -47,7 +63,6 @@ passing run within the diagnostic budgets:
 | Wide dynamic FF checkpoint | A 600-second run completed mapping and simulation IR construction, then timed out during native simulator construction. |
 | Constant-driven typed reverse bound | A 240-second run completed mapping in about 51 seconds, then timed out during native simulator construction. |
 | Packed scatter store | The 60-second audit timed out during synthesis. |
-| Signed 128-bit and wide division/remainder | The 60-second audit timed out. Longer diagnostics were explicitly stopped after excessive local memory use was reported; they provide no completed correctness result. |
 
 These limits do not establish a semantic mismatch or an unsynthesizable source.
 They remain separate from tagged expectation exclusions, frontend restrictions,
