@@ -18,12 +18,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "A 600-second diagnostic completed ECP5 mapping and simulation IR construction but not native simulator construction."
-cases = [
-  "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
-]
-
-[[ignore]]
 reason = "The upstream veryl-std 0.21 onehot leaves o_gt_one undriven in its W=1 base case; filling it with zero would change the supplied RTL."
 cases = [
   "std_onehot::test_onehot_8bit_exhaustive",
@@ -270,12 +264,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Packed scatter store exceeds the 60-second case budget during synthesis."
-cases = [
-  "packed_scatter_store::packed_scatter_last_lane_does_not_touch_adjacent_storage",
-]
-
-[[ignore]]
 reason = "Veryl 0.22.0 rejects scalar x[0] (InvalidSelect::Scalar); the suite expects acceptance of a scalar bit-select."
 cases = [
   "flip_flop::test_ff_function_call_bit_select_on_nonvariable_one_bit_formal",
@@ -293,12 +281,6 @@ cases = [
   "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
 ]
 
-[[ignore]]
-reason = "Bounded arithmetic forward/reverse loops lower successfully but exceed the 60-second case budget during mapping and native simulator construction."
-cases = [
-  "veryl_context_regressions::runtime_for_bound_keeps_its_type",
-]
-
 # Execute verified slow cases in CI with bounded native compilation time.
 [[timeout]]
 seconds = 600
@@ -314,6 +296,8 @@ cases = [
   "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
   "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
   "signed_divrem::signed_divrem_i64",
+  "veryl_context_regressions::runtime_for_bound_keeps_its_type",
+  "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
 ]
 
 [[timeout]]

@@ -149,6 +149,7 @@ struct Lowering<'a> {
     signal_bits: Vec<Vec<Option<NetId>>>,
     drivers: Vec<Vec<Option<Driver>>>,
     expression_bits: Vec<Option<Vec<NetId>>>,
+    expression_ranges: HashMap<(ExprId, usize, usize), Vec<NetId>>,
     adder_widths: Vec<Option<usize>>,
     word_cells: word_cells::WordCells,
     resolving: HashSet<(SignalId, usize)>,
@@ -173,6 +174,7 @@ impl<'a> Lowering<'a> {
             signal_bits,
             drivers,
             expression_bits: vec![None; module.expressions().len()],
+            expression_ranges: HashMap::new(),
             adder_widths: ranges::adder_widths(module),
             word_cells: word_cells::WordCells::default(),
             resolving: HashSet::new(),
@@ -604,6 +606,25 @@ impl<'a> Lowering<'a> {
         if let Some(bits) = &self.expression_bits[id.index() as usize] {
             return Ok(bits[lsb..lsb + width].to_vec());
         }
+        let key = (id, lsb, width);
+        if let Some(bits) = self.expression_ranges.get(&key) {
+            return Ok(bits.clone());
+        }
+        // Cache only completed ranges. Recursion still resolves signal bits
+        // normally, so a genuine feedback edge cannot hide in a partial entry.
+        // Each lowering attempt owns its cache; the observable-only retry
+        // starts from a new Lowering rather than reusing strict-mode results.
+        let bits = self.lower_expression_range_uncached(id, lsb, width)?;
+        self.expression_ranges.insert(key, bits.clone());
+        Ok(bits)
+    }
+
+    fn lower_expression_range_uncached(
+        &mut self,
+        id: ExprId,
+        lsb: usize,
+        width: usize,
+    ) -> Result<Vec<NetId>, SynthesisError> {
         let expression = &self.module.expressions()[id.index() as usize];
         debug_assert!(lsb + width <= expression.r#type().width.get() as usize);
         // Keep bitwise expressions lazy across slices. Procedural partial
@@ -2078,6 +2099,83 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lowers_repeated_partial_writes_without_rewalking_shared_ranges() {
+        let mut module = Module::new("Scatter");
+        let base = module.add_port(Port {
+            name: "base".into(),
+            direction: PortDirection::Input,
+            r#type: bits(32),
+        });
+        let selector = module.add_port(Port {
+            name: "selector".into(),
+            direction: PortDirection::Input,
+            r#type: bits(5),
+        });
+        let value = module.add_port(Port {
+            name: "value".into(),
+            direction: PortDirection::Input,
+            r#type: bits(1),
+        });
+        let output = module.add_port(Port {
+            name: "result".into(),
+            direction: PortDirection::Output,
+            r#type: bits(32),
+        });
+        let mut current = module.read(base).unwrap();
+        let selector = module.read(selector).unwrap();
+        let value = module.read(value).unwrap();
+        for lane in 0..32 {
+            let lane_value = module.constant(Constant::from_u64(
+                BitWidth::new(5).unwrap(),
+                u64::from(lane),
+            ));
+            let selected = module
+                .binary(BinaryOp::Equal, selector, lane_value)
+                .unwrap();
+            let mut parts = Vec::new();
+            if lane < 31 {
+                parts.push(
+                    module
+                        .expression_slice(current, lane + 1, BitWidth::new(31 - lane).unwrap())
+                        .unwrap(),
+                );
+            }
+            parts.push(value);
+            if lane > 0 {
+                parts.push(
+                    module
+                        .expression_slice(current, 0, BitWidth::new(lane).unwrap())
+                        .unwrap(),
+                );
+            }
+            let replacement = module.concat(parts).unwrap();
+            current = module.mux(selected, replacement, current).unwrap();
+        }
+        module
+            .assign(module.whole(output).unwrap(), current)
+            .unwrap();
+        let mut design = Design::new("Scatter");
+        design.add_module(module);
+        let result = synthesize(&design).unwrap();
+        for base in [0, u64::from(u32::MAX), 0xa55a_c33c] {
+            for selector in 0..32 {
+                for value in 0..2 {
+                    let inputs = input_word("base", 32, base)
+                        .into_iter()
+                        .chain(input_word("selector", 5, selector))
+                        .chain([("value".into(), value != 0)])
+                        .collect();
+                    let outputs = evaluate_combinational(&result.netlist, &inputs);
+                    assert_eq!(
+                        output_word(&outputs, "result", 32),
+                        (base & !(1 << selector)) | (value << selector)
+                    );
                 }
             }
         }

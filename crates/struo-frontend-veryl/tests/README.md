@@ -51,18 +51,24 @@ about 68 seconds; the wide division and remainder cases passed in about 39 and
 measurements used one worker under a hard 4096 MiB address-space limit and do
 not establish a general simulation-throughput improvement.
 
+Partial-write synthesis memoizes completed expression ranges, preserving lazy
+bit dependencies and cycle detection. This avoids revisiting shared MUX and
+concatenation ranges exponentially. The packed scatter case now completes in
+about 0.12 seconds, including native execution, under the default case budget.
+The typed reverse-bound case also passes with the mapped simulator policy
+above (about 121 seconds). The wide FF checkpoint passes in about 91 seconds.
+Both use the existing 300-second CI budget group.
+
 ## Remaining resource limitations
 
 Timeout exceptions enable verified slow cases in CI without weakening their
 assertions. The remaining performance ignores have not demonstrated a complete
 passing run within the diagnostic budgets:
 
-| Case family | Evidence and current limitation |
-| --- | --- |
-| Large sparse FF line-write array | A 600-second run completed lowering in about 201 seconds, then timed out during synthesis. |
-| Wide dynamic FF checkpoint | A 600-second run completed mapping and simulation IR construction, then timed out during native simulator construction. |
-| Constant-driven typed reverse bound | A 240-second run completed mapping in about 51 seconds, then timed out during native simulator construction. |
-| Packed scatter store | The 60-second audit timed out during synthesis. |
+The large sparse FF line-write array remains resource-limited. A prior
+600-second run completed lowering in about 201 seconds, then timed out during
+synthesis. It has not demonstrated a complete passing run under the worker
+memory limit.
 
 These limits do not establish a semantic mismatch or an unsynthesizable source.
 They remain separate from tagged expectation exclusions, frontend restrictions,
