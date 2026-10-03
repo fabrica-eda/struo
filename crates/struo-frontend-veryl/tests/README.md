@@ -158,7 +158,7 @@ signed range, even when the analyzer's host enumerator saturates it to zero.
 Runtime bounds are accepted for a
 non-negative constant start that fits the induction variable and a positive
 additive step, when either the bound's type or a guaranteed break proves that
-at most 256 candidate iterations are needed. This budget includes the iteration
+at most 512 candidate iterations are needed. This budget includes the iteration
 that executes a break; it is a compile-time resource policy, never a silent
 runtime truncation. An input-dependent break alone is not a termination proof,
 and a nested loop's break does not terminate its parent.
@@ -168,7 +168,7 @@ lowering. A missing/non-terminating default or any non-terminating arm does not
 prove a bound, even if test inputs happen to select a terminating arm.
 
 A runtime start is also accepted when its unsigned leaf type fits the counter
-without truncation and the end range fits within 256 non-negative counter values.
+without truncation and the end range fits within 512 non-negative counter values.
 The initializer is evaluated exactly once, including output-argument writes and
 empty ranges. Lowering tracks the counter value reached by each positive additive
 step, suppressing both writes and breaks from skipped candidates. Unit-stride
@@ -215,12 +215,23 @@ write cannot supply the current initializer.
 initializers and immutable constant bounds, including negative initial values
 and bounds computed by enclosing loop substitution. Comparisons use the actual
 operand widths and common signedness; updates wrap at the counter width. The
-proof rejects cycles and traces exceeding 256 iterations. It does not treat a
+proof rejects cycles and traces exceeding 512 iterations. It does not treat a
 mutable bound's initial constant value as an invariant. The shared read-only
 RTL evaluator in `constant_values.rs` recognizes scalar arithmetic and bit
 operations without trusting cached AIR numeric values or rewriting the circuit.
 Regression tests include nested negative bounds, initializer capture, mixed
 signed/unsigned comparisons, finite wraparound, and rejection of signed cycles.
+
+The bound proof also recognizes non-negative additions without overflow in the
+actual expression context. Thus an 8-bit input plus `8'd1` has maximum 256 in a
+32-bit loop comparison. The 512-candidate policy includes its inclusive endpoint.
+`loops/reverse.rs` handles descending runtime loops with constant signed lower
+bounds and proven non-negative initial bounds. It captures the initializer once,
+subtracts one before counter conversion for exclusive ranges, and visits only
+reachable descending candidates. Unsigned lower comparisons and unproven
+initial truncation remain rejected. Regression tests cover all 256 narrow
+bound/break combinations, non-unit steps, initializer effects even for empty
+ranges, blocking FF-local writes, and the 512/513-candidate boundary.
 
 The remaining reverse/bitwise corpus ignores have concrete non-terminating input
 values. They are not excluded merely because their loops are dynamic:
@@ -230,6 +241,7 @@ values. They are not excluded merely because their loops are dynamic:
 | OR/XOR loops starting at 3 with endpoint-dependent breaks | Endpoint 8 makes OR stall at 7 and XOR cycle between 3 and 5. |
 | Bitwise step operands with bits above the i32 counter | Start 0 and endpoints 8 make OR stall at 6 and XOR cycle between 0 and 6, missing breaks at 7/5. |
 | FF signed XOR with external initial value | Start 0 and a large positive endpoint cycle between 0 and i32 minimum, never reaching the break at 2147483640. |
+| Signed inclusive dynamic endpoints | An endpoint equal to i32 maximum keeps the condition true even after the counter wraps. |
 | Multiplicative stalled step | Start 0, count 4, and `sel = 0` repeat 0 without breaking. |
 | Unsigned reverse singleton fixtures | Start/count 0 let the counter wrap under an unsigned comparison with zero. |
 | Signed wide reverse fixtures without guaranteed breaks | An i64-minimum lower bound is below every i32 counter value, including values after wrap. |
