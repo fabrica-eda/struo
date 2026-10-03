@@ -340,7 +340,7 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
       - name: Run Veryl corpus with explicit ignores and expectation policies
-        run: python3 scripts/check-veryl-suite.py --timing --jobs 4 --report target/veryl-corpus/results.json
+        run: python3 scripts/check-veryl-suite.py --timing --jobs 1 --memory-mib 4096 --report target/veryl-corpus/results.json
 
       - name: Summarize corpus results
         if: ${{ always() }}
