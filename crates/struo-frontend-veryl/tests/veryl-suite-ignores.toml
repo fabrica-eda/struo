@@ -246,8 +246,6 @@ cases = [
 reason = "Struo cannot prove termination within its 512-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
 cases = [
   "synth_dynamic_loop::test_runtime_bounds_preserve_loop_carried_state_for_indexed_reads",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_pre_loop_bits_for_partial_updates",
-  "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
   "synth_dynamic_loop::test_runtime_bounds_reconstruct_wide_loop_carried_reads_from_partial_state",
   "synth_dynamic_loop::test_runtime_bounds_truncate_loop_var_to_declared_width",
 ]

@@ -3788,3 +3788,81 @@ fn invariant_additive_reductions_reject_changing_or_effectful_guards() {
         );
     }
 }
+
+#[test]
+fn idempotent_loops_preserve_partial_writes_order_and_empty_ranges() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<3>, count: input logic<32>, idx: input logic<32>,
+                   copied: output logic<3>, selected: output logic) {
+            var x: logic<2>;
+            always_comb {
+                copied = seed;
+                for i in 0..count { copied[0] = copied[1]; }
+                x = seed as 2;
+                selected = 1;
+                for i in 0..count { x[0] = 0; selected = x[idx]; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    let index_signal = sim.signal("idx");
+    for count in [0u32, 1, 2, 256, 0x8000_0000, u32::MAX] {
+        for seed in 0..8u8 {
+            for index in [0u32, 1, 2, 3, u32::MAX] {
+                sim.modify(|io| {
+                    io.set(seed_signal, seed);
+                    io.set(count_signal, count);
+                    io.set(index_signal, index);
+                })
+                .unwrap();
+                let copied = if count == 0 {
+                    seed
+                } else {
+                    (seed & 6) | ((seed >> 1) & 1)
+                };
+                let selected = if count == 0 {
+                    1
+                } else if index == 1 {
+                    (seed >> 1) & 1
+                } else {
+                    0
+                };
+                assert_eq!(sim.get(sim.signal("copied")), copied.into());
+                assert_eq!(sim.get(sim.signal("selected")), selected.into());
+            }
+        }
+    }
+}
+
+#[test]
+fn idempotent_loops_reject_unproven_state_and_counter_dependencies() {
+    for body in [
+        "x[0] = ~x[0];",
+        "x[0] = x == 2'b10;",
+        "x[i] = 0;",
+        "x[0] = i as 1;",
+        "x[0] = x[index];",
+        "y = x[index]; x[0] = 0;",
+        "x[0] = effect(calls);",
+        "x[effect(calls)] = 0;",
+        "x[0] = x[effect(calls)];",
+        "limit = 0;",
+    ] {
+        let source = format!("module Top(count: input logic<32>, seed: input logic<2>, index: input logic<32>, x: output logic<2>, y: output logic, calls: output logic<32>) {{
+            function effect(n: inout logic<32>) -> logic {{ n += 1; return 0; }}
+            always_comb {{ var limit: logic<32>; limit = count; x = seed; y = 0; calls = 0;
+                for i in 0..limit {{ {body} }}
+            }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_idempotence", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
