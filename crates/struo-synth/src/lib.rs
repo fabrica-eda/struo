@@ -1,6 +1,7 @@
 //! Technology-independent synthesis for Struo.
 
 mod ranges;
+mod word_cells;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -59,7 +60,8 @@ impl Default for SynthesisOptions {
 
 /// Synthesizes the selected top module into a bit-level logic netlist.
 ///
-/// Construction performs constant folding and structural hashing. Word-level
+/// Construction performs constant folding and structural hashing, including
+/// sharing identical word operations after resolving their inputs. Word-level
 /// addition, subtraction, and ordering comparisons are retained for target-specific carry mapping.
 /// Synchronous simple-dual-port memories are retained for block-RAM mapping. Hierarchy
 /// and inout ports are rejected until their semantics have dedicated passes.
@@ -148,6 +150,7 @@ struct Lowering<'a> {
     drivers: Vec<Vec<Option<Driver>>>,
     expression_bits: Vec<Option<Vec<NetId>>>,
     adder_widths: Vec<Option<usize>>,
+    word_cells: word_cells::WordCells,
     resolving: HashSet<(SignalId, usize)>,
     resolve_observable_dependencies: bool,
 }
@@ -171,6 +174,7 @@ impl<'a> Lowering<'a> {
             drivers,
             expression_bits: vec![None; module.expressions().len()],
             adder_widths: ranges::adder_widths(module),
+            word_cells: word_cells::WordCells::default(),
             resolving: HashSet::new(),
             resolve_observable_dependencies: false,
         }
@@ -541,11 +545,13 @@ impl<'a> Lowering<'a> {
             lhs.truncate(width);
             rhs.truncate(width);
         }
-        Ok(Some(
-            self.netlist
-                .add_arithmetic_with_carry(&lhs, &rhs, carry)
-                .expect("validated RTL carry addition has equal, non-zero widths"),
-        ))
+        Ok(Some(self.word_cells.arithmetic(
+            &mut self.netlist,
+            ArithmeticOp::Add,
+            &lhs,
+            &rhs,
+            Some(carry),
+        )))
     }
 
     fn add_operands(&self, id: ExprId) -> Option<(ExprId, ExprId)> {
@@ -696,18 +702,24 @@ impl<'a> Lowering<'a> {
             BinaryOp::And => self.bitwise(lhs, rhs, Netlist::add_and),
             BinaryOp::Or => self.bitwise(lhs, rhs, Netlist::add_or),
             BinaryOp::Xor => self.bitwise(lhs, rhs, Netlist::add_xor),
-            BinaryOp::Add => self
-                .netlist
-                .add_arithmetic(ArithmeticOp::Add, lhs, rhs)
-                .expect("validated RTL arithmetic has equal, non-zero widths"),
-            BinaryOp::Sub => self
-                .netlist
-                .add_arithmetic(ArithmeticOp::Subtract, lhs, rhs)
-                .expect("validated RTL arithmetic has equal, non-zero widths"),
-            BinaryOp::Mul => self
-                .netlist
-                .add_arithmetic(ArithmeticOp::Multiply, lhs, rhs)
-                .expect("validated RTL multiplication has equal, non-zero widths"),
+            BinaryOp::Add => {
+                self.word_cells
+                    .arithmetic(&mut self.netlist, ArithmeticOp::Add, lhs, rhs, None)
+            }
+            BinaryOp::Sub => self.word_cells.arithmetic(
+                &mut self.netlist,
+                ArithmeticOp::Subtract,
+                lhs,
+                rhs,
+                None,
+            ),
+            BinaryOp::Mul => self.word_cells.arithmetic(
+                &mut self.netlist,
+                ArithmeticOp::Multiply,
+                lhs,
+                rhs,
+                None,
+            ),
             BinaryOp::Equal => vec![self.equal_words(lhs, rhs)],
             BinaryOp::NotEqual => {
                 let equal = self.equal_words(lhs, rhs);
@@ -747,9 +759,8 @@ impl<'a> Lowering<'a> {
 
     fn compare(&mut self, operation: ComparisonOp, lhs: &[NetId], rhs: &[NetId]) -> Vec<NetId> {
         vec![
-            self.netlist
-                .add_comparison(operation, lhs, rhs)
-                .expect("validated RTL comparisons have equal, non-zero widths"),
+            self.word_cells
+                .comparison(&mut self.netlist, operation, lhs, rhs),
         ]
     }
 
@@ -1917,6 +1928,156 @@ mod tests {
                         .collect();
                     let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
                     assert_eq!(output_word(&outputs, "sum", 4), (lhs + rhs + carry) & 0xf);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shares_word_cells_across_distinct_rtl_expressions() {
+        let mut module = Module::new("SharedWords");
+        let a = module.add_port(Port {
+            name: "a".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        let b = module.add_port(Port {
+            name: "b".into(),
+            direction: PortDirection::Input,
+            r#type: bits(4),
+        });
+        for copy in 0..2 {
+            // Separate read and operator IDs must still share resolved word cells.
+            let a = module.read(a).unwrap();
+            let b = module.read(b).unwrap();
+            let sub = module.binary(BinaryOp::Sub, a, b).unwrap();
+            let reverse = module.binary(BinaryOp::Sub, b, a).unwrap();
+            let product = module.binary(BinaryOp::Mul, sub, b).unwrap();
+            let unsigned = module
+                .binary(BinaryOp::LessThanUnsigned, product, reverse)
+                .unwrap();
+            let signed = module
+                .binary(BinaryOp::LessThanSigned, product, reverse)
+                .unwrap();
+            for (name, value, width) in [
+                ("sub", sub, 4),
+                ("reverse", reverse, 4),
+                ("product", product, 4),
+                ("unsigned", unsigned, 1),
+                ("signed", signed, 1),
+            ] {
+                let output = module.add_port(Port {
+                    name: format!("{name}{copy}"),
+                    direction: PortDirection::Output,
+                    r#type: bits(width),
+                });
+                let target = module.whole(output).unwrap();
+                module.assign(target, value).unwrap();
+            }
+        }
+        let mut design = Design::new("SharedWords");
+        design.add_module(module);
+        let result = synthesize(&design).unwrap();
+        assert_eq!(result.netlist.arithmetic().len(), 3);
+        assert_eq!(result.netlist.comparisons().len(), 2);
+        for a in 0u64..16 {
+            for b in 0u64..16 {
+                let inputs = input_word("a", 4, a)
+                    .into_iter()
+                    .chain(input_word("b", 4, b))
+                    .collect();
+                let outputs = evaluate_combinational(&result.netlist, &inputs);
+                let sub = a.wrapping_sub(b) & 15;
+                let reverse = b.wrapping_sub(a) & 15;
+                let product = (sub * b) & 15;
+                for copy in 0..2 {
+                    for (name, width, expected) in [
+                        ("sub", 4, sub),
+                        ("reverse", 4, reverse),
+                        ("product", 4, product),
+                        ("unsigned", 1, u64::from(product < reverse)),
+                        ("signed", 1, u64::from((product ^ 8) < (reverse ^ 8))),
+                    ] {
+                        let name = format!("{name}{copy}");
+                        let actual = if width == 1 {
+                            u64::from(outputs[&name])
+                        } else {
+                            output_word(&outputs, &name, width)
+                        };
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_adders_preserve_widths_and_distinct_carries() {
+        let mut module = Module::new("SharedAdders");
+        let inputs = [("a", 3), ("b", 3), ("c", 1), ("d", 1)].map(|(name, width)| {
+            module.add_port(Port {
+                name: name.into(),
+                direction: PortDirection::Input,
+                r#type: bits(width),
+            })
+        });
+        for copy in 0..2 {
+            for width in [2, 3] {
+                for carry in 0..3 {
+                    let a = module.read(inputs[0]).unwrap();
+                    let b = module.read(inputs[1]).unwrap();
+                    let a = module
+                        .expression_slice(a, 0, BitWidth::new(width).unwrap())
+                        .unwrap();
+                    let b = module
+                        .expression_slice(b, 0, BitWidth::new(width).unwrap())
+                        .unwrap();
+                    let mut sum = module.binary(BinaryOp::Add, a, b).unwrap();
+                    if carry != 0 {
+                        let c = module.read(inputs[carry + 1]).unwrap();
+                        let zero = module
+                            .constant(Constant::from_u64(BitWidth::new(width - 1).unwrap(), 0));
+                        let c = module.concat(vec![zero, c]).unwrap();
+                        sum = module.binary(BinaryOp::Add, sum, c).unwrap();
+                    }
+                    let output = module.add_port(Port {
+                        name: format!("sum_{copy}_{width}_{carry}"),
+                        direction: PortDirection::Output,
+                        r#type: bits(width),
+                    });
+                    module.assign(module.whole(output).unwrap(), sum).unwrap();
+                }
+            }
+        }
+        let mut design = Design::new("SharedAdders");
+        design.add_module(module);
+        let result = synthesize(&design).unwrap();
+        assert_eq!(result.netlist.arithmetic().len(), 6);
+        for a in 0..8 {
+            for b in 0..8 {
+                for carries in 0..4 {
+                    let c = carries & 1;
+                    let d = carries >> 1;
+                    let inputs = input_word("a", 3, a)
+                        .into_iter()
+                        .chain(input_word("b", 3, b))
+                        .chain([("c".into(), c != 0), ("d".into(), d != 0)])
+                        .collect();
+                    let outputs = evaluate_combinational(&result.netlist, &inputs);
+                    for copy in 0..2 {
+                        for width in [2, 3] {
+                            for (carry, value) in [0, c, d].into_iter().enumerate() {
+                                assert_eq!(
+                                    output_word(
+                                        &outputs,
+                                        &format!("sum_{copy}_{width}_{carry}"),
+                                        width
+                                    ),
+                                    (a + b + value) & ((1 << width) - 1)
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
