@@ -250,8 +250,6 @@ cases = [
   "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
   "synth_dynamic_loop::test_runtime_bounds_reconstruct_wide_loop_carried_reads_from_partial_state",
   "synth_dynamic_loop::test_runtime_bounds_truncate_loop_var_to_declared_width",
-  "synth_dynamic_loop::test_runtime_break_condition_dependency_across_module_boundary",
-  "synth_dynamic_loop::test_runtime_if_without_break_in_synth_comb_loop",
 ]
 
 [[ignore]]

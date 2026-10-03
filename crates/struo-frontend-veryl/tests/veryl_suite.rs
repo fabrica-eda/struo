@@ -3717,3 +3717,74 @@ fn additive_reductions_reject_unproven_bounds_and_dependent_bodies() {
         );
     }
 }
+
+#[test]
+fn invariant_additive_reductions_preserve_empty_ranges_and_boolean_guards() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<8>, count: input logic<32>, gate: input logic<8>,
+                   enabled: output logic<8>, stopped: output logic<8>) {
+            always_comb {
+                enabled = seed;
+                for i in 0..count { if gate { enabled += 3; } }
+                stopped = seed;
+                for i in 0..count { stopped += 5; if gate { break; } }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    let gate_signal = sim.signal("gate");
+    for count in [0u32, 1, 255, 256, 512, 0x8000_0000, u32::MAX] {
+        for gate in [0u8, 1, 2, 128] {
+            for seed in [0u8, 17, 255] {
+                sim.modify(|io| {
+                    io.set(seed_signal, seed);
+                    io.set(count_signal, count);
+                    io.set(gate_signal, gate);
+                })
+                .unwrap();
+                let enabled_count = if gate == 0 { 0 } else { count };
+                let stopped_count = if gate == 0 {
+                    count
+                } else {
+                    u32::from(count != 0)
+                };
+                assert_eq!(
+                    sim.get(sim.signal("enabled")),
+                    ((u32::from(seed).wrapping_add(enabled_count.wrapping_mul(3))) & 255).into()
+                );
+                assert_eq!(
+                    sim.get(sim.signal("stopped")),
+                    ((u32::from(seed).wrapping_add(stopped_count.wrapping_mul(5))) & 255).into()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn invariant_additive_reductions_reject_changing_or_effectful_guards() {
+    for body in [
+        "if out { out += 1; }",
+        "if i { out += 1; }",
+        "out += 1; if out { break; }",
+        "out += 1; if i == 2147483646 { break; }",
+        "if gate { out += 1; } else { out += 2; }",
+        "if effect(gate, calls) { out += 1; }",
+        "out += 1; if effect(gate, calls) { break; }",
+    ] {
+        let source = format!("module Top(count: input logic<32>, gate: input logic, out: output logic<32>, calls: output logic<32>) {{
+            function effect(x: input logic, n: inout logic<32>) -> logic {{ n += 1; return x; }}
+            always_comb {{ out = 0; calls = 0; for i in 0..count {{ {body} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "dependent_reduction_guard", "Top").is_err(),
+            "{source}"
+        );
+    }
+}

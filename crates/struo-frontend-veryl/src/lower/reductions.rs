@@ -2,8 +2,8 @@
 use veryl_analyzer::ir::{AssignStatement, ForBound, ForRange, ForStatement};
 
 use super::{
-    DrivenBits, Env, Expression, Factor, ImportError, ModuleLowerer, Op, Statement, VarId,
-    concrete_width, types,
+    DrivenBits, Env, Expression, Factor, ImportError, LoweredExpr, ModuleLowerer, Op, Statement,
+    VarId, concrete_width, types,
 };
 
 impl ModuleLowerer<'_> {
@@ -12,7 +12,14 @@ impl ModuleLowerer<'_> {
         statement: &ForStatement,
         writes: &mut Env,
     ) -> Result<Option<DrivenBits>, ImportError> {
-        let Some((bound, assign, accumulator, increment)) = reduction(statement) else {
+        let Some(Reduction {
+            bound,
+            assign,
+            accumulator,
+            increment,
+            guard,
+        }) = reduction(statement)
+        else {
             return Ok(None);
         };
         let bound_id = whole_variable(bound).expect("validated reduction bound");
@@ -29,7 +36,8 @@ impl ModuleLowerer<'_> {
         }
         // IEEE 1800-2023 12.7.1 and 11.8.1: starting at zero, an unsigned
         // exclusive bound no wider than the counter is reached before wrap.
-        // The body never changes that bound and executes exactly bound times.
+        // Without a break the body executes exactly bound times. An invariant
+        // guard can adjust the number of accumulator updates below.
         let width = concrete_width(accumulator_type, "reduction accumulator")?;
         let initial = self.lower_expression(accumulator, writes)?;
         let mut increment = self.lower_expression(increment, writes)?;
@@ -38,6 +46,7 @@ impl ModuleLowerer<'_> {
         increment.signed = types::expression_signedness(&assign.expr);
         let increment = self.resize(increment, width, false)?;
         let count = self.lower_expression(bound, writes)?;
+        let count = self.guard_reduction_count(count, guard, writes)?;
         let count = self.resize(count, width, false)?;
         let delta = self.lower_binary(Op::Mul, count, increment, width, false)?;
         let initial = self.resize(initial, width, false)?;
@@ -48,14 +57,47 @@ impl ModuleLowerer<'_> {
             writes,
         )?))
     }
+
+    fn guard_reduction_count(
+        &mut self,
+        count: LoweredExpr,
+        guard: Option<(&Expression, Guard)>,
+        writes: &Env,
+    ) -> Result<LoweredExpr, ImportError> {
+        let Some((condition, kind)) = guard else {
+            return Ok(count);
+        };
+        let condition = self.lower_expression(condition, writes)?;
+        let condition = self.boolean(condition)?;
+        let (yes, no) = match kind {
+            Guard::Enable => (count, self.constant(count.width, 0)),
+            Guard::Break => {
+                // Test the original bound before narrowing to the accumulator:
+                // count=256 still executes once when an 8-bit result is used.
+                let nonempty = self.boolean(count)?;
+                (self.resize(nonempty, count.width, false)?, count)
+            }
+        };
+        Ok(LoweredExpr {
+            id: self.rtl.mux(condition.id, yes.id, no.id)?,
+            ..count
+        })
+    }
 }
 
-type Reduction<'a> = (
-    &'a Expression,
-    &'a AssignStatement,
-    &'a Expression,
-    &'a Expression,
-);
+#[derive(Clone, Copy)]
+enum Guard {
+    Enable,
+    Break,
+}
+
+struct Reduction<'a> {
+    bound: &'a Expression,
+    assign: &'a AssignStatement,
+    accumulator: &'a Expression,
+    increment: &'a Expression,
+    guard: Option<(&'a Expression, Guard)>,
+}
 
 fn reduction(statement: &ForStatement) -> Option<Reduction<'_>> {
     let ForRange::Forward {
@@ -68,9 +110,7 @@ fn reduction(statement: &ForStatement) -> Option<Reduction<'_>> {
         return None;
     };
     let bound_id = whole_variable(bound)?;
-    let [Statement::Assign(assign)] = statement.body.as_slice() else {
-        return None;
-    };
+    let (assign, guard) = reduction_body(&statement.body)?;
     let [destination] = assign.dst.as_slice() else {
         return None;
     };
@@ -81,6 +121,12 @@ fn reduction(statement: &ForStatement) -> Option<Reduction<'_>> {
         || destination.id == statement.var_id
     {
         return None;
+    }
+    if let Some((condition, _)) = guard {
+        let condition_id = whole_variable(condition)?;
+        if condition_id == destination.id || condition_id == statement.var_id {
+            return None;
+        }
     }
     let Expression::Binary(lhs, Op::Add, rhs, _) = &assign.expr else {
         return None;
@@ -96,7 +142,32 @@ fn reduction(statement: &ForStatement) -> Option<Reduction<'_>> {
     {
         return None;
     }
-    Some((bound, assign, accumulator, increment))
+    Some(Reduction {
+        bound,
+        assign,
+        accumulator,
+        increment,
+        guard,
+    })
+}
+
+fn reduction_body(body: &[Statement]) -> Option<(&AssignStatement, Option<(&Expression, Guard)>)> {
+    match body {
+        [Statement::Assign(assign)] => Some((assign, None)),
+        [Statement::If(branch)] if branch.false_side.is_empty() => {
+            let [Statement::Assign(assign)] = branch.true_side.as_slice() else {
+                return None;
+            };
+            Some((assign, Some((&branch.cond, Guard::Enable))))
+        }
+        [Statement::Assign(assign), Statement::If(branch)]
+            if branch.false_side.is_empty()
+                && matches!(branch.true_side.as_slice(), [Statement::Break]) =>
+        {
+            Some((assign, Some((&branch.cond, Guard::Break))))
+        }
+        _ => None,
+    }
 }
 
 fn whole_variable(expression: &Expression) -> Option<VarId> {
