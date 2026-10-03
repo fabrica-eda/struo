@@ -15,14 +15,11 @@ cases = [
 reason = "Exceeds the 60-second per-case budget on the CI runner."
 cases = [
   "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
   "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
   "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
   "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
-  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
   "signed_divrem::signed_divrem_i128",
-  "signed_divrem::signed_divrem_i64",
   "wide_operators::test_wide_comb_div",
   "wide_operators::test_wide_comb_rem",
 ]
@@ -322,6 +319,22 @@ cases = [
 [[ignore]]
 reason = "Bounded arithmetic forward/reverse loops lower successfully but exceed the 60-second case budget during mapping and native simulator construction."
 cases = [
-  "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
   "veryl_context_regressions::runtime_for_bound_keeps_its_type",
+]
+
+# Execute verified slow cases in CI with bounded native compilation time.
+[[timeout]]
+seconds = 600
+reason = "Bounded arithmetic expansion is correct but native simulator compilation exceeds the default budget."
+cases = [
+  "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
+]
+
+[[timeout]]
+seconds = 300
+reason = "Verified mapped circuits require longer native simulator construction, especially on CI runners."
+cases = [
+  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
+  "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
+  "signed_divrem::signed_divrem_i64",
 ]

@@ -30,6 +30,28 @@ def load_ignores(catalogue):
     return ignored
 
 
+def load_timeouts(catalogue, skipped):
+    policies = {}
+    for policy in tomllib.loads(IGNORE_FILE.read_text()).get('timeout', []):
+        reason = policy['reason'].strip()
+        seconds = policy['seconds']
+        if not reason or type(seconds) is not int or seconds <= 0:
+            raise ValueError('timeout requires a reason and positive integer seconds')
+        for name in policy['cases']:
+            if name not in catalogue:
+                raise ValueError(f'timeout entry is not in the pinned corpus: {name}')
+            if name in policies or name in skipped:
+                raise ValueError(f'duplicate or skipped timeout entry: {name}')
+            policies[name] = (seconds, reason)
+    return policies
+
+
+def case_timeout(name, policies, override):
+    if override is not None:
+        return override, 'Command-line override'
+    return policies.get(name, (60, 'Default per-case budget'))
+
+
 def load_tag_exclusions(catalogue):
     policies = {}
     known = {tag for case in catalogue.values() for tag in case['tags']}
@@ -54,9 +76,11 @@ def main():
     parser.add_argument('--filter', default='')
     parser.add_argument('--include-ignored', action='store_true', help='execute ignored cases and tag-excluded expectations too')
     parser.add_argument('--jobs', type=int, default=4)
-    parser.add_argument('--timeout', type=int, default=60)
+    parser.add_argument('--timeout', type=int, help='override every case budget; otherwise use per-case policies or 60 seconds')
     parser.add_argument('--report', type=Path, default=Path('target/veryl-suite.json'))
     args = parser.parse_args()
+    if args.timeout is not None and args.timeout <= 0:
+        parser.error('--timeout must be positive')
     build = subprocess.run(['cargo', 'test', '--locked', '-p', 'struo-frontend-veryl',
                             '--test', 'veryl_suite', '--no-run', '--message-format=json'],
                            stdout=subprocess.PIPE, text=True)
@@ -82,6 +106,7 @@ def main():
         overlap = ignored.keys() & excluded.keys()
         if overlap:
             raise ValueError(f'tag-excluded cases must not also be ignored: {sorted(overlap)}')
+        timeouts = load_timeouts(catalogue, ignored.keys() | excluded.keys())
         names = [name for name in catalogue if args.filter in name]
         if not names:
             parser.error('no matching cases')
@@ -95,6 +120,7 @@ def main():
                 result = {**catalogue[name], 'status': 'ignored', 'reason': ignored[name]}
                 print(f"{'ignored':24} {name}: {ignored[name]}", flush=True)
                 return result
+            seconds, reason = case_timeout(name, timeouts, args.timeout)
             env = dict(os.environ, STRUO_VERYL_CASE=name)
             env.pop('STRUO_VERYL_REFERENCE', None)
             if args.timing:
@@ -104,7 +130,7 @@ def main():
             try:
                 proc = subprocess.run([binary, '--ignored', '--exact', 'corpus_case', '--nocapture'],
                                       env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                      text=True, timeout=args.timeout)
+                                      text=True, timeout=seconds)
                 output = proc.stdout
                 result = next((json.loads(line.removeprefix('STRUO_RESULT '))
                                for line in proc.stdout.splitlines() if line.startswith('STRUO_RESULT ')),
@@ -123,9 +149,10 @@ def main():
                 timings = {}
                 for line in output.splitlines():
                     if line.startswith('STRUO_TIMING '):
-                        _, stage, seconds = line.split()
-                        timings[stage] = timings.get(stage, 0.0) + float(seconds)
+                        _, stage, elapsed = line.split()
+                        timings[stage] = timings.get(stage, 0.0) + float(elapsed)
                 result['timings_seconds'] = timings
+            result.update(timeout_seconds=seconds, timeout_reason=reason)
             result.update(catalogue[name])
             print(f"{result['status']:24} {name}", flush=True)
             return result
@@ -137,7 +164,8 @@ def main():
             counts[result['status']] = counts.get(result['status'], 0) + 1
         report = {'celox_version': '0.9.0', 'suite_version': '0.9.0', 'veryl_version': '0.21.0' if args.reference else '0.22.0',
                   'pipeline': 'Veryl -> Celox native' if args.reference else 'Veryl -> Struo RTL -> synthesis -> ECP5 -> Celox native',
-                  'timeout_seconds': args.timeout, 'include_ignored': args.include_ignored or args.reference,
+                  'timeout_seconds': args.timeout if args.timeout is not None else 60,
+                  'timeout_override_seconds': args.timeout, 'include_ignored': args.include_ignored or args.reference,
                   'counts': counts, 'cases': results}
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + '\n')

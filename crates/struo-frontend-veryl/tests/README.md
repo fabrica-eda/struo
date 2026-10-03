@@ -13,7 +13,11 @@ unsupported/failing cases are skipped using exact names and reasons in
 `ignored`, never as passes. New failures outside that list fail the job;
 there is no `continue-on-error`.
 
-Each executed case runs in a separate process with a 60-second limit. Ignore
+Each executed case runs in a separate process with a default 60-second limit.
+Verified slow cases have exact `[[timeout]]` entries with a reason and a bounded
+`seconds` budget in `veryl-suite-ignores.toml`; they execute in CI and must pass.
+`--timeout N` overrides all case budgets, including these exceptions. Executed
+cases record their effective `timeout_seconds` and `timeout_reason` in the report. Ignore
 entries must exist in the pinned catalogue and cannot be duplicated. Use
 `--include-ignored` to execute excluded cases and expose their actual outcomes.
 
