@@ -324,3 +324,12 @@ unbounded expansion without changing accepted loop plans. Tests cover zero,
 `u32::MAX`, modular overflow, mixed signedness, and rejected dependent bodies.
 FFs, inclusive ranges, wider or signed bounds, and other bodies retain the
 existing proof requirements.
+
+
+The reduction recognizer also accepts one invariant whole-variable condition:
+`if gate { acc += C; }` performs either `count` or zero updates, while
+`acc += C; if gate { break; }` performs either `count` updates or one update for
+a nonempty range. The condition cannot read the accumulator or induction
+variable, and cannot contain calls or other effects. The nonempty test uses the
+full bound before truncating the effective count to the accumulator width.
+Other statements and else branches retain the existing loop proof requirements.
