@@ -333,3 +333,20 @@ a nonempty range. The condition cannot read the accumulator or induction
 variable, and cannot contain calls or other effects. The nonempty test uses the
 full bound before truncating the effective count to the accumulator width.
 Other statements and else branches retain the existing loop proof requirements.
+
+
+`src/lower/idempotent_loops.rs` handles a separate class of finite zero-based
+unit-step loops with an unsigned exclusive bound: straight-line scalar writes
+whose final written bits do not depend on any pre-iteration bit the body writes.
+A bit-level dependency analysis follows blocking assignment order. Unwritten
+bits remain invariant, so this sufficient proof establishes `F(F(x)) = F(x)`:
+emit one body execution when the full count is nonzero, otherwise preserve the
+pre-loop environment. This supports partial copies and dynamic reads following
+an earlier clear, while preserving assignment order and untouched bits.
+
+Destinations use literal-derived, in-range packed selects and at most 4096 bits
+per variable. Dynamic reads conservatively depend on every candidate bit and
+on their selector expressions. Calls, array destinations, control statements,
+induction-variable reads, and writes to the bound cannot supply this proof.
+It is conservative: an unproven body is not assumed to be non-idempotent.
+FF behavior and existing successful expansion plans are unchanged.

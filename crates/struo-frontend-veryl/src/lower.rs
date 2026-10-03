@@ -4,6 +4,7 @@ mod bitwise_loops;
 mod comparisons;
 mod constant_driven_loops;
 mod constant_values;
+mod idempotent_loops;
 mod loops;
 mod members;
 mod reductions;
@@ -1706,7 +1707,7 @@ impl<'a> ModuleLowerer<'a> {
                 if let Some(plan) = self.plan_known_loop(statement, reads, writes, sequential)? {
                     plan
                 } else if !sequential
-                    && let Some(changed) = self.lower_additive_reduction(statement, writes)?
+                    && let Some(changed) = self.lower_reduction(statement, writes)?
                 {
                     return Ok(changed);
                 } else {

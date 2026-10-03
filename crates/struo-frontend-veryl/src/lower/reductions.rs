@@ -7,6 +7,18 @@ use super::{
 };
 
 impl ModuleLowerer<'_> {
+    pub(super) fn lower_reduction(
+        &mut self,
+        statement: &ForStatement,
+        writes: &mut Env,
+    ) -> Result<Option<DrivenBits>, ImportError> {
+        if let Some(changed) = self.lower_additive_reduction(statement, writes)? {
+            Ok(Some(changed))
+        } else {
+            self.lower_idempotent_loop(statement, writes)
+        }
+    }
+
     pub(super) fn lower_additive_reduction(
         &mut self,
         statement: &ForStatement,
