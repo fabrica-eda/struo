@@ -308,3 +308,19 @@ For example, a 32-bit input trip count may require billions of expanded bodies;
 a small sampled count in a simulator test does not justify truncating it. New
 proofs or algebraic transformations can extend support independently of the
 lowering path. The always_ff function-effect restrictions remain unchanged.
+
+
+When existing loop planners cannot produce a finite expansion,
+`src/lower/reductions.rs` recognizes scalar modular additive reductions in
+combinational processes: an exclusive `0..count` range with unit step, an unsigned
+whole-variable count no wider than the induction variable, and a single
+whole-variable accumulator assignment adding a literal constant. The count and
+counter cannot be the destination. IEEE 1800-2023 12.7.1 and 11.8.1 imply exactly
+`count` iterations before termination, including counts above the signed counter
+boundary under the unsigned comparison. The result is computed as
+`initial + count * increment` modulo the accumulator width, preserving the
+original addition's signedness when extending its increment. This avoids an
+unbounded expansion without changing accepted loop plans. Tests cover zero,
+`u32::MAX`, modular overflow, mixed signedness, and rejected dependent bodies.
+FFs, inclusive ranges, wider or signed bounds, and other bodies retain the
+existing proof requirements.

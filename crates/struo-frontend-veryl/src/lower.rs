@@ -6,6 +6,7 @@ mod constant_driven_loops;
 mod constant_values;
 mod loops;
 mod members;
+mod reductions;
 mod single_iteration;
 mod system_tasks;
 mod types;
@@ -22,8 +23,9 @@ use struo_rtl::{
 };
 use veryl_analyzer::ir::{
     ArrayLiteralItem, AssignDestination, CasePattern, CaseStatement, Component, Comptime,
-    Declaration, Expression, Factor, FfDeclaration, IfResetStatement, InstDeclaration, Ir, Module,
-    Op, Statement, Type, TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect, VarSelectOp,
+    Declaration, Expression, Factor, FfDeclaration, ForRange, IfResetStatement, InstDeclaration,
+    Ir, Module, Op, Statement, Type, TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarSelect,
+    VarSelectOp,
 };
 use veryl_analyzer::{attribute::Attribute as VerylAttribute, attribute_table};
 use veryl_parser::resource_table::StrId;
@@ -1700,14 +1702,19 @@ impl<'a> ModuleLowerer<'a> {
             Err(_) if loops::always_breaks(&statement.body, self.source) => {
                 return self.lower_single_iteration(statement, reads, writes, sequential);
             }
-            Err(error) => self
-                .plan_known_loop(statement, reads, writes, sequential)?
-                .ok_or(error)?,
+            Err(error) => {
+                if let Some(plan) = self.plan_known_loop(statement, reads, writes, sequential)? {
+                    plan
+                } else if !sequential
+                    && let Some(changed) = self.lower_additive_reduction(statement, writes)?
+                {
+                    return Ok(changed);
+                } else {
+                    return Err(error);
+                }
+            }
         };
-        let reverse = matches!(
-            statement.range,
-            veryl_analyzer::ir::ForRange::Reverse { .. }
-        );
+        let reverse = matches!(statement.range, ForRange::Reverse { .. });
         let mut changed = DrivenBits::default();
         let mut cursor =
             self.lower_loop_start(&plan, statement, reads, writes, sequential, &mut changed)?;
@@ -1838,7 +1845,7 @@ impl<'a> ModuleLowerer<'a> {
         };
         let value = if matches!(
             statement.range,
-            veryl_analyzer::ir::ForRange::Reverse {
+            ForRange::Reverse {
                 inclusive: false,
                 ..
             }
