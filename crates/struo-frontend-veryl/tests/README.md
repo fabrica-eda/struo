@@ -129,28 +129,113 @@ static-loop break guards suppress subsequent writes. Non-local function writes
 are explicitly rejected until caller writeback is implemented. Array-valued
 expressions, nested argument effects and runtime loops still have limitations.
 
+`$display` and `$write` statements preserve function output/inout effects in
+argument expressions, including short-circuit and loop-break guards. Formatting
+and literal arguments produce no hardware or console output. This statement
+lowering lives in `src/lower/system_tasks.rs`; value-returning system functions
+keep their existing expression behavior and other unsupported tasks still fail.
+FF function-write restrictions are unchanged.
+
+Function output arguments in an instance input connection remain rejected:
+IEEE 1800-2023 13.4 prohibits those calls outside procedural statements. The
+suite's packed/unpacked mux-port mismatches also remain explicit ignores rather
+than being accepted through an implicit layout conversion (7.6 and 23.3.3.3).
+Missing drivers in a supplied library, such as the onehot W=1 base case, are not
+filled with invented constants. The manifest distinguishes these fixture issues
+from missing lowering support; absence of a suite tag does not prove valid SV.
+
 Dynamic addressing of an instance output is rejected as an invalid implicit
 continuous assignment, independently of analyzer warnings (IEEE 1800-2023
 Table 10-1). Procedural dynamic part-select assignments remain supported.
 
 Runtime-loop synthesis uses a separate planner in `src/lower/loops.rs`. Existing
-constant-range expansion is retained. Runtime bounds are accepted for a
+constant-range expansion of retained AIR loops is checked by
+`src/lower/loops/static_range.rs`: initialization and updates must fit the
+counter, and a negative reverse sentinel must not become a large unsigned
+comparison operand (IEEE 1800-2023 11.8.1). Guaranteed breaks need no final
+update. An exclusive zero upper bound with a larger reverse step is an empty
+signed range, even when the analyzer's host enumerator saturates it to zero.
+Runtime bounds are accepted for a
 non-negative constant start that fits the induction variable and a positive
 additive step, when either the bound's type or a guaranteed break proves that
-at most 64 candidate iterations are needed. This budget includes the iteration
+at most 256 candidate iterations are needed. This budget includes the iteration
 that executes a break; it is a compile-time resource policy, never a silent
 runtime truncation. An input-dependent break alone is not a termination proof,
 and a nested loop's break does not terminate its parent.
+The proof also accepts a `case` whose default and every arm terminate this loop.
+Case-target effects and guarded branch writes are still evaluated by ordinary
+lowering. A missing/non-terminating default or any non-terminating arm does not
+prove a bound, even if test inputs happen to select a terminating arm.
+
+A runtime start is also accepted when its unsigned leaf type fits the counter
+without truncation and the end range fits within 256 non-negative counter values.
+The initializer is evaluated exactly once, including output-argument writes and
+empty ranges. Lowering tracks the counter value reached by each positive additive
+step, suppressing both writes and breaks from skipped candidates. Unit-stride
+loops compare each candidate with the captured start directly, avoiding a chain
+of counter increments and muxes. Signed starts
+without a non-negative proof and possible counter overflow remain unsupported.
 
 Each candidate iteration retains the actual bound comparison and break guard.
 The bound is reevaluated against the current combinational environment (or the
 pre-edge FF reads), matching for-loop condition evaluation in IEEE 1800-2023
 12.7.1 and Veryl's emitted SV. No clock cycles are introduced. Tests cover the
-64-iteration boundary, signed bounds, stepped loops, changing bounds, FF writes,
-and proof rejection. Bound output effects remain unsupported and are rejected
-even for an empty range.
+256-iteration boundary, signed bounds, stepped loops, changing bounds, FF writes,
+and proof rejection. Runtime-start tests also cover 4,096 start/end/break
+combinations, initialization effects, empty ranges, and unsigned packed selects.
+Output effects in the end condition remain unsupported and are rejected even
+for an empty range.
 
-The ignore manifest distinguishes runtime starts, reverse/non-additive loops,
+When range expansion cannot prove a bound, `src/lower/single_iteration.rs` also
+accepts a body that exits through `break` on every path. It evaluates the actual
+initializer, assigns it into the counter's declared width, and then compares it
+with the condition bound. This supports wide or signed initializers and reverse
+ranges, including wrapped exclusive reverse initializers, without executing any
+step. A scoped runtime binding supplies the counter to expressions and nested
+loops; constant and parameter reads elsewhere keep their usual treatment.
+Initializer effects happen once even when the first condition is false. Body
+writes are guarded by that condition, and existing FF function-write restrictions
+remain in force. Tests cover 162 signed-bound/gate combinations and 48 FF cases
+with mixed signed/unsigned comparison contexts, dynamic packed selects, and
+constant-array reads. Veryl saturates constant range values at host integer
+limits; a constant initializer at that boundary is rejected because AIR cannot
+distinguish the exact boundary from a larger original value with different low
+bits. Runtime expressions retain their full initializer bits.
+
+`src/lower/bitwise_loops.rs` also proves OR/XOR counter traces when the initializer
+lowers to an effect-free constant in the current procedural environment. Each
+update is masked to the counter width, preserving signed interpretation when
+substituting the next value. A guaranteed break must be reached before a repeated
+counter value or the expansion budget; every actual bound comparison remains in
+the circuit. Initializer writes and unknown initializers are rejected by this
+proof. FF-local blocking initialization is visible, while a scheduled module FF
+write cannot supply the current initializer.
+
+The remaining reverse/bitwise corpus ignores have concrete non-terminating input
+values. They are not excluded merely because their loops are dynamic:
+
+| Fixture family | Counterexample to termination |
+| --- | --- |
+| OR/XOR loops starting at 3 with endpoint-dependent breaks | Endpoint 8 makes OR stall at 7 and XOR cycle between 3 and 5. |
+| Bitwise step operands with bits above the i32 counter | Start 0 and endpoints 8 make OR stall at 6 and XOR cycle between 0 and 6, missing breaks at 7/5. |
+| FF signed XOR with external initial value | Start 0 and a large positive endpoint cycle between 0 and i32 minimum, never reaching the break at 2147483640. |
+| Multiplicative stalled step | Start 0, count 4, and `sel = 0` repeat 0 without breaking. |
+| Unsigned reverse singleton fixtures | Start/count 0 let the counter wrap under an unsigned comparison with zero. |
+| Signed wide reverse fixtures without guaranteed breaks | An i64-minimum lower bound is below every i32 counter value, including values after wrap. |
+
+Finite test vectors do not constrain these full input domains for synthesis.
+
+Veryl 0.22 has an upstream static-unrolling limitation before this validation:
+when no `break` retains the loop in AIR, it already expands
+`for i in rev 8'd0..4 { q += 1; }` into four assignments. Its emitted SV instead
+uses `for (int i = 4 - 1; i >= 8'd0; i--)`, whose unsigned comparison does not
+terminate at -1. Likewise, a wide initializer can be truncated by the emitted
+`int` counter while host enumeration uses the original wide value. The original
+range is absent from this AIR, so the lowering check cannot repair these upstream
+expansions. Constant optimization remains enabled; this is an unresolved analyzer
+conformance issue, not a supported finite-loop interpretation.
+
+The ignore manifest distinguishes unproven runtime starts, reverse/non-additive loops,
 and loops without a proof inside the expansion budget. These are current Struo
 synthesis limits, not claims that every such loop is inherently unsynthesizable.
 For example, a 32-bit input trip count may require billions of expanded bodies;

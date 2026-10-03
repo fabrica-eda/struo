@@ -14,8 +14,11 @@ cases = [
 [[ignore]]
 reason = "Exceeds the 60-second per-case budget on the CI runner."
 cases = [
+  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
+  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
   "nba_dynamic_array::test_line_write_loop_updates_large_sparse_ff_array",
   "nba_dynamic_array::test_packed_rat_checkpoint_round_trip",
+  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
   "nba_dynamic_array::test_wide_dynamic_ff_checkpoint_round_trip",
   "recovered_unrolled_fold::recovered_unrolled_store_forward_selects_older_entry",
   "signed_divrem::signed_divrem_i128",
@@ -25,26 +28,21 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Synthesis currently reports a combinational loop or an undriven signal."
+reason = "The upstream veryl-std 0.21 onehot leaves o_gt_one undriven in its W=1 base case; filling it with zero would change the supplied RTL."
 cases = [
-  "duplicate_varpath::test_duplicate_scoped_var_with_generate_for",
   "std_onehot::test_onehot_8bit_exhaustive",
 ]
 
 [[ignore]]
-reason = "The frontend does not yet lower this construct; retain the upstream expectation."
+reason = "The fixture calls a function with output arguments in a module input connection, outside a procedural statement; IEEE 1800-2023 13.4 prohibits this."
 cases = [
-  "basic::test_comb_function_call_with_output_argument_in_display_argument",
-  "duplicate_varpath::test_duplicate_scoped_var_in_always_comb",
-  "expression_semantics::short_circuit_operators_skip_effectful_operands",
-  "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
-  "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
-  "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
   "hierarchy::test_instance_input_function_output_concat_dynamic_writeback",
   "hierarchy::test_instance_input_function_output_writeback",
-  "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
-  "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
-  "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
+]
+
+[[ignore]]
+reason = "The fixture connects an unpacked array to a packed port without an explicit cast (IEEE 1800-2023 7.6 and 23.3.3.3); implicit layout reinterpretation is not supported."
+cases = [
   "std_mux::test_demux_build_smoke",
   "std_mux::test_mux_build_smoke",
 ]
@@ -170,32 +168,13 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 folds $size of packed dimensions to total width instead of the first dimension."
-cases = [
-  "system_function::test_direct_ff_size_packed_multidimensional_system_function",
-  "system_function::test_direct_ff_size_packed_multidimensional_type_system_function",
-]
-
-[[ignore]]
-reason = "Veryl 0.21.0 folds a function actual before the formal width is applied."
-cases = [
-  "flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion",
-]
-
-[[ignore]]
-reason = "Veryl 0.21.0 folds signed size-cast division/remainder with incorrect signedness."
-cases = [
-  "expression_semantics::constant_and_runtime_casts_use_the_same_resize_rule",
-]
-
-[[ignore]]
 reason = "Requires previous-evaluation state from an always_comb read before write; the mapped combinational circuit settles to the current input."
 cases = [
   "basic::test_always_comb_read_before_write_uses_previous_value",
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 forbids function output/non-local writes from always_ff; these corpus cases require non-default FF function effects."
+reason = "Veryl 0.22.0 forbids function output/non-local writes from always_ff; these corpus cases require non-default FF function effects."
 cases = [
   "flip_flop::test_ff_bits_and_size_array_dependencies_do_not_alias_later_write",
   "flip_flop::test_ff_bits_and_size_operands_do_not_alias_earlier_array_argument",
@@ -236,14 +215,14 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 rejects constant signed loop bounds (InvalidForRange)."
+reason = "Veryl 0.22.0 rejects constant signed loop bounds (InvalidForRange)."
 cases = [
   "flip_flop::test_ff_constant_signed_bounds_in_unrolled_loops",
   "synth_dynamic_loop::test_constant_signed_bounds_in_unrolled_synth_loops",
 ]
 
 [[ignore]]
-reason = "Veryl 0.21.0 requires a compile-time operand for this system-function use (UnevaluableValue)."
+reason = "Veryl 0.22.0 requires a compile-time operand for this system-function use (UnevaluableValue)."
 cases = [
   "system_function::test_direct_comb_clog2_system_function",
   "system_function::test_direct_comb_onehot_system_function",
@@ -252,13 +231,9 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Struo runtime-loop synthesis currently requires a constant non-negative start; a proof for runtime initial values is not implemented."
+reason = "The runtime start is not proven non-negative without truncation, or the counter can overflow before termination."
 cases = [
-  "basic::test_comb_loop_bound_output_call_writes_back_once",
-  "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",
-  "flip_flop::test_ff_runtime_for_forward_overshoot_exits_without_wraparound",
   "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
-  "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
   "synth_dynamic_loop::test_constant_bounds_preserve_wide_limit_above_loop_width",
   "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
   "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
@@ -266,13 +241,10 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Struo cannot prove termination within its 64-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
+reason = "Struo cannot prove termination within its 256-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
 cases = [
-  "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
-  "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
   "flip_flop::test_ff_runtime_for_bounds",
   "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
-  "synth_dynamic_loop::test_runtime_bounds_inclusive_max_bound_runs_full_range",
   "synth_dynamic_loop::test_runtime_bounds_preserve_loop_carried_state_for_indexed_reads",
   "synth_dynamic_loop::test_runtime_bounds_preserve_pre_loop_bits_for_partial_updates",
   "synth_dynamic_loop::test_runtime_bounds_preserve_untouched_high_bits_for_dynamic_index_reads",
@@ -285,13 +257,12 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Struo has no bounded expansion proof for reverse or non-additive runtime loops; this is a synthesis support limit, not a universal language prohibition."
+reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
 cases = [
   "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
   "flip_flop::test_ff_runtime_for_bitwise_steps",
   "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
   "flip_flop::test_ff_runtime_reverse_exclusive_i32_upper_sentinel",
-  "flip_flop::test_ff_runtime_reverse_min_i32_end_wraps_before_range_check",
   "flip_flop::test_ff_runtime_reverse_step_matches_emitted_sv_order",
   "flip_flop::test_ff_signed_xor_step_uses_loop_counter_width",
   "synth_dynamic_loop::test_i32_bitwise_steps_discard_bits_above_the_counter_width",
@@ -299,7 +270,6 @@ cases = [
   "synth_dynamic_loop::test_runtime_bounds_reverse_singleton_exits_cleanly",
   "synth_dynamic_loop::test_runtime_bounds_stalled_step_with_break_exits_cleanly",
   "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
-  "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
 ]
 
 
@@ -332,39 +302,29 @@ cases = [
 ]
 
 [[ignore]]
-reason = "New 0.9.0 regression exposes incorrect width/signedness or constant-context behavior; retain the upstream expectation pending diagnosis."
-cases = [
-  "veryl_context_regressions::constant_ternary_keeps_both_arm_types",
-  "veryl_context_regressions::signed_cast_of_folded_constant_sign_extends",
-  "veryl_context_regressions::constant_case_on_signed_target",
-  "veryl_regressions::wide_struct_bit_field_rhs_no_spill",
-]
-
-[[ignore]]
-reason = "Runtime loop bounds fall outside the current non-negative constant-start and proven 64-iteration synthesis policy."
+reason = "Runtime loop bounds fall outside the proven non-negative range and 256-iteration synthesis policy."
 cases = [
   "veryl_context_regressions::runtime_for_with_negative_bound",
   "veryl_context_regressions::runtime_for_bound_keeps_its_type",
   "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
 ]
 
+
+
 [[ignore]]
-reason = "Dynamic reads of constant unpacked arrays are not lowered."
+reason = "Veryl 0.22.0 rejects scalar x[0] (InvalidSelect::Scalar); the suite expects acceptance of a scalar bit-select."
 cases = [
-  "veryl_context_regressions::folded_const_select_keeps_its_sign",
-  "veryl_regressions::nested_array_index_const_array",
+  "flip_flop::test_ff_function_call_bit_select_on_nonvariable_one_bit_formal",
 ]
 
 [[ignore]]
-reason = "Wildcard equality used by inside/case expressions is not lowered."
+reason = "Veryl 0.22.0 rejects tri on a function formal (NetInFunction); legal inout variable formals are covered separately."
 cases = [
-  "veryl_context_regressions::case_compares_each_label_as_an_if_does",
-  "veryl_context_regressions::runtime_case_target_uses_comparison_context",
-  "veryl_language::inside_outside_range_endpoints",
+  "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
 ]
 
 [[ignore]]
-reason = "An omitted child input with a default value remains undriven."
+reason = "Veryl 0.22.0 reports CombinationalLoop for cand: the runtime-bounded write leaves array entries unassigned."
 cases = [
-  "veryl_regressions::inst_port_default_value_connected_not_folded",
+  "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
 ]

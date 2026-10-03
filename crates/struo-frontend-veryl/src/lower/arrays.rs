@@ -50,3 +50,71 @@ pub(super) fn literal_repetitions(
     }
     Ok(repetitions)
 }
+
+impl super::ModuleLowerer<'_> {
+    pub(super) fn is_constant_variable(&self, id: super::VarId) -> bool {
+        !self.runtime_loop_variables.contains(&id)
+            && self.source.variables.get(&id).is_some_and(|variable| {
+                matches!(variable.kind, super::VarKind::Const | super::VarKind::Param)
+            })
+    }
+
+    pub(super) fn lower_constant_variable_read(
+        &mut self,
+        id: super::VarId,
+        index: &super::VarIndex,
+        env: &mut super::Env,
+        effects: &mut super::DrivenBits,
+    ) -> Result<super::LoweredExpr, ImportError> {
+        if !super::has_dynamic_array_index(index) {
+            let key = self.key_from_index(id, index)?;
+            return self.lower_constant_array_element(&key);
+        }
+        let keys = super::array_indices(self.variable_type(id)?, "constant array")?
+            .into_iter()
+            .map(|index| super::SignalKey { id, index })
+            .collect();
+        let candidates = self.lower_array_candidates_effects(id, index, keys, env, effects)?;
+        let mut entries = Vec::with_capacity(candidates.len());
+        for (key, condition) in candidates {
+            entries.push((condition, self.lower_constant_array_element(&key)?));
+        }
+        // Reuse the balanced selector; the unmatched result follows the
+        // mapped two-state backend's existing unpacked-array read policy.
+        let (matched, value) = self.lower_array_read_tree(&entries)?;
+        let zero = self.constant(value.width, 0);
+        Ok(super::LoweredExpr {
+            id: self.rtl.mux(matched.id, value.id, zero.id)?,
+            ..value
+        })
+    }
+
+    fn lower_constant_array_element(
+        &mut self,
+        key: &super::SignalKey,
+    ) -> Result<super::LoweredExpr, ImportError> {
+        let variable = &self.source.variables[&key.id];
+        let value = variable.get_value(&key.index).ok_or_else(|| {
+            ImportError::UnsupportedBehavior(format!(
+                "constant array element {} has no numeric value",
+                self.signal_name(key)
+            ))
+        })?;
+        if value.is_xz() {
+            return Err(ImportError::UnsupportedBehavior(
+                "unknown or four-state constant array element".into(),
+            ));
+        }
+        let width = super::concrete_width(&variable.r#type, "constant array element")?;
+        let signed = variable.r#type.signed;
+        let value = value.expand(width as usize, signed);
+        Ok(super::LoweredExpr {
+            id: self.rtl.constant(super::Constant::new(
+                super::BitWidth::new(width)?,
+                value.payload().to_u64_digits(),
+            )),
+            width,
+            signed,
+        })
+    }
+}

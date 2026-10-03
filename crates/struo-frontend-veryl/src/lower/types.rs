@@ -36,7 +36,7 @@ pub(super) fn expression_signedness(expression: &Expression) -> bool {
                 use veryl_analyzer::ir::SystemFunctionKind;
                 match call.kind {
                     SystemFunctionKind::Bits(_)
-                    | SystemFunctionKind::Size(_)
+                    | SystemFunctionKind::Size(..)
                     | SystemFunctionKind::Clog2(_)
                     | SystemFunctionKind::Signed(_) => true,
                     SystemFunctionKind::Unsigned(_) | SystemFunctionKind::Onehot(_) => false,
@@ -105,12 +105,5 @@ pub(super) fn variable_signedness(select: &VarSelect, ct: &Comptime) -> bool {
     if select.is_empty() {
         return ct.r#type.signed;
     }
-    ct.part_select.as_ref().is_some_and(|path| {
-        path.path.0.last() == Some(&ct.token.end.text)
-            && path.part_select.last().is_some_and(|member| {
-                let mut ty = member.r#type.clone();
-                ty.flatten_struct_union_enum();
-                ty.signed
-            })
-    })
+    ct.member_signed.unwrap_or(false)
 }

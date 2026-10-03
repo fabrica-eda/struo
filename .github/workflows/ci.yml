@@ -48,8 +48,8 @@ jobs:
 
       - name: Install Veryl
         env:
-          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.21.0/veryl-x86_64-linux.zip
-          VERYL_SHA256: cdc71da21801418aceed129b5c8e5ab2ac30f3ff86827d031c79bd8a4af5e92f
+          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.22.0/veryl-x86_64-linux.zip
+          VERYL_SHA256: 5a955bd395a09e8a611d70d7e6850ed930fa268e83b6a89238ad2670f616016a
         run: |
           curl --fail --location --silent --show-error \
             "$VERYL_URL" --output "$RUNNER_TEMP/veryl.zip"
@@ -228,8 +228,8 @@ jobs:
 
       - name: Install Veryl
         env:
-          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.21.0/veryl-x86_64-linux.zip
-          VERYL_SHA256: cdc71da21801418aceed129b5c8e5ab2ac30f3ff86827d031c79bd8a4af5e92f
+          VERYL_URL: https://github.com/veryl-lang/veryl/releases/download/v0.22.0/veryl-x86_64-linux.zip
+          VERYL_SHA256: 5a955bd395a09e8a611d70d7e6850ed930fa268e83b6a89238ad2670f616016a
         run: |
           curl --fail --location --silent --show-error \
             "$VERYL_URL" --output "$RUNNER_TEMP/veryl.zip"
