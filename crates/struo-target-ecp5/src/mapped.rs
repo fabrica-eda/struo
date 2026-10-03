@@ -21,7 +21,11 @@ use crate::physical::{PhysicalFeedback, PhysicalLocation};
 
 mod lut;
 mod multiply;
+mod replicate;
 use multiply::map_multiply;
+pub use replicate::{
+    RegisterBranchReplication, RegisterBranchReplicationError, RegisterBranchReplicationReport,
+};
 
 use lut::{
     BRAM_CLOCK_TO_OUTPUT_PS, CCU_CARRY_PS, CCU_INPUT_PS, CCU_SUM_PS, CutDatabase,
@@ -373,6 +377,20 @@ pub struct RegisterEnableFanoutReport {
     pub rewired_registers: usize,
     /// Equivalent LUT branches inserted or replicated.
     pub inserted_branches: usize,
+}
+
+/// Advisory position of a mapped register for clock-enable branch grouping.
+/// These coordinates affect grouping only, not placement or timing evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RegisterEnablePlacement {
+    /// Horizontal physical coordinate.
+    pub x: u32,
+    /// Vertical physical coordinate.
+    pub y: u32,
+    /// Registers sharing a physical enable wire should remain together when
+    /// their group fits the requested fanout limit. Omit if it is unknown.
+    #[serde(default)]
+    pub shared_enable: Option<String>,
 }
 
 impl Default for MappingOptions {
@@ -1101,6 +1119,28 @@ impl Ecp5Netlist {
         &mut self,
         constraints: &[RegisterEnableFanoutConstraint],
     ) -> Result<RegisterEnableFanoutReport, RegisterEnableFanoutError> {
+        self.apply_register_enable_fanout_with_placement(constraints, &BTreeMap::new())
+    }
+
+    /// Applies CE limits while grouping nearby register sinks from a previous
+    /// placement. Registers must still share the same logical enable driver;
+    /// hints cannot combine different control functions. Unknown registers keep
+    /// their original relative order in separate fallback groups.
+    ///
+    /// Branch LUTs remain logically equivalent to the original enable. No
+    /// register boundary, priority, polarity or reset behavior changes. Hints
+    /// do not bind sites or qualify timing; fresh placement/routing is required.
+    /// An empty hint map preserves the original grouping exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as
+    /// [`Self::apply_register_enable_fanout_constraints`], without mutation.
+    pub fn apply_register_enable_fanout_with_placement(
+        &mut self,
+        constraints: &[RegisterEnableFanoutConstraint],
+        placement: &BTreeMap<String, RegisterEnablePlacement>,
+    ) -> Result<RegisterEnableFanoutReport, RegisterEnableFanoutError> {
         if constraints.is_empty() {
             return Ok(RegisterEnableFanoutReport::default());
         }
@@ -1108,7 +1148,7 @@ impl Ecp5Netlist {
             resolve_register_enable_fanout_constraints(self, constraints)?;
         let mut candidate = self.clone();
         let (rewired_registers, inserted_branches) =
-            insert_register_enable_fanout_branches(&mut candidate, branches)?;
+            insert_register_enable_fanout_branches(&mut candidate, branches, placement)?;
 
         candidate.equivalence_proof.equivalent_logic_replications += inserted_branches;
         candidate.retiming.equivalent_logic_replications += inserted_branches;
@@ -3975,6 +4015,11 @@ fn replicate_physically_critical_cells(
         .unwrap_or(1);
     let mut replicas = 0usize;
     let mut rewires = 0usize;
+    let mut names = netlist
+        .cells
+        .iter()
+        .map(|cell| mapped_cell_name(cell).to_owned())
+        .collect::<HashSet<_>>();
     for timing in feedback.net_timings() {
         if replicas >= MAX_PHYSICAL_REPLICAS {
             break;
@@ -4029,7 +4074,14 @@ fn replicate_physically_critical_cells(
         }
         match &mut replica {
             Ecp5Cell::Lut4 { name, output, .. } | Ecp5Cell::FlipFlop { name, output, .. } => {
-                *name = format!("physical_replicate_{}_{replicas}", timing.driver);
+                let mut serial = replicas;
+                *name = loop {
+                    let proposed = format!("physical_replicate_{}_{serial}", timing.driver);
+                    if names.insert(proposed.clone()) {
+                        break proposed;
+                    }
+                    serial += 1;
+                };
                 *output = clone_output;
             }
             _ => unreachable!("only LUT and flip-flop drivers are selected"),
@@ -6157,6 +6209,7 @@ fn resolve_register_enable_fanout_constraints(
 fn insert_register_enable_fanout_branches(
     candidate: &mut Ecp5Netlist,
     branches: EnableFanoutBranches,
+    placement: &BTreeMap<String, RegisterEnablePlacement>,
 ) -> Result<(usize, usize), RegisterEnableFanoutError> {
     let original_cells = candidate.cells.clone();
     let mut next_wire = maximum_mapped_wire(candidate)
@@ -6174,12 +6227,12 @@ fn insert_register_enable_fanout_branches(
             } if *output == wire => Some((name.clone(), *inputs, *init)),
             _ => None,
         });
-        for chunk in sinks.chunks(max_fanout) {
+        for chunk in group_enable_sinks(&original_cells, &sinks, max_fanout, placement) {
             let output = next_wire;
             next_wire = next_wire
                 .checked_add(1)
                 .ok_or(RegisterEnableFanoutError::MappedWireOverflow)?;
-            for &sink in chunk {
+            for &sink in &chunk {
                 let Ecp5Cell::FlipFlop {
                     enable: Some(enable),
                     ..
@@ -6213,6 +6266,71 @@ fn insert_register_enable_fanout_branches(
     }
     cleanup_lut4_dynamic_inputs(candidate);
     Ok((rewired, inserted))
+}
+
+fn group_enable_sinks(
+    cells: &[Ecp5Cell],
+    sinks: &[usize],
+    limit: usize,
+    placement: &BTreeMap<String, RegisterEnablePlacement>,
+) -> Vec<Vec<usize>> {
+    // The final index distinguishes registers without a known shared enable
+    // wire. Coordinates alone do not prove that two sites share a control pin.
+    let mut sites = BTreeMap::<(u32, u32, Option<&str>, usize), Vec<usize>>::new();
+    let mut unknown = Vec::new();
+    for &sink in sinks {
+        if let Some(hint) = placement.get(mapped_cell_name(&cells[sink])) {
+            let individual = if hint.shared_enable.is_some() {
+                0
+            } else {
+                sink
+            };
+            sites
+                .entry((hint.x, hint.y, hint.shared_enable.as_deref(), individual))
+                .or_default()
+                .push(sink);
+        } else {
+            unknown.push(sink);
+        }
+    }
+    if sites.is_empty() {
+        return sinks.chunks(limit).map(<[usize]>::to_vec).collect();
+    }
+    let mut units = sites
+        .into_iter()
+        .flat_map(|((x, y, _, _), members)| {
+            // A tighter user fanout limit takes precedence over old site sharing;
+            // the physical implementation must then legalize the new groups.
+            members
+                .chunks(limit)
+                .map(|chunk| (x, y, chunk.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    while !units.is_empty() {
+        let (x, y, mut group) = units.remove(0);
+        loop {
+            let next = units
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, members))| members.len() <= limit - group.len())
+                .min_by_key(|(index, (xx, yy, _))| {
+                    (
+                        u64::from(x.abs_diff(*xx)) + u64::from(y.abs_diff(*yy)),
+                        *index,
+                    )
+                })
+                .map(|(index, _)| index);
+            let Some(next) = next else {
+                break;
+            };
+            group.extend(units.remove(next).2);
+        }
+        result.push(group);
+    }
+    result.extend(unknown.chunks(limit).map(<[usize]>::to_vec));
+    result
 }
 
 fn mapped_cell_glob_matches(pattern: &str, name: &str) -> bool {
@@ -10404,10 +10522,10 @@ mod tests {
             })
             .collect();
         let feedback = PhysicalFeedback::from_observations(
-            placements,
-            bels,
+            placements.clone(),
+            bels.clone(),
             vec![PhysicalNetTiming {
-                driver,
+                driver: driver.clone(),
                 net: "critical".into(),
                 endpoints,
             }],
@@ -10424,6 +10542,38 @@ mod tests {
             Ecp5Cell::FlipFlop { name, .. } if name.starts_with("physical_replicate_")
         )));
         assert!(refined.retiming.equivalence_signed_off);
+
+        // A later physical result can make another branch of the same Q net
+        // critical. Per-pass numbering must not duplicate the first clone name.
+        let later = PhysicalFeedback::from_observations(
+            placements,
+            bels,
+            vec![PhysicalNetTiming {
+                driver,
+                net: "critical".into(),
+                endpoints: sinks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, cell)| PhysicalTimingEndpoint {
+                        cell: cell.clone(),
+                        port: "A".into(),
+                        delay_ps: if (4..8).contains(&index) {
+                            4_000
+                        } else {
+                            2_000
+                        },
+                        budget_ps: 3_000,
+                    })
+                    .collect(),
+            }],
+            Vec::new(),
+            BTreeMap::new(),
+        );
+        let second = refined.apply_physical_feedback(&later);
+        assert_eq!(second.cells.len(), refined.cells.len() + 1);
+        assert_eq!(second.retiming.equivalent_physical_rewires, 8);
+        second.validate_export_names().unwrap();
+        assert!(second.retiming.equivalence_signed_off);
     }
 
     #[test]
