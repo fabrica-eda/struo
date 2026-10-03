@@ -235,13 +235,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "The runtime start is not proven non-negative without truncation, or the counter can overflow before termination."
-cases = [
-  "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
-]
-
-[[ignore]]
 reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles, signed inclusive maximum endpoints, or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
 cases = [
   "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",

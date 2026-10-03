@@ -301,8 +301,7 @@ range is absent from this AIR, so the lowering check cannot repair these upstrea
 expansions. Constant optimization remains enabled; this is an unresolved analyzer
 conformance issue, not a supported finite-loop interpretation.
 
-The ignore manifest distinguishes unproven runtime starts from loops with
-nonterminating input values. The guarded-expansion budget limits that planner;
+The remaining loop-proof ignores admit nonterminating input values. The guarded-expansion budget limits that planner;
 other proofs and reductions can handle finite loops without expanding every body.
 For example, a 32-bit input trip count may require billions of expanded bodies;
 a small sampled count in a simulator test does not justify truncating it. New
@@ -421,3 +420,22 @@ handles negative starts without unrolling. Starts at or beyond the end produce
 zero updates. Unsigned end comparisons, endpoints beyond the signed counter
 range, inclusive bounds, non-unit steps, and initializer effects remain outside
 this proof. Saturated endpoint encodings are also excluded.
+
+
+`src/lower/linear_reductions.rs` handles independent scalar updates in forward
+loops with a captured runtime start, a signed constant exclusive end, and a
+positive additive step. It requires `end - 1 + step` to fit the signed counter,
+so even the exit step cannot wrap. Initializer conversion is preserved; negative
+starts are ordered by flipping the sign bit, as in periodic reductions.
+
+For a nonempty range, the trip count is `(distance - 1) / step + 1`; the final
+active counter is `start + (count - 1) * step`. Constant additive accumulations
+use that count in the destination's modular width. Whole-scalar assignments of
+the counter, its casts, or a literal use the final value. Empty ranges preserve
+all initial destinations, including last-value outputs. A body may update its
+initializer source because the initialized counter is captured before updates.
+Destinations must be distinct and independent; effects, control flow, dependent
+updates, unsigned end comparisons, and possibly wrapping exit steps are excluded.
+The analysis handles up to 32 assignments and counters up to 64 bits without
+expanding the runtime iteration count. Existing successful lowering paths retain
+priority.

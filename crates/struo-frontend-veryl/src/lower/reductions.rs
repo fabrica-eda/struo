@@ -20,8 +20,10 @@ impl ModuleLowerer<'_> {
             Ok(Some(changed))
         } else if let Some(changed) = self.lower_sparse_index_loop(statement, writes)? {
             Ok(Some(changed))
+        } else if let Some(changed) = self.lower_periodic_reduction(statement, writes)? {
+            Ok(Some(changed))
         } else {
-            self.lower_periodic_reduction(statement, writes)
+            self.lower_linear_reduction(statement, writes)
         }
     }
 

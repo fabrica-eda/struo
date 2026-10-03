@@ -5,6 +5,7 @@ mod comparisons;
 mod constant_driven_loops;
 mod constant_values;
 mod idempotent_loops;
+mod linear_reductions;
 mod loops;
 mod members;
 mod periodic_reductions;

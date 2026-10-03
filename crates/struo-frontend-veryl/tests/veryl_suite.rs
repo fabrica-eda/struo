@@ -3393,7 +3393,6 @@ fn known_additive_loops_reject_mutable_bounds_and_signed_wraparound() {
             "seed..limit",
             "limit += 1; q += 1;",
         ),
-        ("seed = value;", "seed..2", "q += 1;"),
     ] {
         let source = format!(
             "module Top(value: input i32, q: output logic<32>) {{
@@ -4262,6 +4261,136 @@ fn signed_periodic_starts_reject_unproven_ranges_and_effects() {
         }}");
         assert!(
             analyze_and_lower(&source, "unproven_signed_periodic_range", "Top").is_err(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn linear_reductions_preserve_steps_last_values_and_captured_starts() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(start: input logic<64>, seed: input logic<8>,
+                   hits10: output logic<32>, last10: output logic<8>, narrow: output logic<8>,
+                   hits300: output signed logic<64>, last300: output signed logic<64>, captured: output logic<32>,
+                   full: output logic<64>) {
+            always_comb {
+                var local_start: i32;
+                local_start = start as i32;
+                hits10 = seed; last10 = 8'hee; narrow = seed;
+                for i in start..255 step += 10 { hits10 += 3; last10 = i; narrow += 5; }
+                hits300 = seed; last300 = -99; captured = start as 32;
+                for i in captured..255 step += 300 { captured += 1; hits300 += 8'shff; last300 = i; }
+                full = 0;
+                for i in local_start..2147483647 { full += 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let start_signal = sim.signal("start");
+    let seed_signal = sim.signal("seed");
+    for start in [
+        0u64,
+        1,
+        9,
+        10,
+        127,
+        245,
+        249,
+        250,
+        254,
+        255,
+        256,
+        0x7fff_ffff,
+        0x8000_0000,
+        0x8000_0001,
+        0xffff_ff00,
+        0xffff_ffd2,
+        0xffff_ffd3,
+        0xffff_fffe,
+        0xffff_ffff,
+        0x1_0000_00fa,
+        u64::MAX,
+    ] {
+        let bytes = start.to_le_bytes();
+        let initial_bits = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let initial = i64::from(i32::from_le_bytes(initial_bits.to_le_bytes()));
+        let trip_count = |step| {
+            if initial >= 255 {
+                0
+            } else {
+                (254 - initial) / step + 1
+            }
+        };
+        let n10 = trip_count(10);
+        let n300 = trip_count(300);
+        let last10 = if n10 == 0 {
+            238
+        } else {
+            initial + (n10 - 1) * 10
+        };
+        let last300 = if n300 == 0 {
+            -99
+        } else {
+            initial + (n300 - 1) * 300
+        };
+        let n10 = u64::try_from(n10).unwrap();
+        let n300 = u64::try_from(n300).unwrap();
+        for seed in [0u8, 17, 255] {
+            sim.modify(|io| {
+                io.set(start_signal, start);
+                io.set(seed_signal, seed);
+            })
+            .unwrap();
+            for (name, expected) in [
+                (
+                    "full",
+                    u64::try_from(i64::from(i32::MAX) - initial).unwrap(),
+                ),
+                ("hits10", (u64::from(seed) + n10 * 3) & u64::from(u32::MAX)),
+                ("last10", u64::from_le_bytes(last10.to_le_bytes()) & 255),
+                ("narrow", (u64::from(seed) + n10 * 5) & 255),
+                ("hits300", u64::from(seed).wrapping_sub(n300)),
+                ("last300", u64::from_le_bytes(last300.to_le_bytes())),
+                (
+                    "captured",
+                    (u64::from(initial_bits) + n300) & u64::from(u32::MAX),
+                ),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: start={start}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn linear_reductions_reject_dependent_updates_and_wrapping_exit_steps() {
+    for (range, body) in [
+        ("start..255 step += 10", "hits += i as 32;"),
+        ("start..255 step += 10", "last = i; hits += last;"),
+        ("start..255 step += 10", "hits += 1; hits += 2;"),
+        ("start..255 step += 10", "hits += effect(calls);"),
+        ("start..255 step += 10", "if hits { break; } hits += 1;"),
+        ("start..2147483647 step += 2", "hits += 1;"),
+        ("start..=2147483647", "hits += 1;"),
+        ("start..64'sd2147483648", "hits += 1;"),
+        ("start..32'd255 step += 10", "hits += 1;"),
+        ("start..255 step += 2147483648", "hits += 1;"),
+        ("start..255 step *= 2", "hits += 1;"),
+    ] {
+        let source = format!("module Top(start: input logic<32>, hits: output logic<32>, last: output logic<32>, calls: output logic<32>) {{
+            function effect(n: inout logic<32>) -> logic<32> {{ n += 1; return 1; }}
+            always_comb {{ hits = 0; last = 0; calls = 0; for i in {range} {{ {body} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_linear_loop", "Top").is_err(),
             "{source}"
         );
     }
