@@ -284,8 +284,24 @@ pub(super) fn unsigned_unit_range<'a>(
     statement: &'a ForStatement,
     source: &Module,
 ) -> Option<&'a Expression> {
+    if !matches!(
+        statement.range,
+        ForRange::Forward {
+            start: ForBound::Const(0, _),
+            ..
+        }
+    ) {
+        return None;
+    }
+    unsigned_unit_bound(statement, source)
+}
+
+pub(super) fn unsigned_unit_bound<'a>(
+    statement: &'a ForStatement,
+    source: &Module,
+) -> Option<&'a Expression> {
     let ForRange::Forward {
-        start: ForBound::Const(0, _),
+        start: ForBound::Const(_, _),
         end: ForBound::Expression(bound),
         inclusive: false,
         step: 1,

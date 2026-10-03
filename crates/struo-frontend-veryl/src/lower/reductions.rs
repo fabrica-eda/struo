@@ -18,8 +18,10 @@ impl ModuleLowerer<'_> {
             Ok(Some(changed))
         } else if let Some(changed) = self.lower_small_state_loop(statement, writes)? {
             Ok(Some(changed))
+        } else if let Some(changed) = self.lower_sparse_index_loop(statement, writes)? {
+            Ok(Some(changed))
         } else {
-            self.lower_sparse_index_loop(statement, writes)
+            self.lower_periodic_reduction(statement, writes)
         }
     }
 
@@ -144,6 +146,20 @@ fn reduction(statement: &ForStatement) -> Option<Reduction<'_>> {
             return None;
         }
     }
+    let (accumulator, increment) = constant_addition(assign)?;
+    Some(Reduction {
+        bound,
+        assign,
+        accumulator,
+        increment,
+        guard,
+    })
+}
+
+pub(super) fn constant_addition(assign: &AssignStatement) -> Option<(&Expression, &Expression)> {
+    let [destination] = assign.dst.as_slice() else {
+        return None;
+    };
     let Expression::Binary(lhs, Op::Add, rhs, _) = &assign.expr else {
         return None;
     };
@@ -158,13 +174,7 @@ fn reduction(statement: &ForStatement) -> Option<Reduction<'_>> {
     {
         return None;
     }
-    Some(Reduction {
-        bound,
-        assign,
-        accumulator,
-        increment,
-        guard,
-    })
+    Some((accumulator, increment))
 }
 
 fn reduction_body(body: &[Statement]) -> Option<(&AssignStatement, Option<(&Expression, Guard)>)> {
@@ -186,7 +196,7 @@ fn reduction_body(body: &[Statement]) -> Option<(&AssignStatement, Option<(&Expr
     }
 }
 
-fn whole_variable(expression: &Expression) -> Option<VarId> {
+pub(super) fn whole_variable(expression: &Expression) -> Option<VarId> {
     let Expression::Term(factor) = expression else {
         return None;
     };

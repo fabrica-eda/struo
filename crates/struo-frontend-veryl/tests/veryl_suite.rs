@@ -4052,3 +4052,105 @@ fn sparse_index_loops_reject_unproven_indices_and_skipped_effects() {
         );
     }
 }
+
+#[test]
+fn periodic_reductions_preserve_offsets_signed_casts_and_modular_counts() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(seed: input logic<8>, count: input logic<32>,
+                   hits: output logic<32>, masked: output logic<8>,
+                   negative: output signed logic<64>, mixed: output logic<64>) {
+            always_comb {
+                hits = seed;
+                for i in 254..count { if (i as u8) <: 8'd4 { hits += 3; } }
+                masked = seed;
+                for i in 5..count { if ((i as u8) & 8'd3) == 8'd1 { masked += 5; } }
+                negative = 0;
+                for i in 128..count { if (i as i8) <: 0 { negative += 8'shff; } }
+                mixed = 0;
+                for i in 254..count { if (i as u8) <: 8'd4 { mixed += 8'shff; } }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let seed_signal = sim.signal("seed");
+    let count_signal = sim.signal("count");
+    for count in [
+        0u32,
+        1,
+        4,
+        5,
+        6,
+        127,
+        128,
+        129,
+        254,
+        255,
+        256,
+        257,
+        260,
+        511,
+        512,
+        0x8000_0000,
+        u32::MAX,
+    ] {
+        for seed in [0u8, 17, 255] {
+            sim.modify(|io| {
+                io.set(seed_signal, seed);
+                io.set(count_signal, count);
+            })
+            .unwrap();
+            let n = u64::from(count);
+            let hits = (n / 256 * 4 + (n % 256).min(4)).saturating_sub(4);
+            let masked = ((n + 2) / 4).saturating_sub(1);
+            let negative = n / 256 * 128 + (n % 256).saturating_sub(128);
+            assert_eq!(
+                sim.get(sim.signal("hits")),
+                ((u64::from(seed) + hits * 3) & u64::from(u32::MAX)).into(),
+                "count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("masked")),
+                ((u64::from(seed) + masked * 5) & 255).into(),
+                "count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("negative")),
+                0u64.wrapping_sub(negative).into(),
+                "count={count}"
+            );
+            assert_eq!(
+                sim.get(sim.signal("mixed")),
+                (hits * 255).into(),
+                "count={count}"
+            );
+        }
+    }
+}
+
+#[test]
+fn periodic_reductions_reject_nonperiodic_or_effectful_conditions() {
+    for body in [
+        "if i <: 4 { out += 1; }",
+        "if (i as u16) <: 4 { out += 1; }",
+        "if (i as u8) <: count { out += 1; }",
+        "if (i as u8) <: out { out += 1; }",
+        "if (i as u8) <: 4 { out += i as 32; }",
+        "if (i as u8) <: 4 { out += seed; }",
+        "if effect(calls) { out += 1; }",
+        "if (i as u8) <: 4 { out += 1; calls += 1; }",
+        "if (i as u8) <: 4 { out += 1; } else { out += 2; }",
+    ] {
+        let source = format!("module Top(count: input logic<32>, seed: input logic<32>, out: output logic<32>, calls: output logic<32>) {{
+            function effect(n: inout logic<32>) -> logic {{ n += 1; return 1; }}
+            always_comb {{ out = seed; calls = 0; for i in 254..count {{ {body} }} }}
+        }}");
+        assert!(
+            analyze_and_lower(&source, "unproven_periodic_reduction", "Top").is_err(),
+            "{source}"
+        );
+    }
+}

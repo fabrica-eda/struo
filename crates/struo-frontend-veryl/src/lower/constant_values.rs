@@ -26,17 +26,9 @@ impl ModuleLowerer<'_> {
                         ExprKind::Constant(value) => (0..width)
                             .fold(0, |bits, bit| bits | (u64::from(value.bit(bit)) << bit)),
                         ExprKind::Binary { op, lhs, rhs } => {
-                            let (lhs, rhs) = (get(*lhs)?, get(*rhs)?);
-                            match op {
-                                BinaryOp::Add => lhs.wrapping_add(rhs),
-                                BinaryOp::Sub => lhs.wrapping_sub(rhs),
-                                BinaryOp::Mul => lhs.wrapping_mul(rhs),
-                                BinaryOp::Equal => u64::from(lhs == rhs),
-                                BinaryOp::And => lhs & rhs,
-                                BinaryOp::Or => lhs | rhs,
-                                BinaryOp::Xor => lhs ^ rhs,
-                                _ => return None,
-                            }
+                            let operand_width =
+                                expressions[lhs.index() as usize].r#type().width.get();
+                            constant_binary(*op, get(*lhs)?, get(*rhs)?, operand_width)?
                         }
                         ExprKind::Unary {
                             op: UnaryOp::BitNot,
@@ -115,6 +107,87 @@ impl ModuleLowerer<'_> {
                     }
                 }
                 Ok(Some(bits))
+            }
+        }
+    }
+}
+
+fn constant_binary(op: BinaryOp, lhs: u64, rhs: u64, width: u32) -> Option<u64> {
+    // Flipping the sign bit orders two's-complement bit patterns as unsigned keys.
+    let sign = 1u64 << (width - 1);
+    let (signed_lhs, signed_rhs) = (lhs ^ sign, rhs ^ sign);
+    Some(match op {
+        BinaryOp::Add => lhs.wrapping_add(rhs),
+        BinaryOp::Sub => lhs.wrapping_sub(rhs),
+        BinaryOp::Mul => lhs.wrapping_mul(rhs),
+        BinaryOp::Equal => u64::from(lhs == rhs),
+        BinaryOp::NotEqual => u64::from(lhs != rhs),
+        BinaryOp::LessThanUnsigned => u64::from(lhs < rhs),
+        BinaryOp::LessOrEqualUnsigned => u64::from(lhs <= rhs),
+        BinaryOp::GreaterThanUnsigned => u64::from(lhs > rhs),
+        BinaryOp::GreaterOrEqualUnsigned => u64::from(lhs >= rhs),
+        BinaryOp::LessThanSigned => u64::from(signed_lhs < signed_rhs),
+        BinaryOp::LessOrEqualSigned => u64::from(signed_lhs <= signed_rhs),
+        BinaryOp::GreaterThanSigned => u64::from(signed_lhs > signed_rhs),
+        BinaryOp::GreaterOrEqualSigned => u64::from(signed_lhs >= signed_rhs),
+        BinaryOp::And => lhs & rhs,
+        BinaryOp::Or => lhs | rhs,
+        BinaryOp::Xor => lhs ^ rhs,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BinaryOp, constant_binary};
+
+    #[test]
+    fn constant_comparisons_preserve_operand_width_and_sign() {
+        for width in 1..=8 {
+            let values = (0..(1u64 << width)).collect::<Vec<_>>();
+            check_comparisons(width, &values);
+        }
+        check_comparisons(
+            64,
+            &[
+                0,
+                1,
+                i64::MAX.unsigned_abs(),
+                1u64 << 63,
+                u64::MAX - 1,
+                u64::MAX,
+            ],
+        );
+    }
+
+    fn check_comparisons(width: u32, values: &[u64]) {
+        let signed = |bits: u64| {
+            if bits & (1 << (width - 1)) == 0 {
+                i128::from(bits)
+            } else {
+                i128::from(bits) - (1i128 << width)
+            }
+        };
+        for &lhs in values {
+            for &rhs in values {
+                for (op, expected) in [
+                    (BinaryOp::Equal, lhs == rhs),
+                    (BinaryOp::NotEqual, lhs != rhs),
+                    (BinaryOp::LessThanUnsigned, lhs < rhs),
+                    (BinaryOp::LessOrEqualUnsigned, lhs <= rhs),
+                    (BinaryOp::GreaterThanUnsigned, lhs > rhs),
+                    (BinaryOp::GreaterOrEqualUnsigned, lhs >= rhs),
+                    (BinaryOp::LessThanSigned, signed(lhs) < signed(rhs)),
+                    (BinaryOp::LessOrEqualSigned, signed(lhs) <= signed(rhs)),
+                    (BinaryOp::GreaterThanSigned, signed(lhs) > signed(rhs)),
+                    (BinaryOp::GreaterOrEqualSigned, signed(lhs) >= signed(rhs)),
+                ] {
+                    assert_eq!(
+                        constant_binary(op, lhs, rhs, width),
+                        Some(u64::from(expected)),
+                        "{op:?}: width={width}, lhs={lhs}, rhs={rhs}"
+                    );
+                }
             }
         }
     }

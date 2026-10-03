@@ -7,6 +7,7 @@ mod constant_values;
 mod idempotent_loops;
 mod loops;
 mod members;
+mod periodic_reductions;
 mod reductions;
 mod single_iteration;
 mod small_state_loops;

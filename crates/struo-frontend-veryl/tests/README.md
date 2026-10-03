@@ -301,9 +301,9 @@ range is absent from this AIR, so the lowering check cannot repair these upstrea
 expansions. Constant optimization remains enabled; this is an unresolved analyzer
 conformance issue, not a supported finite-loop interpretation.
 
-The ignore manifest distinguishes unproven runtime starts, reverse/non-additive loops,
-and loops without a proof inside the expansion budget. These are current Struo
-synthesis limits, not claims that every such loop is inherently unsynthesizable.
+The ignore manifest distinguishes unproven runtime starts from loops with
+nonterminating input values. The guarded-expansion budget limits that planner;
+other proofs and reductions can handle finite loops without expanding every body.
 For example, a 32-bit input trip count may require billions of expanded bodies;
 a small sampled count in a simulator test does not justify truncating it. New
 proofs or algebraic transformations can extend support independently of the
@@ -386,3 +386,24 @@ writes to the bound or counter remain outside this proof. Analysis is limited
 to 32 assignments, 512 bits per destination, and 512 distinct write events;
 the runtime trip count is not capped. RHS reads use the normal typed lowering
 and may depend on state written by earlier assignments and events.
+
+
+`src/lower/periodic_reductions.rs` counts scalar additive updates guarded by a
+predicate proven to depend only on at most eight low counter bits. Narrow casts
+directly on the counter establish that dependency; pure operators can combine
+those values and constants. Each residue is evaluated through normal typed
+lowering, and all predicate results must be proven constant. This preserves
+signed casts and comparisons instead of assuming an unsigned mathematical
+interpretation of the guard.
+
+For period `P`, the number of enabled iterations before an exclusive bound `n`
+is `(n / P) * hits_per_period + prefix[n % P]`. The implementation subtracts
+the prefix count at the constant start and returns zero for empty ranges. It
+extracts the quotient before narrowing to the accumulator width, preserving
+whole periods even for narrow modular results. Starts must fit the counter
+without truncation, and the invariant unsigned exclusive bound must be no wider
+than the counter. Unit stride, one conditional scalar addition of a literal,
+and an empty else branch are required. Effects, changing predicates, wider
+periods, and unsupported constant operations fail closed. Existing expansion
+and reduction paths retain priority; 256 predicate residues bound analysis,
+not the runtime iteration count.

@@ -243,12 +243,6 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Struo cannot prove termination within its 512-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
-cases = [
-  "synth_dynamic_loop::test_runtime_bounds_truncate_loop_var_to_declared_width",
-]
-
-[[ignore]]
 reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles, signed inclusive maximum endpoints, or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
 cases = [
   "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
