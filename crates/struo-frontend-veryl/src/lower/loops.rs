@@ -1,4 +1,6 @@
 //! Plans finite hardware expansion without using simulation input samples.
+mod bounds;
+mod reverse;
 mod static_range;
 use veryl_analyzer::ir::{
     Expression, Factor, ForBound, ForRange, ForStatement, Module, Op, Statement,
@@ -7,12 +9,19 @@ use veryl_analyzer::ir::{
 use super::{ImportError, concrete_width, context_width, evaluated_u64, substitute_statements};
 
 /// Resource budget for newly supported runtime-bound loops, not a runtime cap.
-pub(super) const GUARDED_ITERATION_BUDGET: usize = 256;
+pub(super) const GUARDED_ITERATION_BUDGET: usize = 512;
 
 pub(super) struct LoopPlan {
     pub iterations: Vec<usize>,
     pub guard: Option<(ForBound, bool)>,
     pub runtime_start: Option<(ForBound, usize)>,
+}
+
+pub(super) fn plan_reverse_with_lower(
+    statement: &ForStatement,
+    lower: i128,
+) -> Result<LoopPlan, ImportError> {
+    reverse::plan_with_lower(statement, lower)
 }
 
 pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan, ImportError> {
@@ -24,6 +33,9 @@ pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan
             guard: None,
             runtime_start: None,
         });
+    }
+    if matches!(statement.range, ForRange::Reverse { .. }) {
+        return reverse::plan(statement);
     }
     let (ForRange::Forward {
         start,
@@ -103,7 +115,7 @@ pub(super) fn plan(statement: &ForStatement, source: &Module) -> Result<LoopPlan
         });
     }
     Err(unsupported(
-        "runtime loop termination is not proven within the 256-iteration synthesis budget",
+        "runtime loop termination is not proven within the 512-iteration synthesis budget",
     ))
 }
 
@@ -141,7 +153,7 @@ fn plan_runtime_start(
         .filter(|count| *count <= GUARDED_ITERATION_BUDGET)
         .ok_or_else(|| {
             unsupported(
-                "runtime loop termination is not proven within the 256-iteration synthesis budget",
+                "runtime loop termination is not proven within the 512-iteration synthesis budget",
             )
         })?;
     let counter_max = if magnitude >= usize::BITS {
@@ -177,6 +189,9 @@ fn maximum_bound(bound: &ForBound, induction_signed: bool) -> Result<Option<usiz
     let ForBound::Expression(expression) = bound else {
         unreachable!()
     };
+    if let Some(maximum) = bounds::nonnegative_maximum(expression)? {
+        return Ok(Some(maximum));
+    }
     // A value-producing leaf keeps its declared result width even when the
     // for comparison widens it to int. Unsigned leaves zero-extend; signed
     // leaves compared with a signed induction cannot gain a larger positive value.
@@ -263,4 +278,52 @@ fn known_condition(expression: &Expression, source: &Module) -> Option<u64> {
     } else {
         value
     })
+}
+
+pub(super) fn unsigned_unit_range<'a>(
+    statement: &'a ForStatement,
+    source: &Module,
+) -> Option<&'a Expression> {
+    if !matches!(
+        statement.range,
+        ForRange::Forward {
+            start: ForBound::Const(0, _),
+            ..
+        }
+    ) {
+        return None;
+    }
+    unsigned_unit_bound(statement, source)
+}
+
+pub(super) fn unsigned_unit_bound<'a>(
+    statement: &'a ForStatement,
+    source: &Module,
+) -> Option<&'a Expression> {
+    let ForRange::Forward {
+        start: ForBound::Const(_, _),
+        end: ForBound::Expression(bound),
+        inclusive: false,
+        step: 1,
+    } = &statement.range
+    else {
+        return None;
+    };
+    let Expression::Term(factor) = bound.as_ref() else {
+        return None;
+    };
+    let Factor::Variable(id, index, select, _) = factor.as_ref() else {
+        return None;
+    };
+    let ty = &source.variables.get(id)?.r#type;
+    if !index.0.is_empty()
+        || !select.is_empty()
+        || ty.signed
+        || !ty.array.is_empty()
+        || concrete_width(ty, "unsigned loop bound").ok()?
+            > concrete_width(&statement.var_type, "unit-step loop counter").ok()?
+    {
+        return None;
+    }
+    Some(bound)
 }
