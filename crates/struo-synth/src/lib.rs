@@ -88,12 +88,16 @@ pub fn synthesize_with_options(
     // Keep the established whole-expression construction order for ordinary
     // acyclic designs. Always resolving individual bits changes netlist sharing
     // and node order, which can regress downstream placement and timing.
-    // A vector-level cycle may still be acyclic at bit granularity; retry that
-    // case from a fresh lowering state without hiding genuine feedback errors.
+    // A vector-level cycle may be acyclic at bit granularity, and an inactive
+    // constant-mux arm can contain unobservable feedback or undriven bits.
+    // Retry those failures using only observable dependencies. Active feedback
+    // and undriven inputs still fail; no state or default drivers are invented.
     let mut netlist = match Lowering::new(module).lower() {
-        Err(SynthesisError::CombinationalLoop { .. }) => {
+        Err(
+            SynthesisError::CombinationalLoop { .. } | SynthesisError::UndrivenSignalBit { .. },
+        ) => {
             let mut lowering = Lowering::new(module);
-            lowering.resolve_driver_ranges = true;
+            lowering.resolve_observable_dependencies = true;
             lowering.lower()?
         }
         result => result?,
@@ -142,7 +146,7 @@ struct Lowering<'a> {
     drivers: Vec<Vec<Option<Driver>>>,
     expression_bits: Vec<Option<Vec<NetId>>>,
     resolving: HashSet<(SignalId, usize)>,
-    resolve_driver_ranges: bool,
+    resolve_observable_dependencies: bool,
 }
 
 impl<'a> Lowering<'a> {
@@ -164,7 +168,7 @@ impl<'a> Lowering<'a> {
             drivers,
             expression_bits: vec![None; module.expressions().len()],
             resolving: HashSet::new(),
-            resolve_driver_ranges: false,
+            resolve_observable_dependencies: false,
         }
     }
 
@@ -408,7 +412,7 @@ impl<'a> Lowering<'a> {
         // Follow only this bit's dependency cone. A whole-vector connection
         // can contain unrelated bits that lead back to the current signal,
         // especially after flattening module ports.
-        let result = if self.resolve_driver_ranges {
+        let result = if self.resolve_observable_dependencies {
             self.lower_expression_range(driver.0, driver.1, 1)
                 .map(|bits| bits[0])
         } else {
@@ -467,6 +471,14 @@ impl<'a> Lowering<'a> {
                 else_expr,
             } => {
                 let condition = self.lower_expression(condition)?[0];
+                if self.resolve_observable_dependencies
+                    && let Some(selected) = self.netlist.constant_value(condition)
+                {
+                    let bits =
+                        self.lower_expression(if selected { then_expr } else { else_expr })?;
+                    self.expression_bits[index] = Some(bits.clone());
+                    return Ok(bits);
+                }
                 let then_bits = self.lower_expression(then_expr)?;
                 let else_bits = self.lower_expression(else_expr)?;
                 then_bits
@@ -607,6 +619,15 @@ impl<'a> Lowering<'a> {
                 else_expr,
             } => {
                 let condition = self.lower_expression(condition)?[0];
+                if self.resolve_observable_dependencies
+                    && let Some(selected) = self.netlist.constant_value(condition)
+                {
+                    return self.lower_expression_range(
+                        if selected { then_expr } else { else_expr },
+                        lsb,
+                        width,
+                    );
+                }
                 let then_bits = self.lower_expression_range(then_expr, lsb, width)?;
                 let else_bits = self.lower_expression_range(else_expr, lsb, width)?;
                 Ok(then_bits
@@ -1797,6 +1818,91 @@ mod tests {
                     .collect();
                 let outputs = evaluate_combinational(&synthesized.netlist, &inputs);
                 assert_eq!(output_word(&outputs, "sum", 4), lhs.wrapping_sub(rhs) & 0xf);
+            }
+        }
+    }
+
+    #[test]
+    fn ignores_only_proven_inactive_mux_dependencies() {
+        for selected in [None, Some(false), Some(true)] {
+            for invalid_on_true in [false, true] {
+                for undriven in [false, true] {
+                    for ranged in [false, true] {
+                        let mut module = Module::new("ObservableMux");
+                        let width = if ranged { 4 } else { 2 };
+                        let input = module.add_port(Port {
+                            name: "input".into(),
+                            direction: PortDirection::Input,
+                            r#type: bits(width),
+                        });
+                        let output = module.add_port(Port {
+                            name: "output".into(),
+                            direction: PortDirection::Output,
+                            r#type: bits(2),
+                        });
+                        let condition = if let Some(selected) = selected {
+                            module.constant(Constant::from_u64(
+                                BitWidth::new(1).unwrap(),
+                                u64::from(selected),
+                            ))
+                        } else {
+                            let select = module.add_port(Port {
+                                name: "select".into(),
+                                direction: PortDirection::Input,
+                                r#type: bits(1),
+                            });
+                            module.read(select).unwrap()
+                        };
+                        let good = module.read(input).unwrap();
+                        let bad = if undriven {
+                            let floating = module.add_signal("floating", bits(width));
+                            module.read(floating).unwrap()
+                        } else {
+                            let feedback = module.read(output).unwrap();
+                            if ranged {
+                                module.concat(vec![feedback, feedback]).unwrap()
+                            } else {
+                                feedback
+                            }
+                        };
+                        let (yes, no) = if invalid_on_true {
+                            (bad, good)
+                        } else {
+                            (good, bad)
+                        };
+                        let value = module.mux(condition, yes, no).unwrap();
+                        let value = if ranged {
+                            module
+                                .expression_slice(value, 0, BitWidth::new(2).unwrap())
+                                .unwrap()
+                        } else {
+                            value
+                        };
+                        module.assign(module.whole(output).unwrap(), value).unwrap();
+                        let mut design = Design::new("ObservableMux");
+                        design.add_module(module);
+                        let result = synthesize(&design);
+                        if selected.is_none_or(|selected| selected == invalid_on_true) {
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(super::SynthesisError::CombinationalLoop { .. }
+                                        | super::SynthesisError::UndrivenSignalBit { .. })
+                                ),
+                                "selected={selected:?}, invalid_on_true={invalid_on_true}, undriven={undriven}, ranged={ranged}: {result:?}"
+                            );
+                        } else {
+                            let result = result.unwrap();
+                            for value in 0..(1u64 << width) {
+                                let output = evaluate_combinational(
+                                    &result.netlist,
+                                    &input_word("input", width as usize, value),
+                                );
+                                assert_eq!(output_word(&output, "output", 2), value & 3);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

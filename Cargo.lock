@@ -383,11 +383,11 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "tracing",
- "veryl-analyzer",
+ "veryl-analyzer 0.21.0",
  "veryl-component-sys",
- "veryl-metadata",
- "veryl-parser",
- "veryl-path",
+ "veryl-metadata 0.21.0",
+ "veryl-parser 0.21.0",
+ "veryl-path 0.21.0",
  "wasmtime",
 ]
 
@@ -538,9 +538,9 @@ dependencies = [
  "num-traits",
  "thiserror 2.0.20",
  "tracing",
- "veryl-analyzer",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-analyzer 0.21.0",
+ "veryl-metadata 0.21.0",
+ "veryl-parser 0.21.0",
 ]
 
 [[package]]
@@ -554,9 +554,9 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
- "veryl-analyzer",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-analyzer 0.21.0",
+ "veryl-metadata 0.21.0",
+ "veryl-parser 0.21.0",
 ]
 
 [[package]]
@@ -644,7 +644,7 @@ checksum = "5c77627ccbd6792b6dadead63f42a01b83c31e49e555700465bf27fdef0c2d21"
 dependencies = [
  "num-bigint",
  "num-traits",
- "veryl-std",
+ "veryl-std 0.21.0",
 ]
 
 [[package]]
@@ -3107,9 +3107,9 @@ dependencies = [
  "struo-target-ecp5",
  "tempfile",
  "tracing-subscriber",
- "veryl-analyzer",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-analyzer 0.22.0",
+ "veryl-metadata 0.22.0",
+ "veryl-parser 0.22.0",
 ]
 
 [[package]]
@@ -3590,15 +3590,47 @@ dependencies = [
  "toml",
  "vcd",
  "veryl-component-sys",
- "veryl-metadata",
- "veryl-parser",
+ "veryl-metadata 0.21.0",
+ "veryl-parser 0.21.0",
+]
+
+[[package]]
+name = "veryl-analyzer"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c706e71bd1b264ef400acac505335f341721f83cc62fd29018e435914313f8cf"
+dependencies = [
+ "bimap",
+ "daggy",
+ "fxhash",
+ "indent",
+ "itertools 0.15.0",
+ "log",
+ "miette",
+ "num-bigint",
+ "num-traits",
+ "paste",
+ "postcard",
+ "serde",
+ "serde_json",
+ "similar",
+ "smallvec",
+ "strnum_bitwidth",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.20",
+ "toml",
+ "vcd",
+ "veryl-component-sys",
+ "veryl-metadata 0.22.0",
+ "veryl-parser 0.22.0",
 ]
 
 [[package]]
 name = "veryl-component-sys"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b79b55aefeb953c53c719399b6bd185f9a2f5a196af6bb08586d22568449b5e"
+checksum = "51fd96eba08b4bad6f83eca30c213e6fc29f83d02be4d67d8604fd95be757ff8"
 
 [[package]]
 name = "veryl-metadata"
@@ -3621,9 +3653,37 @@ dependencies = [
  "url",
  "uuid",
  "veryl-component-sys",
- "veryl-parser",
- "veryl-path",
- "veryl-std",
+ "veryl-parser 0.21.0",
+ "veryl-path 0.21.0",
+ "veryl-std 0.21.0",
+ "walkdir",
+ "which",
+]
+
+[[package]]
+name = "veryl-metadata"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f75d3b9a6b644739c31368b4196095b57a4c808eadddc14f90582d5d9b3c0c36"
+dependencies = [
+ "log",
+ "miette",
+ "once_cell",
+ "pathdiff",
+ "regex",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_regex",
+ "spdx",
+ "thiserror 2.0.20",
+ "toml",
+ "url",
+ "uuid",
+ "veryl-component-sys",
+ "veryl-parser 0.22.0",
+ "veryl-path 0.22.0",
+ "veryl-std 0.22.0",
  "walkdir",
  "which",
 ]
@@ -3633,6 +3693,25 @@ name = "veryl-parser"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d8b2b967783ca8fbb19915e9dd7fb9d69bc6b51dcda8a7c578d31d724c8f7fa"
+dependencies = [
+ "anyhow",
+ "bimap",
+ "miette",
+ "once_cell",
+ "parol",
+ "parol_runtime",
+ "paste",
+ "regex",
+ "scnr2",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "veryl-parser"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1610540dee5a0482cac2b2855df561e8fa50b90d4a514bde6457efdb0e1a9e5d"
 dependencies = [
  "anyhow",
  "bimap",
@@ -3663,6 +3742,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "veryl-path"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b634d0a91253af293d815892af214c799e9ce356dd3b74c230d83e7d7b67d152"
+dependencies = [
+ "directories",
+ "fs4",
+ "log",
+ "miette",
+ "tempfile",
+ "thiserror 2.0.20",
+ "walkdir",
+]
+
+[[package]]
 name = "veryl-std"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3672,7 +3766,20 @@ dependencies = [
  "miette",
  "rust-embed",
  "thiserror 2.0.20",
- "veryl-path",
+ "veryl-path 0.21.0",
+]
+
+[[package]]
+name = "veryl-std"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30bf95dea1084d78b50f2b0a7e1bd2a9c5135ab56f4bbe7b2911042b24a5b457"
+dependencies = [
+ "merkle_hash",
+ "miette",
+ "rust-embed",
+ "thiserror 2.0.20",
+ "veryl-path 0.22.0",
 ]
 
 [[package]]

@@ -464,9 +464,12 @@ fn corpus_runtime_loops_with_proven_breaks() {
     let stage = Rc::new(RefCell::new(String::new()));
     for name in [
         "basic::test_comb_effectful_if_condition_after_dynamic_break_stays_inactive",
+        "basic::test_comb_effectful_case_after_dynamic_break_stays_inactive",
+        "basic::test_comb_value_system_function_after_dynamic_break_stays_inactive",
         "synth_dynamic_loop::test_runtime_break_in_synth_comb_loop",
         "synth_dynamic_loop::test_runtime_break_after_assign_in_synth_comb_loop",
         "flip_flop::test_ff_runtime_for_break",
+        "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
     ] {
         celox_test_suite_veryl::case(name)
             .unwrap()
@@ -1626,5 +1629,1555 @@ fn expression_types_preserve_members_selections_and_context() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn packed_member_dynamic_access_stays_in_its_domain() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<8>, idx: input signed logic<8>,
+                   read: output logic<3>, written: output logic<16>,
+                   row_read: output logic, row_written: output logic<16>, expr_read: output logic, calls: output logic<8>) {
+            struct S { high: logic<4>, data: logic<8>, low: logic<4>, }
+            struct Rows { high: logic<4>, data: logic<2,4>, low: logic<4>, }
+            function address(x: input signed logic<8>, old: input logic<8>,
+                             next: output logic<8>) -> signed logic<8> {
+                next = old + 1;
+                return x;
+            }
+            var s: S;
+            var rows: Rows;
+            always_comb {
+                calls = 0;
+                s.high = 4'ha;
+                s.data = d;
+                s.low = 4'h5;
+                read = s.data[address(idx, calls, calls)+:3];
+                s.data[address(idx, calls, calls)+:3] = 3'b101;
+                written = {s.high, s.data, s.low};
+                rows.high = 4'ha;
+                rows.data = d;
+                rows.low = 4'h5;
+                row_read = rows.data[1][idx];
+                expr_read = rows.data[1][((idx as u8) + 8'hff)];
+                rows.data[1][idx] = 1'b1;
+                row_written = {rows.high, rows.data, rows.low};
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let idx = sim.signal("idx");
+    for value in 0..256u32 {
+        for index in -12..20i32 {
+            sim.modify(|io| {
+                io.set(d, value);
+                io.set(idx, index.to_le_bytes()[0]);
+            })
+            .unwrap();
+            let mut read = 0u32;
+            let mut written = value;
+            for bit in 0..3 {
+                let target = index + bit;
+                if (0..8).contains(&target) {
+                    read |= ((value >> target) & 1) << bit;
+                    written = (written & !(1 << target)) | (((5 >> bit) & 1) << target);
+                }
+            }
+            let row_read = if (0..4).contains(&index) {
+                (value >> (index + 4)) & 1
+            } else {
+                0
+            };
+            let row_written = if (0..4).contains(&index) {
+                value | (1 << (index + 4))
+            } else {
+                value
+            };
+            for (name, expected) in [
+                ("calls", 2),
+                ("read", read),
+                ("written", 0xa005 | (written << 4)),
+                ("row_read", row_read),
+                (
+                    "expr_read",
+                    if (1..=4).contains(&index) {
+                        (value >> (index + 3)) & 1
+                    } else {
+                        0
+                    },
+                ),
+                ("row_written", 0xa005 | (row_written << 4)),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: d={value}, idx={index}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_member_stride_does_not_wrap_large_indices() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<8>, idx: input logic<32>,
+                   read: output logic<4>, written: output logic<16>) {
+            struct S { high: logic<4>, data: logic<2,4>, low: logic<4>, }
+            var s: S;
+            always_comb {
+                s.high = 4'ha;
+                s.data = d;
+                s.low = 4'h5;
+                read = s.data[idx];
+                s.data[idx] = 4'hc;
+                written = {s.high, s.data, s.low};
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let idx = sim.signal("idx");
+    for value in 0..256u32 {
+        for index in [0, 1, 2, 0x4000_0000, 0x8000_0000, u32::MAX] {
+            sim.modify(|io| {
+                io.set(d, value);
+                io.set(idx, index);
+            })
+            .unwrap();
+            let (read, written) = if index < 2 {
+                let shift = index * 4;
+                (
+                    (value >> shift) & 15,
+                    (value & !(15 << shift)) | (12 << shift),
+                )
+            } else {
+                (0, value)
+            };
+            assert_eq!(sim.get(sim.signal("read")), read.into(), "idx={index}");
+            assert_eq!(
+                sim.get(sim.signal("written")),
+                (0xa005 | (written << 4)).into(),
+                "idx={index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn corpus_veryl_022_regressions() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "expression_semantics::short_circuit_operators_skip_effectful_operands",
+        "expression_semantics::constant_and_runtime_casts_use_the_same_resize_rule",
+        "flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion",
+        "system_function::test_direct_ff_size_packed_multidimensional_system_function",
+        "system_function::test_direct_ff_size_packed_multidimensional_type_system_function",
+        "veryl_context_regressions::constant_ternary_keeps_both_arm_types",
+        "veryl_context_regressions::signed_cast_of_folded_constant_sign_extends",
+        "veryl_context_regressions::constant_case_on_signed_target",
+        "veryl_regressions::wide_struct_bit_field_rhs_no_spill",
+        "hierarchy::test_inactive_instance_input_output_call_adds_no_parent_driver",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn function_inout_variable_formals_copy_in_before_body() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<8>, q: output logic<8>, original: output logic<8>) {
+            function update(value: inout logic<8>, snapshot: input logic<8>,
+                            observed: output logic<8>) {
+                value += 8'd3;
+                observed = snapshot;
+                value += snapshot;
+            }
+            always_comb {
+                q = d;
+                update(q, q, original);
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    for value in 0..=255u8 {
+        sim.modify(|io| io.set(d, value)).unwrap();
+        assert_eq!(
+            sim.get(sim.signal("q")),
+            value.wrapping_mul(2).wrapping_add(3).into()
+        );
+        assert_eq!(sim.get(sim.signal("original")), value.into());
+    }
+}
+
+#[test]
+fn ff_inout_to_module_state_remains_rejected() {
+    let error = analyze_and_lower(
+        r"
+        module Top(clk: input clock, q: output logic<8>) {
+            function update(value: inout logic<8>) { value += 8'd1; }
+            always_ff(clk) { update(q); }
+        }
+        ",
+        "ff_inout",
+        "Top",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ImportError::AnalysisFailed(_) | ImportError::UnsupportedBehavior(_)
+    ));
+}
+
+#[test]
+fn corpus_wildcard_comparisons() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "veryl_context_regressions::runtime_case_target_uses_comparison_context",
+        "expression_semantics::wildcard_predicates_remain_one_bit_in_ternaries_and_concats",
+        "veryl_context_regressions::case_compares_each_label_as_an_if_does",
+        "veryl_language::inside_outside_range_endpoints",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn wildcard_constant_masks_preserve_width_and_signedness() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(a: input logic<8>, s: input signed logic<8>, wide: input logic<128>,
+                   eq: output logic, ne: output logic, sx: output logic, ux: output logic,
+                   sign: output logic, all: output logic, calls: output logic<8>, wide_eq: output logic,
+                   bits: output logic<3>, registered: output logic<3>, clk: input clock) {
+            function observe(x: input logic<8>, old: input logic<8>, next: output logic<8>) -> logic<8> {
+                next = old + 1;
+                return x;
+            }
+            const P: signed logic<4> = 4'sbx101;
+            assign eq = a ==? 8'b10xz01xz;
+            assign ne = a !=? 8'b10xz01xz;
+            assign sx = s ==? P;
+            assign ux = a ==? P;
+            assign sign = s ==? 4'sb1x01;
+            always_comb {
+                calls = 0;
+                all = observe(a, calls, calls) ==? 'x;
+            }
+            assign wide_eq = wide ==? {48'hxxxxxxxxxxxx, 8'b10xz01xz, 8'hzz,
+                                       48'hzzzzzzzzzzzz, 8'b01xz10xz, 8'hxx};
+            assign bits = {1'b1, (a ==? 8'b10xz01xz), (a !=? 8'b10xz01xz)};
+            always_ff (clk) {
+                registered = {1'b1, (a ==? 8'b10xz01xz), (a !=? 8'b10xz01xz)};
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let a = sim.signal("a");
+    let s = sim.signal("s");
+    let wide = sim.signal("wide");
+    let clk = sim.event("clk");
+    for value in 0..256u32 {
+        sim.modify(|io| {
+            io.set(a, value);
+            io.set(s, value);
+            io.set(
+                wide,
+                (u128::from(value) << 72) | (u128::from(value ^ 255) << 8),
+            );
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+        let eq = u32::from(value & 0xcc == 0x84);
+        for (name, expected) in [
+            ("eq", eq),
+            ("ne", 1 - eq),
+            ("sx", u32::from(value & 7 == 5)),
+            ("ux", u32::from(value & 0xf7 == 5)),
+            ("sign", u32::from(value & 0xfb == 0xf9)),
+            ("all", 1),
+            ("calls", 1),
+            ("wide_eq", eq),
+            ("bits", 4 | (eq << 1) | (1 - eq)),
+            ("registered", 4 | (eq << 1) | (1 - eq)),
+        ] {
+            assert_eq!(
+                sim.get(sim.signal(name)),
+                expected.into(),
+                "{name}: a={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn case_context_preserves_priority_and_evaluates_target_once() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(a: input logic<8>, clk: input clock,
+                   calls: output logic<8>, y: output logic<3>, f: output logic<3>,
+                   function_y: output logic<3>, loop_y: output logic<3>) {
+            function observe(x: input logic<8>, old: input logic<8>, next: output logic<8>) -> logic<8> {
+                next = old + 1;
+                return x;
+            }
+            function select_value(x: input logic<8>) -> logic<3> {
+                var result: logic<3>;
+                case x + 8'h10 {
+                    9'h105: result = 1;
+                    default: result = 0;
+                }
+                return result;
+            }
+            always_comb {
+                calls = 0;
+                case observe(a, calls, calls) + 8'h10 {
+                    9'h105: y = 1;
+                    9'h106: y = 2;
+                    9'bx0000xxxx: y = 3;
+                    9'bxxxxx0000: y = 4;
+                    default: y = 0;
+                }
+                function_y = select_value(a);
+                loop_y = 0;
+                for i in 0..2 {
+                    case a + 8'h10 {
+                        9'h105: loop_y += 1;
+                        default: loop_y += 0;
+                    }
+                }
+            }
+            always_ff (clk) {
+                case a + 8'h10 {
+                    9'h105: f = 1;
+                    9'h106: f = 2;
+                    9'bx0000xxxx: f = 3;
+                    9'bxxxxx0000: f = 4;
+                    default: f = 0;
+                }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let a = sim.signal("a");
+    let clk = sim.event("clk");
+    for value in 0..256u32 {
+        sim.modify(|io| io.set(a, value)).unwrap();
+        sim.tick(clk).unwrap();
+        let selected = match value {
+            245 => 1u32,
+            246 => 2,
+            240..=255 => 3,
+            _ if value % 16 == 0 => 4,
+            _ => 0,
+        };
+        for (name, expected) in [
+            ("calls", 1),
+            ("y", selected),
+            ("f", selected),
+            ("function_y", u32::from(value == 245)),
+            ("loop_y", 2 * u32::from(value == 245)),
+        ] {
+            assert_eq!(
+                sim.get(sim.signal(name)),
+                expected.into(),
+                "{name}: a={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn corpus_constant_array_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "veryl_regressions::nested_array_index_const_array",
+        "veryl_context_regressions::folded_const_select_keeps_its_sign",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+fn constant_array_read_design() -> Design {
+    Design::new(
+        r"
+        package pkg {
+            const W: logic<80> [2] = '{80'h123456789abcdef01234, 80'hfedcba9876543210abcd};
+        }
+        module Top #(
+            param TABLE: i8 [2,3] = '{'{-3, 7, -5}, '{9, -11, 13}},
+        ) (
+            row: input logic<8>, col: input logic<8>,
+            selected: output logic<16>, nibble: output logic<16>, calls: output logic<8>,
+            row_sum: output logic<16>, fixed_row: output logic<16>,
+            defaults: output logic<8>, repeated: output logic<8>, wide: output logic<80>,
+        ) {
+            const D: logic<8> [5] = '{default: 8'ha5};
+            const R: logic<8> [5] = '{8'h12, 8'h34 repeat 3, 8'h56};
+            function observe(x: input logic<8>, old: input logic<8>, next: output logic<8>) -> logic<8> {
+                next = old + 1;
+                return x;
+            }
+            function sum(values: input i8 [3]) -> i16 {
+                return values[0] + values[1] + values[2];
+            }
+            always_comb {
+                calls = 0;
+                selected = TABLE[observe(row, calls, calls)][observe(col, calls, calls)];
+                nibble = TABLE[row][col][3:0];
+                row_sum = sum(TABLE[row]);
+                fixed_row = TABLE[1][col];
+                defaults = D[col];
+                repeated = R[col];
+                wide = pkg::W[row];
+            }
+        }
+        ",
+        "Top",
+    )
+}
+
+#[test]
+fn constant_arrays_preserve_shape_sign_and_index_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = constant_array_read_design();
+    let rtl = analyze_and_lower(&design.sources[0].text, "constant_rom", "Top").unwrap();
+    let top = rtl.top_module().unwrap();
+    assert!(top.registers().is_empty());
+    assert!(top.memories().is_empty());
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let row = sim.signal("row");
+    let col = sim.signal("col");
+    let table = [[-3i16, 7, -5], [9, -11, 13]];
+    for r in [0u8, 1, 2, 3, 255] {
+        for c in [0u8, 1, 2, 3, 4, 5, 255] {
+            sim.modify(|io| {
+                io.set(row, r);
+                io.set(col, c);
+            })
+            .unwrap();
+            let value = table
+                .get(usize::from(r))
+                .and_then(|row| row.get(usize::from(c)))
+                .copied()
+                .unwrap_or(0);
+            let fixed = table[1].get(usize::from(c)).copied().unwrap_or(0);
+            let sum = table
+                .get(usize::from(r))
+                .map_or(0, |row| row.iter().sum::<i16>());
+            for (name, expected) in [
+                ("selected", u16::from_le_bytes(value.to_le_bytes())),
+                ("nibble", u16::from_le_bytes(value.to_le_bytes()) & 15),
+                ("calls", 2),
+                ("fixed_row", u16::from_le_bytes(fixed.to_le_bytes())),
+                ("row_sum", u16::from_le_bytes(sum.to_le_bytes())),
+                ("defaults", if c < 5 { 0xa5 } else { 0 }),
+                (
+                    "repeated",
+                    match c {
+                        0 => 0x12,
+                        1..=3 => 0x34,
+                        4 => 0x56,
+                        _ => 0,
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    sim.get(sim.signal(name)),
+                    expected.into(),
+                    "{name}: row={r}, col={c}"
+                );
+            }
+            let wide = match r {
+                0 => 0x1234_5678_9abc_def0_1234u128,
+                1 => 0xfedc_ba98_7654_3210_abcdu128,
+                _ => 0,
+            };
+            assert_eq!(sim.get(sim.signal("wide")), wide.into(), "row={r}");
+        }
+    }
+}
+
+#[test]
+fn signed_array_indices_do_not_alias_negative_values() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(idx: input signed logic<2>, rom: output logic<8>,
+                   read: output logic<8>, written: output logic<32>) {
+            const TABLE: logic<8> [4] = '{11, 22, 33, 44};
+            var data: logic<8> [4];
+            always_comb {
+                data = '{11, 22, 33, 44};
+                rom = TABLE[idx];
+                read = data[idx];
+                data[idx] = 8'hcc;
+                written = {data[3], data[2], data[1], data[0]};
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let idx = sim.signal("idx");
+    for (bits, expected, written) in [
+        (0u8, 11u8, 0x2c21_16ccu32),
+        (1, 22, 0x2c21_cc0b),
+        (2, 0, 0x2c21_160b),
+        (3, 0, 0x2c21_160b),
+    ] {
+        sim.modify(|io| io.set(idx, bits)).unwrap();
+        assert_eq!(sim.get(sim.signal("rom")), expected.into());
+        assert_eq!(sim.get(sim.signal("read")), expected.into());
+        assert_eq!(sim.get(sim.signal("written")), written.into());
+    }
+}
+
+#[test]
+fn runtime_values_do_not_prove_unconditional_loop_breaks() {
+    for condition in ["A[index]", "early(index)", "truncated()"] {
+        let source = format!(
+            r"
+            module Top(index: input logic, count: input logic<32>, q: output logic<8>) {{
+                const A: logic [2] = '{{1'b1, 1'b0}};
+                function early(x: input logic) -> logic {{
+                    if x {{ return 1'b0; }}
+                    return 1'b1;
+                }}
+                function truncated() -> logic {{ return 2'd2; }}
+                always_comb {{
+                    q = 0;
+                    for i in 0..count {{
+                        if {condition} {{ break; }}
+                        q += 1;
+                    }}
+                }}
+            }}
+            "
+        );
+        let error = analyze_and_lower(&source, "runtime_break_proof", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::UnsupportedBehavior(message)
+                if message.contains("termination is not proven")),
+            "{condition}: {error}"
+        );
+    }
+}
+
+#[test]
+fn corpus_scoped_local_variables() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("duplicate_varpath::test_duplicate_scoped_var_in_always_comb")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn corpus_generate_constant_mux_dependencies() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("duplicate_varpath::test_duplicate_scoped_var_with_generate_for")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn scoped_signal_names_are_unique_and_stable() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input logic<4>, clk: input clock,
+                   c0: output logic<4>, c1: output logic<4>,
+                   q0: output logic<4>, q1: output logic<4>) {
+            always_comb {
+                for i in 0..2 {
+                    var tmp: logic<4>;
+                    tmp = d + i;
+                    c0 = tmp;
+                }
+                for j in 0..3 {
+                    var tmp: logic<4>;
+                    tmp = d + j;
+                    c1 = tmp;
+                }
+            }
+            always_ff (clk) {
+                var tmp: logic<4>;
+                tmp = d + 4'd1;
+                q0 = tmp;
+            }
+            always_ff (clk) {
+                var tmp: logic<4>;
+                tmp = d + 4'd2;
+                q1 = tmp;
+            }
+        }
+        ",
+        "Top",
+    );
+    let names = || {
+        let rtl = analyze_and_lower(&design.sources[0].text, "scoped_locals", "Top").unwrap();
+        rtl.top_module()
+            .unwrap()
+            .signals()
+            .iter()
+            .map(|signal| signal.name().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let first = names();
+    assert_eq!(
+        first.iter().collect::<std::collections::HashSet<_>>().len(),
+        first.len()
+    );
+    assert!(first.iter().any(|name| name.contains("$scope")));
+    analyze_and_lower(
+        "module Other(a: input logic, q: output logic) { assign q = a; }",
+        "other",
+        "Other",
+    )
+    .unwrap();
+    assert_eq!(first, names());
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let clk = sim.event("clk");
+    for value in 0..16u8 {
+        sim.modify(|io| io.set(d, value)).unwrap();
+        sim.tick(clk).unwrap();
+        for (name, increment) in [("c0", 1), ("c1", 2), ("q0", 1), ("q1", 2)] {
+            assert_eq!(
+                sim.get(sim.signal(name)),
+                ((value + increment) & 15).into(),
+                "{name}: d={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ff_local_blocking_updates_preserve_state_and_global_nba_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, clear: input logic, d: input logic<8>, idx: input logic<2>,
+                   current: output logic<8>, prior: output logic<8>, local_read: output logic<8>) {
+            var delayed: logic<8>;
+            always_ff (clk) {
+                var state: logic<8>;
+                if clear {
+                    state = 0;
+                    delayed = 0;
+                    current = 0;
+                    prior = 0;
+                } else {
+                    state += d;
+                    delayed = state;
+                    current = state;
+                    prior = delayed;
+                }
+            }
+            always_ff (clk) {
+                var words: logic<8> [4];
+                words[idx] = d;
+                local_read = words[idx];
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let clk = sim.event("clk");
+    let clear = sim.signal("clear");
+    let d = sim.signal("d");
+    let idx = sim.signal("idx");
+    sim.modify(|io| io.set(clear, 1u8)).unwrap();
+    sim.tick(clk).unwrap();
+    sim.modify(|io| io.set(clear, 0u8)).unwrap();
+    let mut previous = 0u8;
+    for value in 0..=255u8 {
+        sim.modify(|io| {
+            io.set(d, value);
+            io.set(idx, value & 3);
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+        let current = previous.wrapping_add(value);
+        assert_eq!(sim.get(sim.signal("current")), current.into());
+        assert_eq!(sim.get(sim.signal("prior")), previous.into());
+        assert_eq!(sim.get(sim.signal("local_read")), value.into());
+        previous = current;
+    }
+}
+
+#[test]
+fn ff_local_blocking_memory_requirement_is_not_silently_read_first() {
+    for policy in ["required", "block", "distributed"] {
+        let source = format!(
+            r#"
+            module Top(clk: input clock, idx: input logic<2>, d: input logic<8>, q: output logic<8>) {{
+                always_ff (clk) {{
+                    #[sv("struo_memory = \"{policy}\"")]
+                    var words: logic<8> [4];
+                    words[idx] = d;
+                    q = words[idx];
+                }}
+            }}
+            "#
+        );
+        let error = analyze_and_lower(&source, "blocking_memory", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::RequiredMemoryInferenceFailed { reason, .. }
+            if reason.contains("blocking always_ff-local")),
+            "{policy}: {error}"
+        );
+    }
+}
+
+#[test]
+fn corpus_instance_input_defaults() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case("veryl_regressions::inst_port_default_value_connected_not_folded")
+        .unwrap()
+        .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn instance_input_defaults_preserve_connected_runtime_values() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Child(i: input logic<80> = 80'hfedc_ba98_7654_3210_abcd,
+                     o: output logic<80>) { assign o = i; }
+        module Top(d: input logic<80>, a: output logic<80>, b: output logic<80>) {
+            inst omitted: Child(o: a);
+            inst connected: Child(i: d, o: b);
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    for value in [
+        0u128,
+        1,
+        0xffff_ffff_ffff_ffff_ffff,
+        0x1234_5678_9abc_def0_1234,
+    ] {
+        sim.modify(|io| io.set(d, value)).unwrap();
+        assert_eq!(
+            sim.get(sim.signal("a")),
+            0xfedc_ba98_7654_3210_abcdu128.into()
+        );
+        assert_eq!(sim.get(sim.signal("b")), value.into());
+    }
+}
+
+#[test]
+fn instance_input_defaults_do_not_zero_unknowns() {
+    let source = "module Child(i: input logic<8> = 8'hxx, o: output logic<8>) { assign o = i; }
+                  module Top(q: output logic<8>) { inst u: Child(o: q); }";
+    let design = analyze_and_lower(source, "unknown_input_default", "Top").unwrap();
+    let error = struo_synth::synthesize(&design).unwrap_err();
+    assert!(
+        matches!(error, struo_synth::SynthesisError::UndrivenSignalBit { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn instance_input_defaults_do_not_bypass_anonymous_input_rejection() {
+    let source = "module Child(i: input logic<8> = 8'h5a, o: output logic<8>) { assign o = i; }
+                  module Top(q: output logic<8>) { inst u: Child(i: _, o: q); }";
+    let error = analyze_and_lower(source, "anonymous_input_default", "Top").unwrap_err();
+    assert!(
+        matches!(&error, ImportError::AnalysisFailed(message) if message.contains("AnonymousIdentifierUsage")),
+        "{error}"
+    );
+}
+
+#[test]
+fn instance_input_defaults_preserve_signed_extension() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Child (
+            i: input signed logic<12> = -12'sd3,
+            o: output signed logic<16>
+        ) { assign o = i; }
+        module Top(a: output logic<16>, b: output logic<16>, c: output logic<16>) {
+            inst first: Child(o: a);
+            inst second: Child(o: b);
+            inst explicit: Child(i: 12'sd2, o: c);
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    for (name, expected) in [("a", 0xfffdu16), ("b", 0xfffd), ("c", 2)] {
+        assert_eq!(sim.get(sim.signal(name)), expected.into());
+    }
+}
+
+#[test]
+fn corpus_preferred_memory_falls_back_to_registers() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "flip_flop::test_ff_static_and_dynamic_writes_share_sparse_state",
+        "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
+        "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn preferred_memory_fallback_retains_other_memories_and_required_policy() {
+    let source = r"
+        module Top(clk: input clock, idx: input logic<2>, d: input logic<8>,
+                   good_q: output logic<8>, bad_q: output logic<8>) {
+            var a_good: logic<8> [4];
+            BAD_POLICY
+            var z_bad: logic<8> [4];
+            always_ff (clk) {
+                a_good[idx] = d;
+                good_q = a_good[idx];
+                z_bad[idx] = d;
+                z_bad[0] = d + 8'd1;
+                bad_q = z_bad[idx];
+            }
+        }
+    ";
+    let ordinary = source.replace("BAD_POLICY", "");
+    let lowered = analyze_and_lower(&ordinary, "mixed_memory_fallback", "Top").unwrap();
+    let memories = lowered.top_module().unwrap().memories();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].name, "a_good");
+    let stage = Rc::new(RefCell::new(String::new()));
+    let mut sim = celox_test_suite_veryl::Simulator::new(
+        compile(&Design::new(&ordinary, "Top"), &stage).unwrap(),
+    );
+    let clk = sim.event("clk");
+    let idx = sim.signal("idx");
+    let d = sim.signal("d");
+    for index in 0..4u8 {
+        sim.modify(|io| {
+            io.set(idx, index);
+            io.set(d, 20u8 + index);
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+    }
+    let mut good = [20u8, 21, 22, 23];
+    let mut bad = [24u8, 21, 22, 23];
+    for value in 0..64u8 {
+        let index = value & 3;
+        sim.modify(|io| {
+            io.set(idx, index);
+            io.set(d, value);
+        })
+        .unwrap();
+        sim.tick(clk).unwrap();
+        assert_eq!(sim.get(sim.signal("good_q")), good[index as usize].into());
+        assert_eq!(sim.get(sim.signal("bad_q")), bad[index as usize].into());
+        good[index as usize] = value;
+        bad[index as usize] = value;
+        bad[0] = value + 1;
+    }
+    for policy in ["required", "block"] {
+        let required = source.replace(
+            "BAD_POLICY",
+            &format!(r#"#[sv("struo_memory = \"{policy}\"")]"#),
+        );
+        let error = analyze_and_lower(&required, "required_memory_fallback", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::RequiredMemoryInferenceFailed { memory, .. } if memory == "z_bad"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn corpus_bounded_runtime_loop_initializers() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    for name in [
+        "basic::test_comb_loop_bound_output_call_writes_back_once",
+        "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",
+    ] {
+        celox_test_suite_veryl::case(name)
+            .unwrap()
+            .run(&mut |design| compile(design, &stage));
+    }
+}
+
+#[test]
+fn bounded_runtime_starts_preserve_steps_effects_breaks_and_empty_ranges() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, start: input logic<4>, limit: input logic<4>,
+                   stop: input logic<4>, sum: output logic<8>, q: output logic<8>,
+                   init_calls: output logic<8>, body_calls: output logic<8>) {
+            function begin_loop(x: input logic<4>, calls: inout logic<8>) -> logic<4> {
+                calls += 8'd1;
+                return x;
+            }
+            function mark(x: input logic<4>, calls: inout logic<8>) -> logic<4> {
+                calls += 8'd1;
+                return x;
+            }
+            always_comb {
+                init_calls = 0;
+                body_calls = 0;
+                sum = 0;
+                for i in begin_loop(start, init_calls)..limit step += 3 {
+                    if i == stop { break; }
+                    sum += mark(i as 4, body_calls) as 8;
+                }
+                for unused in begin_loop(start, init_calls)..0 {
+                    body_calls += 8'd10;
+                }
+            }
+            always_ff (clk) {
+                var tmp: logic<8>;
+                tmp = 0;
+                for i in start..=limit step += 2 { tmp += i as 8; }
+                q = tmp;
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let clk = sim.event("clk");
+    let start = sim.signal("start");
+    let limit = sim.signal("limit");
+    let stop = sim.signal("stop");
+    for first in 0..16u8 {
+        for end in 0..16u8 {
+            for stop_at in 0..16u8 {
+                sim.modify(|io| {
+                    io.set(start, first);
+                    io.set(limit, end);
+                    io.set(stop, stop_at);
+                })
+                .unwrap();
+                let values = (first..end)
+                    .step_by(3)
+                    .take_while(|i| *i != stop_at)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    sim.get(sim.signal("sum")),
+                    values.iter().copied().sum::<u8>().into(),
+                    "start={first}, end={end}, stop={stop_at}"
+                );
+                assert_eq!(sim.get(sim.signal("init_calls")), 2u8.into());
+                assert_eq!(sim.get(sim.signal("body_calls")), values.len().into());
+                sim.tick(clk).unwrap();
+                assert_eq!(
+                    sim.get(sim.signal("q")),
+                    (first..=end).step_by(2).sum::<u8>().into()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn runtime_starts_reject_unproven_ranges_and_counter_overflow() {
+    for (start_type, end_type, step, reason) in [
+        ("signed logic<8>", "logic<4>", 1u32, "non-negative"),
+        ("logic<32>", "logic<4>", 1, "non-negative"),
+        ("logic<4>", "logic<32>", 1, "termination is not proven"),
+        ("logic<4>", "logic<4>", 2_147_483_647, "overflow"),
+    ] {
+        let source = format!(
+            "module Top(start: input {start_type}, limit: input {end_type}, q: output logic<8>) {{
+                always_comb {{ q = 0; for i in start..limit step += {step} {{ q += 1; }} }}
+             }}"
+        );
+        let error = analyze_and_lower(&source, "unproven_runtime_start", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains(reason)),
+            "{error}"
+        );
+    }
+    let source = "module Top(start: input logic<4>, q: output logic<8>) {
+        always_comb { q = 0; for i in $signed(start)..8 { q += 1; } }
+    }";
+    let error = analyze_and_lower(source, "signed_runtime_start", "Top").unwrap_err();
+    assert!(
+        matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains("non-negative")),
+        "{error}"
+    );
+}
+
+#[test]
+fn runtime_start_packed_select_remains_unsigned() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(d: input signed logic<8>, q: output logic<8>) {
+            always_comb {
+                q = 0;
+                for i in d[3:0]..8 { q += i as 8; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    for start in 0..16u8 {
+        sim.modify(|io| io.set(d, 0xf0u8 | start)).unwrap();
+        assert_eq!(sim.get(sim.signal("q")), (start..8).sum::<u8>().into());
+    }
+}
+
+#[test]
+fn corpus_display_argument_function_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case(
+        "basic::test_comb_function_call_with_output_argument_in_display_argument",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn output_task_arguments_preserve_short_circuit_and_break_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r#"
+        module Top(d: input logic<8>, gate: input logic, stop: input logic<3>, q: output logic<8>) {
+            function bump(x: input logic<8>, calls: inout logic<8>) -> logic<8> {
+                calls += x + 8'd1;
+                return x;
+            }
+            always_comb {
+                q = 0;
+                $display("", 8'hxx);
+                $display("%d", gate && bump(d, q));
+                if !gate { $write("%d", bump(d, q)); }
+                for i in 0..4 {
+                    if i == stop { break; }
+                    $write("%d", bump(i as 8, q));
+                }
+            }
+        }
+        "#,
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let d = sim.signal("d");
+    let gate = sim.signal("gate");
+    let stop = sim.signal("stop");
+    for value in [0u8, 1, 255] {
+        for enabled in [0u8, 1] {
+            for stopped_at in 0..8u8 {
+                sim.modify(|io| {
+                    io.set(d, value);
+                    io.set(gate, enabled);
+                    io.set(stop, stopped_at);
+                })
+                .unwrap();
+                assert_eq!(
+                    sim.get(sim.signal("q")),
+                    value
+                        .wrapping_add(1)
+                        .wrapping_add((0..stopped_at.min(4)).map(|i| i + 1).sum::<u8>())
+                        .into()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn output_tasks_do_not_bypass_ff_function_write_restrictions() {
+    for task in ["display", "write"] {
+        let source = format!(
+            r#"
+            module Top(clk: input clock, q: output logic<8>) {{
+                function mark(x: output logic<8>) -> logic {{ x = 8'd1; return 1'b1; }}
+                always_ff(clk) {{ ${task}("%d", mark(q)); }}
+            }}
+        "#
+        );
+        let error = analyze_and_lower(&source, "ff_output_task_effects", "Top").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ImportError::AnalysisFailed(_) | ImportError::UnsupportedBehavior(_)
+            ),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn instance_input_function_output_effects_remain_rejected() {
+    let source = r"
+        module Child(i: input logic, o: output logic) { assign o = i; }
+        module Top(d: input logic, q: output logic, side: output logic) {
+            function mark(x: input logic, seen: output logic) -> logic { seen = x; return x; }
+            inst u: Child(i: mark(d, side), o: q);
+        }
+    ";
+    let error = analyze_and_lower(source, "nonprocedural_function_outputs", "Top").unwrap_err();
+    assert!(
+        matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains("read-only expression")),
+        "{error}"
+    );
+}
+
+#[test]
+fn case_loop_termination_preserves_target_effects_and_each_branch() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(count: input logic<32>, sel: input logic<2>, gate: input logic,
+                   q: output logic<8>, calls: output logic<8>) {
+            function target(x: input logic<2>, n: inout logic<8>) -> logic<2> {
+                n += 1;
+                return x;
+            }
+            always_comb {
+                q = 0;
+                calls = 0;
+                for i in 0..count {
+                    case target(sel, calls) {
+                        0: { q = 10; break; }
+                        1: {
+                            if gate { q = 20; break; }
+                            else { q = 30; break; }
+                        }
+                        default: { q = 40; break; }
+                    }
+                    q = 99;
+                }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let count = sim.signal("count");
+    let sel = sim.signal("sel");
+    let gate = sim.signal("gate");
+    for bound in [0u32, 1, 64, 255, u32::MAX] {
+        for selector in 0..4u8 {
+            for enabled in [0u8, 1] {
+                sim.modify(|io| {
+                    io.set(count, bound);
+                    io.set(sel, selector);
+                    io.set(gate, enabled);
+                })
+                .unwrap();
+                let expected = if bound == 0 {
+                    0u8
+                } else {
+                    match selector {
+                        0 => 10,
+                        1 if enabled == 1 => 20,
+                        1 => 30,
+                        _ => 40,
+                    }
+                };
+                assert_eq!(sim.get(sim.signal("q")), expected.into());
+                assert_eq!(sim.get(sim.signal("calls")), u8::from(bound != 0).into());
+            }
+        }
+    }
+}
+
+#[test]
+fn case_loop_termination_requires_every_path_to_break_this_loop() {
+    for body in [
+        "case sel { 0: break; }",
+        "case sel { 0: break; default: { q += 1; } }",
+        "case sel { 0: { q += 1; } default: break; }",
+        "case sel { 0: break; default: { if gate { break; } } }",
+        "case sel { 0: break; default: { for j in 0..2 { break; } } }",
+    ] {
+        let source = format!(
+            "module Top(count: input logic<32>, sel: input logic<2>, gate: input logic,
+                        q: output logic<8>) {{
+                always_comb {{ q = 0; for i in 0..count {{ {body} }} }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "case_termination", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("termination"), "{error}");
+    }
+}
+
+#[test]
+fn byte_bound_loops_cover_the_full_range_and_break_boundary() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(count: input logic<8>, start: input logic<8>, stop: input logic<8>,
+                   hits: output logic<9>, sum: output logic<16>, tail: output logic<9>) {
+            always_comb {
+                hits = 0;
+                for i in 0..=count { hits = (i + 1) as 9; }
+                sum = 0;
+                for i in 0..count step += 3 {
+                    if i == stop { break; }
+                    sum ^= i as 16;
+                }
+                tail = 0;
+                for i in start..=count { tail = (i + 1) as 9; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let count = sim.signal("count");
+    let start = sim.signal("start");
+    let stop = sim.signal("stop");
+    for n in 0..256u16 {
+        for stop_at in [0u16, 63, 64, 252, 255] {
+            sim.modify(|io| {
+                io.set(count, n);
+                io.set(start, n ^ 128);
+                io.set(stop, stop_at);
+            })
+            .unwrap();
+            assert_eq!(sim.get(sim.signal("hits")), (n + 1).into());
+            assert_eq!(
+                sim.get(sim.signal("tail")),
+                (if (n ^ 128) <= n { n + 1 } else { 0 }).into()
+            );
+            assert_eq!(
+                sim.get(sim.signal("sum")),
+                (0..n)
+                    .step_by(3)
+                    .take_while(|i| *i != stop_at)
+                    .fold(0u16, |value, i| value ^ i)
+                    .into()
+            );
+        }
+    }
+}
+
+#[test]
+fn static_loop_ranges_do_not_hide_counter_wrap_or_unsigned_reverse_sentinels() {
+    for range in [
+        "rev 8'd0..4",
+        "rev 8'd1..3 step += 3",
+        "rev 8'd0..0",
+        "64'd4294967296..64'd4294967298",
+        "2147483646..=2147483647",
+    ] {
+        let source = format!(
+            "module Top(stop: input logic, q: output logic<8>) {{
+                always_comb {{ q = 0; for i in {range} {{ if stop {{ break; }} q += 1; }} }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "static_loop_range", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{range}: {error}"
+        );
+    }
+}
+
+#[test]
+fn static_loop_proofs_preserve_signed_sentinels_and_guaranteed_breaks() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(stop: input logic, digits: output logic<16>, singleton: output logic<8>,
+                   broken: output logic<8>, empty: output logic<8>) {
+            always_comb {
+                digits = 0;
+                for i in rev 8'sd0..4 {
+                    digits = digits * 10 + i as 16;
+                    if stop { break; }
+                }
+                singleton = 0;
+                for i in rev 8'd1..4 step += 3 {
+                    singleton = i as 8;
+                    if stop { break; }
+                }
+                broken = 0;
+                for i in rev 8'd0..1 { broken += 1; break; }
+                empty = 0;
+                for i in rev 0..0 step += 2 { empty += 1; if stop { break; } }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let stop = sim.signal("stop");
+    for halted in [0u8, 1] {
+        sim.modify(|io| io.set(stop, halted)).unwrap();
+        assert_eq!(
+            sim.get(sim.signal("digits")),
+            (if halted == 0 { 3210u16 } else { 3 }).into()
+        );
+        assert_eq!(sim.get(sim.signal("singleton")), 3u8.into());
+        assert_eq!(sim.get(sim.signal("broken")), 1u8.into());
+        assert_eq!(sim.get(sim.signal("empty")), 0u8.into());
+    }
+}
+
+#[test]
+fn corpus_reverse_loop_with_guaranteed_first_iteration_break() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    celox_test_suite_veryl::case(
+        "flip_flop::test_ff_runtime_reverse_min_i32_end_wraps_before_range_check",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
+}
+
+#[test]
+fn single_iteration_loops_use_truncated_counters_and_preserve_nested_effects() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(start: input signed logic<64>, limit: input signed logic<64>, gate: input logic,
+                   fwd: output logic<32>, reverse_value: output logic<32>, nested: output logic<32>,
+                   calls: output logic<8>, branch: output logic<8>) {
+            function seed(x: input signed logic<64>, n: inout logic<8>) -> signed logic<64> {
+                n += 1;
+                return x;
+            }
+            always_comb {
+                calls = 0;
+                fwd = 32'heeeeeeee;
+                reverse_value = 32'hdddddddd;
+                nested = 32'hcccccccc;
+                branch = 0;
+                for i in seed(start, calls)..limit step *= 2 {
+                    fwd = i as 32;
+                    for j in rev start..limit { nested = (i + j) as 32; break; }
+                    if gate { branch = 1; break; } else { branch = 2; break; }
+                }
+                for i in rev start..seed(limit, calls) { reverse_value = i as 32; break; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let start = sim.signal("start");
+    let limit = sim.signal("limit");
+    let gate = sim.signal("gate");
+    let values = [
+        i64::MIN,
+        -4_294_967_296,
+        -2_147_483_648,
+        -1,
+        0,
+        1,
+        2_147_483_647,
+        4_294_967_299,
+        i64::MAX,
+    ];
+    for first in values {
+        for end in values {
+            for enabled in [0u8, 1] {
+                sim.modify(|io| {
+                    io.set(start, first.cast_unsigned());
+                    io.set(limit, end.cast_unsigned());
+                    io.set(gate, enabled);
+                })
+                .unwrap();
+                let forward_counter =
+                    i32::from_le_bytes(first.to_le_bytes()[..4].try_into().unwrap());
+                let reverse_counter =
+                    i32::from_le_bytes(end.wrapping_sub(1).to_le_bytes()[..4].try_into().unwrap());
+                let forward_active = i64::from(forward_counter) < end;
+                let reverse_active = i64::from(reverse_counter) >= first;
+                assert_eq!(
+                    sim.get(sim.signal("fwd")),
+                    (if forward_active {
+                        forward_counter.cast_unsigned()
+                    } else {
+                        0xeeee_eeee
+                    })
+                    .into()
+                );
+                assert_eq!(
+                    sim.get(sim.signal("reverse_value")),
+                    (if reverse_active {
+                        reverse_counter.cast_unsigned()
+                    } else {
+                        0xdddd_dddd
+                    })
+                    .into()
+                );
+                assert_eq!(
+                    sim.get(sim.signal("nested")),
+                    (if forward_active && reverse_active {
+                        forward_counter
+                            .wrapping_add(reverse_counter)
+                            .cast_unsigned()
+                    } else {
+                        0xcccc_cccc
+                    })
+                    .into()
+                );
+                assert_eq!(sim.get(sim.signal("calls")), 2u8.into());
+                assert_eq!(
+                    sim.get(sim.signal("branch")),
+                    (if forward_active {
+                        if enabled == 1 { 1u8 } else { 2 }
+                    } else {
+                        0
+                    })
+                    .into()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn single_iteration_ff_reverse_comparison_keeps_unsigned_bound_context() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, start: input logic<64>, limit: input signed logic<64>,
+                   q: output logic<32>) {
+            always_ff (clk) {
+                q = 32'heeeeeeee;
+                for i in rev start..limit { q = i as 32; break; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let clk = sim.event("clk");
+    let start = sim.signal("start");
+    let limit = sim.signal("limit");
+    for first in [
+        0u64,
+        1,
+        2_147_483_647,
+        4_294_967_295,
+        4_294_967_296,
+        u64::MAX,
+    ] {
+        for end in [
+            i64::MIN,
+            -2_147_483_648,
+            -1,
+            0,
+            1,
+            2_147_483_647,
+            4_294_967_296,
+            i64::MAX,
+        ] {
+            sim.modify(|io| {
+                io.set(start, first);
+                io.set(limit, end.cast_unsigned());
+            })
+            .unwrap();
+            sim.tick(clk).unwrap();
+            let counter =
+                u32::from_le_bytes(end.wrapping_sub(1).to_le_bytes()[..4].try_into().unwrap());
+            let expected = if u64::from(counter) >= first {
+                counter
+            } else {
+                0xeeee_eeee
+            };
+            assert_eq!(
+                sim.get(sim.signal("q")),
+                expected.into(),
+                "start={first}, end={end}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_iteration_counter_drives_dynamic_selects_and_constant_array_reads() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(start: input signed logic<64>, bits: output logic<16>, data: output logic<8>) {
+            const A: logic<8> [4] = '{11, 22, 33, 44};
+            always_comb {
+                bits = 0;
+                data = 0;
+                for i in start..64'sh7fff_ffff_ffff_ffff step *= 2 {
+                    bits[i] = 1;
+                    data = A[i];
+                    break;
+                }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let start = sim.signal("start");
+    for first in [-1i64, 0, 1, 3, 4, 15, 16, 2_147_483_648, 4_294_967_299] {
+        sim.modify(|io| io.set(start, first.cast_unsigned()))
+            .unwrap();
+        let counter = i32::from_le_bytes(first.to_le_bytes()[..4].try_into().unwrap());
+        let bits = if (0..16).contains(&counter) {
+            1u16 << counter
+        } else {
+            0
+        };
+        let data = usize::try_from(counter)
+            .ok()
+            .and_then(|i| [11u8, 22, 33, 44].get(i).copied())
+            .unwrap_or(0);
+        assert_eq!(sim.get(sim.signal("bits")), bits.into());
+        assert_eq!(sim.get(sim.signal("data")), data.into());
+    }
+}
+
+#[test]
+fn single_iteration_loops_reject_lost_constant_initializer_bits() {
+    for start in ["128'h1_0000_0000_0000_0003", "128'sh1_0000_0000_0000_0003"] {
+        let source = format!(
+            "module Top(limit: input logic<128>, q: output logic<32>) {{
+                always_comb {{ q = 0; for i in {start}..limit {{ q = i as 32; break; }} }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "saturated_loop_initializer", "Top").unwrap_err();
+        assert!(
+            matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains("saturated")),
+            "{error}"
+        );
     }
 }

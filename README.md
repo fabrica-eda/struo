@@ -43,7 +43,7 @@ core `rtl`, `ir`, `synth`, `formal`, and `sim` modules are always available.
 Veryl source
     │
     ▼
-veryl-analyzer 0.21.0
+veryl-analyzer 0.22.0
     │  struo-frontend-veryl
     ▼
 struo-rtl              module / type / clock / reset / register / memory
@@ -592,7 +592,7 @@ var words: logic<32> [1024];
 var flags: logic [128];
 ```
 
-Veryl 0.21.0 rejects tool-defined attribute names, which is why this uses
+Veryl 0.22.0 rejects tool-defined attribute names, which is why this uses
 `sv(...)` instead of a Struo-specific attribute namespace. Struo consumes only
 the `struo_memory` key and ignores unrelated `sv` attributes. An explicitly
 typed array that violates its contract reports the array name and the first
