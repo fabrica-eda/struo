@@ -1699,6 +1699,10 @@ impl<'a> ModuleLowerer<'a> {
                 .plan_known_loop(statement, reads, writes, sequential)?
                 .ok_or(error)?,
         };
+        let reverse = matches!(
+            statement.range,
+            veryl_analyzer::ir::ForRange::Reverse { .. }
+        );
         let mut changed = DrivenBits::default();
         let mut cursor =
             self.lower_loop_start(&plan, statement, reads, writes, sequential, &mut changed)?;
@@ -1736,7 +1740,9 @@ impl<'a> ModuleLowerer<'a> {
                     signed: statement.var_type.signed,
                     ..self.constant(width, iteration as u64)
                 };
-                let op = if *inclusive {
+                let op = if reverse {
+                    Op::Less
+                } else if *inclusive {
                     Op::Greater
                 } else {
                     Op::GreaterEq
@@ -1747,15 +1753,18 @@ impl<'a> ModuleLowerer<'a> {
             // Candidates before initialization or skipped by the step are
             // inactive. In particular, their breaks must not stop later work.
             let skip = if let Some(cursor) = cursor {
-                let candidate = self.constant(cursor.width, iteration as u64);
-                // With unit stride, every candidate at or above the captured
-                // start is reachable. Avoid a chain of counter adders/muxes.
+                let candidate = LoweredExpr {
+                    signed: reverse && cursor.signed,
+                    ..self.constant(cursor.width, iteration as u64)
+                };
+                // Unit stride reaches candidates on the advancing side of
+                // the captured start, without counter adders/muxes.
                 let op = if plan
                     .runtime_start
                     .as_ref()
                     .is_some_and(|(_, step)| *step == 1)
                 {
-                    Op::Greater
+                    if reverse { Op::Less } else { Op::Greater }
                 } else {
                     Op::Ne
                 };
@@ -1771,18 +1780,7 @@ impl<'a> ModuleLowerer<'a> {
             *writes = self.merge_values(skip, &before, writes)?;
             if let (Some(current), Some((_, step))) = (cursor, &plan.runtime_start) {
                 if *step != 1 {
-                    let increment = self.constant(current.width, *step as u64);
-                    let next = self.lower_binary(
-                        Op::Add,
-                        current,
-                        increment,
-                        current.width,
-                        current.signed,
-                    )?;
-                    cursor = Some(LoweredExpr {
-                        id: self.rtl.mux(skip.id, current.id, next.id)?,
-                        ..current
-                    });
+                    cursor = Some(self.advance_loop_cursor(current, skip, *step, reverse)?);
                 }
                 let zero = self.constant(1, 0);
                 stop.id = self.rtl.mux(skip.id, zero.id, stop.id)?;
@@ -1791,6 +1789,27 @@ impl<'a> ModuleLowerer<'a> {
             changed.extend(written);
         }
         Ok(changed)
+    }
+
+    fn advance_loop_cursor(
+        &mut self,
+        current: LoweredExpr,
+        skip: LoweredExpr,
+        step: usize,
+        reverse: bool,
+    ) -> Result<LoweredExpr, ImportError> {
+        let increment = self.constant(current.width, step as u64);
+        let next = self.lower_binary(
+            if reverse { Op::Sub } else { Op::Add },
+            current,
+            increment,
+            current.width,
+            current.signed,
+        )?;
+        Ok(LoweredExpr {
+            id: self.rtl.mux(skip.id, current.id, next.id)?,
+            ..current
+        })
     }
 
     fn lower_loop_start(
@@ -1811,6 +1830,22 @@ impl<'a> ModuleLowerer<'a> {
             self.lower_expression(start, &self.sequential_reads(reads, writes))?
         } else {
             self.lower_comb_expression(start, writes, changed)?
+        };
+        let value = if matches!(
+            statement.range,
+            veryl_analyzer::ir::ForRange::Reverse {
+                inclusive: false,
+                ..
+            }
+        ) {
+            let width = value.width.max(concrete_width(
+                &statement.var_type,
+                "loop induction variable",
+            )?);
+            let one = self.constant(width, 1);
+            self.lower_binary(Op::Sub, value, one, width, value.signed)?
+        } else {
+            value
         };
         self.resize(
             value,

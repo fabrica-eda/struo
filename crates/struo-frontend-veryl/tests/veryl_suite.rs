@@ -3409,3 +3409,140 @@ fn known_additive_loops_reject_mutable_bounds_and_signed_wraparound() {
         );
     }
 }
+
+#[test]
+fn bounded_reverse_loops_capture_starts_and_preserve_steps_and_breaks() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(b: input logic<4>, stop: input logic<4>, exclusive: output logic<16>,
+                   inclusive: output logic<16>, stepped: output logic<16>, forward: output logic<8>) {
+            always_comb {
+                var upper: logic<4>;
+                upper = b;
+                exclusive = 0;
+                for i in rev 0..upper {
+                    exclusive += (i + 1) as 16;
+                    upper = 0;
+                    if i == stop { break; }
+                }
+                inclusive = 0;
+                for i in rev 0..=(b + 4'd1) { inclusive += (i + 1) as 16; }
+                stepped = 0;
+                for i in rev 0..b step += 3 { stepped += (i + 1) as 16; }
+                forward = 0;
+                for i in 0..=(b + 4'd1) { forward += 1; }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let b = sim.signal("b");
+    let stop = sim.signal("stop");
+    for bound in 0..16u16 {
+        for stop_value in 0..16u16 {
+            sim.modify(|io| {
+                io.set(b, bound);
+                io.set(stop, stop_value);
+            })
+            .unwrap();
+            let mut exclusive = 0u16;
+            for i in (0..bound).rev() {
+                exclusive += i + 1;
+                if i == stop_value {
+                    break;
+                }
+            }
+            let stepped: u16 = (0..bound).rev().step_by(3).map(|i| i + 1).sum();
+            assert_eq!(sim.get(sim.signal("exclusive")), exclusive.into());
+            assert_eq!(
+                sim.get(sim.signal("inclusive")),
+                ((bound + 2) * (bound + 3) / 2).into()
+            );
+            assert_eq!(sim.get(sim.signal("stepped")), stepped.into());
+            assert_eq!(sim.get(sim.signal("forward")), (bound + 2).into());
+        }
+    }
+}
+
+#[test]
+fn bounded_reverse_loops_reject_unsigned_conditions_and_unproven_initializers() {
+    for range in ["rev 8'd0..b", "rev 0..wide", "rev 0..signed_bound"] {
+        let source = format!(
+            "module Top(b: input logic<4>, wide: input logic<32>, signed_bound: input i32, q: output logic<32>) {{
+                always_comb {{ q = 0; for i in {range} {{ q += 1; }} }}
+            }}"
+        );
+        let error = analyze_and_lower(&source, "unproven_reverse_loop", "Top").unwrap_err();
+        assert!(
+            matches!(error, ImportError::UnsupportedBehavior(_)),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn bounded_reverse_initialization_effects_and_ff_local_writes() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top(clk: input clock, b: input logic<4>, q: output logic<16>,
+                   calls: output logic<8>, comb: output logic<16>) {
+            function upper(v: input logic<4>, n: inout logic<8>) -> logic<4> {
+                n += 1; return v;
+            }
+            always_comb {
+                calls = 0;
+                comb = 0;
+                for i in rev 2..upper(b, calls) step += 3 { comb += (i + 1) as 16; }
+            }
+            always_ff (clk) {
+                var bound: logic<4>;
+                var total: logic<16>;
+                bound = b;
+                total = 0;
+                for i in rev 0..=bound { total += (i + 1) as 16; bound = 0; }
+                q = total;
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let b = sim.signal("b");
+    let clk = sim.event("clk");
+    for bound in 0..16u16 {
+        sim.modify(|io| io.set(b, bound)).unwrap();
+        sim.tick(clk).unwrap();
+        let comb: u16 = (2..bound).rev().step_by(3).map(|i| i + 1).sum();
+        assert_eq!(
+            sim.get(sim.signal("q")),
+            ((bound + 1) * (bound + 2) / 2).into()
+        );
+        assert_eq!(sim.get(sim.signal("comb")), comb.into());
+        assert_eq!(sim.get(sim.signal("calls")), 1u8.into());
+    }
+}
+
+#[test]
+fn arithmetic_loop_ranges_enforce_the_expansion_budget() {
+    for (range, accepted) in [
+        ("0..(b + 9'd1)", true),
+        ("0..=(b + 9'd1)", false),
+        ("rev 0..(b + 9'd1)", true),
+        ("rev 0..=(b + 9'd1)", false),
+    ] {
+        let source = format!(
+            "module Top(b: input logic<9>, q: output logic<32>) {{
+                always_comb {{ q = 0; for i in {range} {{ q = i as 32; }} }}
+            }}"
+        );
+        let result = analyze_and_lower(&source, "arithmetic_loop_budget", "Top");
+        if accepted {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(ImportError::UnsupportedBehavior(_))));
+        }
+    }
+}

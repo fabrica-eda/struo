@@ -233,15 +233,13 @@ cases = [
 [[ignore]]
 reason = "The runtime start is not proven non-negative without truncation, or the counter can overflow before termination."
 cases = [
-  "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
   "synth_dynamic_loop::test_constant_bounds_preserve_wide_limit_above_loop_width",
   "synth_dynamic_loop::test_runtime_bounds_forward_overshoot_exits_without_wraparound",
   "synth_dynamic_loop::test_runtime_bounds_large_additive_step_exits_without_wraparound",
-  "synth_dynamic_loop::test_runtime_bounds_signed_inclusive_range_preserves_negative_bounds",
 ]
 
 [[ignore]]
-reason = "Struo cannot prove termination within its 256-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
+reason = "Struo cannot prove termination within its 512-iteration guarded expansion budget. Simulation input samples do not establish a synthesis bound."
 cases = [
   "flip_flop::test_ff_runtime_for_bounds",
   "synth_dynamic_loop::test_runtime_bounds_in_synth_for_loops",
@@ -257,8 +255,10 @@ cases = [
 ]
 
 [[ignore]]
-reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
+reason = "These runtime loops admit non-terminating input values (bitwise/stalled cycles, signed inclusive maximum endpoints, or reverse-counter wrap); test-vector values alone are not a synthesis termination proof."
 cases = [
+  "flip_flop::test_ff_runtime_for_signed_inclusive_range_preserves_negative_bounds",
+  "synth_dynamic_loop::test_runtime_bounds_signed_inclusive_range_preserves_negative_bounds",
   "flip_flop::test_ff_i32_bitwise_steps_discard_bits_above_the_counter_width",
   "flip_flop::test_ff_runtime_for_bitwise_steps",
   "flip_flop::test_ff_runtime_for_reverse_singleton_exits_cleanly",
@@ -302,10 +302,9 @@ cases = [
 ]
 
 [[ignore]]
-reason = "Runtime loop bounds fall outside the proven non-negative range and 256-iteration synthesis policy."
+reason = "The reverse lower bound is a variable assigned in a separate combinational block; its constant value is not available to the current loop proof."
 cases = [
   "veryl_context_regressions::runtime_for_bound_keeps_its_type",
-  "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
 ]
 
 
@@ -326,4 +325,10 @@ cases = [
 reason = "Veryl 0.22.0 reports CombinationalLoop for cand: the runtime-bounded write leaves array entries unassigned."
 cases = [
   "nba_dynamic_array::test_subbyte_arithmetic_padding_does_not_corrupt_concat",
+]
+
+[[ignore]]
+reason = "Bounded arithmetic forward/reverse loops lower successfully but exceed the 60-second case budget during mapping and native simulator construction."
+cases = [
+  "veryl_context_regressions::runtime_for_bound_arithmetic_uses_int_context",
 ]
