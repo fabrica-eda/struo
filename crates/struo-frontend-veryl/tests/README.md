@@ -21,6 +21,15 @@ cases record their effective `timeout_seconds` and `timeout_reason` in the repor
 entries must exist in the pinned catalogue and cannot be duplicated. Use
 `--include-ignored` to execute excluded cases and expose their actual outcomes.
 
+The runner defaults to one worker and a hard 4096 MiB address-space limit per
+worker (`--memory-mib`). The limit is applied before executing the native worker,
+inherited by its child processes, and cannot be raised by the worker. Allocation
+failure is a failed case, never a pass. Core dumps are disabled for workers.
+This limits virtual address space, not just resident memory; a large reservation
+can fail even without equivalent physical allocation. Multiple workers or runner
+invocations multiply the possible memory usage. CI uses one worker explicitly.
+The limit does not apply to the initial Cargo build.
+
 The Actions job summary shows outcome counts. Download the
 `veryl-corpus-results` artifact for per-case diagnostics, including after a
 failed run. Reports are generated under `target/` and retained by Actions for

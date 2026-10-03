@@ -75,12 +75,16 @@ def main():
     parser.add_argument('--reference', action='store_true', help='compare with direct Celox source simulation')
     parser.add_argument('--filter', default='')
     parser.add_argument('--include-ignored', action='store_true', help='execute ignored cases and tag-excluded expectations too')
-    parser.add_argument('--jobs', type=int, default=4)
+    parser.add_argument('--jobs', type=int, default=1)
+    parser.add_argument('--memory-mib', type=int, default=4096,
+                        help='hard address-space limit per worker (default: 4096 MiB)')
     parser.add_argument('--timeout', type=int, help='override every case budget; otherwise use per-case policies or 60 seconds')
     parser.add_argument('--report', type=Path, default=Path('target/veryl-suite.json'))
     args = parser.parse_args()
     if args.timeout is not None and args.timeout <= 0:
         parser.error('--timeout must be positive')
+    if args.jobs <= 0 or args.memory_mib <= 0:
+        parser.error('--jobs and --memory-mib must be positive')
     build = subprocess.run(['cargo', 'test', '--locked', '-p', 'struo-frontend-veryl',
                             '--test', 'veryl_suite', '--no-run', '--message-format=json'],
                            stdout=subprocess.PIPE, text=True)
@@ -128,7 +132,9 @@ def main():
             if args.reference:
                 env['STRUO_VERYL_REFERENCE'] = '1'
             try:
-                proc = subprocess.run([binary, '--ignored', '--exact', 'corpus_case', '--nocapture'],
+                proc = subprocess.run([sys.executable, str(Path(__file__).with_name('limited-worker.py')),
+                                       '--memory-mib', str(args.memory_mib),
+                                       binary, '--ignored', '--exact', 'corpus_case', '--nocapture'],
                                       env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                       text=True, timeout=seconds)
                 output = proc.stdout
@@ -152,7 +158,7 @@ def main():
                         _, stage, elapsed = line.split()
                         timings[stage] = timings.get(stage, 0.0) + float(elapsed)
                 result['timings_seconds'] = timings
-            result.update(timeout_seconds=seconds, timeout_reason=reason)
+            result.update(timeout_seconds=seconds, timeout_reason=reason, memory_limit_mib=args.memory_mib)
             result.update(catalogue[name])
             print(f"{result['status']:24} {name}", flush=True)
             return result
@@ -166,6 +172,7 @@ def main():
                   'pipeline': 'Veryl -> Celox native' if args.reference else 'Veryl -> Struo RTL -> synthesis -> ECP5 -> Celox native',
                   'timeout_seconds': args.timeout if args.timeout is not None else 60,
                   'timeout_override_seconds': args.timeout, 'include_ignored': args.include_ignored or args.reference,
+                  'memory_limit_mib': args.memory_mib, 'jobs': args.jobs,
                   'counts': counts, 'cases': results}
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + '\n')

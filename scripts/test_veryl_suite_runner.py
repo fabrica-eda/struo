@@ -56,8 +56,12 @@ cases = ["slow"]
                   patch.object(runner, 'load_timeouts', return_value={'slow': (300, 'Slow build')})):
                 self.assertEqual(runner.main(), 0)
             self.assertEqual(run.call_args.kwargs['timeout'], 300)
+            command = run.call_args.args[0]
+            self.assertEqual(Path(command[1]).name, 'limited-worker.py')
+            self.assertEqual(command[2:4], ['--memory-mib', '4096'])
             result = json.loads(report.read_text())['cases'][0]
             self.assertEqual(result['timeout_seconds'], 300)
+            self.assertEqual(result['memory_limit_mib'], 4096)
             self.assertEqual(result['timings_seconds']['case_total'], 1.25)
 
     def test_rejects_invalid_policy(self):
