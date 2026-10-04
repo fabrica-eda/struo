@@ -1,11 +1,11 @@
-# Explicit exclusions for celox-test-suite-veryl 0.9.0.
+# Explicit exclusions for celox-test-suite-veryl 0.10.1.
 # Skipped cases are not passes. Remove entries only after validation.
 # Tag exclusions below describe incompatible oracles, not frontend gaps.
 # Untagged cases are not automatically proof of portable SV conformance.
 # Recheck with scripts/check-veryl-suite.py --include-ignored --filter <case>.
 
 [[ignore]]
-reason = "Celox 0.9.0 rejects an asynchronous reset shared across distinct clock domains."
+reason = "Celox 0.10.1 rejects an asynchronous reset shared across distinct clock domains."
 cases = [
   "multi_clock::test_clock_domain_crossing_pattern",
   "multi_clock::test_independent_clock_domains",
@@ -240,6 +240,19 @@ cases = [
   "synth_dynamic_loop::test_runtime_reverse_step_matches_emitted_sv_order",
 ]
 
+[[ignore]]
+reason = "The fixture drives the design from initial blocks; initial and final blocks are simulation-only and are not synthesized."
+cases = [
+  "concurrent_initial::clock_periods",
+  "concurrent_initial::control_flow",
+  "concurrent_initial::hierarchy",
+  "concurrent_initial::reset",
+  "concurrent_initial::reset_between_edges",
+  "concurrent_initial::reset_only_clock",
+  "concurrent_initial::shared_clock",
+  "hierarchical_assignment::disjoint_loop",
+  "hierarchical_assignment::selections",
+]
 
 # These oracles require behavior outside Struo's synthesis contract.
 # --include-ignored executes them too, retaining upstream tag metadata.
@@ -261,18 +274,6 @@ cases = [
   "ff_narrow_arrays::ff_captures_padded_elements_and_unknown_masks",
   "veryl_regressions::wide_shift_count_preserves_unknowns_and_sign_fill",
   "veryl_regressions::constant_arrays_initialize_comb_and_ff_reads",
-]
-
-[[ignore]]
-reason = "Veryl 0.22.0 rejects scalar x[0] (InvalidSelect::Scalar); the suite expects acceptance of a scalar bit-select."
-cases = [
-  "flip_flop::test_ff_function_call_bit_select_on_nonvariable_one_bit_formal",
-]
-
-[[ignore]]
-reason = "Veryl 0.22.0 rejects tri on a function formal (NetInFunction); legal inout variable formals are covered separately."
-cases = [
-  "function_arguments::test_comb_inout_statement_copies_input_before_mutating_formal",
 ]
 
 [[ignore]]
