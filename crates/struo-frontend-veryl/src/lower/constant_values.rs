@@ -92,7 +92,12 @@ impl ModuleLowerer<'_> {
                 // Read-only lowering rejects initializer writes; skipping its
                 // later evaluation is safe only for an effect-free constant.
                 let value = self.lower_expression(expression, &snapshot)?;
-                let Some(constant) = self.known_rtl_constant(value.id) else {
+                // The initializer is evaluated once, so a wire driven by a
+                // constant from another process also fixes the start.
+                let Some(constant) = self
+                    .known_rtl_constant(value.id)
+                    .or_else(|| self.constant_driver(value.id))
+                else {
                     return Ok(None);
                 };
                 let mut bits = 0usize;

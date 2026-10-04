@@ -1783,6 +1783,7 @@ fn corpus_veryl_022_regressions() {
         "veryl_context_regressions::constant_ternary_keeps_both_arm_types",
         "veryl_context_regressions::signed_cast_of_folded_constant_sign_extends",
         "veryl_context_regressions::constant_case_on_signed_target",
+        "veryl_context_regressions::runtime_for_bound_keeps_its_type",
         "veryl_regressions::wide_struct_bit_field_rhs_no_spill",
         "hierarchy::test_inactive_instance_input_output_call_adds_no_parent_driver",
     ] {
@@ -2633,6 +2634,32 @@ fn runtime_starts_reject_unproven_ranges_and_counter_overflow() {
         matches!(&error, ImportError::UnsupportedBehavior(message) if message.contains("non-negative")),
         "{error}"
     );
+}
+
+#[test]
+fn constant_driven_signed_starts_count_from_the_negative_value() {
+    let stage = Rc::new(RefCell::new(String::new()));
+    let design = Design::new(
+        r"
+        module Top #(param S: i32 = 2) (unsigned_end: output logic<32>, signed_end: output logic<32>) {
+            var lo: i32;
+            assign lo = -3;
+            always_comb {
+                unsigned_end = 0;
+                for i in lo..4'd2 { unsigned_end += 1 + (i - i); }
+            }
+            always_comb {
+                signed_end = 0;
+                for i in lo..S { signed_end += 1 + (i - i); }
+            }
+        }
+        ",
+        "Top",
+    );
+    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    // An unsigned bound compares the negative start unsigned, so no iteration runs.
+    assert_eq!(sim.get(sim.signal("unsigned_end")), 0u32.into());
+    assert_eq!(sim.get(sim.signal("signed_end")), 5u32.into());
 }
 
 #[test]
