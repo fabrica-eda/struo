@@ -28,7 +28,7 @@ keywords = ["fpga", "hdl", "synthesis", "veryl", "ecp5"]
 categories = ["compilers", "development-tools"]
 
 [workspace.dependencies]
-celox = "=0.9.0"
+celox = "=0.10.1"
 struo = { version = "=0.1.1", path = "crates/struo" } # x-release-please-version
 struo-celox = { version = "=0.1.1", path = "crates/struo-celox" } # x-release-please-version
 struo-formal = { version = "=0.1.1", path = "crates/struo-formal" } # x-release-please-version
