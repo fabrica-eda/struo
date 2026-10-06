@@ -3720,19 +3720,68 @@ fn propagate_lut4_constants(netlist: &mut Ecp5Netlist) {
             .collect::<WireMap<_>>();
         let mut changed = false;
         for cell in &mut netlist.cells {
-            let Ecp5Cell::Lut4 { inputs, .. } = cell else {
-                continue;
-            };
-            for input in inputs {
-                if let Bit::Wire(wire) = input
-                    && let Some(constant) = constants.get(wire)
-                {
-                    *input = *constant;
-                    changed = true;
+            match cell {
+                Ecp5Cell::Lut4 { inputs, .. } => {
+                    for input in inputs {
+                        if let Bit::Wire(wire) = input
+                            && let Some(constant) = constants.get(wire)
+                        {
+                            *input = *constant;
+                            changed = true;
+                        }
+                    }
                 }
+                // A constant D is a tie. A clock enable that is always
+                // asserted is no enable at all; a constant CE must never be
+                // left on a LUT, whose pin would then have no launching
+                // register for timing analysis.
+                Ecp5Cell::FlipFlop { data, enable, .. } => {
+                    if let Bit::Wire(wire) = data
+                        && let Some(constant) = constants.get(wire)
+                    {
+                        *data = *constant;
+                        changed = true;
+                    }
+                    if let Some(control) = enable
+                        && let Bit::Wire(wire) = control.signal
+                        && let Some(constant) = constants.get(&wire)
+                    {
+                        let asserted =
+                            (*constant == Bit::One) == (control.active == ActiveLevel::High);
+                        if asserted {
+                            *enable = None;
+                        } else {
+                            control.signal = *constant;
+                        }
+                        changed = true;
+                    }
+                }
+                _ => {}
             }
         }
         if !changed {
+            break;
+        }
+    }
+    remove_unused_constant_lut4s(netlist);
+}
+
+/// Removes LUT4 cells whose inputs are all constant once propagation has
+/// replaced every use of their output.
+fn remove_unused_constant_lut4s(netlist: &mut Ecp5Netlist) {
+    loop {
+        let fanouts = mapped_wire_fanouts(netlist);
+        let previous_len = netlist.cells.len();
+        netlist.cells.retain(|cell| {
+            let Ecp5Cell::Lut4 { inputs, output, .. } = cell else {
+                return true;
+            };
+            !inputs
+                .iter()
+                .all(|input| matches!(input, Bit::Zero | Bit::One))
+                || fanouts.contains_key(output)
+        });
+        if netlist.cells.len() == previous_len {
             break;
         }
     }
@@ -11593,15 +11642,31 @@ mod tests {
                 if reverse {
                     mapped.cells.reverse();
                 }
+                mapped.ports.push(MappedPort {
+                    name: "result".into(),
+                    direction: PortDirection::Output,
+                    bits: vec![Bit::Wire(23)],
+                });
                 let original = mapped.cells.clone();
                 super::propagate_lut4_constants(&mut mapped);
-                assert_eq!(mapped.cells.len(), original.len());
-                for wire in 20..=22 {
-                    assert!(mapped.cells.iter().any(|cell| matches!(cell,
-                        Ecp5Cell::Lut4 { inputs, output, .. }
-                        if *output == wire && inputs.iter().all(|bit| !matches!(bit, Bit::Wire(_)))
-                    )));
-                }
+                // The constant cone is folded into its consumer. Constant
+                // LUTs left without a sink are removed; output ports observe
+                // wires 20 and 23.
+                let remaining = mapped
+                    .cells
+                    .iter()
+                    .map(|cell| match cell {
+                        Ecp5Cell::Lut4 { output, inputs, .. } => (*output, *inputs),
+                        _ => unreachable!("fixture contains only LUT4s"),
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(remaining.keys().copied().collect::<Vec<_>>(), [20, 23]);
+                assert!(
+                    remaining[&20]
+                        .iter()
+                        .all(|bit| !matches!(bit, Bit::Wire(_)))
+                );
+                assert!(!matches!(remaining[&23][0], Bit::Wire(_)));
                 // Evaluate the original and transformed cones independently of
                 // cleanup's cofactor calculation, for every primary input.
                 let evaluate = |cells: &[Ecp5Cell], assignment: u32| {
@@ -11609,7 +11674,11 @@ mod tests {
                         .map(|wire| (wire, (assignment >> (wire - 10)) & 1))
                         .collect::<BTreeMap<_, _>>();
                     for wire in 20..=23 {
-                        let cell = cells.iter().find(|cell| matches!(cell, Ecp5Cell::Lut4 { output, .. } if *output == wire)).unwrap();
+                        let Some(cell) = cells.iter().find(
+                            |cell| matches!(cell, Ecp5Cell::Lut4 { output, .. } if *output == wire),
+                        ) else {
+                            continue;
+                        };
                         let Ecp5Cell::Lut4 { inputs, init, .. } = cell else {
                             unreachable!()
                         };
@@ -11672,6 +11741,90 @@ mod tests {
         assert_eq!(&mapped.cells[1..], &dedicated);
         assert!(matches!(mapped.cells[0], Ecp5Cell::Lut4 { output: 20, .. }));
         assert_eq!(mapped.ports, ports);
+    }
+
+    #[test]
+    fn constant_register_controls_become_ties_and_their_luts_are_removed() {
+        let mut mapped = direct_lut_fixture(0);
+        let constant_lut = |name: &str, output, init| Ecp5Cell::Lut4 {
+            name: name.into(),
+            inputs: [Bit::Zero; 4],
+            output,
+            init,
+        };
+        let flip_flop = |name: &str, data, enable: super::Control, output| Ecp5Cell::FlipFlop {
+            name: name.into(),
+            data,
+            output,
+            clock: Bit::Wire(13),
+            edge: ClockEdge::Rising,
+            enable: Some(enable),
+            reset: None,
+        };
+        let high = |signal| super::Control {
+            signal,
+            active: ActiveLevel::High,
+        };
+        mapped.cells.extend([
+            constant_lut("always_one", 30, u16::MAX),
+            constant_lut("always_zero", 31, 0),
+            // Enable always asserted: no enable remains.
+            flip_flop("enabled", Bit::Wire(10), high(Bit::Wire(30)), 40),
+            // Active-low enable driven high: never asserted, a constant tie.
+            flip_flop(
+                "disabled",
+                Bit::Wire(10),
+                super::Control {
+                    signal: Bit::Wire(30),
+                    active: ActiveLevel::Low,
+                },
+                41,
+            ),
+            // A constant D is a tie; a dynamic enable is kept.
+            flip_flop("constant_data", Bit::Wire(31), high(Bit::Wire(11)), 42),
+        ]);
+        mapped.ports.push(MappedPort {
+            name: "q".into(),
+            direction: PortDirection::Output,
+            bits: vec![Bit::Wire(40), Bit::Wire(41), Bit::Wire(42)],
+        });
+        super::propagate_lut4_constants(&mut mapped);
+
+        let flip_flop = |name: &str| {
+            mapped
+                .cells
+                .iter()
+                .find_map(|cell| match cell {
+                    Ecp5Cell::FlipFlop {
+                        name: cell_name,
+                        data,
+                        enable,
+                        ..
+                    } if cell_name == name => Some((*data, *enable)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(flip_flop("enabled"), (Bit::Wire(10), None));
+        assert_eq!(
+            flip_flop("disabled"),
+            (
+                Bit::Wire(10),
+                Some(super::Control {
+                    signal: Bit::One,
+                    active: ActiveLevel::Low
+                })
+            )
+        );
+        assert_eq!(
+            flip_flop("constant_data"),
+            (Bit::Zero, Some(high(Bit::Wire(11))))
+        );
+        assert!(mapped.cells.iter().all(|cell| !matches!(
+            cell,
+            Ecp5Cell::Lut4 { name, .. } if name == "always_one" || name == "always_zero"
+        )));
+        assert!(matches!(mapped.cells[0], Ecp5Cell::Lut4 { output: 20, .. }));
     }
 
     #[test]
