@@ -98,6 +98,46 @@ impl ModuleLowerer<'_> {
         })
     }
 
+    /// Whether the arms' constant equality labels match every value of the
+    /// case target, making a `default` arm unreachable.
+    ///
+    /// Only labels compared in the target's own width and signedness are
+    /// counted (the comparison is then on the target value itself); wildcard
+    /// and range labels are ignored, so an uncertain case keeps its default.
+    pub(super) fn case_arms_cover_target<'a>(
+        target: &PreparedCaseTarget,
+        arm_patterns: impl IntoIterator<Item = &'a [super::CasePattern]>,
+    ) -> bool {
+        const MAX_COVERED_WIDTH: u32 = 12;
+        let width = target.value.width;
+        if width > MAX_COVERED_WIDTH {
+            return false;
+        }
+        let own = target.expression.comptime().expr_context;
+        let mut covered = vec![false; 1 << width];
+        for patterns in arm_patterns {
+            for pattern in patterns {
+                let super::CasePattern::Eq(label) = pattern else {
+                    continue;
+                };
+                let pair = label.comptime().expr_context;
+                if !(target.expression.is_self_determined()
+                    || (pair.width == own.width && pair.signed == own.signed))
+                    || wildcard_pattern(label.as_ref()).is_some()
+                {
+                    continue;
+                }
+                if let Some(index) = super::evaluated_u64(label.as_ref())
+                    .filter(|value| *value >> width == 0)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    covered[index] = true;
+                }
+            }
+        }
+        covered.iter().all(|covered| *covered)
+    }
+
     pub(super) fn lower_case_label(
         &mut self,
         expression: &super::Expression,
