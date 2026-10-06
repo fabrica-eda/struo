@@ -1978,6 +1978,15 @@ impl<'a> ModuleLowerer<'a> {
         let mut changed =
             self.lower_statements(&statement.default, reads, &mut else_env, sequential)?;
         changed.extend(effects);
+        // When the labels cover every target value, the default is
+        // unreachable. Selecting it would guard every write with a
+        // tautological "some arm matched" condition, which register-enable
+        // inference would then adopt as a clock enable that is always true.
+        let exhaustive = !statement.arms.is_empty()
+            && Self::case_arms_cover_target(
+                &target,
+                statement.arms.iter().map(|arm| arm.patterns.as_slice()),
+            );
 
         // A balanced first-match tree does not reduce the mux depth below four
         // arms: the final default selection replaces the level saved in the
@@ -1985,13 +1994,20 @@ impl<'a> ModuleLowerer<'a> {
         // small cases so equivalent source does not needlessly perturb packing
         // and placement.
         if statement.arms.len() < 4 {
-            for arm in statement.arms.iter().rev() {
+            for (index, arm) in statement.arms.iter().rev().enumerate() {
                 let mut then_env = base.clone();
                 let arm_changed =
                     self.lower_statements(&arm.body, reads, &mut then_env, sequential)?;
                 let condition = self.lower_case_patterns(&target, &arm.patterns, &base)?;
                 let mut merged_changed = changed.clone();
                 merged_changed.extend(arm_changed);
+                // Exhaustive: the lowest-priority arm takes every value the
+                // others do not, so it replaces the default unconditionally.
+                if exhaustive && index == 0 {
+                    else_env = then_env;
+                    changed = merged_changed;
+                    continue;
+                }
                 let mut merged_env = base.clone();
                 for key in merged_changed.keys() {
                     let width = self.width(key)?;
@@ -2047,10 +2063,13 @@ impl<'a> ModuleLowerer<'a> {
             let signed = self.is_signed(key);
             let matched_value =
                 self.lower_case_value_tree(&match_tree, &lowered_arms, key, width, signed)?;
-            let default_value = self.resize(else_env[key], width, signed)?;
-            let value =
+            let value = if exhaustive {
+                matched_value.id
+            } else {
+                let default_value = self.resize(else_env[key], width, signed)?;
                 self.rtl
-                    .mux(match_tree.any_match.id, matched_value.id, default_value.id)?;
+                    .mux(match_tree.any_match.id, matched_value.id, default_value.id)?
+            };
             merged_env.insert(
                 key.clone(),
                 LoweredExpr {
@@ -5300,6 +5319,58 @@ module CaseFirstMatchTop (
 }
 ";
 
+    // Both cases cover every selector value, so `default` is unreachable:
+    // four arms take the balanced path, two arms the priority chain. As in a
+    // state machine, the default writes another register, so wide_q and
+    // narrow_q hold when it is selected.
+    const EXHAUSTIVE_CASE_SOURCE: &str = r"
+module ExhaustiveCaseTop (
+    clk     : input clock_posedge,
+    rst_n   : input reset_async_low,
+    state   : input logic<2>,
+    phase   : input logic,
+    start   : input logic,
+    value   : input logic<4>,
+    fallback: input logic<4>,
+    wide    : output logic<4>,
+    narrow  : output logic<4>,
+    other   : output logic<4>,
+) {
+    var wide_q  : logic<4>;
+    var narrow_q: logic<4>;
+    var other_q : logic<4>;
+    always_ff (clk, rst_n) {
+        if_reset {
+            wide_q   = 4'd0;
+            narrow_q = 4'd0;
+            other_q  = 4'd0;
+        } else {
+            case state {
+                2'd0: if start {
+                    wide_q = value;
+                }
+                2'd1: {}
+                2'd2: {}
+                2'd3: if start {
+                    wide_q = ~value;
+                }
+                default: other_q = fallback;
+            }
+            case phase {
+                1'b0: if start {
+                    narrow_q = value;
+                }
+                1'b1: {}
+                default: other_q = ~fallback;
+            }
+        }
+    }
+    assign wide   = wide_q;
+    assign narrow = narrow_q;
+    assign other  = other_q;
+}
+";
+
     const BALANCED_CASE_SOURCE: &str = r"
 module BalancedCaseTop (
     select : input  logic<5>,
@@ -6012,6 +6083,79 @@ module WideLiteralTop (
             set(&mut simulator, "select", select);
             assert_value(&mut simulator, "decoded", decoded);
             assert_value(&mut simulator, "side", side);
+        }
+    }
+
+    #[test]
+    fn exhaustive_case_drops_its_unreachable_default_and_keeps_real_enables() {
+        let design = analyze_and_lower(
+            EXHAUSTIVE_CASE_SOURCE,
+            "exhaustive_case",
+            "ExhaustiveCaseTop",
+        )
+        .unwrap();
+        let synthesized = synthesize(&design).unwrap();
+        let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
+
+        // Guarding the arms with "some label matched" would make every
+        // inferred enable a tautology. Each register keeps a real enable,
+        // and no constant LUT is left behind.
+        let constant_lut = |wire: u32| {
+            mapped.cells().iter().any(|cell| {
+                matches!(cell, Ecp5Cell::Lut4 { inputs, output, .. }
+                    if *output == wire
+                        && inputs.iter().all(|input| !matches!(input, struo_target_ecp5::Bit::Wire(_))))
+            })
+        };
+        let mut registers = 0;
+        for cell in mapped.cells() {
+            let Ecp5Cell::FlipFlop { name, enable, .. } = cell else {
+                continue;
+            };
+            if !(name.contains("wide_q") || name.contains("narrow_q")) {
+                continue;
+            }
+            registers += 1;
+            let signal = enable
+                .unwrap_or_else(|| panic!("{name} lost its enable"))
+                .signal;
+            let struo_target_ecp5::Bit::Wire(wire) = signal else {
+                panic!("{name} has a constant enable");
+            };
+            assert!(!constant_lut(wire), "{name} enable is a constant LUT");
+        }
+        assert_eq!(registers, 8);
+
+        let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
+        set(&mut simulator, "rst_n", 0);
+        tick(&mut simulator);
+        set(&mut simulator, "rst_n", 1);
+        set(&mut simulator, "fallback", 0xf);
+        let mut wide = 0;
+        let mut narrow = 0;
+        for cycle in 0..64u8 {
+            let state = cycle % 4;
+            let phase = (cycle / 4) % 2;
+            let start = (cycle / 8) % 2;
+            let value = cycle.wrapping_mul(7) & 0xf;
+            set(&mut simulator, "state", state);
+            set(&mut simulator, "phase", phase);
+            set(&mut simulator, "start", start);
+            set(&mut simulator, "value", value);
+            tick(&mut simulator);
+            if start == 1 {
+                if state == 0 {
+                    wide = value;
+                } else if state == 3 {
+                    wide = !value & 0xf;
+                }
+                if phase == 0 {
+                    narrow = value;
+                }
+            }
+            assert_value(&mut simulator, "wide", wide.into());
+            assert_value(&mut simulator, "narrow", narrow.into());
+            assert_value(&mut simulator, "other", 0);
         }
     }
 
