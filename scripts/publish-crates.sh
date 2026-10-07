@@ -39,6 +39,20 @@ fi
 
 "$script_dir/check-release-version.py"
 
+# Fail before uploading anything if a crate needs an internal crate (of any
+# dependency kind) that the order above publishes later.
+cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+import json, sys
+order = sys.argv[1:]
+packages = {p["name"]: p for p in json.load(sys.stdin)["packages"]}
+for index, name in enumerate(order):
+    for dependency in packages[name]["dependencies"]:
+        dep = dependency["name"]
+        if dep in order and order.index(dep) >= index:
+            kind = dependency["kind"] or "normal"
+            sys.exit(f"{name} has a {kind} dependency on {dep}, which is not published before it")
+' "${crates[@]}"
+
 if [[ "$mode" == "publish" ]]; then
   : "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN is required for publication}"
 fi

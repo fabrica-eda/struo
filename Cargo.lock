@@ -3124,8 +3124,6 @@ name = "struo-celox"
 version = "0.2.0"
 dependencies = [
  "celox",
- "serde_json",
- "struo-frontend-veryl",
  "struo-ir",
  "struo-rtl",
  "struo-synth",
