@@ -1002,6 +1002,18 @@ impl Netlist {
         if let Some(value) = self.constant_value(condition) {
             return if value { then_net } else { else_net };
         }
+        // Select on the uninverted condition so that `c ? b : a` and
+        // `!c ? a : b` share one node, as negated operands already do for
+        // the other gates; register-enable inference then sees one form.
+        if let Some(Node {
+            kind: NodeKind::Not,
+            inputs,
+            ..
+        }) = self.node_for_net(condition)
+        {
+            let condition = inputs[0];
+            return self.add_mux(condition, else_net, then_net);
+        }
         self.add_cached(
             LogicKey::Mux(condition, then_net, else_net),
             NodeKind::Mux,
@@ -1623,6 +1635,23 @@ mod tests {
                 .nodes()
                 .iter()
                 .any(|node| matches!(node.kind(), NodeKind::And | NodeKind::Xor))
+        );
+    }
+
+    #[test]
+    fn builder_selects_muxes_on_uninverted_conditions() {
+        let mut design = Netlist::new("mux");
+        let condition = design.add_input("c");
+        let then_net = design.add_input("a");
+        let else_net = design.add_input("b");
+        let direct = design.add_mux(condition, else_net, then_net);
+        let inverted = design.add_not(condition);
+        let swapped = design.add_mux(inverted, then_net, else_net);
+
+        assert_eq!(swapped, direct);
+        assert_eq!(
+            design.nodes()[direct.index() as usize].inputs(),
+            [condition, else_net, then_net]
         );
     }
 
