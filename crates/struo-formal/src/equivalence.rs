@@ -587,7 +587,7 @@ mod tests {
         let counterexample = result.counterexample().unwrap();
 
         assert_eq!(result.status(), EquivalenceStatus::NotEquivalent);
-        assert!(!counterexample.frames().is_empty());
+        assert_ne!(counterexample.frames(), []);
         assert_eq!(counterexample.differing_outputs(), ["q_out"]);
     }
 

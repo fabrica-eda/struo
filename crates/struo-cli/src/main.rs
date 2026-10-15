@@ -537,12 +537,15 @@ mod tests {
         assert_eq!(defaults.io_timing_constraints, None);
         assert_eq!(defaults.ooc_timing_constraints, None);
         assert_eq!(defaults.timing_constraints, None);
-        assert!(defaults.open_drain.is_empty());
+        assert_eq!(defaults.open_drain, [] as [struo::OpenDrainIo; 0]);
         assert_eq!(defaults.jtagg_prefix, None);
-        assert!(defaults.pll_binding.is_empty());
+        assert_eq!(defaults.pll_binding, [] as [std::path::PathBuf; 0]);
         assert!(!defaults.no_infer_register_enables);
         assert!(!defaults.no_relax_qualified_register_enables);
-        assert!(defaults.register_enable_fanout.is_empty());
+        assert_eq!(
+            defaults.register_enable_fanout,
+            [] as [struo::RegisterEnableFanoutConstraint; 0]
+        );
         assert_eq!(defaults.verbose, 0);
 
         let project =
@@ -674,7 +677,13 @@ mod tests {
 
         assert_eq!(constraints.tightest_effective_period_ps(), Some(9_900));
         assert_eq!(constraints.clocks["core"].port, "clk");
-        assert!(constraints.false_paths.is_empty());
-        assert!(constraints.multicycle_paths.is_empty());
+        assert_eq!(
+            constraints.false_paths,
+            [] as [struo::TimingPathConstraint; 0]
+        );
+        assert_eq!(
+            constraints.multicycle_paths,
+            [] as [struo::MulticyclePathConstraint; 0]
+        );
     }
 }

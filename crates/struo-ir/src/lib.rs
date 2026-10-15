@@ -1730,7 +1730,7 @@ mod tests {
                                 constant_word(&mut design, lhs + rhs + u64::from(carry), width)
                             );
                         }
-                        assert!(design.arithmetic().is_empty());
+                        assert_eq!(design.arithmetic(), []);
                         assert_eq!(design.validate(), Ok(()));
                     }
                 }
@@ -1782,7 +1782,7 @@ mod tests {
                     .unwrap(),
                 zeros
             );
-            assert!(design.arithmetic().is_empty());
+            assert_eq!(design.arithmetic(), []);
             assert_eq!(design.nodes().len(), 2);
             assert_eq!(design.validate(), Ok(()));
         }

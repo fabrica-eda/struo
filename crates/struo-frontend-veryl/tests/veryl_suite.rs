@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use celox::{NativeBackend, Simulator};
-use celox_test_suite_veryl::{Backend, BigUint, CompilationRejected, Design, Result, SignalPath};
+use celox_test_suite::{Backend, BigUint, CompilationRejected, Design, Result, SignalPath};
 use struo_frontend_veryl::{ImportError, analyze_and_lower};
 
 type Stage = Rc<RefCell<String>>;
@@ -154,7 +154,7 @@ fn compile(design: &Design, stage: &Stage) -> Result<Box<dyn Backend>> {
     let rtl = analyze_and_lower(&source, "suite", &design.top).map_err(|error| {
         if let ImportError::AnalysisFailed(diagnostic) = error {
             *stage.borrow_mut() = "analysis_error".into();
-            Box::new(CompilationRejected(diagnostic)) as celox_test_suite_veryl::Error
+            Box::new(CompilationRejected(diagnostic)) as celox_test_suite::Error
         } else {
             error.to_string().into()
         }
@@ -216,7 +216,7 @@ fn corpus_case() {
             .try_init();
     }
     let name = std::env::var("STRUO_VERYL_CASE").expect("STRUO_VERYL_CASE");
-    let case = celox_test_suite_veryl::case(&name).expect("unknown corpus case");
+    let case = celox_test_suite::veryl::case(&name).expect("unknown corpus case");
     let stage = Rc::new(RefCell::new("setup_error".into()));
     let mut timer = std::time::Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -224,7 +224,7 @@ fn corpus_case() {
     }));
     report_elapsed("case_total", &mut timer);
     let status = if result.is_ok() {
-        if case.expectation == celox_test_suite_veryl::Expectation::CompilationError {
+        if case.expectation == celox_test_suite::Expectation::CompilationError {
             "rejected".to_owned()
         } else {
             "passed".to_owned()
@@ -242,7 +242,7 @@ fn corpus_case() {
 #[test]
 #[ignore = "catalogue for scripts/check-veryl-suite.py"]
 fn corpus_list() {
-    for case in celox_test_suite_veryl::cases() {
+    for case in celox_test_suite::veryl::cases() {
         println!(
             "STRUO_CASE {}",
             serde_json::json!({
@@ -270,7 +270,7 @@ fn corpus_smoke() {
         "multi_clock::test_separate_resets_per_domain",
         "wide_operators::test_wide_ff_accumulator",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -296,7 +296,7 @@ fn corpus_width_and_signedness_regressions() {
         "flip_flop::test_ff_function_call_part_select_of_signed_formal_is_unsigned",
         "hierarchy::test_instance_input_port_assignment_width_context",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -305,7 +305,7 @@ fn corpus_width_and_signedness_regressions() {
 #[test]
 fn corpus_unpacked_array_output_slice() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case("hierarchy::test_instance_unpacked_array_slice_output")
+    celox_test_suite::veryl::case("hierarchy::test_instance_unpacked_array_slice_output")
         .unwrap()
         .run(&mut |design| compile(design, &stage));
 }
@@ -343,7 +343,7 @@ fn array_output_slices_preserve_element_order_and_neighbors() {
             "
         );
         let design = Design::new(&code, "Top");
-        let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+        let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
         let i = sim.signal("i");
         let o = sim.signal("o");
         let packed = sim.signal("o_packed");
@@ -397,7 +397,7 @@ fn corpus_open_output_ports() {
         "std_binary_codec::test_binary_encoder_disabled",
         "std_binary_codec::test_binary_codec_roundtrip",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -423,7 +423,7 @@ fn open_output_ports_preserve_child_internal_reads() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let i = sim.signal("i");
     let explicit = sim.signal("explicit");
     let omitted = sim.signal("omitted");
@@ -453,7 +453,7 @@ fn corpus_disjoint_combinational_drivers() {
         "hierarchy::test_hierarchical_dual_dynamic_readers_feedback_runtime",
         "hierarchy::test_hierarchical_overlapping_partial_write_dynamic_index_runtime",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -471,7 +471,7 @@ fn corpus_runtime_loops_with_proven_breaks() {
         "flip_flop::test_ff_runtime_for_break",
         "flip_flop::test_ff_runtime_for_unsigned_slice_bound_zero_extends_signed_source",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -513,7 +513,7 @@ fn bounded_runtime_loops_preserve_guards_steps_and_mutable_bounds() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let count = sim.signal("count");
     let bound = sim.signal("bound");
     let stop = sim.signal("stop");
@@ -575,7 +575,7 @@ fn packed_array_literals_reject_invalid_shapes() {
 #[test]
 fn corpus_array_literal_effects() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case(
+    celox_test_suite::veryl::case(
         "comb_observer::test_comb_function_packed_array_literal_preserves_source_order",
     )
     .unwrap()
@@ -656,7 +656,7 @@ fn array_literal_effects_design() -> Design {
 fn array_literal_effects_preserve_values_order_and_guards() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = array_literal_effects_design();
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     let gate = sim.signal("gate");
     for value in 0..=255u8 {
@@ -716,7 +716,7 @@ fn corpus_function_input_effects() {
         "basic::test_statement_call_inputs_follow_output_writeback_order",
         "comb_observer::test_named_function_inputs_evaluate_in_source_order",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -782,7 +782,7 @@ fn function_input_effects_design() -> Design {
 fn function_input_effects_preserve_snapshots_frames_and_guards() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = function_input_effects_design();
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     let gate = sim.signal("gate");
     for value in 0..=255u8 {
@@ -854,7 +854,7 @@ fn corpus_functions_and_static_loops() {
         "nba_dynamic_array::test_always_ff_let_bindings_are_visible_immediately",
         "nba_dynamic_array::test_dynamic_ff_array_partial_squash_preserves_head_and_branch",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -876,7 +876,7 @@ fn corpus_comb_function_effects_and_language_rejections() {
         "hierarchy::test_instance_output_concat_advances_each_destination",
         "hierarchy::test_dynamic_output_port_rmw_preserves_unselected_bits",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -889,7 +889,7 @@ fn corpus_system_function_output_effects() {
         "basic::test_comb_function_call_expression_output_survives_system_function_wrapper",
         "basic::test_comb_value_system_function_statement_applies_argument_outputs",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -930,7 +930,7 @@ fn system_function_effects_preserve_values_and_execution_guards() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     let stop = sim.signal("stop");
     let signed_q = sim.signal("signed_q");
@@ -975,7 +975,7 @@ fn corpus_function_array_arguments() {
         "flip_flop::test_ff_function_call_array_literal_supports_dynamic_multidim_indexing",
         "flip_flop::test_ff_function_call_restores_nearest_array_view_after_deep_reentrant_call",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -1008,7 +1008,7 @@ fn array_returns_preserve_runtime_elements_and_signedness() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let a = sim.signal("a");
     let b = sim.signal("b");
     let index = sim.signal("index");
@@ -1037,7 +1037,7 @@ fn corpus_constant_power() {
         "operators::test_pow_operator_constant_exponent",
         "operators::test_pow_operator_constant_exponent_ff",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -1076,7 +1076,7 @@ fn powers_preserve_context_and_self_determined_exponents() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let base = sim.signal("base");
     let signed_base = sim.signal("signed_base");
     let exponent = sim.signal("exponent");
@@ -1169,7 +1169,7 @@ fn dynamic_part_selects_preserve_only_in_range_bits() {
     ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let index = sim.signal("index");
     let data = sim.signal("data");
     let value = sim.signal("value");
@@ -1217,7 +1217,7 @@ fn mixed_width_comparison_zero_extends_when_either_operand_is_unsigned() {
     ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let a = sim.signal("a");
     let b = sim.signal("b");
     let less = sim.signal("less");
@@ -1270,7 +1270,7 @@ fn corpus_division_system_functions_and_eliminated_clocks() {
         "system_function::test_direct_comb_signed_system_function_sign_extends_to_context",
         "system_function::test_direct_comb_unsigned_system_function_zero_extends_to_context",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -1319,7 +1319,7 @@ fn unsigned_parent_reaches_ternary_but_not_concatenation_operands() {
 #[test]
 fn upstream_constant_size_cast_regression() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case(
+    celox_test_suite::veryl::case(
         "expression_semantics::constant_and_runtime_casts_use_the_same_resize_rule",
     )
     .unwrap()
@@ -1329,14 +1329,14 @@ fn upstream_constant_size_cast_regression() {
 #[test]
 fn upstream_constant_function_actual_regression() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case("flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion")
+    celox_test_suite::veryl::case("flip_flop::test_ff_function_call_nonvariable_argument_preserves_self_sized_overflow_before_coercion")
         .unwrap().run(&mut |design| compile(design, &stage));
 }
 
 #[test]
 fn corpus_index_read_effects() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case(
+    celox_test_suite::veryl::case(
         "basic::test_comb_function_call_with_output_argument_in_index_expression",
     )
     .unwrap()
@@ -1392,7 +1392,7 @@ fn index_read_effects_design() -> Design {
 fn index_reads_evaluate_once_and_preserve_guards() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = index_read_effects_design();
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     let sel = sim.signal("sel");
     let gate = sim.signal("gate");
@@ -1440,7 +1440,7 @@ fn index_reads_evaluate_once_and_preserve_guards() {
 #[test]
 fn corpus_destination_index_effects() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case(
+    celox_test_suite::veryl::case(
         "basic::test_comb_function_call_with_output_argument_in_destination_index",
     )
     .unwrap()
@@ -1511,7 +1511,7 @@ fn destination_index_effects_design() -> Design {
 fn destination_indices_freeze_once_before_writes() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = destination_index_effects_design();
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let sel = sim.signal("sel");
     let gate = sim.signal("gate");
     for index in 0..8u32 {
@@ -1553,7 +1553,7 @@ fn corpus_expression_type_regressions() {
         "veryl_context_regressions::signed_struct_member_sign_extends",
         "veryl_context_regressions::wide_logical_operand_keeps_result_type",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -1594,7 +1594,7 @@ fn expression_type_design() -> Design {
 fn expression_types_preserve_members_selections_and_context() {
     let stage = Rc::new(RefCell::new(String::new()));
     let design = expression_type_design();
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let a = sim.signal("a");
     let b = sim.signal("b");
     for value in 0..=255u32 {
@@ -1667,7 +1667,7 @@ fn packed_member_dynamic_access_stays_in_its_domain() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     let idx = sim.signal("idx");
     for value in 0..256u32 {
@@ -1742,7 +1742,7 @@ fn packed_member_stride_does_not_wrap_large_indices() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     let idx = sim.signal("idx");
     for value in 0..256u32 {
@@ -1787,7 +1787,7 @@ fn corpus_veryl_022_regressions() {
         "veryl_regressions::wide_struct_bit_field_rhs_no_spill",
         "hierarchy::test_inactive_instance_input_output_call_adds_no_parent_driver",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -1813,7 +1813,7 @@ fn function_inout_variable_formals_copy_in_before_body() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     for value in 0..=255u8 {
         sim.modify(|io| io.set(d, value)).unwrap();
@@ -1853,7 +1853,7 @@ fn corpus_wildcard_comparisons() {
         "veryl_context_regressions::case_compares_each_label_as_an_if_does",
         "veryl_language::inside_outside_range_endpoints",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -1892,7 +1892,7 @@ fn wildcard_constant_masks_preserve_width_and_signedness() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let a = sim.signal("a");
     let s = sim.signal("s");
     let wide = sim.signal("wide");
@@ -1981,7 +1981,7 @@ fn case_context_preserves_priority_and_evaluates_target_once() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let a = sim.signal("a");
     let clk = sim.event("clk");
     for value in 0..256u32 {
@@ -2017,7 +2017,7 @@ fn corpus_constant_array_reads() {
         "veryl_regressions::nested_array_index_const_array",
         "veryl_context_regressions::folded_const_select_keeps_its_sign",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -2068,9 +2068,9 @@ fn constant_arrays_preserve_shape_sign_and_index_effects() {
     let design = constant_array_read_design();
     let rtl = analyze_and_lower(&design.sources[0].text, "constant_rom", "Top").unwrap();
     let top = rtl.top_module().unwrap();
-    assert!(top.registers().is_empty());
-    assert!(top.memories().is_empty());
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    assert_eq!(top.registers(), []);
+    assert_eq!(top.memories(), []);
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let row = sim.signal("row");
     let col = sim.signal("col");
     let table = [[-3i16, 7, -5], [9, -11, 13]];
@@ -2143,7 +2143,7 @@ fn signed_array_indices_do_not_alias_negative_values() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let idx = sim.signal("idx");
     for (bits, expected, written) in [
         (0u8, 11u8, 0x2c21_16ccu32),
@@ -2192,7 +2192,7 @@ fn runtime_values_do_not_prove_unconditional_loop_breaks() {
 #[test]
 fn corpus_scoped_local_variables() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case("duplicate_varpath::test_duplicate_scoped_var_in_always_comb")
+    celox_test_suite::veryl::case("duplicate_varpath::test_duplicate_scoped_var_in_always_comb")
         .unwrap()
         .run(&mut |design| compile(design, &stage));
 }
@@ -2200,7 +2200,7 @@ fn corpus_scoped_local_variables() {
 #[test]
 fn corpus_generate_constant_mux_dependencies() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case("duplicate_varpath::test_duplicate_scoped_var_with_generate_for")
+    celox_test_suite::veryl::case("duplicate_varpath::test_duplicate_scoped_var_with_generate_for")
         .unwrap()
         .run(&mut |design| compile(design, &stage));
 }
@@ -2261,7 +2261,7 @@ fn scoped_signal_names_are_unique_and_stable() {
     )
     .unwrap();
     assert_eq!(first, names());
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     let clk = sim.event("clk");
     for value in 0..16u8 {
@@ -2308,7 +2308,7 @@ fn ff_local_blocking_updates_preserve_state_and_global_nba_reads() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let clk = sim.event("clk");
     let clear = sim.signal("clear");
     let d = sim.signal("d");
@@ -2359,9 +2359,11 @@ fn ff_local_blocking_memory_requirement_is_not_silently_read_first() {
 #[test]
 fn corpus_instance_input_defaults() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case("veryl_regressions::inst_port_default_value_connected_not_folded")
-        .unwrap()
-        .run(&mut |design| compile(design, &stage));
+    celox_test_suite::veryl::case(
+        "veryl_regressions::inst_port_default_value_connected_not_folded",
+    )
+    .unwrap()
+    .run(&mut |design| compile(design, &stage));
 }
 
 #[test]
@@ -2378,7 +2380,7 @@ fn instance_input_defaults_preserve_connected_runtime_values() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     for value in [
         0u128,
@@ -2435,7 +2437,7 @@ fn instance_input_defaults_preserve_signed_extension() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     for (name, expected) in [("a", 0xfffdu16), ("b", 0xfffd), ("c", 2)] {
         assert_eq!(sim.get(sim.signal(name)), expected.into());
     }
@@ -2449,7 +2451,7 @@ fn corpus_preferred_memory_falls_back_to_registers() {
         "nba_dynamic_array::test_dynamic_array_write_is_deferred_across_ff_blocks",
         "nba_dynamic_array::test_unaligned_309_bit_dynamic_ff_round_trip",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -2478,9 +2480,8 @@ fn preferred_memory_fallback_retains_other_memories_and_required_policy() {
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0].name, "a_good");
     let stage = Rc::new(RefCell::new(String::new()));
-    let mut sim = celox_test_suite_veryl::Simulator::new(
-        compile(&Design::new(&ordinary, "Top"), &stage).unwrap(),
-    );
+    let mut sim =
+        celox_test_suite::Simulator::new(compile(&Design::new(&ordinary, "Top"), &stage).unwrap());
     let clk = sim.event("clk");
     let idx = sim.signal("idx");
     let d = sim.signal("d");
@@ -2528,7 +2529,7 @@ fn corpus_bounded_runtime_loop_initializers() {
         "basic::test_comb_loop_bound_output_call_writes_back_once",
         "comb_observer::test_comb_function_loop_bounds_apply_output_effects_left_to_right",
     ] {
-        celox_test_suite_veryl::case(name)
+        celox_test_suite::veryl::case(name)
             .unwrap()
             .run(&mut |design| compile(design, &stage));
     }
@@ -2572,7 +2573,7 @@ fn bounded_runtime_starts_preserve_steps_effects_breaks_and_empty_ranges() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let clk = sim.event("clk");
     let start = sim.signal("start");
     let limit = sim.signal("limit");
@@ -2656,7 +2657,7 @@ fn constant_driven_signed_starts_count_from_the_negative_value() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     // An unsigned bound compares the negative start unsigned, so no iteration runs.
     assert_eq!(sim.get(sim.signal("unsigned_end")), 0u32.into());
     assert_eq!(sim.get(sim.signal("signed_end")), 5u32.into());
@@ -2676,7 +2677,7 @@ fn runtime_start_packed_select_remains_unsigned() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     for start in 0..16u8 {
         sim.modify(|io| io.set(d, 0xf0u8 | start)).unwrap();
@@ -2687,7 +2688,7 @@ fn runtime_start_packed_select_remains_unsigned() {
 #[test]
 fn corpus_display_argument_function_effects() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case(
+    celox_test_suite::veryl::case(
         "basic::test_comb_function_call_with_output_argument_in_display_argument",
     )
     .unwrap()
@@ -2718,7 +2719,7 @@ fn output_task_arguments_preserve_short_circuit_and_break_effects() {
         "#,
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let d = sim.signal("d");
     let gate = sim.signal("gate");
     let stop = sim.signal("stop");
@@ -2811,7 +2812,7 @@ fn case_loop_termination_preserves_target_effects_and_each_branch() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let count = sim.signal("count");
     let sel = sim.signal("sel");
     let gate = sim.signal("gate");
@@ -2887,7 +2888,7 @@ fn byte_bound_loops_cover_the_full_range_and_break_boundary() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let count = sim.signal("count");
     let start = sim.signal("start");
     let stop = sim.signal("stop");
@@ -2965,7 +2966,7 @@ fn static_loop_proofs_preserve_signed_sentinels_and_guaranteed_breaks() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let stop = sim.signal("stop");
     for halted in [0u8, 1] {
         sim.modify(|io| io.set(stop, halted)).unwrap();
@@ -2982,7 +2983,7 @@ fn static_loop_proofs_preserve_signed_sentinels_and_guaranteed_breaks() {
 #[test]
 fn corpus_reverse_loop_with_guaranteed_first_iteration_break() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case(
+    celox_test_suite::veryl::case(
         "flip_flop::test_ff_runtime_reverse_min_i32_end_wraps_before_range_check",
     )
     .unwrap()
@@ -3018,7 +3019,7 @@ fn single_iteration_loops_use_truncated_counters_and_preserve_nested_effects() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let start = sim.signal("start");
     let limit = sim.signal("limit");
     let gate = sim.signal("gate");
@@ -3107,7 +3108,7 @@ fn single_iteration_ff_reverse_comparison_keeps_unsigned_bound_context() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let clk = sim.event("clk");
     let start = sim.signal("start");
     let limit = sim.signal("limit");
@@ -3171,7 +3172,7 @@ fn single_iteration_counter_drives_dynamic_selects_and_constant_array_reads() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let start = sim.signal("start");
     for first in [-1i64, 0, 1, 3, 4, 15, 16, 2_147_483_648, 4_294_967_299] {
         sim.modify(|io| io.set(start, first.cast_unsigned()))
@@ -3210,7 +3211,7 @@ fn single_iteration_loops_reject_lost_constant_initializer_bits() {
 #[test]
 fn corpus_proven_signed_bitwise_loop() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case(
+    celox_test_suite::veryl::case(
         "synth_dynamic_loop::test_signed_xor_step_uses_loop_counter_width",
     )
     .unwrap()
@@ -3258,7 +3259,7 @@ fn known_bitwise_initializers_preserve_sign_step_width_and_condition_order() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let limit = sim.signal("limit");
     for bound in [
         i128::MIN,
@@ -3351,7 +3352,7 @@ fn bitwise_loop_proof_observes_blocking_ff_local_initialization() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let clk = sim.event("clk");
     let count = sim.signal("count");
     for n in 0..256u16 {
@@ -3365,7 +3366,7 @@ fn bitwise_loop_proof_observes_blocking_ff_local_initialization() {
 #[test]
 fn corpus_known_negative_additive_loop() {
     let stage = Rc::new(RefCell::new(String::new()));
-    celox_test_suite_veryl::case("veryl_context_regressions::runtime_for_with_negative_bound")
+    celox_test_suite::veryl::case("veryl_context_regressions::runtime_for_with_negative_bound")
         .unwrap()
         .run(&mut |design| compile(design, &stage));
 }
@@ -3398,7 +3399,7 @@ fn known_additive_loops_preserve_typed_bounds_and_capture_initializers() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let a = sim.signal("a");
     for value in 0..256u16 {
         sim.modify(|io| io.set(a, value)).unwrap();
@@ -3461,7 +3462,7 @@ fn bounded_reverse_loops_capture_starts_and_preserve_steps_and_breaks() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let b = sim.signal("b");
     let stop = sim.signal("stop");
     for bound in 0..16u16 {
@@ -3533,7 +3534,7 @@ fn bounded_reverse_initialization_effects_and_ff_local_writes() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let b = sim.signal("b");
     let clk = sim.event("clk");
     for bound in 0..16u16 {
@@ -3598,7 +3599,7 @@ fn constant_driven_reverse_bounds_preserve_negative_counters_and_ff_reads() {
         .replace("floor = -2;", &format!("floor = {floor};"))
         .replace("var floor: i32;", &format!("var floor: {kind};"));
         let design = Design::new(&source, "Top");
-        let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+        let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
         let b = sim.signal("b");
         let clk = sim.event("clk");
         for bound in 0..16i32 {
@@ -3678,7 +3679,7 @@ fn additive_reductions_preserve_modular_widths_and_signed_increments() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     for count in [
         0u32,
         1,
@@ -3759,7 +3760,7 @@ fn invariant_additive_reductions_preserve_empty_ranges_and_boolean_guards() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let seed_signal = sim.signal("seed");
     let count_signal = sim.signal("count");
     let gate_signal = sim.signal("gate");
@@ -3832,7 +3833,7 @@ fn idempotent_loops_preserve_partial_writes_order_and_empty_ranges() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let seed_signal = sim.signal("seed");
     let count_signal = sim.signal("count");
     let index_signal = sim.signal("idx");
@@ -3911,7 +3912,7 @@ fn small_state_loops_preserve_cycles_transients_and_full_counts() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let seed_signal = sim.signal("seed");
     let count_signal = sim.signal("count");
     for count in [0u32, 1, 2, 3, 4, 5, 6, 255, 256, 0x8000_0000, u32::MAX] {
@@ -3989,7 +3990,7 @@ fn sparse_index_loops_preserve_order_and_late_wrapped_writes() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let seed_signal = sim.signal("seed");
     let count_signal = sim.signal("count");
     for count in [
@@ -4099,7 +4100,7 @@ fn periodic_reductions_preserve_offsets_signed_casts_and_modular_counts() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let seed_signal = sim.signal("seed");
     let count_signal = sim.signal("count");
     for count in [
@@ -4201,7 +4202,7 @@ fn signed_periodic_starts_preserve_conversion_and_capture() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let start_signal = sim.signal("start");
     let small_signal = sim.signal("short_start");
     let seed_signal = sim.signal("seed");
@@ -4314,7 +4315,7 @@ fn linear_reductions_preserve_steps_last_values_and_captured_starts() {
         ",
         "Top",
     );
-    let mut sim = celox_test_suite_veryl::Simulator::new(compile(&design, &stage).unwrap());
+    let mut sim = celox_test_suite::Simulator::new(compile(&design, &stage).unwrap());
     let start_signal = sim.signal("start");
     let seed_signal = sim.signal("seed");
     for start in [

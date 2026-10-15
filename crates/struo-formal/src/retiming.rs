@@ -818,7 +818,7 @@ mod tests {
         let after = super::derive_retimed_graph(&before, &certificate).unwrap();
 
         assert_eq!(after.edges()[0].reset_values(), &[true]);
-        assert!(after.edges()[1].reset_values().is_empty());
+        assert_eq!(after.edges()[1].reset_values(), []);
         assert_eq!(
             verify_retiming_certificate(&before, &after, &certificate),
             Ok(())

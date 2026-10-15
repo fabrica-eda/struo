@@ -546,7 +546,7 @@ impl<'a> ModuleLowerer<'a> {
             return Err(self.memory_inference_failure(memory_id, "the array has zero depth"));
         }
         let word = value_type(&variable.r#type, &self.variable_name(memory_id))?;
-        let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1);
+        let address_width = (depth - 1).bit_width().max(1);
         let mut ports = ports
             .into_iter()
             .enumerate()
@@ -608,7 +608,7 @@ impl<'a> ModuleLowerer<'a> {
             return Err(self.memory_inference_failure(memory_id, "the array has zero depth"));
         }
         let word = value_type(&variable.r#type, &self.variable_name(memory_id))?;
-        let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1);
+        let address_width = (depth - 1).bit_width().max(1);
         let write = pattern.writes.remove(0);
         let read = pattern.async_reads.remove(0);
         if !read.enable.is_empty() {
@@ -3876,7 +3876,7 @@ impl<'a> ModuleLowerer<'a> {
         };
         let offset_width = index
             .width
-            .checked_add(u32::BITS - width.leading_zeros() + 1)
+            .checked_add(width.bit_width() + 1)
             .ok_or_else(|| ImportError::WidthTooLarge("packed select offset".into()))?;
         let index = self.resize(index, offset_width, true)?;
         let offset = match select.1 {
@@ -6029,7 +6029,7 @@ module WideLiteralTop (
         let design =
             analyze_and_lower(HIERARCHY_SOURCE, "interface_lowering", "HierarchyTop").unwrap();
         let top = design.top_module().unwrap();
-        assert!(top.instances().is_empty());
+        assert_eq!(top.instances(), []);
         assert!(
             top.signals()
                 .iter()
@@ -6345,7 +6345,7 @@ module WideLiteralTop (
             "StructInstanceTop",
         )
         .unwrap();
-        assert!(design.top_module().unwrap().instances().is_empty());
+        assert_eq!(design.top_module().unwrap().instances(), []);
 
         let synthesized = synthesize(&design).unwrap();
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
@@ -6427,7 +6427,7 @@ module WideLiteralTop (
         )
         .unwrap();
         let top = design.top_module().unwrap();
-        assert!(top.instances().is_empty());
+        assert_eq!(top.instances(), []);
         for lane in 0_u8..4 {
             assert!(
                 top.signals().iter().any(|signal| {
@@ -6502,7 +6502,7 @@ module WideLiteralTop (
         )
         .unwrap();
         let top = design.top_module().unwrap();
-        assert!(top.instances().is_empty());
+        assert_eq!(top.instances(), []);
         for lane in 0_u8..4 {
             assert!(
                 top.signals()
@@ -6534,7 +6534,7 @@ module WideLiteralTop (
         )
         .unwrap();
         let top = design.top_module().unwrap();
-        assert!(top.instances().is_empty());
+        assert_eq!(top.instances(), []);
         for lane in 0_u8..4 {
             assert!(
                 top.signals()
@@ -6596,7 +6596,7 @@ module WideLiteralTop (
         )
         .unwrap();
         let synthesized = synthesize(&design).unwrap();
-        assert!(synthesized.netlist.memories().is_empty());
+        assert_eq!(synthesized.netlist.memories(), []);
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
         let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
 
@@ -6819,9 +6819,9 @@ module WideLiteralTop (
             "ForbiddenMemoryTop",
         )
         .unwrap();
-        assert!(design.top_module().unwrap().memories().is_empty());
+        assert_eq!(design.top_module().unwrap().memories(), []);
         let synthesized = synthesize(&design).unwrap();
-        assert!(synthesized.netlist.memories().is_empty());
+        assert_eq!(synthesized.netlist.memories(), []);
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
         let mut simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
 
@@ -6888,7 +6888,7 @@ module DebugTop (
             map_to_ecp5_with_jtagg(&synthesized.netlist, &JtaggBinding::with_prefix("jtag"))
                 .unwrap();
 
-        assert!(mapped.ports().is_empty());
+        assert_eq!(mapped.ports(), []);
         assert!(
             mapped
                 .to_nextpnr_json()

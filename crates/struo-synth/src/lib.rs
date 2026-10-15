@@ -1838,7 +1838,7 @@ mod tests {
         let mut design = Design::new("GuardedCount");
         design.add_module(module);
         let netlist = synthesize(&design).unwrap().netlist;
-        assert!(!netlist.arithmetic().is_empty());
+        assert_ne!(netlist.arithmetic(), []);
         assert!(
             netlist
                 .arithmetic()

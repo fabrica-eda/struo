@@ -74,7 +74,7 @@ mod tests {
         assert!(images.boolean_nodes > images.registers);
         assert!(images.registers >= 400);
         assert!(images.mapped_cells > images.registers);
-        assert!(!images.mapped.code_image().is_empty());
+        assert_ne!(images.mapped.code_image(), [0_u8; 0]);
     }
 
     #[test]
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn self_test_wrapper_passes_before_and_after_mapping() {
         let design = axi4_crossbar_self_test().unwrap();
-        assert!(design.top_module().unwrap().instances().is_empty());
+        assert_eq!(design.top_module().unwrap().instances(), []);
         let synthesized = synthesize(&design).unwrap();
         let mapped = map_to_ecp5(&synthesized.netlist).unwrap();
         let mapped_simulator = ecp5_simulator(&mapped).unwrap().build_native().unwrap();
