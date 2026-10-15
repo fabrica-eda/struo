@@ -4588,7 +4588,7 @@ fn update_mapped_cell_depth(cell: &Ecp5Cell, depths: &mut WireMap<usize>) -> boo
         } => {
             let inputs = lhs.iter().chain(rhs.iter()).collect::<Vec<_>>();
             let mut progress = false;
-            for output in product.iter() {
+            for output in product {
                 progress = update(&inputs, *output, depths) || progress;
             }
             progress
@@ -4737,7 +4737,7 @@ fn mapped_timing_arrivals(netlist: &Ecp5Netlist) -> WireMap<u32> {
                         .max()
                         .map(|arrival| arrival.saturating_add(MULTIPLIER_DELAY_PS));
                     if let Some(arrival) = arrival {
-                        for output in product.iter() {
+                        for output in product {
                             progress |= arrivals.insert(*output, arrival) != Some(arrival);
                         }
                     }
@@ -7393,7 +7393,7 @@ fn map_memory(
         depth: memory.depth(),
         width: memory.write_data().len(),
     };
-    let chunk_width = maximum_block_ram_width(memory.depth()).ok_or_else(&geometry_error)?;
+    let chunk_width = maximum_block_ram_width(memory.depth()).ok_or_else(geometry_error)?;
     let chunk_count = memory.write_data().len().div_ceil(usize::from(chunk_width));
     for (chunk, (write_data, read_data)) in memory
         .write_data()
@@ -7403,7 +7403,7 @@ fn map_memory(
     {
         let word_width = u8::try_from(write_data.len()).map_err(|_| geometry_error())?;
         let physical_width =
-            block_ram_width(memory.depth(), word_width).ok_or_else(&geometry_error)?;
+            block_ram_width(memory.depth(), word_width).ok_or_else(geometry_error)?;
         let mut write_address = physical_address(bits, memory.write_address(), physical_width);
         if physical_width == 18 {
             // In 18-bit mode ADA0/ADA1 are the two 9-bit byte enables rather
@@ -12400,7 +12400,7 @@ mod tests {
 
         let mapped = map_to_ecp5_with_jtagg(&source, &binding).unwrap();
 
-        assert!(mapped.ports().is_empty());
+        assert_eq!(mapped.ports(), []);
         assert!(matches!(
             mapped.cells(),
             [Ecp5Cell::Jtagg {

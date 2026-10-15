@@ -586,6 +586,6 @@ target = { type = "directory", path = "target" }
         let design = analyze_project_and_lower(directory.path(), "Top").unwrap();
         let top = design.top_module().unwrap();
         assert_eq!(top.name(), "Top");
-        assert!(top.instances().is_empty());
+        assert_eq!(top.instances(), []);
     }
 }

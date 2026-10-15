@@ -84,7 +84,7 @@ pub(super) fn adder_widths(module: &Module) -> Vec<Option<usize>> {
             })
         })()
         .unwrap_or(full);
-        let needed = (u64::BITS - range.max.leading_zeros()).max(1);
+        let needed = range.max.bit_width().max(1);
         widths.push(
             (matches!(
                 expression.kind(),

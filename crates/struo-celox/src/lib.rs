@@ -958,7 +958,7 @@ fn emit_block_ram(
     edge: ClockEdge,
     second_port: Option<BlockRamSecondPort<'_>>,
 ) -> Result<(), CeloxAdapterError> {
-    let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1) as usize;
+    let address_width = (depth - 1).bit_width().max(1) as usize;
     let shift = match physical_width {
         1 => 0,
         2 => 1,
@@ -1414,7 +1414,7 @@ mod tests {
         let read_enable_b = source.add_input("read_enable_b");
         let write_enable_a = source.add_input("write_enable_a");
         let write_enable_b = source.add_input("write_enable_b");
-        let address_width = (u32::BITS - (depth - 1).leading_zeros()).max(1);
+        let address_width = (depth - 1).bit_width().max(1);
         let address_a = source.add_input_port("address_a", NonZeroU32::new(address_width).unwrap());
         let address_b = source.add_input_port("address_b", NonZeroU32::new(address_width).unwrap());
         let write_a = source.add_input_port("write_a", NonZeroU32::new(word_width).unwrap());

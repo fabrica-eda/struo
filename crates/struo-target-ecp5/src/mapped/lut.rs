@@ -413,7 +413,7 @@ fn structural_fanouts(netlist: &Netlist) -> Vec<usize> {
 
 pub(super) fn wire_delay_ps(fanout: usize) -> u32 {
     let fanout = fanout.max(1);
-    let levels = usize::BITS - (fanout - 1).leading_zeros();
+    let levels = (fanout - 1).bit_width();
     ROUTE_BASE_PS + ROUTE_FANOUT_STEP_PS * levels
 }
 
@@ -436,11 +436,7 @@ fn arithmetic_arc_ps(
         // The hard multiplier estimate uses the characterized ECP5-5G speed-8
         // unregistered maximum. Wider words add a conservative carry-tree cost.
         let chunks = arithmetic.outputs().len().div_ceil(18);
-        let levels = usize::BITS
-            - chunks
-                .saturating_mul(chunks)
-                .saturating_sub(1)
-                .leading_zeros();
+        let levels = chunks.saturating_mul(chunks).saturating_sub(1).bit_width();
         let width = u32::try_from(arithmetic.outputs().len()).unwrap_or(u32::MAX);
         let adder = CCU_INPUT_PS
             .saturating_add(CCU_CARRY_PS.saturating_mul(width))

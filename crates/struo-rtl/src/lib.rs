@@ -965,8 +965,7 @@ impl Module {
                     latency: memory.read_latency,
                 });
             }
-            let address_width =
-                BitWidth::new((u32::BITS - (memory.depth - 1).leading_zeros()).max(1))?;
+            let address_width = BitWidth::new((memory.depth - 1).bit_width().max(1))?;
             let primary = MemoryPort {
                 read_address: memory.read_address,
                 read_data: memory.read_data,

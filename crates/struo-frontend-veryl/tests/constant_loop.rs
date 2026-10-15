@@ -14,7 +14,7 @@ fn constant_loop_arithmetic_does_not_create_carry_cells() {
     )
     .unwrap();
     let netlist = synthesize(&rtl).unwrap().netlist;
-    assert!(netlist.arithmetic().is_empty());
+    assert_eq!(netlist.arithmetic(), []);
     let mapped = map_to_ecp5_with_options(
         &netlist,
         MappingOptions {

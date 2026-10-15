@@ -20,7 +20,7 @@ impl ModuleLowerer<'_> {
             && let ValueVariant::Numeric(value) = &ct.value
             && let Some(number) = value.to_usize_saturating()
         {
-            let bits = (usize::BITS - number.leading_zeros()).max(1) + 1;
+            let bits = number.bit_width().max(1) + 1;
             return Ok(LoweredExpr {
                 signed: true,
                 ..self.constant(bits, number as u64)
