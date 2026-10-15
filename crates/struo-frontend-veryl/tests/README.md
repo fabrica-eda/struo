@@ -1,9 +1,9 @@
 # Veryl corpus tests
 
-The pinned `celox-test-suite-veryl` 0.9.0 corpus exercises:
+The pinned `celox-test-suite` 0.11.0 Veryl corpus exercises:
 
 ```text
-Veryl -> Struo RTL -> synthesis -> ECP5 mapping -> Celox 0.9.0 native simulation
+Veryl -> Struo RTL -> synthesis -> ECP5 mapping -> Celox 0.11.0 native simulation
 ```
 
 CI enumerates every corpus case in the `Veryl corpus (Celox 0.9.0)` job on
